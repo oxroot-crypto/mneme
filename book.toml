@@ -1,0 +1,22 @@
+[book]
+title = "Mneme 设计文档"
+description = "AI Agent 超长期记忆层 —— 嵌入式向量存储引擎设计"
+authors = ["Mneme contributors"]
+language = "zh"
+src = "docs"
+
+[output.html]
+default-theme = "light"
+preferred-dark-theme = "navy"
+no-section-label = true
+additional-js = ["mermaid.min.js", "mermaid-init.js"]
+
+# 数学公式渲染(KaTeX)。安装:cargo install mdbook-katex --no-default-features --features duktape
+# Windows MSVC 无法编译默认的 quick-js 后端,必须用 duktape 后端。
+[preprocessor.katex]
+after = ["links"]
+
+# 图表渲染(Mermaid)。安装:cargo install mdbook-mermaid
+# 首次需运行 `mdbook-mermaid install .`(复制 mermaid 资源并补全 additional-js)。
+[preprocessor.mermaid]
+command = "mdbook-mermaid"
