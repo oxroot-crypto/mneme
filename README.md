@@ -1,6 +1,6 @@
 # Mneme
 
-> **Mneme**(μνήμη,希腊记忆女神)是一个纯 Rust 编写的**嵌入式向量存储引擎**,
+> **Mneme**(μνήμη,希腊记忆女神)是一个纯 Rust 编写的**嵌入型向量存储引擎**,
 > 专为 **AI Agent 的超长期记忆层**设计:进程内运行、无需服务端、数据经年累月增长而不失控。
 
 **状态**:设计阶段(尚未发布到 crates.io)。本仓库当前包含完整设计文档,代码实现按
@@ -24,12 +24,16 @@ LLM 每次对话结束就"忘光"上下文之外的一切。要让 Agent 长期�
 | 能力 | 说明 |
 |---|---|
 | 向量检索 | 余弦 / 点积 / 欧氏;自研 HNSW(过滤感知),小数据自动暴力扫描 |
-| 混合检索 | 过滤 DSL + BM25 关键词 + RRF/加权融合 + 去重 |
-| 记忆生命周期 | TTL 两阶段过期、指数遗忘曲线、访问强化、命名空间隔离 |
-| 持久化 | WAL + 不可变段 + MANIFEST 原子提交,任意点掉电可恢复 |
+| 混合检索 | 过滤 DSL + BM25 关键词 + RRF/加权融合 + 去重 + MMR 多样性 |
+| **记忆感知排序** | 相似度 + 新鲜度 + 重要度 + 访问频次 + 可信度可配置组合;联想扩展 |
+| **记忆模型** | 关系图(联想检索)、双时态 `as_of` 时间旅行(历史版本默认永久保留,可配保留期)、`supersede` 信念修订、来源/可信度、记忆沉淀 |
+| 记忆生命周期 | TTL 两阶段过期、指数遗忘曲线、访问强化、命名空间隔离(自动遗忘默认关闭) |
+| 持久化 | WAL + 不可变段 + delta 覆盖区 + MANIFEST 原子提交,任意点掉电可恢复、删除不复活 |
 | 超长期 | size-tiered compaction,写放大 O(log N)、活跃段数有界 |
-| 量化 | i8 / f16 量化副本 + 两阶段重打分,查询带宽 ÷4 |
-| 依赖极简 | 非 feature 强依赖 4 个小 crate(默认开 `mmap` 共 5 个),复杂算法全部自研 |
+| 量化 | i8 / f16 量化副本 + 两阶段重打分,查询带宽 i8 ÷4 / f16 ÷2(f32 原向量保留供精排,故磁盘不缩减) |
+| **存储安全**(可选) | AES-256-GCM 静态加密、文本/元数据压缩 |
+| **部署形态** | 多进程只读共享;`Storage` 抽象支持 WASM/边缘适配;可观测事件钩子 |
+| 依赖极简 | 非 feature 强依赖 4 个小 crate(默认开 `mmap` 共 5 个),复杂算法全部自研;加密/压缩均为可选 feature |
 
 ## 安装
 
@@ -79,7 +83,7 @@ fn main() -> mneme::Result<()> {
 ```
 
 完整 API 语义、配置项、错误处理与备份恢复见
-[11 公开 API 与运维参考](docs/design/11-api-reference.md)。
+[16 公开 API 与运维参考](docs/design/16-api-reference.md)。
 
 ## Feature 开关
 
@@ -88,6 +92,10 @@ fn main() -> mneme::Result<()> {
 | `mmap` | ✅ 开 | 段文件 mmap 零拷贝读;关闭后走 `Read + Seek` 兜底 |
 | `async` | ❌ 关 | 提供 `insert().await` 等 async 门面(`spawn_blocking` 薄包装) |
 | `quant-f16` | ❌ 关 | f16 量化副本;关闭时只有 f32 / i8 |
+| `encrypt` | ❌ 关 | AES-256-GCM 静态加密 |
+| `compress` | ❌ 关 | 文本/元数据压缩(内置 LZ4 风格 codec) |
+| `compress-zstd` | ❌ 关 | 可选更强压缩(引入 `zstd`) |
+| `wasm` | ❌ 关 | 关闭 mmap/线程并行,WASM 目标 |
 
 ## 文档
 
@@ -97,9 +105,15 @@ fn main() -> mneme::Result<()> {
 | [00 零基础篇](docs/design/00-fundamentals.md) | 嵌入向量、相似度、ANN、WAL/MVCC 等全部前置概念 |
 | [01 总览](docs/design/01-overview.md) | 定位、架构、依赖白名单、公开 API 速览 |
 | [02–08 各层设计](docs/design/02-l0-core.md) | L0 原语 → L6 量化,含完整数学推导 |
-| [09 测试与验收](docs/design/09-testing.md) | 崩溃注入、召回属性测试、基准、fuzz、长跑 |
-| [10 术语表](docs/design/10-glossary.md) | 中英对照、符号表、复杂度速查 |
-| [11 API 与运维参考](docs/design/11-api-reference.md) | 完整 API、配置总表、错误/重试、线程安全、备份恢复 |
+| [14 测试与验收](docs/design/14-testing.md) | 崩溃注入、召回属性测试、基准、fuzz、长跑 |
+| [15 术语表](docs/design/15-glossary.md) | 中英对照、符号表、复杂度速查 |
+| [16 API 与运维参考](docs/design/16-api-reference.md) | 完整 API、配置总表、错误/重试、线程安全、备份恢复 |
+| [09 记忆模型](docs/design/09-memory-model.md) | 关系图、双时态、来源/可信度、记忆沉淀 |
+| [10 记忆感知排序](docs/design/10-scoring.md) | 综合打分、联想扩展、反馈闭环、MMR |
+| [11 存储安全与压缩](docs/design/11-security-storage.md) | 静态加密、文本/元数据压缩 |
+| [12 部署形态](docs/design/12-deployment.md) | 多进程只读、WASM 适配、可观测 |
+| [13 记忆模式手册](docs/design/13-cookbook.md) | Agent 记忆配方(可直接照抄) |
+| [spec/contracts.md](docs/spec/contracts.md) | 形式化契约矩阵(FC-Matrix) |
 
 ## 构建文档站点
 
@@ -119,11 +133,12 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test                       # 单测 + 集成测试
 cargo test --features async      # async 门面等价性
+cargo doc --no-deps              # 公开项 100% 文档覆盖(#![deny(missing_docs)])
 cargo bench                      # criterion 基准(L3 起)
 ```
 
 CI 分 fast / middle / heavy / fuzz 四档,矩阵覆盖 Linux(x86_64/aarch64)与
-Windows(x86_64),详见 [09 §7](docs/design/09-testing.md)。
+Windows(x86_64),详见 [14 §7](docs/design/14-testing.md)。
 
 ## MSRV
 

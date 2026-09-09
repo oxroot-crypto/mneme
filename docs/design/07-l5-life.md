@@ -22,7 +22,8 @@
 
 不变量:**过期只可能"晚消失",不可能"早消失"**——逻辑过期兜住正确性,
 物理清除只负责回收。`ns.forget(filter)` 是人工 TTL:立即打墓碑(逻辑过期),
-等 compaction 物理回收。
+等 compaction 物理回收。**历史读的过期判定以视图时刻为准**:记录在 `as_of(t)` 中可见
+当且仅当 `expires_at > t`(或未设 TTL),与当前读一致地复用同一条可见性规则。
 
 `now` 一律取自可注入的 `Clock`([04 §10.2](04-l2-persist.md)),并做单调钳制,
 因此测试可"快进时间"、系统时钟回拨也不会导致误过期。
@@ -38,8 +39,8 @@
 
 ```text
 查询命中 → 读者把 RowId 追加进线程本地缓冲 → 攒批后合并进
-  Mutex<HashMap<RowId, AccessStat>>     (内存,写者锁外;AccessStat 见 [11 §1.6](11-api-reference.md))
-后台每 30s(默认): 把增量以 WAL Touch 帧落盘(一帧合并多次命中)
+  Mutex<HashMap<RowId, AccessStat>>     (内存,写者锁外;AccessStat 见 [16 §1.6](16-api-reference.md))
+后台每 30s(默认): 把增量以 WAL Touch/TouchRow 帧落盘(一帧合并多次命中,`access_delta` 记合并后的次数)
 compaction: 把 Touch 历史并入新 msec 的 last_access / access_count 列([04 §2.2](04-l2-persist.md) entry 格式)
 ```
 
@@ -83,38 +84,46 @@ $$\frac{E(t + T_{1/2})}{E(t)} = \frac{I \cdot 2^{-(t+T_{1/2})/T_{1/2}}}{I \cdot 
 
 被回忆会刷新 $t$(重置时钟)并计入 $c$(累计次数)。有效强度:
 
-$$S = I \cdot 2^{-t/T_{1/2}} + w \cdot \ln(1 + c)$$
+$$E_{\text{eff}} = I \cdot 2^{-t/T_{1/2}} + w \cdot \ln(1 + c)$$
 
-(纯文本:`S = I * 2^(-t / T_half) + w * ln(1 + c)`,c = 累计访问次数)
+(纯文本:`E_eff = I * 2^(-t / T_half) + w * ln(1 + c)`,c = 累计访问次数)
 
 **为什么增益是 $\ln(1+c)$?** 其导数 $\frac{d}{dc}\ln(1+c) = \frac{1}{1+c}$
 单调递减——第 1 次回忆的强化远大于第 100 次(边际递减),符合直觉;
 且 $\ln$ 增长极慢,任何记忆都无法靠刷访问次数变成"不朽"
-($c = 10^6$ 也只加 $w \times 13.8$),$w$ 默认 0.05。
+($c = 10^6$ 也只加 $w \times 13.8$),$w$ 默认 0.05、经 `Retention::w` 配置。
 
 ### 3.4 Retain 算法与算例
 
 ```text
 ns.retain(policy):  扫描候选(过滤 + protect 白名单豁免)
-  S = I·2^(-t/T½) + w·ln(1+c)
-  S < min_importance → 打墓碑(逻辑过期,物理回收留给 compaction)
-   返回 (扫描数, 遗忘数);也可由后台周期性自动执行
-   (默认开,周期 = 半衰期/4,可用 `Builder::retain_interval` 调整;默认策略经
-    `retention(Option<Retention>)` 配置,`retention(None)` 关闭自动模式,
-    见 [11 §2](11-api-reference.md))
+  E_eff = I·2^(-t/T½) + w·ln(1+c)
+  E_eff < min_importance → 打墓碑(逻辑过期,物理回收留给 compaction)
+   返回 RetainReport{ scanned, forgotten, sampled_ids }
+   (后台自动执行 **默认关闭**,需显式 `Builder::retention(Some(policy))` 开启,
+    周期 = 半衰期/4,可用 `Builder::retain_interval` 调整;见 [16 §2](16-api-reference.md))
 ```
 
 **【算例】** $T_{1/2} = 14$ 天,$w = 0.05$,$min\_importance = 0.2$:
 
 ```
-记忆 A: I=0.8, 从未访问, 28 天未强化 → S = 0.8 × 2^(-28/14) = 0.8 × 0.25 = 0.20
+记忆 A: I=0.8, 从未访问, 28 天未强化 → E_eff = 0.8 × 2^(-28/14) = 0.8 × 0.25 = 0.20
         → 恰在阈值边缘(≥0.2 保留)
-记忆 B: I=0.8, 同龄, 但被访问过 3 次 → S = 0.20 + 0.05·ln(4) ≈ 0.20 + 0.069 = 0.269 → 保留 ✓
-记忆 C: I=0.2 的临时记录, 14 天未动 → S = 0.2 × 0.5 = 0.10 → 遗忘 ✓
+记忆 B: I=0.8, 同龄, 但被访问过 3 次 → E_eff = 0.20 + 0.05·ln(4) ≈ 0.20 + 0.069 = 0.269 → 保留 ✓
+记忆 C: I=0.2 的临时记录, 14 天未动 → E_eff = 0.2 × 0.5 = 0.10 → 遗忘 ✓
 ```
 
 **【复杂度】** 一次 retain 扫描 $O(N_{\text{候选}})$(元数据级,不读向量);
-自动模式摊销进后台,周期 = 半衰期/4(默认),单次成本与 compaction 同量级、受同一限速。
+自动模式摊销进后台,周期 = 半衰期/4,单次成本与 compaction 同量级、受同一限速。
+
+> **安全默认与可审计(I23)**:自动遗忘**默认关闭**——一个记忆库不应在用户未显式授权时
+> 自行删除记忆。开启后,`RetainReport` 记录 `forgotten` 数量与抽样 `sampled_ids`,
+> 后台模式亦经 `Stats.retain` 暴露最近一次结果;`forget`/`retain` 产生的墓碑作为版本链的
+> 一部分被保留(默认永久,受 `history_horizon` 约束,§4.2a),可经
+> `iter` + `include_deleted` 审计导出(见 [16 §1.3](16-api-reference.md));
+> 仅超期回收后不再保留逐行内容(仍保留 `RetainReport`/`Stats.retain` 的聚合记录)。
+> 若确需自动清理,推荐先用 `min_importance` 保守阈值 + `protect` 白名单 + 只对
+> `kind == "scratch"` 之类过滤器生效,而非全库默认。
 
 ---
 
@@ -141,15 +150,34 @@ $r$ = 分级比,默认 4;每行大小近似常数,故行数正比于字节数);
 
 $$W_{\text{amp}} \;\approx\; \frac{\text{全层总写入}}{N} \;\approx\; L \;=\; \log_r\frac{N}{B}$$
 
+(纯文本:`W_amp ≈ 全层总写入 / N ≈ L = log_r(N/B)`)
+
 (几何级数各项——每层的总写入——近似相等,是 size-tiered 写放大可控的关键;
 保守上界带常数因子 $\frac{r}{r-1}$。)
-代入 $r=4$:$N = 10^8$ 行(远超实际),$B$ = 8k 行 → $\log_4 12500 \approx 6.8$,
+代入 $r=4$:$N = 10^8$ 行(远超实际),$B = 8192$ 行 → $\log_4(10^8/8192) \approx 6.8$,
 即**平均每字节被重写约 7 次**(上界 ≈ 9,仍是个位数)——写放大可预测、可接受。
 
 **段数有界证明**:层 $i$ 的段数 ≤ $T-1$(否则触发合并),层数 $\log_r(N/B)$
 → 活跃段数 $\le (T-1)\log_r(N/B) + O(1) = O(\log_r N)$。这就是
 [01 §1.1](01-overview.md)"超长期不失控"的数学根据:**无论跑十年还是五十年,
 打开的文件数只随数据量对数增长**。
+
+### 4.2a 历史版本保留(`history_horizon`)
+
+`as_of(t)` 与 `supersede` 的历史依赖**版本链**([04 §2.2](04-l2-persist.md))。compaction 对每个
+RowId 的版本链:
+
+- **始终保留**最新版本(或最新墓碑,以维持当前可见状态);
+- 保留事务时间 `tx_ms ≥ now - history_horizon` 的历史版本;
+- 仅回收 `tx_ms < now - history_horizon` 的历史版本(墓碑同理);
+- 若整条链(含最新)都是超期墓碑 → 回收整个 RowId(RowId 永不复用)。
+
+`history_horizon` 默认 `None` = **永久保留**,即 `as_of`/`supersede` 历史不受 compaction 影响;
+设置有限值(如 90 天)可把磁盘占用约束为"最近该窗口内的版本数",代价是更早的历史不可回溯。
+保留窗口内,**活跃段数仍有界**(I8),但磁盘随历史版本数线性增长——这是"保留历史"的必然代价。
+
+**版本链物化**:compaction 把同一 RowId 跨段的多版本合并进新段的一条 version_table 记录序列
+(§2.2),墓碑并入 delta;合并只重排物理布局,不改变可见性结果(同快照语义)。
 
 ### 4.3 触发条件(任一满足)
 
@@ -163,14 +191,15 @@ $$W_{\text{amp}} \;\approx\; \frac{\text{全层总写入}}{N} \;\approx\; L \;=\
 
 ```text
 1. 调度线程选段组(最少写入热度的优先)→ 生成合并计划(登记,可取消)
-2. scoped threads 并行: 逐行过滤(墓碑/TTL/retain 评分)→ 写新 vsec/msec
-3. 对幸存行并行重建 HNSW(05 §4 的 build,分块并行)+ 重建倒排/zone map
+2. scoped threads 并行: 逐版本过滤(墓碑/TTL/retain 评分/history_horizon 超期回收)
+   → 幸存版本按 RowId 合并成版本链 → 写新 vsec/msec
+3. 对幸存版本并行重建 HNSW(05 §4 的 build,分块并行)+ 重建倒排/zone map
 4. 提交: 新段写完 + CRC → 新 MANIFEST(原子,04 §6)→ 旧段进 trash(04 §9)
-失败: 任意一步崩溃 → 新段是孤儿(下轮启动清理), 旧 MANIFEST 完好, 无损回滚
+失败: 任意一步崩溃 → 新段是孤儿(下次启动清理), 旧 MANIFEST 完好, 无损回滚
 ```
 
 - **限速**:合并 IO 与前台共享配额(默认磁盘预算 30%),写竞争时主动让路
-  (`db.compact_control()` 的 `pause()` / `resume()`,见 [11 §1.6](11-api-reference.md)),保证查询 P99 不被 compaction 拖爆;
+  (`db.compact_control()` 的 `pause()` / `resume()`,见 [16 §1.6](16-api-reference.md)),保证查询 P99 不被 compaction 拖爆;
 - **查询可见性**:合并期间新旧段同时在 MANIFEST 里吗?不——旧段保持到提交瞬间,
   新段在提交后可见,中间的读者要么看旧要么看新(快照语义),永不看到半成品;
 - **结果稳定性**:重建会重排 HNSW 邻接(并行构建 + 新段布局),故同一数据在合并前后
@@ -205,8 +234,8 @@ $$W_{\text{amp}} \;\approx\; \frac{\text{全层总写入}}{N} \;\approx\; L \;=\
 ```rust
 db.namespace("a/b");            // 不存在则隐式创建(空命名空间不占物理空间)
 db.list_namespaces()?;          // 按前缀树顺序列出全部路径
-db.drop_namespace("a/b")?;      // 墓碑该前缀下所有记录(含子命名空间),返回行数;
-                                // 物理回收留给 compaction
+db.drop_namespace("a/b")?;      // 墓碑该路径及其子命名空间下的所有记录,返回行数;
+                                // 按 `/` 段边界匹配("a/b" 不含 "a/bc");物理回收留给 compaction
 ns.iter(None)?;                 // 遍历/导出一个命名空间的全部活记录
 ```
 
@@ -214,6 +243,9 @@ ns.iter(None)?;                 // 遍历/导出一个命名空间的全部活�
   `NsEntry` 在该命名空间**首次成功写入**(`insert`/`insert_batch`,经 WAL 提交)时
   惰性登记进 MANIFEST。因此 `list_namespaces()` 列的是"注册过的"命名空间——
   仅调用过 `namespace()` 但从未写入的空空间不会出现(它也不占物理空间);
+- **路径规范**:路径为 `/` 分隔的段序列;`namespace(path)` 会规范化(去除首尾 `/`、
+  合并连续 `/`),规范化后为空视为根命名空间,最多 `Limits.ns_depth` 级。由于
+  `namespace()` 不返回 `Result`,超深/含非法字符等错误在**首次写入**时以 `Invalid` 报告;
 - per-NS 统计:来自 msec 的 `ns_stats`(每段每命名空间的 `doc_count`/`total_doc_len`,
   [04 §5.6](04-l2-persist.md))聚合(`db.stats()` 的 `per_namespace`)。
 
@@ -231,18 +263,19 @@ db.backup_to(dir) → 先 flush() 形成一致性点, 再在快照视图上:
                  → 复制 current 与 MANIFEST.<v> → 目标目录即可被 Mneme::open 独立打开
 ```
 
-`SnapshotHandle` 的完整接口(`version / search / get / get_by_rowid / get_vector / iter / stats`)
-见 [11 §1.6](11-api-reference.md);它 `Send + Sync`,可交给只读线程做长查询而
-不阻塞前台写入。
+`SnapshotHandle` 的接口(`version / as_of_ms / stats` 与 `namespace() → SnapshotNamespace`)
+及 `SnapshotNamespace` 的读取面(`search / get / get_by_rowid / get_many / get_vector /
+neighbors / iter`)见 [16 §1.6](16-api-reference.md);二者均 `Send + Sync`,可交给只读线程
+做长查询而不阻塞前台写入。
 
 - **一致性**:硬链接的文件集来自**同一 Manifest 版本**,而段文件 write-once——
   备份期间的前台写入不污染备份(它们写的是新段);
 - 成本:同盘硬链接 $O(\text{文件数})$;跨盘复制 = 数据量,可在 `stats()` 里预估;
 - 恢复演练:备份目录 `open` + `check()` 全绿 = 备份有效(写进 CI 的验收项,
-  见 [09 §6](09-testing.md));
+  见 [14 §6](14-testing.md));
 - **时间点恢复 / 损坏处置**:MANIFEST 保留最近 2 个版本,把 `current` 指向上一个
   版本号即可回滚一个提交点;完整 runbook(含 ENOSPC、MANIFEST 全坏、段隔离)
-  见 [11 §7](11-api-reference.md)。
+  见 [16 §7](16-api-reference.md)。
 
 ---
 
@@ -254,9 +287,14 @@ db.stats()?  -> Stats {
     wal_bytes, memory_est, trash_bytes,
     query_latency: Histogram(固定桶: 1ms..1s, 32 桶),
     per_namespace: HashMap<String, NsStat>,   // 键为命名空间路径(经 MANIFEST 注册表解析)
-    compaction: CompactionState,   // Idle | Running{progress, segments},定义见 [11 §1.6](11-api-reference.md)
+    quant: QuantStat,              // 配置/生效量化格式 + 召回估计(08 §4.3)
+    compaction: CompactionState,   // Idle | Running{progress, segments},定义见 [16 §1.6](16-api-reference.md)
+    retain: Option<RetainReport>,  // 最近一次后台遗忘(未开启则 None,§3.4)
+    relations: u64,                // 关系边数(09 §2)
+    history: HistoryStat,          // 版本链/历史保留统计(§4.2a)
+    storage: StorageStat,          // 加密/压缩生效状态与迁移进度(11)
 }
-db.check()?   // fsck: 全量 CRC + slot 表/RowId 映射一致性 + key 索引 ↔ entries 对账
+db.check()?   // fsck: 全量 CRC + version_table/RowId 版本链一致性 + key 索引 ↔ entries 对账
               //           + 墓碑/TTL 占比报告 + 建议动作(如 "建议合并 3 个 25MB 段")
 ```
 
@@ -276,10 +314,17 @@ db.check()?   // fsck: 全量 CRC + slot 表/RowId 映射一致性 + key 索引 
 **不变量**:
 
 - I8 任意时刻活跃段数 ≤ $(T-1)\cdot\log_r(N/B) + c$;WAL 总量 ≤ 256MB(默认);
-- I9 逻辑过期/墓碑记录永不返回给读者;物理回收只发生在 compaction 提交点之后;
+  (磁盘随保留的历史版本数线性增长,由 `history_horizon` 控制,§4.2a)
+- I9 逻辑过期/墓碑记录在**常规读路径**(`search`/`get`/`iter` 默认)永不返回;
+  仅 `iter_with(..., include_deleted=true)` 审计入口可见;物理回收只发生在 compaction 提交点之后;
 - I10 compaction 任意时刻崩溃 → 恢复后数据集 = 提交前状态(孤儿段自动清理);
 - I11 备份目录独立打开 + check 通过;
-- I17 `SnapshotHandle` 存活期间看到固定 ReaderView 的完整视图(段集 + 取快照时的可变表快照),后台 compaction 不影响其正确性。
+- I17 `SnapshotHandle` 存活期间看到固定 ReaderView 的完整视图(段集 + 取快照时的可变表快照),后台 compaction 不影响其正确性;
+- **I23 删除可审计与安全默认**:自动遗忘默认关闭;任何 `forget`/`retain` 的删除都可经
+  `RetainReport`/`Stats.retain` 或带 `include_deleted` 的 `iter` 追溯(墓碑在 `history_horizon`
+  内保留,默认永久),绝不静默删除(§3.4、§4.2a);
+- **I26 历史保留(存储侧)**:每个 RowId 的最新版本与 `history_horizon` 内的历史版本被保留;
+  `as_of(t)` 在保留窗口内不随后续写入/compaction 变化(默认永久);超期版本才可回收(§4.2a)。
 
 ## 下一章
 

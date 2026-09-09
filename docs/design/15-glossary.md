@@ -1,5 +1,9 @@
-# 10 术语表、符号表与复杂度速查
+# 15 术语表、符号表与复杂度速查
 
+> **本章目标**:提供全书的中英术语、符号与复杂度速查入口,遇到不熟悉的词随时回查。
+> **前置阅读**:无(可随时穿插查阅)。
+> **本章你将学到**:领域/索引/存储/量化术语中英对照 → 数学符号约定 → 复杂度速查总表。
+>
 > 按主题分组;"详见"列指向完整讲解所在小节,可跳回原文。
 
 ---
@@ -20,10 +24,22 @@
 | 召回率 | Recall@k | ANN 结果与精确结果的重合比例 | [00 §5.2](00-fundamentals.md) |
 | 记忆生命周期 | memory lifecycle | 写入→强化→衰减→遗忘的完整管理 | [07](07-l5-life.md) |
 | 命名空间 | Namespace | 记忆的逻辑分区;路径式层级,`(NsId, Key)` 为复合主键 | [07 §5](07-l5-life.md) |
-| 记录 | Record | 一条记忆:向量 + 可选 key/text/元数据/TTL/importance | [11 §1.2](11-api-reference.md) |
-| 命中 | Hit | 检索结果:RowId、key、score 与记录视图(不含向量) | [11 §1.2](11-api-reference.md) |
-| 记录视图 | RecordRef | 存储记录的只读视图(无 score),`get`/`iter` 返回;可取回原始向量 | [11 §1.2](11-api-reference.md) |
+| 记录 | Record | 一条记忆:向量 + 可选 key/text/元数据/TTL/importance | [16 §1.2](16-api-reference.md) |
+| 命中 | Hit | 检索结果:RowId、key、score 与记录视图(不含向量) | [16 §1.2](16-api-reference.md) |
+| 记录视图 | RecordRef | 存储记录的只读视图(无 score),`get`/`iter` 返回;可取回原始向量 | [16 §1.2](16-api-reference.md) |
 | 艾宾浩斯曲线 | Ebbinghaus curve | 记忆保持率随时间指数衰减、回忆可减缓衰减 | [07 §3](07-l5-life.md) |
+| 记忆关系 | relation | 记忆间的有向带权边(supports/contradicts/derived_from…);联想检索的基础 | [09 §2](09-memory-model.md) |
+| 联想扩展 | spreading activation | 沿关系边扩散,把相关记忆补进候选 | [10 §3](10-scoring.md) |
+| 双时态 | bi-temporal | 同时维护事务时间与有效时间两个时间轴 | [09 §3](09-memory-model.md) |
+| 有效时间 | valid time | 事实在现实世界中成立的时间区间 | [09 §3](09-memory-model.md) |
+| 事务时间 | transaction time | 记录被写入/更新的时间(引擎自动维护) | [09 §3](09-memory-model.md) |
+| 信念修订 | supersede | 用新事实取代旧事实的有效时间,同时保留历史 | [09 §3.3](09-memory-model.md) |
+| 来源 | provenance | 记忆的来源/派生链(开放 JSON) | [09 §4](09-memory-model.md) |
+| 可信度 | confidence | 记忆为真的置信度,参与排序 | [09 §4](09-memory-model.md) |
+| 记忆沉淀 | consolidation | 把近似重复的碎片聚簇、合并/摘要为稳定知识 | [09 §5](09-memory-model.md) |
+| 综合打分 | scoring | 相似度 + 新鲜度 + 重要度 + 访问 + 可信度的统一排序 | [10 §2](10-scoring.md) |
+| 反馈闭环 | feedback loop | 把"命中是否被采用"回写为访问/重要度增益 | [10 §4](10-scoring.md) |
+| 最大边际相关性 | MMR (Maximal Marginal Relevance) | 兼顾相关性与多样性的结果选择 | [10 §5](10-scoring.md) |
 
 ### 索引与检索
 
@@ -70,8 +86,10 @@
 | 快照 | snapshot | 钉住某 ReaderView 的完整只读视图 | [07 §6](07-l5-life.md) |
 | 文件系统检查 | fsck | 全量完整性校验与对账 | [07 §7](07-l5-life.md) |
 | 记录标识 / 物理槽位 | RowId / SlotId | 全局稳定的记录身份 / 段内物理下标 | [02 §1](02-l0-core.md) |
+| 版本链 | version chain | 同一 RowId 按 seqno 升序保留的历史物理版本(含墓碑版本) | [04 §2.2](04-l2-persist.md) |
+| 历史保留窗口 | history horizon | compaction 保留历史版本的时间窗口;`None` = 永久 | [07 §4.2a](07-l5-life.md) |
 | 段文件 | vsec / msec / hidx | 向量段 / 元数据段 / HNSW 图段,共享同一 SegmentId | [04 §1](04-l2-persist.md) |
-| key 索引 | key index | msec 内 (NsId, key)→SlotId 有序索引,供 `get` | [04 §5.5](04-l2-persist.md) |
+| key 索引 | key index | msec 内 (NsId, key)→RowId 有序索引(条目含 SlotId/seqno),供 `get` | [04 §5.5](04-l2-persist.md) |
 | 命名空间注册表 | namespace registry | MANIFEST 内 path↔NsId 映射,供 `list_namespaces` | [04 §2.4](04-l2-persist.md) |
 | 批量提交帧 | BatchBegin / BatchCommit | WAL 中包裹整批写入、保证批原子 | [04 §2.3](04-l2-persist.md) |
 | FNV-1a | Fowler–Noll–Vo 1a | 精确文本判重用的 64 位非加密哈希 | [03 §6.2](03-l1-memory.md) |
@@ -79,7 +97,13 @@
 | 日志结构合并 | LSM (Log-Structured Merge) | 只追加写、后台合并的存储组织方式 | [00 §6.4](00-fundamentals.md) |
 | 跳表 | skip list | 多层稀疏链表实现对数查找,是 HNSW 分层思想的同源结构 | [05 §3.1](05-l3-hnsw.md) |
 | 交叉编码器 | cross-encoder | 查询与文档一起过模型的精排器,比双塔准但更慢 | [06 §5](06-l4-query.md) |
-| 命名空间统计 | ns_stats | msec 内每命名空间的 doc_count/total_doc_len,供 BM25 局部 IDF | [04 §5.6](04-l2-persist.md) |
+| 命名空间统计 | ns_stats | msec 内每命名空间的 doc_count/total_doc_len,仅用于段内块级剪枝;BM25 的 N/avgdl/df 须跨活跃段全局聚合 | [04 §5.6](04-l2-persist.md) |
+| 覆盖区 | delta | 段内持久化"作用于旧段记录"的墓碑/更新/访问/关系,使 WAL 可安全截断 | [04 §2.2a](04-l2-persist.md) |
+| 命名空间注册帧 | NsRegister | WAL 帧,保证 path↔NsId 崩溃后可恢复 | [04 §2.3](04-l2-persist.md) |
+| 带认证加密 | AEAD | 加密同时校验完整性(如 AES-256-GCM) | [11 §2](11-security-storage.md) |
+| 静态加密 | encryption at rest | 数据在磁盘/备份上不可读 | [11 §2](11-security-storage.md) |
+| 只读共享 | read-only sharing | 多进程只读同一库,写者仍独占 | [12 §2](12-deployment.md) |
+| 可观测钩子 | Observer | 可选事件回调,不改变引擎行为 | [12 §4](12-deployment.md) |
 
 ### 量化([08](08-l6-quant.md))
 
@@ -88,21 +112,22 @@
 | 标量量化 | scalar quantization | 每分量独立映射到 8 位整数 | [08 §2](08-l6-quant.md) |
 | 半精度 | f16 (half precision) | 16 位浮点(1+5+10 位分布) | [08 §3](08-l6-quant.md) |
 | 两阶段检索 | two-phase retrieval | 量化粗排 4k 候选 → f32 精排取 k | [08 §4](08-l6-quant.md) |
-| 乘积量化 / RaBitQ | PQ (Product Quantization) / RaBitQ | 更强的向量压缩方案;v1 未实现,列为未来 | [08 §3](08-l6-quant.md) |
 
-### API 与运维([11](11-api-reference.md))
+### API 与运维([16](16-api-reference.md))
 
 | 术语 | 英文 | 一句话定义 | 详见 |
 |---|---|---|---|
-| 批量原子写 | batch insert | `insert_batch` 整批可见或整批不可见(I15) | [11 §1.2](11-api-reference.md) |
-| 快照句柄 | SnapshotHandle | 钉住某 ReaderView(段集 + 可变表快照)的只读视图,时间旅行读(I17) | [11 §1.6](11-api-reference.md) |
-| 优雅关闭 | graceful close | `close()` 返回 Ok 即已持久;`Drop` 仅尽力(I16) | [11 §1.7](11-api-reference.md) |
+| 批量原子写 | batch insert | `insert_batch` 整批可见或整批不可见(I15) | [16 §1.2](16-api-reference.md) |
+| 快照句柄 | SnapshotHandle | 钉住某 ReaderView(段集 + 可变表快照)的只读视图,时间旅行读(I17) | [16 §1.6](16-api-reference.md) |
+| 快照命名空间视图 | SnapshotNamespace | 快照句柄上按命名空间读取的只读视图(键唯一性按命名空间隔离) | [16 §1.6](16-api-reference.md) |
+| 查询标识 | QueryId | 一次检索的幂等标识,随 `Hit` 返回、供 `feedback` 去重 | [10 §4](10-scoring.md) |
+| 优雅关闭 | graceful close | `close()` 返回 Ok 即已持久;`Drop` 仅尽力(I16) | [16 §1.7](16-api-reference.md) |
 | 时间源 | Clock | 可注入的 Unix 毫秒时钟,保证 TTL/遗忘可测 | [04 §10.2](04-l2-persist.md) |
 | 格式版本 | format_version | 文件头版本号;过新则拒绝打开(I18) | [04 §12](04-l2-persist.md) |
-| 数据限额 | limits | key/text/meta 等硬上限,超限拒绝 | [11 §8](11-api-reference.md) |
-| 时间点恢复 | PITR (point-in-time recovery) | 把 `current` 指回上一 MANIFEST 版本以回滚一个提交点 | [11 §7.2](11-api-reference.md) |
+| 数据限额 | limits | key/text/meta 等硬上限,超限拒绝 | [16 §8](16-api-reference.md) |
+| 时间点恢复 | PITR (point-in-time recovery) | 把 `current` 指回上一 MANIFEST 版本以回滚一个提交点 | [16 §7.2](16-api-reference.md) |
 | 结果去重 | ResultDedup | 只作用于单次查询命中列表的去重策略 | [06 §6](06-l4-query.md) |
-| 压缩控制 | compaction control | `compact_control()` 的 pause/resume,让后台合并让路 | [11 §1.6](11-api-reference.md) |
+| 压缩控制 | compaction control | `compact_control()` 的 pause/resume,让后台合并让路 | [16 §1.6](16-api-reference.md) |
 
 ---
 
@@ -123,6 +148,7 @@
 | $m, n, k, p$ | bloom:位数/元素数/哈希数/误判率 | [04 §5.3](04-l2-persist.md) |
 | $k_1, b$ | BM25 饱和/长度参数(1.2 / 0.75) | [06 §3.2](06-l4-query.md) |
 | $I, T_{1/2}, w$ | importance / 半衰期 / 访问增益权重 | [07 §3](07-l5-life.md) |
+| $E, E_{\text{eff}}$ | 保留强度 / 含访问增益的有效强度 | [07 §3.2–§3.3](07-l5-life.md) |
 | $B, r, T_m$ | 段初始行数 / 分级比 / 同层合并阈值(8k / 4 / 4;正文简记 $T$) | [07 §4.2](07-l5-life.md) |
 | $W_{\text{amp}}$ | 写放大系数(≈ $\log_r(N/B)$) | [07 §4.2](07-l5-life.md) |
 | $\Delta$ | 量化步长 | [08 §2.2](08-l6-quant.md) |
@@ -157,11 +183,12 @@
 | TTL 逻辑过期 | $O(\text{块数})$(块级 min 剪枝) | 8B/块 | [07 §1](07-l5-life.md) |
 | retain 扫描 | $O(N_{\text{候选}})$ | — | [07 §3.4](07-l5-life.md) |
 | compaction 单轮 | $O(S \cdot d \cdot ef_c \cdot M_0)$(建图主导) | 峰值 +$O(S)$ | [07 §4.5](07-l5-life.md) |
-| compaction 摊还 | 每字节重写 ≈ $\log_r(N/B)$ ≤ ~7 次 | 段数 $O(\log_r N)$ | [07 §4.2](07-l5-life.md) |
-| i8 量化点积 | 带宽 ÷4;VNNI 再 ~4× 指令 | $d$ B/行 | [08 §2](08-l6-quant.md) |
+| compaction 摊还 | 每字节重写平均 ≈ $\log_r(N/B)$ ≈ 7 次(上界 ≈ 9) | 段数 $O(\log_r N)$ | [07 §4.2](07-l5-life.md) |
+| i8 量化点积 | 带宽 ÷4;VNNI 再 ~4× 指令 | 粗排副本 $d$ B/行(f32 原向量另存) | [08 §2](08-l6-quant.md) |
 | 单点写(insert) | $O(1)$ 内存 + WAL 追加;fsync 按策略 | $O(d)$ | [04 §3](04-l2-persist.md) |
 | 单点读(get key) | $O(\log n)$(key 索引二分)+ 一次记录读 | — | [04 §5.5](04-l2-persist.md) |
-| 单点读(get_by_rowid) | $O(\log n)$(slot 表二分) | — | [04 §2.2](04-l2-persist.md) |
+| 单点读(get_by_rowid) | $O(\log n)$(版本链定位) | — | [04 §2.2](04-l2-persist.md) |
+| as_of(t) 历史读 | $O(S \cdot \log n)$ 定位版本链 + 查询;窗口受 `history_horizon` 约束 | 历史版本随窗口增长 | [04 §5.5](04-l2-persist.md) |
 | delete / touch | $O(\log n)$ 定位 + 墓碑/统计更新 | — | [03 §2.3](03-l1-memory.md) |
 | iter(filter) | $O(N_c)$($N_c$ = 命中行) | 流式 | [03 §2.3](03-l1-memory.md) |
 | snapshot | $O(1)$(clone Arc 视图) | 按引用 | [07 §6](07-l5-life.md) |
@@ -169,8 +196,48 @@
 | check(fsck) | $O(\text{全量字节})$ CRC + 对账 | — | [07 §7](07-l5-life.md) |
 
 **性能承诺汇总**:Recall@10 ≥ 0.95(ef=128);1M×1536 量化后 P99 < 10ms;
-批量插入 ≥ 50k 向量/秒;冷启动 < 1s;活跃段数有界。验收方法见 [09](09-testing.md)。
+批量插入 ≥ 50k 向量/秒;冷启动 < 1s;活跃段数有界。验收方法见 [14](14-testing.md)。
+
+---
+
+## 4. 不变量速查(I1–I30)
+
+> 完整定义见各章末尾;每条对应的 `FC-*` 契约见 [spec/contracts.md](../spec/contracts.md),
+> "不变量 → 测试"映射见 [14 §1.1](14-testing.md)。
+
+| 编号 | 一句话 | 定义章 | 验收 |
+|---|---|---|---|
+| I1 | 已确认写入不出现半写(持久性按 `FsyncPolicy` 分级) | [04 §14](04-l2-persist.md) | [14 §2](14-testing.md) |
+| I2 | 任意 bit 损坏可检出或拒绝启动,绝不静默返回错误数据 | [04 §14](04-l2-persist.md) | [14 §2](14-testing.md) |
+| I3 | 活跃段集合 = 某 MANIFEST 版本所列集合 | [04 §14](04-l2-persist.md) | [14 §2](14-testing.md) |
+| I4 | WAL 总量有界;段文件只增不改(write-once) | [04 §14](04-l2-persist.md) | [14 §2](14-testing.md) |
+| I5 | 同一快照内 `execute()` = 候选集内暴力 + 标准融合(统计等价) | [06 §7](06-l4-query.md) | [14 §3](14-testing.md) |
+| I6 | 过滤先行;结果与融合顺序无关 | [06 §7](06-l4-query.md) | [14 §3.1](14-testing.md) |
+| I7 | DSL 解析对任意输入不 panic | [06 §7](06-l4-query.md) | [14 §5](14-testing.md) |
+| I8 | 活跃段数 ≤ $(T-1)\log_r(N/B)+c$;WAL ≤ 256MB | [07 §8](07-l5-life.md) | [14 §6](14-testing.md) |
+| I9 | 逻辑过期/墓碑记录永不返回;物理回收仅在 compaction 提交后 | [07 §8](07-l5-life.md) | [14 §6](14-testing.md) |
+| I10 | compaction 任意时刻崩溃 → 恢复后 = 提交前状态 | [07 §8](07-l5-life.md) | [14 §6](14-testing.md) |
+| I11 | 备份目录可独立 `open` + `check` 通过 | [07 §8](07-l5-life.md) | [14 §6](14-testing.md) |
+| I12 | 量化模式 `Hit.score` = f32 精排分 | [08 §8](08-l6-quant.md) | [14 §3.2](14-testing.md) |
+| I13 | 量化召回不达标自动回退 f32,`stats()` 可见 | [08 §8](08-l6-quant.md) | [14 §3.2](14-testing.md) |
+| I14 | async 与 sync API 等价(共享同一写锁) | [08 §8](08-l6-quant.md) | [14 §3.3](14-testing.md) |
+| I15 | `insert_batch` 整批原子(可见数 ∈ {0, n}) | [16 §9](16-api-reference.md) | [14 §2.1](14-testing.md) |
+| I16 | `close()` 返回 `Ok` 后已确认写入持久 | [16 §9](16-api-reference.md) | [14 §2.2](14-testing.md) |
+| I17 | `SnapshotHandle` 视图一致,后台 compaction 不影响 | [07 §8](07-l5-life.md) | [14 §6.1](14-testing.md) |
+| I18 | 拒绝打开更高主版本的文件 | [04 §14](04-l2-persist.md) | [14 §5](14-testing.md) |
+| I19 | 覆盖持久性:删除不复活、更新不丢 | [04 §14](04-l2-persist.md) | [14 §2.4](14-testing.md) |
+| I20 | 注册与水位可恢复,NsId/RowId 永不复用 | [04 §14](04-l2-persist.md) | [14 §2.5](14-testing.md) |
+| I21 | BM25 统计按查询命名空间跨全部活跃段全局聚合(df/N/avgdl),只计活行,跨 NS 互不影响 | [04 §5.6](04-l2-persist.md) | [14 §3.4](14-testing.md) |
+| I22 | RowId 跨 `update`/upsert 不变 | [02 §1](02-l0-core.md) | [14 §2.3](14-testing.md) |
+| I23 | 自动遗忘默认关闭;删除可审计(墓碑在 `history_horizon` 内保留,默认永久) | [07 §3.4](07-l5-life.md) | [14 §6.2](14-testing.md) |
+| I24 | `update` 新版本对读者原子可见,旧版本立即遮蔽 | [03 §2.1](03-l1-memory.md) | [14 §3.5](14-testing.md) |
+| I25 | 关系一致:悬挂边不可见,删除级联失效 | [09 §2.3](09-memory-model.md) | [14 §3.6](14-testing.md) |
+| I26 | 双时态一致:`as_of(t)` 不随后续写入/compaction 变化;历史默认永久保留 | [09 §3.2](09-memory-model.md) | [14 §6.3](14-testing.md) |
+| I27 | 反馈幂等:同一 `(rowid, query_id)` 至多计一次 | [10 §4.2](10-scoring.md) | [14 §3.7](14-testing.md) |
+| I28 | 加密不落明文;认证失败 → `Corrupted` | [11 §2.5](11-security-storage.md) | [14 §5.3](14-testing.md) |
+| I29 | 只读一致:始终看到某已提交 MANIFEST 版本的完整视图 | [12 §2.1](12-deployment.md) | [14 §6.4](14-testing.md) |
+| I30 | 可观测无副作用;回调 panic 被隔离 | [12 §4.1](12-deployment.md) | [14 §6.5](14-testing.md) |
 
 ## 下一章
 
-[11-api-reference.md](11-api-reference.md):完整公开 API、配置与运维参考。
+[16-api-reference.md](16-api-reference.md):完整公开 API、配置与运维参考。

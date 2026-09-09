@@ -14,10 +14,10 @@
 六类标识符,全部用 **newtype 模式**(用单字段结构体包住整数;`Key` 包住字符串)——
 编译器从此能区分"这个 u64 是行号还是序号",混用即编译错误:
 
-| 类型 | 底层 | 含义 | 生命周期 |
+| 类型 | 角色 / 范围 | 含义 | 生命周期 |
 |---|---|---|---|
-| `RowId(u64)` | **全局**记录标识,首次写入时分配 | 公开 API 的稳定句柄(`Hit.rowid`、`get_by_rowid`);`key_index`、访问统计均以它为主键 | 永不复用;跨段、跨 compaction 稳定不变 |
-| `SlotId(u32)` | **内部**段内物理槽位 | vectors 下标 / 删除位图 bit / HNSW 节点 id;仅存储与索引层内部使用,**不对外暴露** | 段内追加写、永不复用;仅 compaction 重建新段时按新段重新编号(见 [03 §3](03-l1-memory.md)) |
+| `RowId(u64)` | **全局稳定逻辑标识**,首次写入时分配 | 公开 API 的稳定句柄(`Hit.rowid`、`get_by_rowid`);访问统计、关系边均以它为主键;更新/upsert **保留 RowId**(写新物理版本) | 永不复用;跨更新、跨段、跨 compaction 稳定不变 |
+| `SlotId(u32)` | **内部**段内物理槽位(每物理版本一个) | vectors 下标 / 删除位图 bit / HNSW 节点 id;仅存储与索引层内部使用,**不对外暴露** | 段内追加写、永不复用;仅 compaction 重建新段时按新段重新编号(见 [03 §3](03-l1-memory.md)) |
 | `SeqNo(u64)` | 全局提交序号,单调递增 | MVCC 快照的基石([00 §6.6](00-fundamentals.md)) | 永不复用 |
 | `SegmentId(u32)` | 段文件编号 | 与文件名 `seg_000042.vsec` 对应 | 永不复用 |
 | `NsId(u32)` | 命名空间编号 | `(NsId, Key)` 是复合主键;WAL 帧、key_index 均引用 | 永不复用 |
@@ -30,6 +30,10 @@ compaction 重排了物理位置,`get_by_rowid` / `Hit.rowid` / 访问统计仍�
 一旦 compaction 重建段、`SlotId` 被重新分配,外部持有的旧槽位就会指向错误的记录
 ——这是超长期系统的典型取舍:**用一点空间与一次映射换永久的不变量**。
 
+**不变量 I22(稳定逻辑标识)**:`RowId` 跨 `update`/upsert 不变,访问统计、关系边与
+`get_by_rowid` 始终以它为主键,跨更新、跨段、跨 compaction 有效(验收见
+[14 §2.3](14-testing.md),映射见 [16 §9](16-api-reference.md))。
+
 ---
 
 ## 2. 错误设计
@@ -40,23 +44,23 @@ compaction 重排了物理位置,`get_by_rowid` / `Hit.rowid` / 访问统计仍�
 ```rust
 pub enum MnemeError {
     Io(#[from] std::io::Error),
-    Corrupted { segment: SegmentId, reason: String },   // CRC 不过/魔数不符
+    Corrupted { segment: Option<SegmentId>, reason: String }, // CRC 不过/魔数不符;None = 文件级损坏(如 MANIFEST 全坏)
     DimensionMismatch { expected: u32, got: usize },    // 建库时已锁维度
     MetricMismatch { existing: Metric, requested: Metric }, // 打开时参数与库不符
-    KeyNotFound(Key),                                   // 保留变体,当前无 API 产生(见 11 §4)
+    KeyNotFound(Key),                                   // 保留变体,当前无 API 产生(见 16 §4)
     DuplicateKey(Key),                                  // InsertMode::RejectDuplicate 时
     FilterParse(String),                                // DSL 语法错误,带位置信息
     Busy(&'static str),                                 // 独占锁被占/备份中
     Invalid(&'static str),                              // 参数非法(如维度超上限)
-    TooLarge { field: &'static str, limit: usize, got: usize }, // 数据超限额,见 11 §8
+    TooLarge { field: &'static str, limit: usize, got: usize }, // 数据超限额,见 16 §8
     UnsupportedVersion { file: &'static str, found: u16, max: u16 }, // 文件格式过新
 }
 pub type Result<T> = std::result::Result<T, MnemeError>;
 ```
 
-设计约定:错误信息面向**排查**——`Corrupted` 必须带段号与原因;
+设计约定:错误信息面向**排查**——`Corrupted` 必须带段号(文件级损坏时为 `None`)与原因;
 `FilterParse` 必须带出错位置;不在错误里嵌套第二层错误类型(避免错误地狱)。
-各错误的可重试性与处置建议见 [11 §4](11-api-reference.md)。
+各错误的可重试性与处置建议见 [16 §4](16-api-reference.md)。
 
 ---
 
@@ -72,7 +76,7 @@ impl Metric {
     /// 绝不直接比较 score 的数值大小。
     pub fn score(&self, a: &[f32], b: &[f32], a_norm: f32, b_norm: f32) -> Score;
     pub fn better(&self, x: Score, y: Score) -> bool;  // 归一比较方向:true = x 更优
-    pub fn needs_norm(&self) -> bool;                  // Cosine 需要 norm 列
+    pub fn needs_norm(&self) -> bool;                  // Cosine/Euclidean 需要 norm 列(仅 Dot 不需要)
 }
 pub type Score = f32;
 ```
@@ -90,12 +94,12 @@ $$\|\mathbf{a}-\mathbf{b}\|^2 \;=\; \|\mathbf{a}\|^2 + \|\mathbf{b}\|^2 - 2\,\ma
 (纯文本:`dist² = ‖a‖² + ‖b‖² − 2*a·b`)
 
 $\|\mathbf{a}\|^2$ 在写入时算好存进 norm 列(每向量 4 字节),查询时
-$\|\mathbf{q}\|^2$ 是常数,于是**三种度量全部归结为一次点积**:
+$\|\mathbf{q}\|^2$ 是常数,于是**三种度量全部归结为一次点积**(norm 列存的是**范数平方**):
 
 | 度量 | 查询时的实际计算 |
 |---|---|
 | Dot | `a·b` |
-| Cosine | `a·b / (‖a‖·‖b‖)`,库侧范数预计算、查询范数每次查询现算一次 |
+| Cosine | `a·b / sqrt(a_norm * b_norm)`,库侧 `a_norm = ‖a‖²` 预计算、查询侧 `b_norm = ‖b‖²` 每次查询现算一次 |
 | Euclidean | `‖a‖² + ‖b‖² − 2*a·b` |
 
 结论:**SIMD 层只需一个极致优化的点积内核**(§4)。代价:欧氏/余弦度量下每个向量
@@ -105,13 +109,14 @@ $\|\mathbf{q}\|^2$ 是常数,于是**三种度量全部归结为一次点积**:
 
 也可以在写入时把向量归一化、余弦退化为点积,但 Mneme **不这么做**:
 原始向量必须原样保留(宿主可能要取回原文向量做重排/可视化),
-归一化副本会占双倍空间。实时除以两个范数(库侧预存 + 查询侧现算)只多 2 次除法,可忽略。
+归一化副本会占双倍空间。实时计算 `a·b / sqrt(a_norm * b_norm)`(库侧预存 + 查询侧现算)
+只多一次乘法、一次开方与一次除法,可忽略。
 
 ### 3.3 数值稳定性
 
 - 分母下限保护:`‖a‖·‖b‖ < ε`(如 1e-12,零向量)时余弦返回 0,不返回 NaN;
 - **非有限值在入口拒绝**:`insert` 时校验每个分量为有限值,`NaN`/`±Inf` 返回
-  `Invalid`(见 [03 §2.1](03-l1-memory.md)、[11 §8](11-api-reference.md));
+  `Invalid`(见 [03 §2.1](03-l1-memory.md)、[16 §8](16-api-reference.md));
   距离函数本身不做该检查,以保持内层循环零分支;
 - 点积用 f32 累加即可(嵌入分量量级 ~0.1,1536 维累加误差远小于嵌入模型自身噪声);
   不用 Kahan/双精度——索引场景要的是**排序稳定性**而非绝对精度,
@@ -133,7 +138,8 @@ $\|\mathbf{q}\|^2$ 是常数,于是**三种度量全部归结为一次点积**:
 普通(CPU)指令一次处理一个数;**SIMD(Single Instruction, Multiple Data,
 单指令多数据)** 一次处理一排数:AVX2 指令集的一条 `vfmadd`(乘加)指令,
 同时对 **8 个 f32** 做乘加。算 1536 维点积,标量要 1536 次乘加,
-AVX2 只要约 192 条指令 + 少量归约。这是"暴力扫描也能跑进毫秒"的物理基础。
+AVX2 只要约 192 条 FMA 指令(仅计乘加,不含两条向量加载;含加载约 576 条,见 §4.3)+ 少量归约。
+这是"暴力扫描也能跑进毫秒"的物理基础。
 
 类比:点积是"两列数字逐位相乘再竖着加总"。标量是单人计算器按 1536 次;
 SIMD 是 8 台计算器并排,每次同时对齐 8 对数字。
@@ -264,8 +270,8 @@ $$\text{encode}(x):\; b_i = \begin{cases} 0x80 \mid (\text{低 7 位组}_i) & i 
 |---|---|---|
 | 编码/解码 u64 | $O(\lfloor \log_{128} x \rfloor + 1) \le 10$ 字节操作 | 小整数(多数)1–2 字节;最坏 10 字节 |
 
-Mneme 用途:倒排表 `SlotId` 差分([06 §3](06-l4-query.md))、WAL 帧长度、
-段内偏移量。配合差分排序序列,期望压缩到原大小的 20–40%(经验值)。
+Mneme 用途:倒排表 `SlotId` 差分([06 §3](06-l4-query.md))、段内变长字段长度前缀。
+配合差分排序序列,期望压缩到原大小的 20–40%(经验值)。
 
 ---
 
@@ -275,6 +281,7 @@ Mneme 用途:倒排表 `SlotId` 差分([06 §3](06-l4-query.md))、WAL 帧长度
 
 ```rust
 pub type Meta = serde_json::Value;                     // 元数据 = 任意 JSON
+pub use serde_json::json;                              // 仅重导出 json! 宏,便于构造 Meta;不暴露其它 serde_json 类型
 pub fn get_path<'v>(v: &'v Meta, path: &str) -> Option<&'v Meta>;   // "a.b.c" 点路径
 pub fn as_f64(v: &Meta) -> Option<f64>;   // as_i64 / as_bool / as_str / as_ts 同理
 ```
@@ -290,14 +297,24 @@ pub fn as_f64(v: &Meta) -> Option<f64>;   // as_i64 / as_bool / as_str / as_ts �
 ## 8. options.rs:全局参数
 
 ```rust
-pub struct Dimension(u32);        // 1..=65536,新类型防裸整数误用
+pub struct Dimension(u32);        // 1..=65536;Builder 入口接受 u32 并校验后转为 Dimension,内部不再用裸整数
 pub enum FsyncPolicy { Always, Batched(Duration), OnFlush, Never }  // Never 仅供测试
 pub enum InsertMode { Upsert, RejectDuplicate }   // 同 key 行为,默认 Upsert
 pub enum VectorFormat { F32, F16, I8Rescored }    // 量化格式,L6
 pub struct HnswParams { m, m0, ef_construction, ef_search }         // L3
-pub struct CompactionPolicy { tier_ratio, tier_count, dead_ratio, wal_bytes, wal_file_bytes, segment_rows, io_budget } // L5
+pub struct CompactionPolicy { tier_ratio, tier_count, dead_ratio, wal_bytes, wal_file_bytes, segment_rows, io_budget, history_horizon } // L5
 pub struct Tuning { parallel_block, field_dict_max, bloom_fpp, brute_force_max_rows, filter_post_threshold, filter_brute_threshold, stopwords } // 进阶
-pub struct Limits { key_bytes, text_bytes, meta_bytes, meta_depth, ns_depth, top_k_max, ef_max, wal_frame_max } // 11 §8
+pub struct Limits { key_bytes, text_bytes, meta_bytes, meta_depth, ns_depth, top_k_max, ef_max, wal_frame_max } // 16 §8
+pub struct Scoring { w_sim, w_recency, w_importance, w_access, w_confidence, half_life, c_norm, floor, time_axis, bias_routing }  // L4 排序打分,见 10
+pub enum TimeAxis { ValidTime, TransactionTime }  // 新鲜度时间轴,见 10
+pub enum Diversity { Off, Mmr { lambda: f32 } }                                     // 结果多样性,见 10
+pub struct RelationKind(pub u16); // 关系类型:内置 + 用户自定义,见 09
+pub enum RelationIndex { Outgoing, Both }  // 关系反向索引,见 09
+pub enum Feedback { Used, Ignored, Corrected { by: RowId } }  // 检索反馈,见 10
+pub struct QueryId(pub u64);      // 一次检索的幂等标识(feedback 幂等键的一半),见 10 §4
+pub struct UpdatePatch { /* 可选字段:vector/text/meta/importance/ttl/valid_time/confidence/provenance;外层 None = 不改动 */ } // 见 03 §2.1
+pub enum Compression { None, Lz4, Zstd }  // 文本/元数据压缩,feature(compress / compress-zstd),见 11
+pub struct Encryption { /* 算法/密钥提供者,feature,见 11 */ }  // 静态加密配置
 
 /// 时间源:TTL / 遗忘曲线 / touch 一律经此取"当前 Unix 毫秒"。
 /// 生产用 SystemClock;测试注入可回拨/快进的假时钟,保证确定性。
@@ -306,7 +323,7 @@ pub trait Clock: Send + Sync { fn now_unix_ms(&self) -> i64; }
 
 `FsyncPolicy` 的语义与权衡见 [00 §6.1](00-fundamentals.md) 与
 [04 §3](04-l2-persist.md);各配置项的默认值与 Builder 方法见
-[11 §2](11-api-reference.md)。
+[16 §2](16-api-reference.md)。
 
 ---
 
@@ -315,8 +332,11 @@ pub trait Clock: Send + Sync { fn now_unix_ms(&self) -> i64; }
 L0 向上提供,且**只**提供:
 
 1. 类型:`RowId / SlotId / SeqNo / SegmentId / NsId / Key / Meta / Dimension / FsyncPolicy /
-   InsertMode / VectorFormat / HnswParams / CompactionPolicy / Tuning / Limits / Clock / Score`;
-2. 数学:`Metric::{score, better}` 与 `simd::{dot, cosine, euclidean_sq}`(对齐前提由调用方保证);
+   InsertMode / VectorFormat / HnswParams / CompactionPolicy / Tuning / Limits / Clock / Score /
+   Scoring / TimeAxis / Diversity / RelationKind / RelationIndex / Feedback / QueryId /
+   UpdatePatch / Compression / Encryption`(以上均为 `options.rs` 中的数据定义,不含行为);
+2. 数学:`Metric::{score, better}` 与 `simd::dot`(及其薄封装 `cosine` / `euclidean_sq`,
+   均归结为一次点积;对齐前提由调用方保证);
 3. 容器:`TopK::{push, merge}`;编解码:`varint::{encode_u32/u64, decode}`;
 4. 错误:`MnemeError` 与 `Result`。
 

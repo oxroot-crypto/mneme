@@ -1,0 +1,33 @@
+# mdBook 构建输出
+/book/
+
+# mdbook-mermaid 生成资源（由 `mdbook-mermaid install .` 生成）
+/mermaid.min.js
+/mermaid-init.js
+
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+
+# 编辑器 / IDE
+.idea/
+.vscode/
+*.iml
+*.swp
+*.swo
+*~
+
+# 操作系统
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# 环境 / 本地配置
+.env
+.env.local
+*.local
+
+# 日志与临时文件
+*.log
+/tmp/

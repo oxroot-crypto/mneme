@@ -21,6 +21,12 @@ and     = not { "and" not } ;
 not     = [ "not" ] cmp ;
 cmp     = path ( "==" | "!=" | ">" | ">=" | "<" | "<=" ) value
         | path "in" "(" value { "," value } ")"
+        | path "contains" value                 (* 数组含元素,或字符串含子串 *)
+        | path "startswith" value
+        | path "endswith" value
+        | path "~" string                       (* 通配符:* 任意串,? 单字符 *)
+        | "exists" "(" path ")"                  (* 字段存在(可为 null) *)
+        | "is_null" "(" path ")"                 (* 字段存在且为 JSON null *)
         | "(" expr ")" ;
 path    = ident { "." ident } ;
 value   = string | number | "true" | "false" | timestamp | duration_expr ;
@@ -36,7 +42,10 @@ duration = number ( "s" | "m" | "h" | "d" | "w" ) ;
 - **时间戳字面量**:`ts"…"` 按 ISO 8601 解析为 Unix 毫秒,与 `Val::Ts` 对应
   (时间字段只能与 `ts` 字面量或 `now ± duration` 比较,见 [03 §5.1](03-l1-memory.md));
 - 时间量:`now - 7d` 在**查询时**求值为绝对毫秒(相对语义,缓存友好性差但语义正确);
-- 类型规则同 [03 §5.1](03-l1-memory.md)(字段缺失 → false);
+- 类型规则同 [03 §5.1](03-l1-memory.md);**缺失字段采用三值语义**:`Cmp`/`In`/`contains`/
+  `startswith`/`endswith`/`~` 对缺失字段求值为 false,而 `Not(false)` 仍为 false(而非 true)——
+  即 `not(kind == "x")` **不会**命中没有 `kind` 字段的记录;要查"字段缺失"请用 `exists`。
+  这是为 Agent 开放 schema 特意选择的语义(不变量 FC-QUERY-ERR-002);
 - 三个入口:`Expr::from_str`(解析)、`Display`(打印)、
   `Meta ↔ Expr`(经 `core::meta` 的 JSON 往返,便于 Agent 框架下发);
 - `filter!` 宏 = `Expr::from_str(...).expect(...)` 的舒适封装(运行时仍是解析,宏不会让
@@ -102,7 +111,7 @@ $$
 
 | 符号 | 含义 | 默认 |
 |---|---|---|
-| $N$ | **查询命名空间内**文档总数(段级按 NS 统计,见下) | — |
+| $N$ | **查询命名空间内**文档总数(跨全部活跃段全局聚合,见下) | — |
 | $df_t$ | 命名空间内含词 $t$ 的文档数 | — |
 | $f(t,D)$ | 词 $t$ 在 $D$ 中的出现次数(tf) | — |
 | $\|D\|$、avgdl | 文档词数、命名空间平均词数 | — |
@@ -121,11 +130,15 @@ $$
 - **长度归一**:$1 - b + b\frac{|D|}{\text{avgdl}}$ 是"等效 tf 折算系数":
   长于平均的文档系数 > 1(tf 更难"达标"),短文档反之。$b=0.75$ 是文献标准值。
 
-**统计范围(命名空间级)**:段内混装多个命名空间([07 §5](07-l5-life.md)),
-若用段级 $N$/avgdl,其他命名空间的文档会稀释 IDF。故 $N$、avgdl 取自 msec 的
-`ns_stats`(每段每命名空间 `doc_count`/`total_doc_len`,[04 §5.6](04-l2-persist.md)),
-$df_t$ 在遍历该词 postings 时按记录的 `ns_id` 统计。一次查询只影响**当前命名空间**的排序,
-跨命名空间互不干扰;段内该 NS 无文档则直接跳过 BM25 通道。
+**统计范围(命名空间级 + 跨段全局)**:段内混装多个命名空间([07 §5](07-l5-life.md)),
+且一个命名空间的数据分散在多个段。若用**段内** $N$/avgdl/df,各段 IDF 尺度不同,跨段归并
+与融合会错排。正确做法见 [04 §5.6](04-l2-persist.md) 的**两遍法**:
+
+- 第 1 遍统计:跨所有活跃段累加查询命名空间的 $N$、`total_doc_len` 与每个查询词的全局
+  $df_t$,$df_t$ 只计**活行**(排除墓碑与被更新遮蔽的旧版本,避免 IDF 虚高);
+- 第 2 遍打分:用同一套全局 $N$/avgdl/$df_t$ 对各段 postings 打分;
+- 段内该 NS 无文档时整段跳过;**不变量 I21(BM25 统计一致性)**:N/avgdl/df 按查询命名空间
+  跨全部活跃段全局聚合、只计活行,与段数无关,且跨命名空间互不干扰(验收 [14 §3.4](14-testing.md))。
 
 ### 3.3 【算例】手算
 
@@ -162,11 +175,13 @@ doc_len:   f32 × count                                     (|D|,归一用)
   ([02 §6](02-l0-core.md));整条 postings 空间 ≈ $df \times 3$ 字节量级(经验值);
 - **打分复杂度**:对查询的每个词走一遍 postings:
 
-$$T = O\!\left(\sum_{t \in Q} df_t\right) \text{ 次堆操作}, \qquad S = O(\text{postings 全量})(静态)$$
+$$T = O\!\left(2\sum_{t \in Q} df_t\right) \text{ 次 postings 访问(统计遍 + 打分遍)}, \qquad S = O(\text{postings 全量})(静态)$$
+
+(纯文本:`T = O(2·Σ_{t∈Q} df_t)` 次 postings 访问;`S = O(postings 全量)`(静态))
 
 查询只碰"含查询词"的文档——这是 BM25 快的根本;无查询词的文档零成本。
-命名空间隔离通过 postings 里的 `ns_id` 判定:同一遍扫描同时完成过滤与 $df_t$ 计数,
-复杂度不变(额外每 posting 一次 `ns_id` 比较)。
+命名空间隔离通过记录体携带的 `ns_id` 判定(记录体带 NsId,[04 §2.2](04-l2-persist.md)):
+同一遍扫描同时完成过滤与 $df_t$ 计数,复杂度不变(额外每 posting 一次 `ns_id` 比较)。
 - **构建**:flush 时顺带生成(分词 + 排序 + 差分),成本与文档数线性,
   由 compaction 摊销,不在写路径热区。
 
@@ -175,14 +190,14 @@ $$T = O\!\left(\sum_{t \in Q} df_t\right) \text{ 次堆操作}, \qquad S = O(\te
 规则:按 Unicode 空白切词 → 小写化 → 去首尾标点;**CJK 连续段做 bigram**
 ("记忆库" → "记忆","忆库")——bigram 是无词典分词的保底方案,精度对
 关键词通道足够;拉丁词按词切。停用词表为内置常量,经 `Tuning::stopwords` 开关(默认开,
-见 [11 §2](11-api-reference.md))。未来替换 jieba 级分词器只动 `bm25::tokenize` 一个函数。
+见 [16 §2](16-api-reference.md))。未来替换 jieba 级分词器只动 `bm25::tokenize` 一个函数。
 
 ---
 
 ## 4. 融合:`fusion.rs`
 
 向量通道产出排名 $R_v$(按相似度),BM25 通道产出排名 $R_b$(按 BM25 分)。
-两套分数**量纲不同**(余弦 ∈ [0,1] 量级,BM25 无上界),直接加权没有意义。
+两套分数**量纲不同**(余弦 ∈ [-1,1],BM25 无上界),直接加权没有意义。
 两种融合:
 
 ### 4.1 RRF(Reciprocal Rank Fusion,倒数排名融合)——默认
@@ -206,12 +221,13 @@ C: 向量第1, BM25缺席 → 1/61                  = 0.01639   (单通道冠军
 
 ### 4.2 加权归一(Weighted)
 
-$$\text{score}(d) = \alpha \cdot \widehat{s_v}(d) + (1-\alpha)\cdot \widehat{s_b}(d), \qquad \widehat{s} = \frac{s - s_{\min}}{s_{\max} - s_{\min}}$$
+$$\text{score}(d) = \alpha \cdot \widehat{s_v}(d) + (1-\alpha)\cdot \widehat{s_b}(d), \qquad \widehat{s} = \frac{s^{*} - s^{*}_{\min}}{s^{*}_{\max} - s^{*}_{\min}}$$
 
-(纯文本:`score = α*norm(向量分) + (1-α)*norm(BM25分)`,norm = 结果集内 min-max 归一)
+(纯文本:`score = α*norm(向量分) + (1-α)*norm(BM25分)`,norm = 结果集内 min-max 归一;向量分先按 `Metric::better` 定向为"越大越优"的 `s*`,欧氏取负,见 [10 §2.2](10-scoring.md))
 
 - 归一化在**本次查询的结果集内**做(不是全库),否则量纲仍不可比;
-- 若某通道只有一个结果(`s_{\max} = s_{\min}`),该通道归一值取 1,避免除零;
+- **向量通道方向**:欧氏原始分为距离平方(越小越优),须先取负得到 $s^{*}$ 再归一,否则排序反转;
+- 若某通道只有一个结果(`s^{*}_{\max} = s^{*}_{\min}`),该通道归一值取 1,避免除零;
 - `Weighted { alpha }`(`alpha ∈ [0,1]`,默认 0.5)供"我就是要向量为主"的场景;融合器整体默认 `Rrf{k:60}`;
 - 复杂度 $O(k)$;缺点:对结果集外的高分文档视而不见(两通道 top-k 之外不参与),
   与 RRF 相同——融合都发生在两通道各自 top-k(默认各取 $2k$ 再融合取 $k$,
@@ -238,9 +254,10 @@ sequenceDiagram
         E->>B: 查询词分词 + 段位图
         B->>S: 倒排打分 → 段内 TopK(2k)
     end
-    E->>E: 段间归并 → 双通道 RRF/Weighted 融合 → top-k
-    E->>E: [可选] Reranker 回调重排
-    E->>C: 返回命中列表(物化记录体,快照一致)
+    E->>E: 段间归并 → 双通道 RRF/Weighted 融合
+    E->>E: [可选] expand 关系联想 → Scoring 综合打分 → 去重/MMR
+    E->>E: [可选] Reranker 回调重排 → top-k
+    E->>C: 返回命中列表(物化记录体,快照一致;生成 query_id 供反馈)
 ```
 
 要点:
@@ -277,8 +294,8 @@ pub enum ResultDedup {
 
 - 判重查询可携带**元数据条件**(如仅在同 `kind` 内判重),复用 §2 计划器——
   "同一类记忆"内判重,避免把"事实"和"偏好"误判为重复;
-- `Merge` 回调的签名升级为 `(old: &RecordRef, new: &RecordRef) -> Option<Record>`,
-  返回 None = KeepBoth(`RecordRef` 见 [11 §1.2](11-api-reference.md));
+- `Merge` 回调的签名升级为 `(old: &RecordRef<'_>, new: &RecordRef<'_>) -> Option<Record>`,
+  返回 None = KeepBoth(`RecordRef` 见 [16 §1.2](16-api-reference.md));
 - 全部去重决策发生在**写者锁内**(单写者,天然无竞争),成本 = 一次 top-1 检索
   (L3 后 $O(ef \cdot M_0 \cdot d)$,微秒级)。
 
@@ -288,10 +305,11 @@ pub enum ResultDedup {
 
 **向上提供**:
 
-1. `SearchBuilder::execute()` 的完整语义(过滤 + 混合 + 去重 + 重排钩子);
+1. `SearchBuilder::execute()` 的完整语义(过滤 + 混合 + 融合 + 关系扩展 + 综合打分 +
+   去重/多样性 + 重排钩子),管线顺序见 §5;
 2. `Expr` 的解析/打印/JSON 往返;`Plan`(内部,含每段位图与选择性);
 3. `tokenize()`(分词,公开给需要自建文本索引的宿主);
-4. `Reranker` trait 与 `ResultDedup`。
+4. `Reranker` trait、`ResultDedup`、`Scoring`、`Diversity`、`RelationExpand`(与 [10](10-scoring.md) 共用)。
 
 **依赖**:L0(TopK/varint/meta)、L2(段与倒排读取)、L3(带位图的 ANN)。
 **不变量**:
@@ -299,7 +317,7 @@ pub enum ResultDedup {
 - I5 同一快照内,`execute()` 结果 = "候选集内暴力计算 + 标准融合"的结果
   (统计等价于理想实现;ANN 的近似性由 [05 §6.2](05-l3-hnsw.md) 召回门槛约束);
 - I6 过滤语义与融合顺序无关(过滤先行,融合只对过滤后候选);
-- I7 DSL 解析对任意输入不 panic(模糊测试,见 [09 §5](09-testing.md))。
+- I7 DSL 解析对任意输入不 panic(模糊测试,见 [14 §5](14-testing.md))。
 
 ## 下一章
 

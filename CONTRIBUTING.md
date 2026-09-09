@@ -3,7 +3,7 @@
 感谢参与 Mneme。本项目的核心约束写在设计文档里,提交前请先读:
 
 - [docs/DESIGN.md](docs/DESIGN.md):分层地图、阅读路线、文档约定;
-- [09 测试与验收](docs/design/09-testing.md):每层"完成"的验收标准;
+- [14 测试与验收](docs/design/14-testing.md):每层"完成"的验收标准;
 - 各章末尾的**层边界契约**:本层向上暴露、向下依赖的精确接口。
 
 ## 基本规则
@@ -14,9 +14,10 @@
    复杂算法(HNSW、BM25、量化、bloom、compaction 调度、分词)一律自研,见
    [01 §5](docs/design/01-overview.md)。
 3. **公开 API 冻结**:L1 起公开 API 签名冻结,变更需单独 RFC 并更新
-   [11 API 参考](docs/design/11-api-reference.md)。
-4. **不变量即测试锚点**:每个测试文件头部列出其覆盖的不变量编号(I1–I18),
-   测试代码注释引用编号,防止"测了个寂寞"。
+   [16 API 参考](docs/design/16-api-reference.md)。
+4. **不变量即测试锚点**:每个测试文件头部列出其覆盖的不变量编号(I1–I30)与
+   [spec/contracts.md](docs/spec/contracts.md) 的 `FC-*` 编号,测试代码注释引用编号,
+   防止"测了个寂寞";CI 的 `xtask check-contracts` 校验契约 100% 追溯。
 5. **无 panic 契约**:L0 所有函数返回 `Result` 或数学上可证明不 panic;
    `unsafe` 仅允许出现在 `simd.rs` 的 arch 内联中。
 
@@ -27,7 +28,7 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test
 cargo test --features async
-cargo doc --no-deps          # 公开项必须 100% 文档覆盖(#[deny(missing_docs)])
+cargo doc --no-deps          # 公开项必须 100% 文档覆盖(#![deny(missing_docs)])
 ```
 
 ## 提交信息
@@ -40,6 +41,17 @@ persist: reject WAL frames with unknown type
 Per 04 §13, an unrecognized frame type must abort replay rather than be
 skipped. Adds regression test covering invariant I2.
 ```
+
+## 契约维护(FSVDD 强制)
+
+本项目的业务逻辑遵循**契约优先、形式化约束驱动开发**:
+
+1. 任何涉及磁盘格式、API 语义、状态流转、并发或错误的改动,**先改契约**
+   [spec/contracts.md](docs/spec/contracts.md),再改测试,最后改代码;
+2. 禁止"先写实现、后补契约";禁止契约漂移(改了代码/测试却不更新契约);
+3. 新增业务逻辑必须至少登记一条 `FC-*` 约束,并给出 1:1 测试;
+4. 破坏性变更需在契约文件顶部"变更记录"标注版本与兼容性迁移约束;
+5. 交付前自查:无孤儿实现、无失效契约、无孤立测试。
 
 ## 文档修改
 
