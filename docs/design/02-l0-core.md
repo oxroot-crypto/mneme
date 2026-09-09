@@ -5,7 +5,8 @@
 > **前置阅读**:[00 §3–§4](00-fundamentals.md)(嵌入向量与相似度)、[00 §7](00-fundamentals.md)(大 O)。
 > **本章你将学到**:ID/错误设计 → 距离度量的完整数学与 SIMD 实现 → TopK 堆 → varint 编码。
 
-模块清单:`core/{types.rs, error.rs, metric.rs, simd.rs, varint.rs, meta.rs, heap.rs, options.rs}`
+模块清单:`core/{types.rs, error.rs, metric.rs, simd.rs, varint.rs, meta.rs, heap.rs, options/}`
+(`options/` 为按主题拆分的模块目录,见 §8)
 
 ---
 
@@ -42,6 +43,7 @@ compaction 重排了物理位置,`get_by_rowid` / `Hit.rowid` / 访问统计仍�
 (枚举体积 = 最大变体大小,无装箱):
 
 ```rust
+#[non_exhaustive] // 预留后续层新增变体而不破坏下游穷尽匹配
 pub enum MnemeError {
     Io(#[from] std::io::Error),
     Corrupted { segment: Option<SegmentId>, reason: String }, // CRC 不过/魔数不符;None = 文件级损坏(如 MANIFEST 全坏)
@@ -146,24 +148,33 @@ SIMD 是 8 台计算器并排,每次同时对齐 8 对数字。
 
 ```rust
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    debug_assert_eq!(a.len(), b.len(), "点积要求两向量等长");
     #[cfg(target_arch = "x86_64")]
     {
-        if is_x86_feature_detected!("avx2") { unsafe { avx2::dot(a, b) } }
-        else { unsafe { sse2::dot(a, b) } }          // x86_64 必有 SSE2
+        // AVX2 内核用 _mm256_fmadd_ps,故需同时具备 avx2 与 fma;否则回退 SSE2。
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: 已确认 avx2 与 fma 均可用。
+            unsafe { x86::dot_avx2(a, b) }
+        } else {
+            // SAFETY: x86_64 基线保证 SSE2 可用。
+            unsafe { x86::dot_sse2(a, b) }
+        }
     }
     #[cfg(target_arch = "aarch64")]
-    { unsafe { neon::dot(a, b) } }                    // aarch64 必有 NEON
+    { unsafe { neon::dot_neon(a, b) } }              // aarch64 必有 NEON
     #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
-    { scalar::dot(a, b) }
+    { dot_scalar(a, b) }
 }
 ```
 
 - 内核手写 `std::arch`(Rust 标准库的 intrinsics),**不引入任何依赖**;
 - f32x8 主循环 + 尾部标量收尾(维度不是 8 的倍数时);
-- **32 字节对齐**:存储层保证向量按 32B 对齐摆放(见 [04 vsec](04-l2-persist.md)),
-  AVX2 加载免跨缓存行惩罚;
-- NEON 是 128 位(4 宽),同样的代码结构、更少的通道——抽象成"LANE 个 f32 的
-  乘加归约"后三种内核共享测试。
+- **非对齐加载**:内核用 `loadu` 读取,**不要求调用方保证 32B 对齐**(避免未对齐
+  输入触发 UB);存储层把向量按 32B 摆放(见 [04 vsec](04-l2-persist.md))只是
+  进一步避免跨缓存行惩罚的优化,而非正确性前提;
+- NEON 是 128 位(4 宽),同样的代码结构、更少的通道;AVX2/SSE2/NEON 三个内核各自
+  独立实现,统一通过与可移植标量参考 `dot_scalar` 的对照测试验证等价性
+  (FC-CORE-INV-001)。
 
 ### 4.3 【数学】点积内核的指令数
 
@@ -290,7 +301,12 @@ pub fn as_f64(v: &Meta) -> Option<f64>;   // as_i64 / as_bool / as_str / as_ts �
 
 ---
 
-## 8. options.rs:全局参数
+## 8. options 模块:全局参数
+
+> 模块目录按主题拆分:`dimension.rs`(维度)、`write.rs`(fsync 策略 / 插入模式 /
+> 更新补丁 / 压缩)、`index.rs`(HNSW / 调参 / 量化格式)、`limits.rs`(限额)、
+> `lifecycle.rs`(compaction)、`scoring.rs`(打分 / 反馈 / 关系)、`clock.rs`(时间源);
+> 子模块保持私有,类型经 `options/mod.rs` 统一 re-export,公共 API 路径不变。
 
 ```rust
 pub struct Dimension(u32);        // 1..=65536;Builder 入口接受 u32 并校验后转为 Dimension,内部不再用裸整数
@@ -308,14 +324,17 @@ pub struct RelationKind(pub u16); // 关系类型:内置占用 0..=15(当前 0..
 pub enum RelationIndex { Outgoing, Both }  // 关系反向索引,见 09
 pub enum Feedback { Used, Ignored, Corrected { by: RowId } }  // 检索反馈,见 10
 pub struct QueryId(pub u64);      // 一次检索的幂等标识(feedback 幂等键的一半),见 10 §4
-pub struct UpdatePatch { /* 可选字段:vector/text/meta/importance/ttl/valid_time/confidence/provenance;外层 None = 不改动 */ } // 见 03 §2.1
+pub struct UpdatePatch { /* 可选字段:vector/text/metadata/importance/ttl/valid_time/confidence/provenance;外层 None = 不改动 */ } // 见 03 §2.1
 pub enum Compression { None, Lz4, Zstd }  // 文本/元数据压缩,feature(compress / compress-zstd),见 11
-pub struct Encryption { /* 算法/密钥提供者,feature,见 11 */ }  // 静态加密配置
 
 /// 时间源:TTL / 遗忘曲线 / touch 一律经此取"当前 Unix 毫秒"。
 /// 生产用 SystemClock;测试注入可回拨/快进的假时钟,保证确定性。
 pub trait Clock: Send + Sync { fn now_unix_ms(&self) -> i64; }
 ```
+
+> `Encryption` 及其 `KeyProvider` / `Cipher` / `Key` 因依赖上层 trait 与 `encrypt`
+> feature(且加密用的 `Key` 与 §1 的外部键 `Key` 同名),由 [11 安全层](11-security-storage.md)
+> 定义,**不在 L0 的 options 模块中**;L0 只提供上表这些无上层依赖的数据定义。
 
 `FsyncPolicy` 的语义与权衡见 [00 §6.1](00-fundamentals.md) 与
 [04 §3](04-l2-persist.md);各配置项的默认值与 Builder 方法见
@@ -328,12 +347,15 @@ pub trait Clock: Send + Sync { fn now_unix_ms(&self) -> i64; }
 L0 向上提供,且**只**提供:
 
 1. 类型:`RowId / SlotId / SeqNo / SegmentId / NsId / Key / Meta / Dimension / FsyncPolicy /
-   InsertMode / VectorFormat / HnswParams / CompactionPolicy / Tuning / Limits / Clock / Score /
-   Scoring / TimeAxis / Diversity / RelationKind / RelationIndex / Feedback / QueryId /
-   UpdatePatch / Compression / Encryption`(以上均为 `options.rs` 中的数据定义,不含行为);
-2. 数学:`Metric::{score, better}` 与 `simd::dot`(及其薄封装 `cosine` / `euclidean_sq`,
-   均归结为一次点积;对齐前提由调用方保证);
-3. 容器:`TopK::{push, merge}`;编解码:`varint::{encode_u32/u64, decode}`;
+   InsertMode / VectorFormat / HnswParams / CompactionPolicy / Tuning / Limits / Clock /
+   SystemClock / Score / Scoring / TimeAxis / Diversity / RelationKind / RelationIndex /
+   Feedback / QueryId / UpdatePatch / Compression`(除 `Score` 定义于 `metric.rs` 外,其余
+   均为 options 模块中的数据定义,不含行为);
+2. 数学:`Metric::{score, better, needs_norm}`、`simd::{dot, dot_scalar}`(后者为可移植
+   标量参考实现,同时用于非 SIMD 架构回退)及其薄封装 `metric::{cosine, euclidean_sq}`
+   (均归结为一次点积;两切片等长由调用方保证);
+3. 容器:`TopK::{new, push, merge, len, is_empty, capacity, into_sorted_vec}`;编解码:
+   `varint::{encode_u32, encode_u64, decode_u32, decode_u64}`;
 4. 错误:`MnemeError` 与 `Result`。
 
 **禁止**:任何 I/O、任何全局状态、任何锁、任何 `unsafe`(除 `simd.rs` 的 arch 内联)、
@@ -345,7 +367,7 @@ L0 向上提供,且**只**提供:
 - 六类标识符用 newtype:`RowId` 是稳定逻辑身份,`SlotId` 是段内物理槽位。
 - 三种度量统一归结为**一次点积**;SIMD 手写三种内核 + 运行时分发,零依赖。
 - `TopK` 是 $O(N \log k)$ 的有界堆,支持并行 `merge`;varint 让小整数省空间。
-- `meta.rs` 是唯一的 serde 隔离区;`options.rs` 集中全部配置类型与 `Clock`。
+- `meta.rs` 是唯一的 serde 隔离区;options 模块(按主题拆分的目录)集中全部配置类型与 `Clock`。
 - **本章不变量**:I22(RowId 跨 update/upsert 稳定)。
 
 ## 下一章

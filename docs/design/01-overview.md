@@ -174,7 +174,7 @@ flowchart LR
 mneme/
 ├── src/
 │   ├── lib.rs          # 门面:Mneme / Namespace / Builder;pub use 公开类型
-│   ├── core/           # L0:types.rs error.rs metric.rs simd.rs varint.rs meta.rs heap.rs options.rs
+│   ├── core/           # L0:types.rs error.rs metric.rs simd.rs varint.rs meta.rs heap.rs options/
 │   ├── memory/         # L1:table.rs engine.rs search.rs pred.rs dedup.rs
 │   ├── persist/        # L2:wal.rs vsec.rs msec.rs delta.rs edges.rs manifest.rs recover.rs flush.rs source.rs storage.rs trash.rs
 │   ├── index/          # L3:hnsw.rs graph.rs filtered.rs merge.rs rebuild.rs
