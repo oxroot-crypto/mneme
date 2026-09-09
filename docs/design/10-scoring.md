@@ -34,14 +34,12 @@
 对候选记录 $d$ 与查询 $q$:
 
 $$
-S(d) \;=\; \underbrace{w_{\text{sim}}\,\hat{s}(d)}_{\text{相似度}}
-\;+\; \underbrace{w_{\text{rec}}\,\text{rec}(d)}_{\text{新鲜度}}
-\;+\; \underbrace{w_{\text{imp}}\,\text{imp}(d)}_{\text{重要度}}
-\;+\; \underbrace{w_{\text{acc}}\,\text{acc}(d)}_{\text{访问}}
-\;+\; \underbrace{w_{\text{conf}}\,c(d)}_{\text{可信度}}
+S(d) \;=\; \underbrace{w_{\text{sim}}\,\hat{s}(d)}_{\text{similarity}}
+\;+\; \underbrace{w_{\text{rec}}\,\text{rec}(d)}_{\text{recency}}
+\;+\; \underbrace{w_{\text{imp}}\,\text{imp}(d)}_{\text{importance}}
+\;+\; \underbrace{w_{\text{acc}}\,\text{acc}(d)}_{\text{access}}
+\;+\; \underbrace{w_{\text{conf}}\,c(d)}_{\text{confidence}}
 $$
-
-(纯文本:`S = w_sim*ŝ + w_rec*rec + w_imp*imp + w_acc*acc + w_conf*conf`)
 
 | 因子 | 定义 | 说明 |
 |---|---|---|
@@ -61,13 +59,14 @@ $$
 \hat{s}(d) = \mathrm{clamp}\!\left(\frac{s^{*}(d) - s^{*}_{\min}}{s^{*}_{\max} - s^{*}_{\min}},\ 0,\ 1\right)
 $$
 
-(纯文本:`s* = 按 Metric::better 定向后的分数(欧氏取负);ŝ(d) = clamp((s*(d) − s*_min)/(s*_max − s*_min), 0, 1)`)
-
 - 候选集 = 各通道 top-$m$($m$ 见 §2.3),不是全库;这与 [06 §4.2](06-l4-query.md) 的加权融合同源;
 - **方向**:直接对欧氏的 `s`(距离平方)套用上式会把最远者归一为 1,故必须先定向为 $s^{*}=-s$;
 - `s^{*}_{\max} = s^{*}_{\min}` 时 $\hat{s} \equiv 1$;
 - **`Scoring::floor`**:若 $\hat{s}(d) < \text{floor}$,则 $S(d)$ 直接置 0——防止"低相似但高重要度"的
-  记录被时序因子顶进 top-k(默认 `floor=0`,即不设限)。
+  记录被时序因子顶进 top-k(默认 `floor=0`,即不设限);
+- **纯 BM25 查询**(只调 `.text()`、无向量通道):没有相似度可言,$\hat{s}(d)$ 取 0,
+  综合分退化为其余因子;需要"关键词为主"时用 `Fusion::Weighted { alpha: 0.0 }`
+  或直接采用 BM25 排名,不要依赖 `w_sim`。
 
 ### 2.3 在 HNSW 上如何不破坏召回
 
@@ -118,12 +117,10 @@ $$
 \text{boost}(v) = \max_{p \in \text{paths}(q \to v)} \left( \hat{s}(\text{seed}_p) \cdot \prod_{e \in p} \text{weight}(e) \cdot \text{decay}^{\,|p|} \right)
 $$
 
-(纯文本:`boost = max over paths of ŝ(seed) * Π weight(e) * decay^hops`)
-
 - `hops` 默认 1(只扩展一跳),最大 3;
 - `decay` 默认 0.5/跳,`max_nodes` 限制扩展节点数以封顶延迟;
 - 扩展命中的 `Hit.via = Some(edge)`,调用方可解释来源;
-- 扩展分与向量分在 [10 §2](#2-综合打分scoring) 的综合分里取 `max(自身分, boost)` 后再排序,
+- 扩展分与向量分在 [§2](#2-综合打分scoring) 的综合分里取 `max(自身分, boost)` 后再排序,
   不叠加(避免关联项被重复加权)。
 
 ### 3.2 复杂度
@@ -180,10 +177,8 @@ $$
 \text{MMR} = \arg\max_{d \in C \setminus R}\Big[\lambda \cdot \text{rel}(d) - (1-\lambda)\cdot \max_{r \in R}\text{sim}(d, r)\Big]
 $$
 
-(纯文本:`MMR = 迭代选取 λ*相关度 - (1-λ)*与已选集合的最大相似度 最大者`)
-
 - `λ ∈ [0,1]`,默认 0.7(偏相关);`λ=1` 等价于不启用;
-- `rel(d)` 用 [10 §2](#2-综合打分scoring) 的综合分;`sim(d,r)` 用向量相似度;
+- `rel(d)` 用 [§2](#2-综合打分scoring) 的综合分;`sim(d,r)` 用向量相似度;
 - 贪心 $O(k^2)$(k = 返回条数),k 通常 ≤ 50,可忽略。
 
 ### 5.2 与去重的关系
@@ -219,11 +214,11 @@ sequenceDiagram
 
 - **顺序固定**:过滤 → 双通道 → 融合 → 关系扩展 → 综合打分 → 去重/多样性 → 重排钩子;
 - 每步都可关闭,关闭后等价旧管线([06 §5](06-l4-query.md));
-- `query_id` 在管线开始时生成,随 `Hit` 返回的 `execute()` 结果集一起交给反馈([10 §4](#4-反馈闭环feedback))。
+- `query_id` 在管线开始时生成,随 `Hit` 返回的 `execute()` 结果集一起交给反馈([§4](#4-反馈闭环feedback))。
 
 ---
 
-## 7. 层边界契约(L4+ → 上层)
+## 7. 层边界契约(产品能力层 → 上层)
 
 **向上提供**:
 
@@ -235,6 +230,13 @@ sequenceDiagram
 **依赖**:L0(度量/类型)、L3(ANN 候选)、L4(过滤/融合)、L5(访问统计)、[09](09-memory-model.md)(关系/时态/可信度)。
 
 **不变量**:I25(关系一致)、I26(双时态一致)、I27(反馈幂等);召回门槛见 [14 §4](14-testing.md)。
+
+## 本章小结
+
+- 纯相似度不够:新鲜度/重要度/访问/可信度/联想统一进综合打分。
+- 综合分在**候选集内**归一化;`floor` 防止低相似记录被时序因子顶进 top-k。
+- HNSW 上用"ANN 粗排 + 综合重排"两段式避免破坏召回;可选重要性偏置路由。
+- 联想扩展、反馈闭环(I27)、MMR 多样性;顺序固定,默认全部关闭。
 
 ## 下一章
 

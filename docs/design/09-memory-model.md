@@ -43,25 +43,28 @@
 ### 2.2 类型与 API
 
 ```rust
-pub struct RelationKind(pub u16);          // 内置 + 用户自定义
+pub struct RelationKind(pub u16);          // 内置占用 0..=15(当前 0..=3),自定义从 16 起
 impl RelationKind {
-    pub const DERIVED_FROM: Self;          // 派生自(摘要→来源)
-    pub const SUPPORTS: Self;              // 支持
-    pub const CONTRADICTS: Self;           // 矛盾
-    pub const RELATED: Self;               // 弱相关
-    pub fn custom(name: &str) -> Self;     // 名称→稳定编号
+    pub const DERIVED_FROM: Self;          // =0 派生自(摘要→来源)
+    pub const SUPPORTS: Self;              // =1 支持
+    pub const CONTRADICTS: Self;           // =2 矛盾
+    pub const RELATED: Self;               // =3 弱相关
+    pub fn custom(name: &str) -> Result<Self>;  // 名称→稳定编号(≥16;已注册则返回既有编号)
 }
 pub struct Edge { pub from: RowId, pub to: RowId, pub kind: RelationKind, pub weight: f32, pub metadata: Meta }
 
 ns.relate(from, to, kind, weight)?;        // 幂等:同 (from,to,kind) 覆盖 weight(metadata 不变)
 ns.relate_with_meta(from, to, kind, weight, meta)?;  // 幂等:同时覆盖 weight 与 metadata
 ns.unrelate(from, to, kind)?;              // 返回是否命中
-let edges: Vec<Edge> = ns.neighbors(from, &[RelationKind::SUPPORTS])?;  // 出边
+let edges: Vec<Edge> = ns.neighbors(from, &[RelationKind::SUPPORTS])?;       // 出边
+let in_edges: Vec<Edge> = ns.predecessors(to, &[RelationKind::SUPPORTS])?;  // 入边(见 §2.3)
 ```
 
 - 关系边以 `(from, to, kind)` 为唯一键,重复 `relate` 为 upsert;
 - 边可携带 `weight ∈ [0,1]`(影响联想扩展的传播强度,[10 §3](10-scoring.md))与任意 metadata;
-- **自定义关系**的 `custom(name)` 经名称注册表映射为稳定 u16;注册经 WAL
+- **自定义关系**的 `custom(name)` 经名称注册表映射为稳定 u16:内置固定占用 `0..=3`,
+  `4..=15` 预留给未来内置类型,自定义从 **16** 起分配;同一名称全局唯一,编号空间耗尽
+  (约 65520 个自定义类型)时返回 `TooLarge`。注册经 WAL
   `RelKindRegister` 帧落盘([04 §2.3](04-l2-persist.md)),并由 MANIFEST 的关系类型注册表
   持久化(`RelKindEntry` + `next_rel_kind` 水位,[04 §2.4](04-l2-persist.md)),
   不同进程/重启后编号一致(与 `NsRegister` 同一恢复机制,[04 §3.3](04-l2-persist.md))。
@@ -76,9 +79,10 @@ let edges: Vec<Edge> = ns.neighbors(from, &[RelationKind::SUPPORTS])?;  // 出�
 
 - **不变量 I25**:`neighbors` 只返回两端都活着的边;删除/遗忘一端后,边**立即**在视图上失效
   (无需等 compaction);compaction 后物理清除;
-- **复杂度**:`neighbors(from)` = `O(log E + degree)`(relations 区按 from 排序);
-  反向查询(入边)默认不建索引,走全段扫描 + zone map;需要高频入边时可显式
-  `Builder::relation_index(RelationIndex::Both)`(空间 ×2),默认 `Outgoing`;
+- **复杂度**:出边 `neighbors(from)` = `O(log E + degree)`(relations 区按 from 排序);
+  入边 `predecessors(to)` 默认走全段扫描(按 from 排序的区无法按 to 二分),需要高频入边时显式
+  `Builder::relation_index(RelationIndex::Both)`(空间 ×2)启用按 `(to, kind, from)` 排序的反向索引,
+  此时同样 `O(log E + degree)`;默认 `Outgoing`(`predecessors` 仍可用,只是较慢);
 - 边**不参与向量打分**,只作为 [10 §3](10-scoring.md) 的扩展算子。
 
 ### 2.4 【算例】联想扩展
@@ -147,6 +151,14 @@ ns.supersede(key, new_record)?;   // 语义糖:update 同 key + 将旧版本 val
   但仍可经 `as_of` 历史读),再在超出 `history_horizon` 后变为 `Reclaimed`(物理回收、彻底不可见)。
   `supersede` 只把旧版本置为 `Shadowed` 并闭合 `valid_to`,不改变该状态机。
 
+```mermaid
+stateDiagram-v2
+    [*] --> Active: 写入 / 更新产生新版本
+    Active --> Shadowed: 被更新遮蔽(仅 as_of 可见)
+    Shadowed --> Reclaimed: 超出 history_horizon
+    Reclaimed --> [*]
+```
+
 ---
 
 ## 4. 来源与可信度(provenance & confidence)
@@ -155,7 +167,7 @@ ns.supersede(key, new_record)?;   // 语义糖:update 同 key + 将旧版本 val
 
 | 字段 | 类型 | 语义 |
 |---|---|---|
-| `confidence` | `f32 ∈ [0,1]` | 该记忆为真的可信度,默认 1.0;参与排序([10 §2](10-scoring.md)) |
+| `confidence` | `f32 ∈ [0,1]` | 该记忆为真的可信度,默认 1.0,越界钳制到 [0,1];参与排序([10 §2](10-scoring.md)) |
 | `provenance` | `Meta` | 来源/派生链,开放 JSON(如 `{"source":"user","session":"s88","derived_from":[123]}`) |
 
 - `provenance` 是开放结构,引擎只在 **consolidation** 时自动写入 `derived_from`;
@@ -219,11 +231,11 @@ DERIVED_FROM: S→m1, S→m2, S→m4
 
 ---
 
-## 6. 层边界契约(L5+ → 上层)
+## 6. 层边界契约(产品能力层 → 上层)
 
 **向上提供**:
 
-1. 关系:类型注册表、`relate/relate_with_meta/unrelate/neighbors`、联想扩展的数据源(不变量 I25);
+1. 关系:类型注册表、`relate/relate_with_meta/unrelate/neighbors/predecessors`、联想扩展的数据源(不变量 I25);
 2. 双时态:`valid_from/valid_to`、`as_of(ts)`、`supersede`(不变量 I26);
 3. 来源/可信度:`confidence`/`provenance` 字段与过滤;
 4. 沉淀:`consolidate(policy)` 与 `ConsolidateReport`。
@@ -231,6 +243,15 @@ DERIVED_FROM: S→m1, S→m2, S→m4
 **依赖**:L0(类型)、L2(delta/relations 持久化)、L3(近邻查询用于聚类)、L4(计划器用于 filter)、L5(compaction/tombstone)。
 
 **不变量**:I22(稳定 RowId)、I24(更新原子可见)、I25(关系一致)、I26(双时态一致;历史默认永久保留,受 `history_horizon` 约束)。
+
+## 本章小结
+
+- 记忆 ≠ 向量:关系图、双时态、来源/可信度、沉淀是引擎级一等公民。
+- `relate` 以 `(from,to,kind)` 幂等;悬挂边不可见(I25);自定义关系类型有稳定注册表。
+- 双时态 = 事务时间 + 有效时间;`as_of` 时间旅行、`supersede` 信念修订(I26)。
+- 版本状态:`Active → Shadowed → Reclaimed`,默认永久保留。
+- `consolidate` 聚类→摘要→`DERIVED_FROM`,默认不删除来源。
+- **本章不变量**:I22、I24、I25、I26。
 
 ## 下一章
 

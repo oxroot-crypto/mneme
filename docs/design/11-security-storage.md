@@ -2,7 +2,7 @@
 
 > **本章目标**:补齐产品化的两块存储能力——**数据静止加密**(Agent 记忆含用户隐私)
 > 与**文本/元数据压缩**(超长期下文本是体积大头),同时守住"默认零成本、依赖可选"。
-> **前置阅读**:[04](04-l2-persist.md)(文件布局/WAL/Manifest)、[02 §7](02-l0-core.md)(meta 隔离)、[01 §5](01-overview.md)(依赖白名单)。
+> **前置阅读**:[04](04-l2-persist.md)(文件布局/WAL/MANIFEST)、[02 §7](02-l0-core.md)(meta 隔离)、[01 §5](01-overview.md)(依赖白名单)。
 > **本章你将学到**:威胁模型与边界 → 页级 AEAD 加密与密钥提供者 → 密钥轮换 →
 > 文本压缩与 BM25 的交互 → 层边界契约。
 >
@@ -55,7 +55,7 @@ AAD   = [segment_id | page_index | format_version]   # 绑定位置,防页重排
   `FileSource` 解码路径([04 §11](04-l2-persist.md)),读吞吐下降(经验值 1.5–3×);
   这是安全换性能的显式取舍;[01 §1.1](01-overview.md)/[14 §4](14-testing.md) 的
   性能目标默认在**未加密**下衡量,加密开启后需重新基准;
-- 页大小 64 KiB 与 OS 页对齐,解密缓冲区可复用。
+- 页大小 64 KiB 是 OS 页(通常 4 KiB)的整数倍,便于对齐与复用解密缓冲区。
 
 ### 2.3 密钥提供者
 
@@ -78,13 +78,14 @@ pub struct Encryption { pub provider: Arc<dyn KeyProvider>, pub cipher: Cipher }
 
 - 引擎**不管理密钥文件**,只经 `KeyProvider` 取密钥;密钥可来自环境变量、OS keychain、
   KMS 或宿主自管(依赖不进入引擎);
-- 每个段/WAL/Manifest 头部记录 `key_id`;解密按 id 查 provider,支持旧密钥仍可读。
+- 每个段/WAL/MANIFEST 头部记录 `key_id`(头部扩展区定义见 [04 §2.5](04-l2-persist.md));
+  解密按 id 查 provider,支持旧密钥仍可读。
 
 ### 2.4 密钥轮换
 
 ```text
 1. provider.rotate() → 新 key_id
-2. 后台任务逐段重写:旧段解密 → 新密钥加密 → 提交新 Manifest(复用 compaction 流程)
+2. 后台任务逐段重写:旧段解密 → 新密钥加密 → 提交新 MANIFEST(复用 compaction 流程)
 3. 全部段迁移完成后,旧 key_id 可退役
 ```
 
@@ -94,7 +95,7 @@ pub struct Encryption { pub provider: Arc<dyn KeyProvider>, pub cipher: Cipher }
 ### 2.5 复杂度与不变量
 
 - 加密/解密吞吐取决于 AES-NI(经验值数 GB/s),相对磁盘带宽通常不是瓶颈;
-- **不变量 I28**:开启加密后,磁盘上任何段/WAL/Manifest 的密文区不含明文记录字段;
+- **不变量 I28**:开启加密后,磁盘上任何段/WAL/MANIFEST 的密文区不含明文记录字段;
   `db.check()` 校验每个页的认证标签,篡改/错误密钥 → `Corrupted`,绝不返回错误数据。
 
 ---
@@ -118,7 +119,7 @@ pub enum Compression { None, Lz4, Zstd }   // 默认 None;`Lz4` 为内置自研�
 
 - 压缩作用于**记录体内的 `text` 与 `meta` 字段**(`[04 §2.2](04-l2-persist.md)` entry 的变长区),
   按字段独立压缩并带 `uncompressed_len` 前缀;向量/norm 不压缩(已定长且量化另有手段);
-- 每段头部记录所用 codec;`Compression::None` 时字节布局与旧格式一致(向后兼容);
+- 每段头部记录所用 codec(头部扩展区定义见 [04 §2.5](04-l2-persist.md));`Compression::None` 时字节布局与旧格式一致(向后兼容);
 - 可选 feature `compress-zstd` 允许接入更强 codec,默认不引入依赖。
 
 ### 3.3 与 BM25 / 过滤的交互
@@ -140,7 +141,7 @@ pub enum Compression { None, Lz4, Zstd }   // 默认 None;`Lz4` 为内置自研�
 
 ---
 
-## 4. 层边界契约(L2+ → 上层)
+## 4. 层边界契约(产品能力层 → 上层)
 
 **向上提供**:
 
@@ -148,9 +149,17 @@ pub enum Compression { None, Lz4, Zstd }   // 默认 None;`Lz4` 为内置自研�
 2. `Compression` + `Codec`(feature `compress`)与内置 codec;
 3. `Stats.storage` 暴露加密/压缩生效状态与迁移进度。
 
-**依赖**:L0(类型)、L2(段/WAL/Manifest 布局、`SegmentSource`)、L5(后台迁移复用 compaction)。
+**依赖**:L0(类型)、L2(段/WAL/MANIFEST 布局、`SegmentSource`)、L5(后台迁移复用 compaction)。
 
 **不变量**:I28(加密不落明文);I2 的加密版(认证失败绝不静默);默认关闭时磁盘布局不变。
+
+## 本章小结
+
+- 威胁模型:保护**静态介质**,不保护进程内存、密钥持有者、侧信道与回滚攻击。
+- 页级 AEAD 加密 + `KeyProvider` + 密钥轮换;加密时 mmap 失效,需重新基准。
+- 文本/元数据压缩;倒排不受影响,只有行级过滤才解压。
+- 默认关闭时磁盘布局与 [04](04-l2-persist.md) 完全一致。
+- **本章不变量**:I28(不落明文),以及 I2 的加密版。
 
 ## 下一章
 

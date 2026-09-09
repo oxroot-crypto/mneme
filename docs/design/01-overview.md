@@ -178,7 +178,7 @@ mneme/
 │   ├── memory/         # L1:table.rs engine.rs search.rs pred.rs dedup.rs
 │   ├── persist/        # L2:wal.rs vsec.rs msec.rs delta.rs edges.rs manifest.rs recover.rs flush.rs source.rs storage.rs trash.rs
 │   ├── index/          # L3:hnsw.rs graph.rs filtered.rs merge.rs rebuild.rs
-│   ├── query/          # L4:parse.rs plan.rs zmap.rs bm25.rs fusion.rs dedup.rs exec.rs
+│   ├── query/          # L4:parse.rs plan.rs zmap.rs bm25.rs fusion.rs result_dedup.rs exec.rs
 │   ├── life/           # L5:ttl.rs retain.rs access.rs namespace.rs compact.rs backup.rs stats.rs
 │   ├── quant/          # L6:scalar_i8.rs f16.rs rescore.rs
 │   ├── model/          # 记忆模型:relation.rs temporal.rs provenance.rs consolidate.rs   (09)
@@ -214,14 +214,15 @@ compaction 调度、分词)**全部自研**。
 | `aes-gcm` | 静态加密 AEAD | L2 | feature `encrypt`(默认关);仅 `crypto/` 接触 |
 | `zstd` | 可选更强压缩 | L2 | feature `compress-zstd`(默认关);内置 LZ4 风格 codec 无依赖 |
 
-> **默认构建口径**:`thiserror` + `serde` + `serde_json` + `crc32fast` = 4 个强依赖;
+> **默认构建口径**:`thiserror` + `serde` + `serde_json` + `crc32fast` = 4 个**直接**强依赖
+> (`serde_json` 另带入 `itoa`/`ryu`/`memchr` 等极少数传递依赖);
 > `mmap` 默认开启会额外引入 `memmap2`,故**默认构建实为 5 个**。`memmap2`/`half`/`tokio`
 > 都随 feature 走,`--no-default-features` 可回到 4 个。
 >
 > **元数据构造**:`Meta` 即 `serde_json::Value`,库重导出 `json!` 宏(`use mneme::json;`),
 > 宿主无需直接依赖 `serde_json`;除此之外不暴露任何 serde_json 类型。
 
-**明确不自引**(自研替代):`rayon`(用 `std::thread::scope`)、`crossbeam`(用
+**明确不引入**(自研替代):`rayon`(用 `std::thread::scope`)、`crossbeam`(用
 `std::sync::mpsc`)、`parking_lot`/`arc-swap`(用 std `RwLock`/`Mutex`)、
 `zerocopy`(手写编解码)、`xxhash`(crc32 足够)、`unicode-segmentation`
 (手写分词:空白切词 + CJK bigram)、任何现成 HNSW/BM25 库。
@@ -269,7 +270,7 @@ let outcome = ns.insert(
         .metadata(json!({"kind":"preference"}))   // 可选 JSON;importance 用 .importance() 设
         .importance(0.8)                          // 可选;默认 0.5
         .ttl(Duration::from_secs(30 * 86400))    // 可选;到期自动遗忘
-)?;   // -> InsertOutcome { Inserted(RowId) | Duplicate{..} }(开了去重时)
+)?;   // -> InsertOutcome { Inserted(RowId) | Merged(RowId) | Duplicate{..} }(去重开启时)
 
 let outcomes = ns.insert_batch(batch)?;          // 批量原子写入(50k/s 目标的公开入口)
 ns.update("mem_001", UpdatePatch::new().text(Some("用户偏好深色模式".into())))?;  // 保留 RowId 的局部更新
@@ -293,14 +294,16 @@ let rec: Option<RecordRef<'_>> = ns.get("mem_001")?;
 if let Some(r) = &rec { let _v = r.vector(); }    // 零拷贝;或 get_vector(rowid)
 let many = ns.get_many(&["mem_001", "mem_002"])?; // 批量点读
 let _exists = ns.exists("mem_001")?;
+let _n = ns.count(Some(filter!("kind == \"scratch\"")))?; // 命中行数(不物化记录)
 ns.delete("mem_001")?;            // 无 key 记录用 delete_by_rowid(rowid)
 for row in ns.iter(Some(filter!("kind == \"scratch\"")))? { let rec = row?; /* ... */ }
 
 // ---- 记忆模型(关系 / 双时态 / 沉淀) ----
 ns.relate(a, b, RelationKind::SUPPORTS, 0.8)?;
 ns.relate_with_meta(a, b, RelationKind::SUPPORTS, 0.8, json!({"reason":"user"}))?; // 带边元数据
-let edges = ns.neighbors(a, &[RelationKind::SUPPORTS])?;
-ns.supersede("pref.theme", Record::new(vector))?; // 信念修订:旧版本 valid_to 闭合
+let edges = ns.neighbors(a, &[RelationKind::SUPPORTS])?;          // 出边
+let in_edges = ns.predecessors(b, &[RelationKind::SUPPORTS])?;    // 入边(开 relation_index(Both) 时更快)
+ns.supersede("pref.theme", Record::new(vector))?; // 信念修订:要求同 key 已存在;旧版本 valid_to 闭合
 let old = db.as_of(ts("2024-03-01"))?;            // 时间旅行读
 let report = ns.consolidate(ConsolidationPolicy::default())?;
 ns.feedback(hits[0].rowid, Feedback::Used, hits[0].query_id)?;  // 检索反馈闭环(query_id 幂等)
@@ -329,14 +332,15 @@ db.close()?;                // flush + 释放文件锁;Drop 只尽力 flush
 完整签名、配置总表、打开校验、错误/重试与备份 runbook 见
 [16 公开 API 与运维参考](16-api-reference.md)。
 
-公开类型速览:
+公开类型速览(首次出现的 `Meta` / `QueryId` / `ConsolidationPolicy` 等,完整定义分别在
+[02 §7](02-l0-core.md) / [10 §4](10-scoring.md) / [09 §5](09-memory-model.md)):
 
 | 类型 | 说明 |
 |---|---|
 | `Record` | 一条记忆:可选 key、向量、可选 text、元数据(JSON)、可选 TTL、可选 importance |
 | `Hit` | 检索命中:RowId(全局稳定)、key、score、记录视图(不含向量) |
 | `RecordRef<'_>` | 存储记录只读视图(无 score),用于 `get`/`iter`;`vector()` 零拷贝取原始向量 |
-| `InsertOutcome` | `Inserted(RowId)` 或 `Duplicate { existing: RowId, score }`(开启去重时) |
+| `InsertOutcome` | `Inserted(RowId)` / `Merged(RowId)`(去重合并)或 `Duplicate { existing: RowId, score }`(去重拒绝) |
 | `Metric` | `Cosine / Dot / Euclidean` |
 | `FsyncPolicy` | `Always / Batched(Duration) / OnFlush / Never` |
 | `InsertMode` / `Dedup` / `ResultDedup` | 同 key 行为 / 写入期去重 / 结果级去重 |
@@ -386,6 +390,14 @@ db.close()?;                // flush + 释放文件锁;Drop 只尽力 flush
 7. **可选存储安全与部署形态**:静态加密/压缩、多进程只读、WASM 适配([11](11-security-storage.md)/[12](12-deployment.md))。
 
 ---
+
+## 本章小结
+
+- 定位:进程内、嵌入型、**Agent 记忆特化**、超长期;明确不做多进程写/分布式/内置 embedding/SQL。
+- 架构:7 层 L0–L6 只向下依赖,每层都是可交付产品;09–12 是横切其上的产品能力层。
+- 依赖白名单 4 个强依赖(默认开 `mmap` 共 5 个),复杂算法全部自研,加密/压缩为可选 feature。
+- 公开 API 在 L1 冻结;并发模型 = 单写者多读者 + MVCC 水位 + async 薄包装。
+- 差异化能力:记忆感知排序、关系图、双时态、沉淀、反馈闭环、超长期闭环。
 
 ## 下一章
 

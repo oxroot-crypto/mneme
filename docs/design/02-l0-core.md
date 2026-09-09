@@ -91,8 +91,6 @@ pub type Score = f32;
 
 $$\|\mathbf{a}-\mathbf{b}\|^2 \;=\; \|\mathbf{a}\|^2 + \|\mathbf{b}\|^2 - 2\,\mathbf{a}\cdot\mathbf{b}$$
 
-(纯文本:`dist² = ‖a‖² + ‖b‖² − 2*a·b`)
-
 $\|\mathbf{a}\|^2$ 在写入时算好存进 norm 列(每向量 4 字节),查询时
 $\|\mathbf{q}\|^2$ 是常数,于是**三种度量全部归结为一次点积**(norm 列存的是**范数平方**):
 
@@ -209,11 +207,11 @@ AVX2 一次 `_mm256_fmadd_ps` 完成 8 对乘加(乘完即加进累加器)。$d$
 - 小根堆性质:任意父节点 ≤ 子节点,故**根是堆中最小值**;
 - `push`/`pop` 均为 $O(\log k)$(沿树高上浮/下沉,树高 $= \log_2 k$);
 
-$$T(N) \;=\; N \cdot O(1)\text{(比较)} \;+\; m \cdot O(\log k)\text{(替换),其中 } m \le N$$
+$$T(N) \;=\; N \cdot O(1) \;+\; m \cdot O(\log k), \qquad m \le N$$
+
+其中第一项是 $N$ 次常数时间比较,第二项是 $m \le N$ 次堆替换。
 
 $$\Rightarrow\; T(N) = O(N \log k), \quad S = O(k)$$
-
-(纯文本:`T(N) = N·O(1) + m·O(log k) ≤ O(N log k)`,m ≤ N 为实际替换次数;空间 O(k))
 
 对比排序的 $O(N \log N)$:$N = 10^6, k = 10$ 时,$N\log_2 k \approx 3.3\times10^6$,
 只有 $N\log_2 N \approx 2\times10^7$ 的约 1/6;何况堆的 $O(1)$ 常数路径(拒绝)占绝大多数,
@@ -246,14 +244,12 @@ push 5 → 堆 {5}            push 9 → {5,9}          push 1 → {1,5,9}
 **varint(变长整数)** 让 0–127 只占 1 字节、128–16383 占 2 字节,以此类推,
 每个字节用最高位当"还有后续"的标志(continuation bit)。
 
-### 6.2 【数学/编码规则】
+### 6.2 【数学】编码规则
 
 把整数的二进制按 **7 位一组**从低位切分,**低位组在前**;除最后一组外,
 每组所在的字节最高位置 1:
 
-$$\text{encode}(x):\; b_i = \begin{cases} 0x80 \mid (\text{低 7 位组}_i) & i < \text{最后组} \\ \text{低 7 位组}_i & i = \text{最后组} \end{cases}$$
-
-(纯文本:按 7 位一组从低位切;非最后一组的字节最高位置 1,最后一组最高位为 0)
+$$\text{encode}(x):\; b_i = \begin{cases} 0x80 \mid (\text{low-7-bit group}_i) & i < \text{last group} \\ \text{low-7-bit group}_i & i = \text{last group} \end{cases}$$
 
 **算例**:encode(300)。300 = `0b100101100`(9 位)→ 按 7 位切:
 低组 `0101100`(44),高组 `0000010`(2)。
@@ -308,7 +304,7 @@ pub struct Limits { key_bytes, text_bytes, meta_bytes, meta_depth, ns_depth, top
 pub struct Scoring { w_sim, w_recency, w_importance, w_access, w_confidence, half_life, c_norm, floor, time_axis, bias_routing }  // L4 排序打分,见 10
 pub enum TimeAxis { ValidTime, TransactionTime }  // 新鲜度时间轴,见 10
 pub enum Diversity { Off, Mmr { lambda: f32 } }                                     // 结果多样性,见 10
-pub struct RelationKind(pub u16); // 关系类型:内置 + 用户自定义,见 09
+pub struct RelationKind(pub u16); // 关系类型:内置占用 0..=15(当前 0..=3),自定义从 16 起,见 09 §2.2
 pub enum RelationIndex { Outgoing, Both }  // 关系反向索引,见 09
 pub enum Feedback { Used, Ignored, Corrected { by: RowId } }  // 检索反馈,见 10
 pub struct QueryId(pub u64);      // 一次检索的幂等标识(feedback 幂等键的一半),见 10 §4
@@ -343,6 +339,14 @@ L0 向上提供,且**只**提供:
 **禁止**:任何 I/O、任何全局状态、任何锁、任何 `unsafe`(除 `simd.rs` 的 arch 内联)、
 对 `serde` 的直接使用(只经 `meta.rs`)。所有函数必须是无 panic 的 `Result` 或
 数学上可证明无 panic(切片长度由调用方断言)。
+
+## 本章小结
+
+- 六类标识符用 newtype:`RowId` 是稳定逻辑身份,`SlotId` 是段内物理槽位。
+- 三种度量统一归结为**一次点积**;SIMD 手写三种内核 + 运行时分发,零依赖。
+- `TopK` 是 $O(N \log k)$ 的有界堆,支持并行 `merge`;varint 让小整数省空间。
+- `meta.rs` 是唯一的 serde 隔离区;`options.rs` 集中全部配置类型与 `Clock`。
+- **本章不变量**:I22(RowId 跨 update/upsert 稳定)。
 
 ## 下一章
 

@@ -30,6 +30,7 @@
 | 2026-09 | 新增 I19–I30:delta/注册/BM25 全局/稳定 RowId/加密/只读等契约 |
 | 2026-09 | 口径修订:统一 I21(BM25 统计一致性);新增 FC-INDEX-POST-003(排序全等性) |
 | 2026-09 | 设计变更:引入 RowId 版本链,`as_of`/`supersede` 历史默认永久保留(受 `history_horizon` 约束);重写 I26,新增 FC-MODEL-POST-004 |
+| 2026-09 | 补充:`predecessors` 入边 API(FC-MODEL-POST-005)、写入期去重语义(FC-INDEX-POST-004);段状态统一为 `Building` |
 
 ---
 
@@ -49,7 +50,7 @@
 | FC-PERSIST-ERR-001 | ERR | 未知 WAL 帧类型 → 停止回放并报错,不静默跳过 | `tests/wal_unknown_frame.rs` | Planned |
 | FC-PERSIST-ERR-002 | ERR | 更高主版本 → `UnsupportedVersion`(I18) | `fuzz/fuzz_vsec.rs` + 版本注入 | Planned |
 | FC-PERSIST-STA-001 | STA | 段生命周期:`Building → Committed → Obsolete → (trash)`;`Committed` 段内容不可变 | `tests/segment_lifecycle.rs` | Planned |
-| FC-PERSIST-STA-002 | STA | 崩溃点状态:`Writing` 段为孤儿,恢复时清理;不进入任何 Manifest 视图 | `tests/orphan_cleanup.rs` | Planned |
+| FC-PERSIST-STA-002 | STA | 崩溃点状态:`Building` 段为孤儿,恢复时清理;不进入任何 MANIFEST 视图 | `tests/orphan_cleanup.rs` | Planned |
 
 ---
 
@@ -69,6 +70,7 @@
 | FC-SCORE-POST-003 | POST | 放大 ef 后综合排序相对召回损失 ≤ 2% | `benches/recall_scoring.rs` | Planned |
 | FC-QUERY-ERR-001 | ERR | DSL 任意输入不 panic,返回结构化 `FilterParse`(I7) | `fuzz/fuzz_dsl.rs` | Planned |
 | FC-QUERY-ERR-002 | ERR | `Not` 对缺失字段采用三值语义(缺失 → `Not` 亦为 false) | `tests/three_valued_logic.rs` | Planned |
+| FC-INDEX-POST-004 | POST | 写入期去重:`Dedup::Merge` 就地更新并保留旧 RowId(返回 `Merged(old)`);`Dedup::Replace` 生成新 RowId 并墓碑旧行;`insert_batch` 中 `RejectDuplicate`/`Dedup::Reject` 逐条返回 `Duplicate`,不回滚整批 | `tests/dedup_semantics.rs` | Planned |
 
 ---
 
@@ -84,6 +86,7 @@
 | FC-MODEL-POST-002 | POST | `consolidate` 幂等:已沉淀簇跳过;`keep_sources=true` 不删除来源 | `tests/consolidate_idempotent.rs` | Planned |
 | FC-MODEL-POST-003 | POST | `supersede` 后旧版本 `valid_to` = 新版本 `valid_from`(历史可见性受 compaction 回收约束,I26) | `tests/supersede_validity.rs` | Planned |
 | FC-MODEL-POST-004 | POST | **版本链保留**:每个 RowId 的最新版本与 `history_horizon` 内的历史版本被保留;仅超期版本被回收,`as_of` 在窗口内可读 | `tests/history_retention.rs` | Planned |
+| FC-MODEL-POST-005 | POST | `predecessors(to, kinds)` 只返回 `edge.to == to` 且 `edge.kind ∈ kinds`、两端存活的边;`RelationIndex::Outgoing` 与 `Both` 结果一致(反向索引只加速、不改语义) | `tests/relation_direction.rs` | Planned |
 | FC-MODEL-STA-001 | STA | 记忆版本:`Active(seqno_max,当前可见) → Shadowed(被遮蔽,仅 `as_of` 可见) → Reclaimed(超出 `history_horizon` 后物理回收)`;`Shadowed` 不可作为当前查询结果 | `tests/version_state.rs` | Planned |
 
 ---
@@ -93,7 +96,7 @@
 | 编号 | 类型 | 形式化规范 | 对应测试 | 状态 |
 |---|---|---|---|---|
 | FC-LIFE-INV-008 | INV | **I8**:活跃段数 ≤ `(T−1)·log_r(N/B)+c`;WAL ≤ `wal_bytes` | `tests/long_run.rs` | Planned |
-| FC-LIFE-INV-009 | INV | **I9**:逻辑过期/墓碑记录永不返回;物理回收仅在 compaction 提交后 | `tests/expiry_invisible.rs` | Planned |
+| FC-LIFE-INV-009 | INV | **I9**:逻辑过期/墓碑记录在常规读路径永不返回(仅 `iter_with(..., true)` 审计入口可见);物理回收仅在 compaction 提交后 | `tests/expiry_invisible.rs` | Planned |
 | FC-LIFE-INV-010 | INV | **I10**:compaction 崩溃 → 恢复后 = 提交前状态(孤儿段清理) | `tests/compaction_crash.rs` | Planned |
 | FC-LIFE-INV-011 | INV | **I11**:备份目录独立 `open` + `check` 通过 | `tests/backup_restore.rs` | Planned |
 | FC-LIFE-INV-017 | INV | **I17**:`SnapshotHandle` 视图一致,后台 compaction 不影响 | `tests/snapshot_concurrent.rs` | Planned |

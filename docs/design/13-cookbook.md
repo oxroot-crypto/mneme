@@ -11,6 +11,74 @@
 
 ---
 
+## 0. 端到端最小示例(先跑通,再看配方)
+
+一个完整的"建库 → 写入 → 混合检索 → 反馈 → 关闭"流程。`embed(...)` 是宿主嵌入模型,
+不是库 API(见章首说明)。
+
+```rust
+use mneme::{filter, json, Diversity, Feedback, FsyncPolicy, Metric, Mneme, Record, Scoring};
+use std::time::Duration;
+
+fn main() -> mneme::Result<()> {
+    // 1. 建库(目录已存在则从 MANIFEST 读回维度/度量)
+    let db = Mneme::builder()
+        .path("./agent_memory")
+        .dimension(1536)
+        .metric(Metric::Cosine)
+        .fsync(FsyncPolicy::Batched(Duration::from_millis(20)))
+        .build()?;
+    let ns = db.namespace("agent-42/profile");
+
+    // 2. 记住两条信息(向量由宿主嵌入模型产生)
+    ns.insert(
+        Record::new(embed("用户喜欢深色模式")?)
+            .key("pref.theme")
+            .text("用户喜欢深色模式")
+            .metadata(json!({"kind": "preference"}))
+            .importance(0.8),
+    )?;
+    ns.insert(
+        Record::new(embed("用户用 macOS")?)
+            .key("pref.os")
+            .text("用户用 macOS")
+            .metadata(json!({"kind": "fact"}))
+            .importance(0.6),
+    )?;
+
+    // 3. 混合检索:向量 + BM25 + 过滤 + 综合打分 + MMR 多样性
+    let q = embed("他喜欢什么界面风格?")?;
+    let hits = ns.search()
+        .vector(&q)
+        .text("界面风格")
+        .filter(filter!(r#"kind == "preference""#))
+        .score(Scoring::new().w_recency(0.2).w_importance(0.3))
+        .diversify(Diversity::Mmr { lambda: 0.7 })
+        .top_k(10)
+        .execute()?;
+    for h in &hits {
+        println!("{:?} {:?} score={:.3}", h.rowid, h.key, h.score);
+    }
+
+    // 4. 反馈闭环(以 (rowid, query_id) 幂等)
+    if let Some(h) = hits.first() {
+        ns.feedback(h.rowid, Feedback::Used, h.query_id)?;
+    }
+
+    // 5. 优雅关闭:返回 Ok 即所有已确认写入已持久
+    db.close()?;
+    Ok(())
+}
+```
+
+**关键点**:
+
+- 维度是**建库属性**,由 MANIFEST 持久化;打开已有目录时无需再传(见 [16 §3](16-api-reference.md))。
+- `filter!` 的表达式写死在代码里,非法字面量会 panic;运行时输入请用 `Expr::from_str`([06 §1.1](06-l4-query.md))。
+- `close` 关闭的是共享库;其余克隆在关闭后不可再用(见 [16 §1.7](16-api-reference.md))。
+
+---
+
 ## 1. 命名空间布局
 
 推荐三层,按"生命周期"而非"数据类型"划分:
@@ -215,9 +283,16 @@ db.close()?;
 let ro = Mneme::builder().path("./agent_memory").read_only(true).build()?;
 ```
 
-- 只读实例自动跟随写者的 Manifest 推进([12 §2](12-deployment.md)),无需锁;
-- 加密:`Builder::encryption(Some(Encryption{ provider: Arc::new(KmsKeyProvider), .. }))`([11 §2](11-security-storage.md));
-- 压缩:`Builder::compression(Compression::Lz4)`([11 §3](11-security-storage.md))。
+- 只读实例自动跟随写者的 MANIFEST 推进([12 §2](12-deployment.md)),无需锁;
+- 加密(feature `encrypt`):`Builder::encryption(Some(Encryption { provider: Arc::new(KmsKeyProvider), cipher: Cipher::Aes256Gcm }))`([11 §2](11-security-storage.md));
+- 压缩(feature `compress`):`Builder::compression(Compression::Lz4)`([11 §3](11-security-storage.md))。
+
+## 本章小结
+
+- 命名空间按**生命周期**划分(profile/session/knowledge),避免遗忘策略误伤。
+- 会话记忆:短 TTL + 新鲜度权重;长期偏好:`supersede` + 高 importance。
+- 去重/沉淀、安全遗忘、混合检索 + 联想、反馈闭环、运维与部署各有配方。
+- 所有配方都能从 §0 的端到端最小示例扩展而来。
 
 ## 下一章
 

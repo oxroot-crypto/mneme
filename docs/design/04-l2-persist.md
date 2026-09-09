@@ -1,10 +1,10 @@
 # 04 L2 持久层:WAL、段文件与崩溃恢复
 
 > **本章目标**:让"重启不丢数据"成立:定义全部文件格式的**字节级布局**,
-> 讲透 WAL 提交/回放、CRC 撕裂写检测、Manifest 原子替换与恢复流程。
+> 讲透 WAL 提交/回放、CRC 撕裂写检测、MANIFEST 原子替换与恢复流程。
 > **前置阅读**:[00 §6](00-fundamentals.md)(WAL/CRC/MVCC/mmap 科普)、[03](03-l1-memory.md)。
 > **本章你将学到**:目录与文件布局 → 四种文件的字节图 → WAL 协议 → CRC 数学 →
-> zone map 与 Bloom filter 完整推导 → Manifest 原子性(Windows 专项) → 恢复流程。
+> zone map 与 Bloom filter 完整推导 → MANIFEST 原子性(Windows 专项) → 恢复流程。
 
 模块:`persist/{wal.rs, vsec.rs, msec.rs, delta.rs, edges.rs, manifest.rs, recover.rs, flush.rs, source.rs, storage.rs, trash.rs}`
 
@@ -15,8 +15,8 @@
 ```text
 agent_memory/
 ├── current              # 指针文件:内容 = 当前 MANIFEST 版本号(如 "42")
-├── MANIFEST.000041      # 旧版本 manifest(write-once,保留最近 2 个)
-├── MANIFEST.000042      # 当前版本 manifest
+├── MANIFEST.000041      # 旧版本 MANIFEST(write-once,保留最近 2 个)
+├── MANIFEST.000042      # 当前版本 MANIFEST
 ├── wal/
 │   ├── wal_000001.log   # 预写日志(可多个,顺序编号)
 │   └── wal_000002.log
@@ -28,7 +28,7 @@ agent_memory/
 ```
 
 **段(segment)** 是不可变文件三元组:`(vsec, msec[, hidx])` 共享同一 `SegmentId`。
-"不可变"是整个存储设计的锚点:只追加新段、只改 Manifest 指针,
+"不可变"是整个存储设计的锚点:只追加新段、只改 MANIFEST 指针,
 读路径因此只需短暂读锁换一次视图引用、扫描全程无锁(§8)。可变性由两个例外承担:WAL 阶段的内存可变表(L2 期间)、
 后台 compaction 的重写(L5)。
 
@@ -38,6 +38,10 @@ agent_memory/
 
 约定:整数**小端**(LE);变长字段自带长度前缀;每个文件头部与数据尾部各一个 CRC-32。
 头内定长字段按 8 字节自然对齐摆放,便于 mmap 后零拷贝读取。
+
+> **feature 扩展区**:`encrypt` / `compress` 默认关闭。关闭时下述字节图**逐字节成立**;
+> 开启后,各文件头在基础字段之后追加一段由 `header_len` 界定的扩展区(§2.5),数据区起点
+> 相应后移。旧读者在 feature 关闭时不会遇到扩展字段,兼容性由次版本号保证(§12)。
 
 > **可移植性**:文件格式固定小端。小端平台上 mmap 后可直接零拷贝读取;大端平台需
 > 逐字段字节交换(或整体走 `FileSource` 解码路径),正确性不变,但不在性能承诺内。
@@ -85,16 +89,16 @@ agent_memory/
 4      format_version                u16
 6      header_len                    u16
 8      row_count                     u64
-16     field_dict_offset             u64    → 字段字典(见下)
-24     zmap_offset / zmap_len        2×u64  → zone maps
-40     bloom_offset / bloom_len      2×u64  → bloom 组
-56     version_table_offset          u64    → 版本链数组(每 RowId 多版本,§5.5)
-64     key_index_offset / key_index_len  2×u64 → (NsId, key)→RowId 索引(条目含 SlotId/seqno,§5.5)
-80     inv_offset / inv_len          2×u64  → 倒排索引(词表/postings/doc_len,§5.4)
-96     ns_stats_offset / ns_stats_len 2×u64 → 命名空间级统计(§5.6)
-112    delta_offset / delta_len      2×u64  → 跨段覆盖区(墓碑/更新/访问/关系,§2.2a)
-128    rel_offset / rel_len          2×u64  → 关系邻接索引(§2.2b)
-144    header_crc32                  u32
+16     field_dict_offset / field_dict_len    2×u64  → 字段字典(见下)
+32     version_table_offset / version_table_len 2×u64 → 版本链数组(每 RowId 多版本,§5.5)
+48     key_index_offset / key_index_len  2×u64 → (NsId, key)→RowId 索引(条目含 SlotId/seqno,§5.5)
+64     inv_offset / inv_len          2×u64  → 倒排索引(词表/postings/doc_len,§5.4)
+80     ns_stats_offset / ns_stats_len 2×u64 → 命名空间级统计(§5.6)
+96     zmap_offset / zmap_len        2×u64  → zone maps(每字段)+ ttl_map(见数据区)
+112    bloom_offset / bloom_len      2×u64  → bloom 组
+128    delta_offset / delta_len      2×u64  → 跨段覆盖区(墓碑/更新/访问/关系,§2.2a)
+144    rel_offset / rel_len          2×u64  → 关系邻接索引(§2.2b)
+160    header_crc32                  u32
 --- 数据区 ----------------------------------------------------------
        doc_region: 连续的记录体(变长,记录体格式见下;段内顺序即 SlotId 顺序)
        version_table: (RowId u64, seqno u64, tx_ms i64, SlotId u32, doc_offset u64)
@@ -105,7 +109,8 @@ agent_memory/
        field_dict:  [(u16 field_id, len, name bytes)...]  上限 16 个索引字段(默认,见 §5.1)
        zone_maps:   每 1024 行一块 × 每个索引字段: (min, max, has_null)
        (数值/时间字段用 f64/i64 存储;created_at 恒定索引)
-       ttl_map:     每 1024 行一块一个 min(expires_at)(无 TTL 行记 +∞)→ TTL 整块剪枝(§5.2)
+       ttl_map:     每 1024 行一块一个 min(expires_at)(无 TTL 行记 +∞)→ TTL 整块剪枝(§5.2);
+                    紧接 zone_maps 之后存放,计入 zmap_len
        blooms:      每个高基数字符串字段(含 key)一个 bloom(参数见 §5.3)
        inverted:    倒排索引 = term_dict + postings + doc_len
                     (编码与打分见 [06 §3.4](06-l4-query.md);无文本记录时为空)
@@ -150,7 +155,6 @@ agent_memory/
 > 的版本被回收。因此 `as_of(t)` 在保留窗口内始终可读,默认永久;需要控制磁盘时设置有限
 > horizon(见 [07 §4.2a](07-l5-life.md))。
 
-<a id="delta"></a>
 ### 2.2a 跨段覆盖区(delta)
 
 **问题**:`delete(key)` / `update(key, patch)` / `touch` / `relate` 作用的对象可能位于
@@ -175,7 +179,7 @@ delta 区(紧随 msec 数据区,自身带长度前缀与 CRC):
 - 读取时,delta 条目与各段记录体、可变表一起参与**统一的可见性合并**(§5.5):同一
   RowId 取最高 seqno;DeleteKey/DeleteRow 遮蔽所有更早版本;Access 覆盖字段;关系边
   叠加到关系邻接索引([09 §2](09-memory-model.md));
-- delta 与 msec 同 CRC、同生同灭,因此 delta 一经所在段提交(Manifest 生效)即可
+- delta 与 msec 同 CRC、同生同灭,因此 delta 一经所在段提交(MANIFEST 生效)即可
   参与 WAL 截断判定(§3.2);
 - compaction 时 delta 被**物化**:目标行若仍在活段则应用更新/删除,关系边重建进新段
   relations 区;窗口内的墓碑/更新作为版本链保留,超期条目才随旧段清理;
@@ -189,8 +193,10 @@ relations 区是**按 `from` RowId 排序**的边表,供 `O(log n + degree)` 定
 ```text
 relations: [from u64][to u64][kind u16][f32 weight][meta len+bytes] × edge_count
            按 (from, kind, to) 排序;另存 from→区间 的稀疏索引(sparse, 每 256 条一个锚点)
-           反向边默认不单独存:查询 to 的入边走全段扫描 + zone map;
-           高频入边场景显式开启 RelationIndex::Both,引擎额外持久化反向邻接索引(见 09 §2.3)
+           反向边默认不单独存:relations 区按 from 排序,查询 to 的入边只能全段扫描;
+           高频入边场景显式开启 RelationIndex::Both,引擎在 relations 区内追加按 (to, kind, from)
+           排序的反向邻接索引(区首记录正向/反向两段偏移,不新增 msec 头字段),
+           供 ns.predecessors() 以 O(log n + degree) 定位(见 09 §2.3)
 ```
 
 - 边的可见性同样受 delta 的 Relate/Unrelate 与墓碑约束:任一端被删除,该边在读取时
@@ -229,13 +235,14 @@ UpdateRow  = [RowId u64][u8 field_mask][可选字段]  # 无 key 记录的局部
 Relate     = [from RowId u64][to RowId u64][kind u16][f32 weight][meta len+bytes]
 Unrelate   = [from RowId u64][to RowId u64][kind u16]
 RelKindRegister = [kind u16][name len+bytes]      # 自定义关系类型注册:首次使用前落帧,保证编号稳定
-BatchBegin = [u32 record_count]                  # 后续连续记录帧(Insert/Delete/DeleteRow/Touch/TouchRow/Update/UpdateRow/Relate/Unrelate)属于同一原子批
+BatchBegin = [u32 record_count]                  # 后续连续"数据帧"(Insert/Delete/DeleteRow/Touch/TouchRow/Update/UpdateRow/Relate/Unrelate)属于同一原子批;
+                                                 # NsRegister/RelKindRegister 不是数据帧,必须写在 BatchBegin 之前(见下)
 BatchCommit= [u32 record_count][u32 batch_crc]   # 批提交标记;缺此帧则整批丢弃
 Checkpoint = [u64 watermark_seqno]
 ```
 
 > **`NsRegister` 的位置保证**:向一个新命名空间写入的**第一批** WAL 必须先写
-> `NsRegister`(同批或更早),回放时据此重建 `path ↔ NsId` 并推进 `next_ns_id`
+> `NsRegister`(必须在同批的 `BatchBegin` 之前,或更早),回放时据此重建 `path ↔ NsId` 并推进 `next_ns_id`
 > (不变量 I20)。这样即使 `insert` 已 fsync、MANIFEST 尚未更新就崩溃,注册表仍可恢复,
 > 且 `NsId` 绝不会因水位回退而被复用。`RelKindRegister` 同理,保证自定义关系类型编号
 > 跨崩溃/重启稳定([09 §2.2](09-memory-model.md))。
@@ -290,7 +297,71 @@ MANIFEST 是**命名空间路径的唯一事实来源**(`NsEntry` 表);删除命
 该路径,但 `next_ns_id` 只增不减,保证 NsId 永不复用([07 §5](07-l5-life.md))。
 同理,`RelKindEntry` 表与 `next_rel_kind` 是自定义关系类型名称↔编号的唯一事实来源,
 `next_rel_kind` 只增不减,保证关系类型编号跨崩溃/重启稳定([09 §2.2](09-memory-model.md))。
-HNSW 入口是**每段一个**(与 [05 §9–§10](05-l3-hnsw.md) 的"每段独立图"一致),不存在全局单入口。
+HNSW 入口是**每段一个**(与 [05 §7/§9](05-l3-hnsw.md) 的"每段独立图"一致),不存在全局单入口。
+
+### 2.5 可选 feature 的头部扩展(encrypt / compress)
+
+基础字节图中的头部均有 `header_len`(vsec/msec/MANIFEST)或保留区(WAL),据此承载
+可选 feature 的扩展字段。扩展区按固定顺序、定长排布,`header_crc32` 一并覆盖:
+
+| 字段 | 类型 | 缺省 | 含义 |
+|---|---|---|---|
+| `key_id` | `u32` | `0`(未加密) | 加密时指向 `KeyProvider` 的密钥标识,见 [11 §2.3](11-security-storage.md) |
+| `codec` | `u8` | `0`(None) | 记录体 `text`/`meta` 所用压缩 codec(0=None 1=Lz4 2=Zstd),见 [11 §3.2](11-security-storage.md) |
+
+- 扩展字段出现在 **vsec / msec / WAL / MANIFEST** 四类文件头中;同一段的三个文件
+  (vsec/msec/hidx)的 `key_id` 与 `codec` 必须一致,不一致视为 `Corrupted`;
+- feature 关闭时扩展区为空(`header_len` = 基础值),磁盘布局与 §2.1–§2.4 逐字节一致;
+  开启时 `header_len` 增大、次版本号递增,关闭 feature 的旧读者按 §12 跳过未知可选字段;
+- 加密页布局与压缩字段前缀的细节见 [11 §2.2](11-security-storage.md) / [11 §3.2](11-security-storage.md)。
+
+### 2.6 一次写入的字节旅程(把本章串起来)
+
+以 `ns.insert(rec)` 为例,标注每一步落在哪个文件、哪些字节(括号为本章小节):
+
+```text
+① 校验:维度 / 有限值 / 限额                                [03 §2.1、16 §8]
+② 取全局写锁 → 分配单调 seqno                              [§3.1]
+③ 编码为 Insert 帧,追加进 WalWriter 缓冲:
+     [crc32][payload_len][seqno][type=1][记录体(§2.2 entry 格式)]  [§2.3]
+   按 FsyncPolicy 等待 fsync(Always 立即 / Batched 组提交)   [§3.1]
+④ 应用到内存可变表:versions / latest / key_index 更新       [03 §3]
+⑤ 返回 Ok(此时按策略已持久或未持久,见 I1)                  [§3.1]
+
+后续 flush 与崩溃恢复:
+⑥ flush:可变表整体写成新段(seg_N.vsec + seg_N.msec);
+   作用于旧段的删除/更新/访问/关系写入该段 delta 区          [§2.1、§2.2a]
+⑦ 写 MANIFEST.<v+1>.tmp → fsync → rename → 更新 current     [§2.4、§6]
+⑧ Checkpoint 帧记录 watermark_seqno → 截断旧 WAL            [§3.2]
+崩溃在任意一步:
+   未提交 → 重放 WAL 中 seqno > watermark 的帧               [§3.3、§7]
+   已提交 → 覆盖条目已在段 delta 区,删除/更新不丢失(I19)     [§7 算例]
+```
+
+**【算例】vsec 头部与数据区的实际字节**:取 `dimension=4`、`row_count=2`、`quant=0`(F32)、`norm_col=1`
+(头部 64B;数据区 = vec `2×4×4=32B` + norm `2×4=8B` + del_bitmap 首块 `128B`;尾部 CRC 4B):
+
+```text
+偏移   内容
+0      "VSC1" = 56 53 43 31
+4      01 00                        format_version = 0x0001
+6      40 00                        header_len = 64
+8      04 00 00 00                  dimension = 4
+12     00                           metric = 0(Cosine)
+13     00                           quant = 0(F32)
+14     01                           norm_col = 1
+16     02 00 00 00 00 00 00 00      row_count = 2
+24     ... created_unix_ms(i64)
+32     ... header_crc32(覆盖 [0,32))
+36     ... padding 至 64B
+64     vec[0] 4 个 f32(LE);vec[1] 紧随其后(共 32B)
+96     norm[0]、norm[1](各 1 个 f32,存范数平方,共 8B)
+104    del_bitmap 首块:16 个 u64(1024 bit;行 2 起为未用槽,恒 1=不可见)
+232    payload_crc32(覆盖 [64,232))
+```
+
+文件总大小 = 64 + 32 + 8 + 128 + 4 = **236 字节**。维度越大,`vec`/`norm` 区按 `d` 线性增长,
+而 `del_bitmap` 只随行数增长——这就是"块粒度 1024 行"固定不变的原因。
 
 ---
 
@@ -358,7 +429,7 @@ last_error }`。提交者追加后 `wait_while(last_durable < my_seqno)`。
 | 单条提交(Batched,组满) | $O(1)$ 内存追加 + 等待 | 顺序写 |
 | 单条提交(Always) | 1 次 fsync ≈ 0.1–10ms(经验值,盘型决定) | 顺序写 |
 | 组提交 N 条/批 | $O(N)$ 追加 + **1 次** fsync | 顺序写 |
-| 回放 | $O(\text{未落盘记录数})$ | 顺序读 |
+| 回放 | $O(\text{unflushed records})$ | 顺序读 |
 
 ---
 
@@ -377,8 +448,6 @@ last_error }`。提交者追加后 `wait_while(last_durable < my_seqno)`。
 简化记法 `0x04C11DB7`,反射实现 `0xEDB88320`)。发送前计算:
 
 $$R(x) = \left( M(x) \cdot x^{32} \right) \bmod G(x)$$
-
-(纯文本:`R = (M 左移 32 位) mod G`,R 即 32 位 CRC)
 
 传输 `M·x³² + R`(补余数使整体被 G 整除);接收端重除,G(x) 首尾项保证:
 若余数 ≠ 0 → 必有错。**检错能力**(代数可证):所有长度 ≤ 32 bit 的
@@ -413,9 +482,9 @@ bit 错误(需要该性质时应选用含 $(x+1)$ 因子的多项式)。
 
 1. WAL 每帧:防撕裂写(读不满/CRC 不符 → 截断);
 2. 文件头:防元数据损坏;
-3. vsec/msec 尾部 payload CRC:**启动时可配校验**(默认只校验头部,全量校验走 `db.check()`,
+3. vsec/msec 尾部 payload CRC:**启动时可配校验**(`Builder::verify_on_open(true)`;默认只校验头部,全量校验走 `db.check()`,
    1GB 段全量 CRC ≈ 1s 量级,启动时间不为其买单);
-4. MANIFEST payload:Manifest 坏 → 回退旧版本(§6)。
+4. MANIFEST payload:MANIFEST 坏 → 回退旧版本(§6)。
 
 CRC 是**意外损坏**检测,不是防篡改(它可被伪造);超长期数据的完整性靠
 "多版本 MANIFEST + 备份"而非加密哈希——诚实标注其边界。
@@ -466,19 +535,15 @@ $O(n)$ 时间(查表法每字节 1 次表查 + XOR,8KB 表)、$O(1)$ 空间;`crc
 **【数学】** m bit 位图、n 个元素、k 个独立均匀哈希。某个特定 bit 在插入 n 个元素后
 仍为 0 的概率:单次插入不碰它的概率是 $1 - 1/m$,独立重复:
 
-$$P(\text{bit 为 }0) = \left(1 - \frac{1}{m}\right)^{kn} \approx e^{-kn/m}$$
+$$P(\text{bit}=0) = \left(1 - \frac{1}{m}\right)^{kn} \approx e^{-kn/m}$$
 
 误判率(查一个未插入的元素,k 个位置全被别人占满):
 
 $$p = \left(1 - e^{-kn/m}\right)^{k}$$
 
-(纯文本:`p = (1 - e^(-(k*n)/m))^k`)
-
 对 k 求导取最优 $k^{*} = \dfrac{m}{n}\ln 2$,代回得空间-误判率关系:
 
-$$\frac{m}{n} = \frac{\log_2 (1/p)}{\ln 2} \approx 1.44 \, \log_2(1/p) \ \text{bit/元素}$$
-
-(纯文本:`bits_per_element ≈ 1.44 * log2(1/p)`)
+$$\frac{m}{n} = \frac{\log_2 (1/p)}{\ln 2} \approx 1.44 \, \log_2(1/p) \ \text{bit/element}$$
 
 **【算例】** n = 10 万,p = 1%:$m/n = 1.44 \times \log_2 100 \approx 9.57$ bit/元素
 → $m \approx 9.6 \times 10^5$ bit ≈ **120 KB**,$k^{*} = 9.57 \times 0.693 \approx 6.6 \Rightarrow k = 7$。
@@ -487,7 +552,7 @@ $$\frac{m}{n} = \frac{\log_2 (1/p)}{\ln 2} \approx 1.44 \, \log_2(1/p) \ \text{b
 **【工程】** 哈希用**双哈希法**(Kirsch–Mitzenmacher):只需两个 64 位哈希 $h_1, h_2$
 (取自 crc32 组合),第 i 个位置 $h_i(x) = h_1(x) + i \cdot h_2(x) \bmod m$——
 k 次哈希的成本变成 2 次哈希 + k 次乘加。误报的后果只是"多评估几行",**安全性无害**。
-Mneme 在 msec 每段每字符串字段放一个 bloom(fpp 1%,默认),给等值过滤下推用;
+Mneme 在 msec 每段每字符串字段放一个 bloom(fpp 1%,默认),供等值过滤下推使用;
 范围过滤走 zone map,两者互补。
 
 ### 5.4 倒排索引(为 BM25 供数据)
@@ -496,8 +561,11 @@ Mneme 在 msec 每段每字符串字段放一个 bloom(fpp 1%,默认),给等值�
 编码细节与 BM25 打分见 [06 §3.4](06-l4-query.md)。此处只定两条规则:
 
 1. 倒排是 **msec 的一部分**(同一 CRC 保护、同生同灭),不是独立文件——
-   保证"向量、元数据、文本索引"三者永远一致(同一 Manifest 版本 = 同一批物理行);
-2. 段内无文本记录时该区域为空(`inv_len = 0`),零开销。
+   保证"向量、元数据、文本索引"三者永远一致(同一 MANIFEST 版本 = 同一批物理行);
+2. 段内无文本记录时该区域为空(`inv_len = 0`),零开销;
+3. **未落段记录**:可变表在内存中维护一份**增量倒排**(词 → 未落段 RowId 列表,插入/更新时增量维护,
+   flush 后并入新段倒排并清空);BM25 查询把它当作"内存段"与各段倒排一起参与两遍统计与打分
+   ([06 §3.2](06-l4-query.md)),因此新写入的 `text` 无需 `flush` 即可被检索。
 
 ### 5.5 key 索引(为 `get(key)` 与去重供路)
 
@@ -563,11 +631,11 @@ key 同时进入该字符串字段的 bloom(§5.3),不存在的 key 先被 bloom
 
 ## 6. MANIFEST 原子性:write-once + 指针(Windows 专项)
 
-**问题**:Manifest 更新必须原子。Unix 上 `rename(tmp, dest)` 可原子覆盖目标;
+**问题**:MANIFEST 更新必须原子。Unix 上 `rename(tmp, dest)` 可原子覆盖目标;
 Windows 的 std `rename` 虽对应 `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`、对已存在的
 普通文件也能覆盖,但替换语义并不可靠——目标被其他句柄打开(共享冲突)或带只读属性时
 会失败,而 `ReplaceFileW` 需要额外 unsafe/依赖,违反依赖白名单。为保证任意一步崩溃后
-仍有一致可用的 Manifest,干脆不依赖"覆盖"这条路:
+仍有一致可用的 MANIFEST,干脆不依赖"覆盖"这条路:
 
 **方案:write-once 版本文件 + 指针**:
 
@@ -578,11 +646,11 @@ Windows 的 std `rename` 虽对应 `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`、�
            ④ 写 current.tmp("42") → rename → current
 读路径:    读 current → 打开 MANIFEST.<v> → 校验 CRC
            失败 → 扫描目录所有 MANIFEST.*,取"最大的、CRC 合法的"版本
-保留策略:  始终保留最近 2 个版本 → 任意一步崩溃都至少有一个完整可用 manifest
+保留策略:  始终保留最近 2 个版本 → 任意一步崩溃都至少有一个完整可用 MANIFEST
 ```
 
 每次提交 = 一个新文件,**永不原地覆盖**;这正是 [00 §6.6](00-fundamentals.md)
-"读端无锁"的基础:读者打开一个 Manifest 版本后,其引用的段文件都不可变,
+"读端无锁"的基础:读者打开一个 MANIFEST 版本后,其引用的段文件都不可变,
 整个读路径与写路径零共享可变状态。
 
 > **`current` 是唯一的原地替换点**:它内容极小(版本号字符串),通过
@@ -599,10 +667,11 @@ Windows 的 std `rename` 虽对应 `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`、�
 open(dir):
  1. 读 current → 定位 MANIFEST.<v>;CRC 失败 → 扫描取最大合法版本;全坏 → 报 Corrupted
  2. 校验各段头部 CRC(全量 CRC 视配置);头部损坏段 → 移入 trash/ 并从视图剔除
-    (可配 fail-fast 模式:直接报错拒绝启动)。只读实例(`read_only`)不写盘,
+    (可配 fail-fast 模式:`Builder::fail_fast_on_corruption(true)`,直接报错拒绝启动)。只读实例(`read_only`)不写盘,
     仅跳过损坏段并从视图剔除,经 `stats()`/`check()` 报告
  3. 打开 WAL 文件(按编号序),只重放 seqno > manifest.watermark_seqno 的帧(§3.3);
-    遇撕裂帧 → 截断该文件尾部
+    遇撕裂帧 → 可写实例截断该文件尾部;只读实例(`read_only`)不写盘,仅在内存中忽略
+    该帧及其后(见 §13 只读模式)
  4. 构建 ReaderView{ manifest 版本, 可变表 }:合并各段 version_table/delta 与 WAL 覆盖,
     重建每个 RowId 的版本链与当前可见版本(§5.5) → 对外服务
 不变量:恢复后的状态 = "已 fsync 确认的全部操作" 的重放结果(可多,不可错;
@@ -616,6 +685,16 @@ open(dir):
 - `(trash)`:已 rename 进 `trash/`、等待最后一个读者释放后物理删除。
 崩溃点若落在 `Building`,该段是孤儿,恢复时清理(不进入任何 MANIFEST 视图)。
 
+```mermaid
+stateDiagram-v2
+    [*] --> Building: 新建 / 写入中
+    Building --> Committed: MANIFEST 提交
+    Committed --> Obsolete: 新 MANIFEST 替换
+    Obsolete --> Trash: rename → trash/
+    Trash --> [*]: 最后一个读者释放后删除
+    Building --> [*]: 崩溃 → 恢复时清理孤儿段
+```
+
 **【算例】崩溃窗口与水位回放**:写操作 `seqno 100–105` 已 fsync 进 WAL;`flush` 把可变表
 写成段并提交 `MANIFEST.000042`(其 `watermark_seqno = 105`);此时进程崩溃,`Checkpoint`
 帧尚未来得及写入。重启时:
@@ -623,7 +702,7 @@ open(dir):
 ```text
 读 current → MANIFEST.000042(watermark = 105)
 只回放 WAL 中 seqno > 105 的帧 → 100–105 不会被重复应用
-删除/更新等覆盖条目已随该段 delta 区落盘 → 截断 WAL 也不会“复活”或丢失(I19)
+删除/更新等覆盖条目已随该段 delta 区落盘 → 截断 WAL 也不会"复活"或丢失(I19)
 ```
 
 若崩溃发生在"WAL 已写、MANIFEST 未提交"的窗口,watermark 仍是旧值,`100–105` 会被完整
@@ -640,11 +719,16 @@ ReaderView(不可变):
   mutable: Arc<MutableSnapshot>      # 取视图时可变表+覆盖层的不可变快照(WAL 已应用部分)
   watermark: SeqNo
 读: 拿读锁 clone Arc → 放锁 → 段扫描 + delta/可变表覆盖 → 全局归并(§5.5)
-删除/更新/插入: 修改可变表覆盖层 → flush 时生成新段(含 delta 区) → 提交新 Manifest → 写锁内换 Arc
+删除/更新/插入: 修改可变表覆盖层 → flush 时生成新段(含 delta 区) → 提交新 MANIFEST → 写锁内换 Arc
 ```
 
 > **覆盖层是可持久的**:视图里的墓碑/更新既来自 WAL 重放,也来自各段已提交的 delta 区
 > (§2.2a)。因此 `flush` 之后即便 WAL 被 Checkpoint 截断,删除与更新依然有效(I19)。
+
+> **可变表也是检索数据源**:除可见性合并外,可变表中**尚未落段**的记录同时参与检索——
+> 向量侧作为一个"内存段"参与暴力扫描([05 §9](05-l3-hnsw.md)),BM25 侧经内存增量倒排
+> 参与两遍统计(见 §5.4、[06 §3.2](06-l4-query.md))。因此新写入无需
+> 先 `flush` 即可被 `search()` 命中;`flush` 只是把可变表转成不可变段、降低内存占用。
 
 旧视图因 `Arc` 仍被读者持有而存活——**读者永远看到一致的过去**,
 这正是 MVCC 水位的工程形态。`SnapshotHandle` 即"钉住一个 `ReaderView`":
@@ -658,7 +742,7 @@ ReaderView(不可变):
 Windows 不允许删除被 mmap/句柄打开的文件。方案:
 
 ```text
-提交新 Manifest 后: 旧段文件 rename → trash/<name>(rename 打开中的文件是允许的)
+提交新 MANIFEST 后: 旧段文件 rename → trash/<name>(rename 打开中的文件是允许的)
 登记待删表 {name → 引用计数};最后一个读者 Drop 时(或下次 open 时)尝试删除;
 删不掉(仍被旧视图引用)→ 留在 trash,下次启动再试。
 ```
@@ -673,6 +757,13 @@ Windows 不允许删除被 mmap/句柄打开的文件。方案:
 ### 10.1 崩溃注入:`FsyncHook`
 
 ```rust
+/// 待注入的 I/O 动作(仅测试 builder 暴露)。
+pub enum IoAction {
+    Write { file: &'static str, offset: u64, len: usize },
+    Fsync { file: &'static str },
+    Rename { from: &'static str, to: &'static str },
+}
+
 pub trait FsyncHook: Send + Sync {
     /// 在每次 write/fsync/rename 前调用;可注入故障(丢写/翻转字节/截断/崩溃)
     fn before(&self, action: IoAction) -> std::io::Result<()>;
@@ -740,11 +831,11 @@ pub trait SegmentSource: Send + Sync {
 | 故障 | 触发 | 引擎行为 | 调用方处置 |
 |---|---|---|---|
 | 磁盘满(ENOSPC) | write/fsync 返回错误 | 写入返回 `Io`;compaction **暂停**而非损坏;WAL 不推进 | 清理 `trash/` 或扩容,重试 `flush()` |
-| 只读文件系统 | `read_only(true)` 打开 | 打开成功(不创建锁文件),任何写操作返回 `Io` | 换可写目录或保持只读 |
+| 只读文件系统 / 只读模式 | `read_only(true)` 打开 | 打开成功(不创建锁文件);任何写操作返回 `Invalid("read-only")`(模式检查先于 I/O) | 换可写目录或保持只读 |
 | 只读文件系统 | 可写打开 | 创建锁文件失败 → `Io`(未创建任何数据) | 换可写目录或改用 `read_only(true)` |
 | 目录被占用 | 第二个实例打开 | `Busy` | 确保单进程独占([16 §3](16-api-reference.md)) |
 | 全部 MANIFEST 损坏 | 扫描 `MANIFEST.*` 无合法版本 | `Corrupted` | 从备份恢复([16 §7](16-api-reference.md)) |
-| 个别段头损坏 | 打开时校验失败 | 移入 `trash/` 并从视图剔除(可配 fail-fast) | `db.check()` 复核;必要时从备份补段 |
+| 个别段头损坏 | 打开时校验失败 | 移入 `trash/` 并从视图剔除(可配 fail-fast,见 §7) | `db.check()` 复核;必要时从备份补段 |
 | WAL 未知帧类型 | 回放遇到 `type` 不在定义内 | **停止回放并报错**(不静默跳过) | 升级库版本;切勿手工改 WAL |
 | mmap 失败 | 平台/文件系统不支持 | 自动退化为 `FileSource` | 无(功能不变,吞吐下降) |
 | 时钟回拨 | `Clock` 返回变小 | 以历史最大水位钳制(本章 §10.2) | 无 |
@@ -761,7 +852,7 @@ pub trait SegmentSource: Send + Sync {
 2. 段格式编解码(`vsec/msec/wal/manifest` 的 read/write/replay,含 version_table 版本链,字节布局本章 §2);
 3. `SegmentSource` 抽象、`FsyncHook` / `Clock` 注入点、`trash` 管理;
 4. 事务语义:单次 `insert_batch` 原子(要么整批进 WAL,要么整批不出现);
-   flush + Manifest 提交 = 一致性点;
+   flush + MANIFEST 提交 = 一致性点;
 5. 格式版本校验与在线迁移(§12)、失败模式处置约定(§13)。
 
 **不变量**(任何上层、任何测试可依赖):
@@ -782,6 +873,14 @@ pub trait SegmentSource: Send + Sync {
 - **版本链保留(I26 的存储侧保证)**:每个 RowId 的最新版本与事务时间在
   `CompactionPolicy.history_horizon` 内的历史版本(默认 `None` = 永久)被保留;
   版本链在重启/compaction 后可由 `version_table` + delta 重建,`as_of(t)` 据此解析(§2.2、§5.5)。
+
+## 本章小结
+
+- 目录布局 + `vsec/msec/hidx/MANIFEST/WAL` 的**字节级格式**是本层的核心产出。
+- WAL 组提交、帧 CRC、`BatchBegin/Commit`、Checkpoint 与 watermark 保证崩溃一致性。
+- **delta 覆盖区**把"作用于旧段记录"的删除/更新/访问/关系持久化,是 I19 的关键。
+- MANIFEST 用 write-once + 指针规避 Windows 替换语义,trash 做延迟删除。
+- **本章不变量**:I1–I4、I18–I20,以及版本链的存储侧保留保证(I26)。
 
 ## 下一章
 

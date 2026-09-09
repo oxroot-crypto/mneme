@@ -1,5 +1,6 @@
 # mdBook 构建输出
 /book/
+/book.tar.gz
 
 # mdbook-mermaid 生成资源（由 `mdbook-mermaid install .` 生成）
 /mermaid.min.js

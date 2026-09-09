@@ -56,8 +56,9 @@ skipped. Adds regression test covering invariant I2.
 ## 文档修改
 
 - 设计文档改动请同步更新 [docs/DESIGN.md](docs/DESIGN.md) 的目录/约定与相关交叉引用;
-- 数学公式遵循"双写"约定:KaTeX 与纯文本各给一份;
-- 本地预览:`cargo install mdbook mdbook-katex mdbook-mermaid && mdbook serve`。
+- 数学公式统一用 KaTeX 书写(行内 `$...$`、块级 `$$...$$`),不再提供纯文本降级形式;
+- 本地预览:`cargo install mdbook mdbook-mermaid && cargo install mdbook-katex --no-default-features --features duktape && mdbook serve`
+  (Windows MSVC 无法编译 `mdbook-katex` 默认的 quick-js 后端,须改用 duktape 后端)。
 
 ## 报告问题
 

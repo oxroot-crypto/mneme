@@ -1,6 +1,6 @@
 # Mneme 设计文档
 
-> **Mneme**(μνήμη,希腊记忆女神)是一个纯 Rust 编写的**嵌入型向量存储引擎**,
+> **Mneme**(μνήμη,古希腊语"记忆";记忆女神 Mnemosyne 的同源词)是一个纯 Rust 编写的**嵌入型向量存储引擎**,
 > 专为 **AI Agent 的超长期记忆层**设计:进程内运行、无需服务端、数据经年累月增长而不失控。
 
 - 许可:The Unlicense(公共领域)
@@ -77,7 +77,7 @@ flowchart TD
 | [01-overview.md](design/01-overview.md) | 项目定位、设计目标、总体架构、依赖白名单、公开 API 清单 | 所有人 |
 | [02-l0-core.md](design/02-l0-core.md) | 原语层:距离度量的数学、SIMD、TopK 堆、varint | 贡献者/学习者 |
 | [03-l1-memory.md](design/03-l1-memory.md) | 内存引擎、暴力检索、过滤 AST、公开 API 冻结 | 贡献者 |
-| [04-l2-persist.md](design/04-l2-persist.md) | 文件字节级布局、WAL/CRC/崩溃恢复、Manifest 原子性、Bloom/zone map | 贡献者 |
+| [04-l2-persist.md](design/04-l2-persist.md) | 文件字节级布局、WAL/CRC/崩溃恢复、MANIFEST 原子性、Bloom/zone map | 贡献者 |
 | [05-l3-hnsw.md](design/05-l3-hnsw.md) | **HNSW 完整数学**:层级分布推导、构建/搜索算法、复杂度、过滤三档策略 | 贡献者/学习者 |
 | [06-l4-query.md](design/06-l4-query.md) | DSL 文法、BM25 公式逐项拆解、RRF 融合、去重、执行管线 | 贡献者 |
 | [07-l5-life.md](design/07-l5-life.md) | 指数遗忘曲线、size-tiered compaction 写放大分析、快照备份 | 贡献者 |
@@ -121,14 +121,13 @@ HNSW 与 BM25 两章是全书数学最密集的部分,但每一步推导都不�
 
 ## 文档约定
 
-1. **四段式讲解**:每个关键算法固定按四段展开——
+1. **四段式讲解**:每个关键算法按以下四要素展开(顺序可按内容调整,【工程】为可选补充段)——
    - **【直觉】** 生活化类比,先弄懂它解决什么问题;
    - **【数学】** 完整公式推导(KaTeX 渲染),符号逐一解释,不跳步;
    - **【复杂度】** 时间/空间复杂度表,含推导过程;标注"经验值"的结论无严格证明;
    - **【算例】** 小规模数字实例手算走一遍(4 维向量、8 个点的图、2 篇文档……)。
    实现取舍、SIMD/存储/性能等工程细节以 **【工程】** 作为可选补充段。
-2. **公式双写**:所有公式同时给出 KaTeX 与纯文本形式,渲染失败也可读。纯文本约定:
-   `a·b` 表示点积,`‖a‖` 表示范数,`ln` 自然对数,`2^-x` 幂运算。
+2. **公式渲染**:所有公式统一用 KaTeX 书写,由 mdbook-katex 预处理器在构建时渲染。
 3. **术语中英对照**:术语首次出现给出英文原文与一句话定义,如
    "近似最近邻检索(ANN, Approximate Nearest Neighbor):不求绝对最近、只求大概率最近的检索策略"。
    完整表见 [15-glossary.md](design/15-glossary.md)。
@@ -143,3 +142,5 @@ HNSW 与 BM25 两章是全书数学最密集的部分,但每一步推导都不�
    `FC-*` 契约条目,CI 校验 100% 追溯(FSVDD 强制)。
 8. **站点构建**:文档用 mdBook 组织(`book.toml` + [SUMMARY.md](SUMMARY.md)),
    KaTeX/Mermaid 由预处理器渲染;本地预览见仓库根目录的 `README.md`。
+9. **阅读时长**:各章不强制标注预计阅读;仅 [00 零基础篇](design/00-fundamentals.md) 给出参考
+   (40–60 分钟),其余按自身密度自行安排。四段式【直觉】【数学】【复杂度】【算例】可按需跳读。

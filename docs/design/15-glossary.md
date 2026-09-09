@@ -29,6 +29,7 @@
 | 记录视图 | RecordRef | 存储记录的只读视图(无 score),`get`/`iter` 返回;可取回原始向量 | [16 §1.2](16-api-reference.md) |
 | 艾宾浩斯曲线 | Ebbinghaus curve | 记忆保持率随时间指数衰减、回忆可减缓衰减 | [07 §3](07-l5-life.md) |
 | 记忆关系 | relation | 记忆间的有向带权边(supports/contradicts/derived_from…);联想检索的基础 | [09 §2](09-memory-model.md) |
+| 入边 / 前驱 | predecessor | 指向某记忆的边;`predecessors(to)` 查询,默认全段扫描,`RelationIndex::Both` 时走反向索引 | [09 §2.3](09-memory-model.md) |
 | 联想扩展 | spreading activation | 沿关系边扩散,把相关记忆补进候选 | [10 §3](10-scoring.md) |
 | 双时态 | bi-temporal | 同时维护事务时间与有效时间两个时间轴 | [09 §3](09-memory-model.md) |
 | 有效时间 | valid time | 事实在现实世界中成立的时间区间 | [09 §3](09-memory-model.md) |
@@ -149,13 +150,14 @@
 | $k_1, b$ | BM25 饱和/长度参数(1.2 / 0.75) | [06 §3.2](06-l4-query.md) |
 | $I, T_{1/2}, w$ | importance / 半衰期 / 访问增益权重 | [07 §3](07-l5-life.md) |
 | $E, E_{\text{eff}}$ | 保留强度 / 含访问增益的有效强度 | [07 §3.2–§3.3](07-l5-life.md) |
-| $B, r, T_m$ | 段初始行数 / 分级比 / 同层合并阈值(8k / 4 / 4;正文简记 $T$) | [07 §4.2](07-l5-life.md) |
+| $B, r$ | 段初始行数 / 分级比(8k / 4) | [07 §4.2](07-l5-life.md) |
+| $T$ / $t$ | 事务时间上界(`as_of` 可见性,04/09 大小写混用同义);07 §4.2 中另指同层合并阈值,以上下文区分 | [04 §2.2](04-l2-persist.md) |
 | $W_{\text{amp}}$ | 写放大系数(≈ $\log_r(N/B)$) | [07 §4.2](07-l5-life.md) |
 | $\Delta$ | 量化步长 | [08 §2.2](08-l6-quant.md) |
-| $\lambda$ | 指数衰减速率 $\ln 2 / T_{1/2}$ | [07 §3.2](07-l5-life.md) |
-| $S$ | 规模/数据量(按上下文:活跃段数见 [04 §5.5](04-l2-persist.md)、合并数据量见 [07 §4.5](07-l5-life.md)) | [04 §5.5](04-l2-persist.md) |
+| $\lambda$ | 指数衰减速率 $\ln 2 / T_{1/2}$;[10 §5](10-scoring.md) 的 MMR 中另指相关性权重 $\lambda$ | [07 §3.2](07-l5-life.md) |
+| $S$ | 规模/数据量(按上下文:活跃段数见 [04 §5.5](04-l2-persist.md)、合并数据量见 [07 §4.5](07-l5-life.md));[10 §2](10-scoring.md) 中 $S(d)$ 指综合打分函数 | [04 §5.5](04-l2-persist.md) |
 | $L$ | 层数(HNSW 最高层 / compaction 顶层 $\log_r(N/B)$) | [07 §4.2](07-l5-life.md) |
-| $W$ | HNSW `SEARCH-LAYER` 的结果集(容量 ef) | [05 §4.1](05-l3-hnsw.md) |
+| $W$ | HNSW `SEARCH-LAYER` 的结果集(容量 ef);[00 §6.6](00-fundamentals.md)/[04 §5.5](04-l2-persist.md) 中另指 MVCC 快照水位 | [05 §4.1](05-l3-hnsw.md) |
 
 ---
 
@@ -169,19 +171,19 @@
 | 暴力扫描 | $O(N \cdot d)$(过滤后 $O(N_c \cdot d)$) | $O(N/8)$ 位图 | [03 §4](03-l1-memory.md) |
 | CRC-32 | $O(n)$(查表,~GB/s) | 8KB 表 | [04 §4](04-l2-persist.md) |
 | WAL 提交(组) | $O(1)$ 内存 + 1 次 fsync/批 | 顺序追加 | [04 §3](04-l2-persist.md) |
-| WAL 回放 | $O(\text{未落盘帧数})$ | — | [04 §3.3](04-l2-persist.md) |
-| zone map 剪枝 | $O(\lceil N/1024\rceil \times \text{条件数})$ | 16B/块/字段 | [04 §5.2](04-l2-persist.md) |
+| WAL 回放 | $O(\text{unflushed frames})$ | — | [04 §3.3](04-l2-persist.md) |
+| zone map 剪枝 | $O(\lceil N/1024\rceil \times \text{predicates})$ | 16B/块/字段 | [04 §5.2](04-l2-persist.md) |
 | bloom 判定 | $O(k) = O(7)$ | $1.44\log_2(1/p)$ bit/元素 | [04 §5.3](04-l2-persist.md) |
-| Manifest 提交 | $O(\text{段数})$ 写新文件 | 保留 2 版 | [04 §6](04-l2-persist.md) |
-| 恢复(open) | $O(\text{WAL 回放})$ + 段头校验 | mmap 惰性 | [04 §7](04-l2-persist.md) |
+| MANIFEST 提交 | $O(\text{segments})$ 写新文件 | 保留 2 版 | [04 §6](04-l2-persist.md) |
+| 恢复(open) | $O(\text{WAL replay})$ + 段头校验 | mmap 惰性 | [04 §7](04-l2-persist.md) |
 | HNSW 构建 | $O(N \cdot d \cdot ef_c \cdot M_0)$ | ≈$(8M+20)$ B/节点 | [05 §4/§6.3](05-l3-hnsw.md) |
 | HNSW 查询 | 上界 $O(d \cdot ef \cdot M_0)$;实测 ≈ (2–5)·ef 次点积 | — | [05 §6.1](05-l3-hnsw.md) |
 | 层级分布 | $P(\ge l) = (1/M)^l$;层高 $O(\log_M N)$ | — | [05 §3.2](05-l3-hnsw.md) |
 | DSL 解析 | $O(L)$ 单遍 | $O(\|E\|)$ | [06 §1](06-l4-query.md) |
-| BM25 打分 | $O(\sum_{t \in Q} df_t)$ 堆操作 | 静态倒排 | [06 §3.4](06-l4-query.md) |
+| BM25 打分 | $O(\sum_{t \in Q} df_t)$ postings 访问 + 堆操作 | 静态倒排 | [06 §3.4](06-l4-query.md) |
 | RRF/加权融合 | $O(k)$ | $O(k)$ | [06 §4](06-l4-query.md) |
-| TTL 逻辑过期 | $O(\text{块数})$(块级 min 剪枝) | 8B/块 | [07 §1](07-l5-life.md) |
-| retain 扫描 | $O(N_{\text{候选}})$ | — | [07 §3.4](07-l5-life.md) |
+| TTL 逻辑过期 | $O(\text{blocks})$(块级 min 剪枝) | 8B/块 | [07 §1](07-l5-life.md) |
+| retain 扫描 | $O(N_{\text{cand}})$ | — | [07 §3.4](07-l5-life.md) |
 | compaction 单轮 | $O(S \cdot d \cdot ef_c \cdot M_0)$(建图主导) | 峰值 +$O(S)$ | [07 §4.5](07-l5-life.md) |
 | compaction 摊还 | 每字节重写平均 ≈ $\log_r(N/B)$ ≈ 7 次(上界 ≈ 9) | 段数 $O(\log_r N)$ | [07 §4.2](07-l5-life.md) |
 | i8 量化点积 | 带宽 ÷4;VNNI 再 ~4× 指令 | 粗排副本 $d$ B/行(f32 原向量另存) | [08 §2](08-l6-quant.md) |
@@ -191,9 +193,10 @@
 | as_of(t) 历史读 | $O(S \cdot \log n)$ 定位版本链 + 查询;窗口受 `history_horizon` 约束 | 历史版本随窗口增长 | [04 §5.5](04-l2-persist.md) |
 | delete / touch | $O(\log n)$ 定位 + 墓碑/统计更新 | — | [03 §2.3](03-l1-memory.md) |
 | iter(filter) | $O(N_c)$($N_c$ = 命中行) | 流式 | [03 §2.3](03-l1-memory.md) |
+| neighbors / predecessors | $O(\log E + \text{degree})$(`predecessors` 默认全段扫描) | $O(\text{degree})$ | [09 §2.3](09-memory-model.md) |
 | snapshot | $O(1)$(clone Arc 视图) | 按引用 | [07 §6](07-l5-life.md) |
-| backup_to | 同盘 $O(\text{文件数})$;跨盘 $O(\text{数据量})$ | 目标目录 | [07 §6](07-l5-life.md) |
-| check(fsck) | $O(\text{全量字节})$ CRC + 对账 | — | [07 §7](07-l5-life.md) |
+| backup_to | 同盘 $O(\text{files})$;跨盘 $O(\text{bytes})$ | 目标目录 | [07 §6](07-l5-life.md) |
+| check(fsck) | $O(\text{total bytes})$ CRC + 对账 | — | [07 §7](07-l5-life.md) |
 
 **性能承诺汇总**:Recall@10 ≥ 0.95(ef=128);1M×1536 量化后 P99 < 10ms;
 批量插入 ≥ 50k 向量/秒;冷启动 < 1s;活跃段数有界。验收方法见 [14](14-testing.md)。
@@ -237,6 +240,12 @@
 | I28 | 加密不落明文;认证失败 → `Corrupted` | [11 §2.5](11-security-storage.md) | [14 §5.3](14-testing.md) |
 | I29 | 只读一致:始终看到某已提交 MANIFEST 版本的完整视图 | [12 §2.1](12-deployment.md) | [14 §6.4](14-testing.md) |
 | I30 | 可观测无副作用;回调 panic 被隔离 | [12 §4.1](12-deployment.md) | [14 §6.5](14-testing.md) |
+
+## 本章小结
+
+- 术语表按领域/索引/存储/量化/API 分组,每条给出中英对照与回查链接。
+- 符号表统一全书记号(注意 $T$ 的上下文重载)。
+- 复杂度速查与不变量速查(I1–I30)是写作与阅读的对照表。
 
 ## 下一章
 

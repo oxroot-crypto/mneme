@@ -6,7 +6,7 @@
 > **本章你将学到**:DSL 文法与解析器 → 查询计划器 → BM25 公式逐项拆解(含手算)→
 > RRF/加权融合 → 执行管线 → 去重服务。
 
-模块:`query/{parse.rs, plan.rs, zmap.rs, bm25.rs, fusion.rs, dedup.rs, exec.rs}`
+模块:`query/{parse.rs, plan.rs, zmap.rs, bm25.rs, fusion.rs, result_dedup.rs, exec.rs}`
 
 ---
 
@@ -18,7 +18,8 @@
 expr    = or ;
 or      = and { "or" and } ;
 and     = not { "and" not } ;
-not     = [ "not" ] cmp ;
+not     = [ "not" ] primary ;
+primary = "(" expr ")" | cmp ;
 cmp     = path ( "==" | "!=" | ">" | ">=" | "<" | "<=" ) value
         | path "in" "(" value { "," value } ")"
         | path "contains" value                 (* 数组含元素,或字符串含子串 *)
@@ -26,9 +27,9 @@ cmp     = path ( "==" | "!=" | ">" | ">=" | "<" | "<=" ) value
         | path "endswith" value
         | path "~" string                       (* 通配符:* 任意串,? 单字符 *)
         | "exists" "(" path ")"                  (* 字段存在(可为 null) *)
-        | "is_null" "(" path ")"                 (* 字段存在且为 JSON null *)
-        | "(" expr ")" ;
+        | "is_null" "(" path ")" ;               (* 字段存在且为 JSON null *)
 path    = ident { "." ident } ;
+ident   = ( letter | "_" ) { letter | digit | "_" | "-" } ;
 value   = string | number | "true" | "false" | timestamp | duration_expr ;
 timestamp    = "ts" string ;                     (* ts"2024-06-01T00:00:00Z" *)
 duration_expr = "now" ( "-" | "+" ) duration ;   (* now - 7d *)
@@ -79,7 +80,7 @@ compile(expr, segment) → Plan {
 - **残留谓词**:块位图只证明"块内**可能**有匹配",行级仍需精确求值——
   plan 只减少工作量,不改变语义(与逐行求值结果全等,属性测试保证)。
 
-**【复杂度】** 计划:$O(\text{块数} \times \text{条件数})$ ≈ 千级判断(1M 行);
+**【复杂度】** 计划:$O(\text{blocks} \times \text{predicates})$ ≈ 千级判断(1M 行);
 残留求值只发生在"候选块内的行",通常 ≪ N(经验值:选择性过滤下 < 1% 的行)。
 
 ---
@@ -103,11 +104,9 @@ compile(expr, segment) → Plan {
 对查询 $Q = \{t_1, \dots, t_m\}$ 与文档 $D$:
 
 $$
-\text{score}(Q, D) = \sum_{t \in Q} \underbrace{\ln\!\left(\frac{N - df_t + 0.5}{df_t + 0.5} + 1\right)}_{\text{IDF:词的稀缺度}}
-\cdot \underbrace{\frac{f(t, D)\,(k_1 + 1)}{f(t, D) + k_1\left(1 - b + b\,\dfrac{|D|}{\text{avgdl}}\right)}}_{\text{TF 项:饱和 + 长度归一}}
+\text{score}(Q, D) = \sum_{t \in Q} \underbrace{\ln\!\left(\frac{N - df_t + 0.5}{df_t + 0.5} + 1\right)}_{\text{IDF: term rarity}}
+\cdot \underbrace{\frac{f(t, D)\,(k_1 + 1)}{f(t, D) + k_1\left(1 - b + b\,\dfrac{|D|}{\text{avgdl}}\right)}}_{\text{TF: saturation + length norm}}
 $$
-
-(纯文本:`score = Σ_t ln((N - df_t + 0.5)/(df_t + 0.5) + 1) × (tf*(k1+1)) / (tf + k1*(1 - b + b*|D|/avgdl))`)
 
 | 符号 | 含义 | 默认 |
 |---|---|---|
@@ -175,15 +174,16 @@ doc_len:   f32 × count                                     (|D|,归一用)
   ([02 §6](02-l0-core.md));整条 postings 空间 ≈ $df \times 3$ 字节量级(经验值);
 - **打分复杂度**:对查询的每个词走一遍 postings:
 
-$$T = O\!\left(2\sum_{t \in Q} df_t\right) \text{ 次 postings 访问(统计遍 + 打分遍)}, \qquad S = O(\text{postings 全量})(静态)$$
-
-(纯文本:`T = O(2·Σ_{t∈Q} df_t)` 次 postings 访问;`S = O(postings 全量)`(静态))
+$$T = O\!\left(2\sum_{t \in Q} df_t\right)\ \text{postings accesses (count pass + score pass)}, \qquad S = O(\text{postings})\ \text{(static)}$$
 
 查询只碰"含查询词"的文档——这是 BM25 快的根本;无查询词的文档零成本。
 命名空间隔离通过记录体携带的 `ns_id` 判定(记录体带 NsId,[04 §2.2](04-l2-persist.md)):
 同一遍扫描同时完成过滤与 $df_t$ 计数,复杂度不变(额外每 posting 一次 `ns_id` 比较)。
 - **构建**:flush 时顺带生成(分词 + 排序 + 差分),成本与文档数线性,
-  由 compaction 摊销,不在写路径热区。
+  由 compaction 摊销,不在写路径热区;
+- **未落段记录**:可变表的**内存增量倒排**同样参与两遍统计与打分([04 §5.4](04-l2-persist.md)),
+  因此新写入的 `text` 无需 `flush` 即可被 BM25 检索;合并 postings 时按 `(ns_id, alive)` 过滤,
+  仍满足 I21(按查询命名空间全局聚合、只计活行)。
 
 ### 3.5 分词(自研,零依赖)
 
@@ -204,8 +204,6 @@ $$T = O\!\left(2\sum_{t \in Q} df_t\right) \text{ 次 postings 访问(统计遍 
 
 $$\text{score}(d) = \sum_{i} \frac{1}{k + \text{rank}_i(d)}, \qquad k = 60$$
 
-(纯文本:`score = Σ 1/(k + rank_i)`,rank 从 1 起;缺席的通道不计项)
-
 **【直觉】** 不比分数只比**名次**:名次天然无量纲。$k=60$ 平滑头部差异——
 第 1 名(1/61)与第 2 名(1/62)差距微小,避免单一通道独裁。
 
@@ -222,8 +220,6 @@ C: 向量第1, BM25缺席 → 1/61                  = 0.01639   (单通道冠军
 ### 4.2 加权归一(Weighted)
 
 $$\text{score}(d) = \alpha \cdot \widehat{s_v}(d) + (1-\alpha)\cdot \widehat{s_b}(d), \qquad \widehat{s} = \frac{s^{*} - s^{*}_{\min}}{s^{*}_{\max} - s^{*}_{\min}}$$
-
-(纯文本:`score = α*norm(向量分) + (1-α)*norm(BM25分)`,norm = 结果集内 min-max 归一;向量分先按 `Metric::better` 定向为"越大越优"的 `s*`,欧氏取负,见 [10 §2.2](10-scoring.md))
 
 - 归一化在**本次查询的结果集内**做(不是全库),否则量纲仍不可比;
 - **向量通道方向**:欧氏原始分为距离平方(越小越优),须先取负得到 $s^{*}$ 再归一,否则排序反转;
@@ -243,7 +239,7 @@ sequenceDiagram
     participant E as exec(计划器)
     participant V as 向量通道
     participant B as BM25 通道
-    participant S as 各段(L3/L2)
+    participant S as 各段 + 可变表(内存段)
 
     C->>E: SearchBuilder.execute()
     E->>E: 解析 DSL → Expr;每段 compile → Plan(位图/选择性)
@@ -262,6 +258,8 @@ sequenceDiagram
 
 要点:
 - 两通道各取 **2k** 再融合(给融合器留余量),最后取 k;
+- **可变表即内存段**:向量通道对其暴力扫描、BM25 通道用内存增量倒排([04 §5.4](04-l2-persist.md)),
+  因此新写入无需 `flush` 即可被检索;
 - 段内候选位图由 Plan 提供,向量与 BM25 通道**共享**同一份过滤语义——
   过滤是"与"在融合之前,而不是之后;
 - `Reranker` 钩子:
@@ -275,9 +273,24 @@ sequenceDiagram
   宿主可接 cross-encoder 模型做精排;引擎不内置任何模型;
 - **排序全等性**([03 §2.2](03-l1-memory.md))在同一快照内对所有通道生效。
 
+**【算例】一次混合检索的数值走查**:沿用 §4.1 的三文档两通道算例(k=2,k_rrf=60):
+
+```text
+候选(过滤后)   向量 sim / 名次     BM25 分 / 名次     RRF 融合分
+A              0.91 / 3           3.1 / 1           1/63 + 1/61 = 0.03227
+B              0.88 / 2           2.8 / 2           1/62 + 1/62 = 0.03226
+C              0.85 / 1           缺席 / —           1/61        = 0.01639
+融合取 top-2 → {A, B}(A、B 仅差 1e-5,A 略高;若精确同分则按 rowid 升序)
+若开启 Scoring:在 {A,B} 内归一化 ŝ,叠加 recency/importance 等因子后重排;
+若开启 MMR:再剔除互相过近者;最后由 Reranker(若注册)定序并返回,同时生成 query_id 供 feedback。
+```
+
+这条走查把 §2 的计划器、§4 的融合、[10](10-scoring.md) 的排序与本章 §5 的管线串成一条线:
+**过滤先行 → 双通道各自 top-k → RRF 融合 → (可选)扩展/综合打分/去重/重排 → 返回**。
+
 ---
 
-## 6. 去重服务:`dedup.rs`
+## 6. 去重服务:`result_dedup.rs`
 
 写入期去重(`Dedup`,见 [03 §6](03-l1-memory.md))与**结果级去重**是两个独立旋钮;
 后者只作用于本次 `execute()` 返回的命中列表:
@@ -318,6 +331,15 @@ pub enum ResultDedup {
   (统计等价于理想实现;ANN 的近似性由 [05 §6.2](05-l3-hnsw.md) 召回门槛约束);
 - I6 过滤语义与融合顺序无关(过滤先行,融合只对过滤后候选);
 - I7 DSL 解析对任意输入不 panic(模糊测试,见 [14 §5](14-testing.md))。
+
+## 本章小结
+
+- 过滤 DSL 的文法/解析/三值语义;`filter!` 是 `from_str(...).expect(...)` 的舒适封装。
+- 计划器用 zone map + bloom 做**块级下推**,残留谓词只作用于候选行。
+- BM25 公式逐项拆解;统计按命名空间**跨全部活跃段全局聚合**(两遍法,I21)。
+- RRF/加权融合都发生在两通道各自 top-k 上;执行管线顺序固定。
+- 结果级去重(`ResultDedup`)与写入期去重(`Dedup`)是两套独立旋钮。
+- **本章不变量**:I5(等价性)、I6(过滤先行)、I7(DSL 不 panic)。
 
 ## 下一章
 

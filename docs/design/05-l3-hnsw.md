@@ -67,8 +67,6 @@ HNSW 属于**基于图**的 ANN:预先把向量组织成一张图,**沿着"越�
 
 $$\text{level} = \left\lfloor -\ln(u) \cdot m_L \right\rfloor, \qquad u \sim \mathrm{Uniform}(0,1),\quad m_L = \frac{1}{\ln M}$$
 
-(纯文本:`level = floor( -ln(u) * m_L )`,m_L = 1/ln(M))
-
 **推导** $P(\text{level} \ge l)$:
 
 $$
@@ -76,18 +74,16 @@ P(\text{level} \ge l) = P(-\ln u \cdot m_L \ge l) = P\big(u \le e^{-l/m_L}\big) 
 \overset{m_L = 1/\ln M}{=} e^{-l \ln M} = M^{-l} = \left(\frac{1}{M}\right)^l
 $$
 
-(纯文本:`P(level ≥ l) = (1/M)^l`)
-
 即**每升一层,存在概率除以 M**。由此:
 
 | 量 | 值($M=16$) | 推导 |
 |---|---|---|
 | $P(\text{level} \ge 1)$(在某上层) | $1/16 = 6.25\%$ | 直接代入 |
 | $P(\text{level} \ge 2)$ | $1/256 \approx 0.39\%$ | 同上 |
-| 节点期望所在层总数 | $\frac{M}{M-1} \approx 1.07$ | $\sum_{l\ge0} P(\ge l) = 1/(1-1/M)$ |
+| 节点期望层数(参与的层数) | $\frac{M}{M-1} \approx 1.07$ | $\sum_{l\ge0} P(\ge l) = 1/(1-1/M)$ |
 | 期望最高层 | $\log_M N$ | 第 $l$ 层节点数 $= N/M^l$;最高层 ≈ 1 个节点当 $N/M^l \sim 1$ |
 
-$N = 10^6$ 时 $\log_{16} 10^6 \approx 5$ 层;每段顶层几乎总是同一个入口点(存于该段 hidx 头部,§10)。
+$N = 10^6$ 时 $\log_{16} 10^6 \approx 5$ 层;每段的入口点几乎总落在顶层(存于该段 hidx 头部,§10)。
 
 **为什么选 $m_L = 1/\ln M$?** 它使"上层节点数按 $1/M$ 递减",从而
 ① 任意层的度数上界 $M$ 保持图稀疏;② 层高只有 $O(\log_M N)$;
@@ -181,9 +177,7 @@ c3=西偏北 1.2→ dist(c3,q)=1.2 < dist(c3,西)=0.3? 否 → 丢弃
 
 $$T_{\text{insert}} = O\big(d \cdot (ef_c M_0 + M\log_M N)\big) \approx O(d \cdot ef_c \cdot M_0)$$
 
-$$T_{\text{build}}(N) = O(N \cdot d \cdot ef_c \cdot M_0), \qquad S_{\text{graph}} \text{ 见 §6.3}$$
-
-(纯文本:构建总时间 = O(N × d × ef_c × M_0);默认值 N=1M, d=1536, ef_c=200, M_0=32)
+$$T_{\text{build}}(N) = O(N \cdot d \cdot ef_c \cdot M_0), \qquad S_{\text{graph}}\ \text{(see §6.3)}$$
 
 **工程注**:上述是**单线程**界;构建天然可并行(不同点并发插入,连边阶段加细粒度锁),
 Mneme 用 scoped threads 按批并行。50k 向量/秒的目标依赖批内并行 + 常见维度(768–1536)
@@ -229,7 +223,7 @@ $ef_c=4$。
 
 | 操作 | 界 | 默认参数代入 |
 |---|---|---|
-| 单点插入 | $O(d \cdot ef_c \cdot M_0)$ | 1536 维 ≈ 200×32 ≈ 6400 次 SIMD 点积 |
+| 单点插入 | $O(d \cdot ef_c \cdot M_0)$ | 1536 维 ≈ 200×32 ≈ 6400 次距离计算(每次一个点积) |
 | 构建全库 | $O(N \cdot d \cdot ef_c \cdot M_0)$ | — |
 | 单次查询 | $O(d \cdot ef \cdot M_0)$ 上界;**实测**距离计算 ≈ (2–5)×ef(经验值) | ef=128 → 数百~千次点积 |
 | 上层下降 | $O(d \cdot M \cdot \log_M N)$ | ≤ 5 层 × 16 邻居 |
@@ -255,9 +249,7 @@ Recall@10 ≥ 0.95(ef=128,随机+簇状数据,见 [14 §3](14-testing.md))。
 $\sum_{l\ge1} P(\ge l) = \frac{1/(M)}{1-1/M} = \frac{1}{M-1}$,
 每成员 $M$ 个 u32 槽(按容量预留)→ 期望 $4\frac{M}{M-1}$ 字节:
 
-$$S_{\text{node}} = \underbrace{4 M_0}_{=8M \text{ 字节}} + \underbrace{\frac{4M}{M-1}}_{\text{上层期望}} + \underbrace{\approx 16}_{\text{NodeMeta\{level,offset\}}} \approx 8M + 20 \ \text{字节}$$
-
-(纯文本:每节点 ≈ 8*M + 20 字节;M=16 → ≈148 字节)
+$$S_{\text{node}} = \underbrace{4 M_0}_{=8M\ \text{bytes}} + \underbrace{\frac{4M}{M-1}}_{\text{upper levels}} + \underbrace{\approx 16}_{\text{NodeMeta\{level,offset\}}} \approx 8M + 20\ \text{bytes}$$
 
 **【算例】** $M=16$:
 
@@ -316,7 +308,7 @@ $t < 25\%$(compaction 触发线,[07 §4](07-l5-life.md))内召回影响 < 1%(经
 
 **问题**:带过滤的检索(如 `kind == "fact"`)如果搜完再筛(后过滤),
 可能返回不足 k 条;如果只沿"过滤内"节点走(预过滤),图可能断连。Mneme 按选择性
-$s = |\text{候选}| / N_{\text{活}}$ 自适应三档:
+$s = |\text{cand}| / N_{\text{alive}}$ 自适应三档:
 
 | 档 | 条件 | 策略 | ef 调整 |
 |---|---|---|---|
@@ -328,10 +320,15 @@ $s = |\text{候选}| / N_{\text{活}}$ 自适应三档:
   $O(N/8)$ 字节、popcount 求 $s$ 为 $O(N/64)$ 字操作——亚微秒;
 - **"后过滤"不违反 I6**:候选位图仍在遍历前算好(过滤先行、融合只作用于过滤后候选);
   档①只是遍历期不做位图剪枝、靠放大 $ef'$ 后过滤以保召回,与 I6 的"过滤先于融合"不矛盾;
+- **与 [10 §2.3](10-scoring.md) 的排序放大叠加**:同时开启过滤与综合排序时,先按本表放大
+  $ef'$ 以保过滤召回,再按排序需求取候选;两者都只改探查宽度,不改语义;
 - 三档的**正确性标准**:结果集 ≡ "候选位图内暴力扫描"的结果(统计等价,
   验收见 [14 §3](14-testing.md));策略只影响速度,不影响(近似)召回语义;
 - 阈值 0.10 / 0.001 为默认,可配;依据:①档时后过滤的"浪费率" ≤ 90% 仍划算;
   ②档图连通性在候选 > 0.1% 时实验上足够(经验值,基准覆盖)。
+
+> **常见误区**:三档是**性能策略**而非语义开关——三档结果都必须等价于"候选位图内暴力"。
+> 若某档结果不同,是 bug 而非预期;阈值调的是速度,不改变(近似)召回语义。
 
 ---
 
@@ -348,6 +345,10 @@ $s = |\text{候选}| / N_{\text{活}}$ 自适应三档:
 归并代价与段数成线性、极小。(L4 混合检索时每个通道各取 $2k$ 再融合,
 见 [06 §5](06-l4-query.md);这里 $k$ 指纯向量检索路径。)
 
+> **可变表(内存段)**:尚未 `flush` 的记录不在任何 HNSW 中,查询时作为一个"内存段"
+> 直接暴力扫描(其规模通常远小于 `brute_force_max_rows`),与各段 TopK 一起归并——
+> 因此新写入无需 `flush` 即可被检索([04 §8](04-l2-persist.md))。
+
 ---
 
 ## 10. hidx 文件布局(简)
@@ -360,6 +361,10 @@ node_table: [(u8 level, u32 adj_off)] × count     # 定长,O(1) 定位
 adj_blob:   逐点逐层 u32 邻居槽位数组(层0 ≤ M0 个,上层按 level ≤ M 个)
 尾部 payload_crc32
 ```
+
+> 上图为**简图**:真实 hidx 头部与 [04 §2.1](04-l2-persist.md) 一致,含 `header_len` 与
+> 可选 feature 扩展区(`key_id`/`codec`);同一段三文件(vsec/msec/hidx)的 `key_id`/`codec`
+> 必须一致([04 §2.5](04-l2-persist.md))。
 
 mmap 惰性加载:打开段只读头部与 node_table,邻接 blob 由缺页按需载入
 ——"1M 条冷启动 < 1s"的主要支撑点([01 §1.1](01-overview.md))。
@@ -382,6 +387,24 @@ mmap 惰性加载:打开段只读头部与 node_table,邻接 blob 由缺页按�
 > 段内行数低于 `Tuning::brute_force_max_rows`(默认 2048)时恒走暴力扫描
 > ([16 §2](16-api-reference.md)),不建/不用图。
 
+### 11.1 调参决策与常见误区
+
+| 目标 | 先动哪个旋钮 | 说明 |
+|---|---|---|
+| 召回不够(Recall@10 < 0.95) | `ef` ↑(64 → 128 → 256) | 最直接;延迟近似线性涨 |
+| 召回够但延迟高 | 开 i8 量化([08](08-l6-quant.md));再考虑 `ef` ↓ | 量化降带宽,不改精排分 |
+| 构建太慢 | `ef_construction` ↓;并行度 ↑ | 会略降图质量,需重测召回 |
+| 内存/磁盘吃紧 | `M`/`M0` ↓;设有限 `history_horizon` | 图变小但召回下降,历史不再永久 |
+| 过滤后召回差 | 先看选择性 `s`,必要时走暴力档(§8) | 三档阈值可配,见 [16 §2](16-api-reference.md) |
+
+**常见误区**:
+
+1. 直接比较 `score` 数值而非走 `Metric::better`——欧氏是"越小越优",会排反;
+2. 把 `ef` 当成"返回条数"——返回由 `top_k` 决定,`ef` 只控制探查宽度;
+3. 期待 compaction 前后近似结果一致——图重建会改变邻接(§6.2 确定性边界);
+4. 用默认 `history_horizon=None` 却频繁 `update`——历史节点会拖累当前搜索(§7);
+5. 段行数低于 `brute_force_max_rows` 时以为 HNSW 生效——实际恒走暴力扫描(§11)。
+
 ---
 
 ## 12. 层边界契约(L3 → 上层)
@@ -398,6 +421,14 @@ mmap 惰性加载:打开段只读头部与 node_table,邻接 blob 由缺页按�
 **不变量**:同一段内,搜索结果 ⊆ alive 位图 ∩ 过滤位图(alive 由可见性规则生成,含 `as_of`);
 死节点与未被 alive 选中的历史版本只可穿越、不可入选;
 `ef → ∞` 时结果收敛于段内暴力扫描(属性测试断言,见 [14 §3](14-testing.md))。
+
+## 本章小结
+
+- NSW = 小世界图 + 贪心路由;分层把"长程跳转"与"短程精修"分开。
+- 层级分配是几何分布 $P(\ge l)=M^{-l}$,层高 $O(\log_M N)$。
+- 构建/搜索/启发式选邻的完整算法;复杂度 $O(N \cdot d \cdot ef_c \cdot M_0)$ 构建、$O(d \cdot ef \cdot M_0)$ 查询。
+- 墓碑删除:遍历可穿死节点、结果只收活节点;物理清理交给 compaction 整体重建。
+- 过滤三档策略按选择性自适应;跨段归并;`ef → ∞` 收敛于暴力(§12)。
 
 ## 下一章
 

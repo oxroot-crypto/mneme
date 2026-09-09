@@ -2,7 +2,7 @@
 
 > **本章目标**:把 Mneme 从"单进程独占库"扩展到更广的部署场景——同机多进程只读共享、
 > 浏览器/边缘(WASM)、以及生产可观测性,同时不破坏核心的简单性。
-> **前置阅读**:[04 §6/§8](04-l2-persist.md)(Manifest 原子性/ReaderView)、[16 §3/§5](16-api-reference.md)(打开校验/线程安全)。
+> **前置阅读**:[04 §6/§8](04-l2-persist.md)(MANIFEST 原子性/ReaderView)、[16 §3/§5](16-api-reference.md)(打开校验/线程安全)。
 > **本章你将学到**:只读共享的可行性与边界 → 存储抽象与 WASM → 可选可观测钩子 → 层边界。
 >
 > 只读共享与 WASM 是**采用门槛级**能力:许多 Agent 框架会
@@ -33,6 +33,8 @@ let db = Mneme::builder().path("./agent_memory").read_only(true).build()?;
 ```
 
 - 只读实例**不创建/不争抢写锁文件**([16 §3](16-api-reference.md));它只校验写者是否存活;
+- 只读实例**不写盘**:打开时在内存中重放未落段的 WAL(遇撕裂帧只忽略、不截断,
+  [04 §7](04-l2-persist.md));损坏段只从视图剔除,不移动文件;
 - 只读实例的可见性:打开时读一次 `current` → MANIFEST,之后**周期性探测** `current`
   的版本号(mtime/内容),发现新版本则原子切换到新的 ReaderView;
 - **不变量 I29**:任意时刻只读实例看到的都是某个**已提交 MANIFEST 版本的完整视图**
@@ -40,7 +42,7 @@ let db = Mneme::builder().path("./agent_memory").read_only(true).build()?;
 
 ### 2.2 为什么不需要协议
 
-段文件是 **write-once**([04 §1](04-l2-persist.md))、Manifest 是 **write-once + 指针**([04 §6](04-l2-persist.md)):
+段文件是 **write-once**([04 §1](04-l2-persist.md))、MANIFEST 是 **write-once + 指针**([04 §6](04-l2-persist.md)):
 写者只会新增文件、切换指针,从不原地修改已有文件。因此只读进程只要"看到某个指针,
 就拥有一份不可变、自洽的数据集"——无需与写者通信,无需文件锁。这正是当初
 "write-once"设计的额外红利。
@@ -83,12 +85,16 @@ pub trait Storage: Send + Sync {
     fn remove(&self, path: &str) -> Result<()>;
     fn list(&self, dir: &str) -> Result<Vec<String>>;
     fn stat(&self, path: &str) -> Result<FileMeta>;
+    fn create_new(&self, path: &str) -> Result<()>;  // 原子创建,已存在则失败(写锁文件用,见 16 §3)
+    fn exists(&self, path: &str) -> Result<bool>;
 }
 ```
 
 - 桌面/服务器用 `FsStorage`(std);WASM 用 `MemStorage`(纯内存)或宿主提供的
-  `OpfsStorage`(Origin Private File System,经宿主实现);
-- `read_only` + `MemStorage` 可用于浏览器内只读记忆;写入需宿主持久化策略。
+  `OpfsStorage`(Origin Private File System,经宿主实现);后端经 `Builder::storage(Arc<dyn Storage>)`
+  注入([16 §1.1](16-api-reference.md)),默认 `FsStorage`;
+- 写锁文件的原子创建(`create_new`)与存在性判定(`exists`)也走 `Storage`,保证后端可替换;
+- `read_only` + `MemStorage` 可用于浏览器内只读记忆;写入需宿主提供持久化策略。
 
 ### 3.2 `no_std + alloc` 核心
 
@@ -123,9 +129,13 @@ pub enum Event {
     Compaction { segments: Vec<SegmentId>, took: Duration, rows_out: u64 },
     Error { kind: ErrorKind, context: &'static str },
 }
-pub enum WriteOp { Insert, InsertBatch, Update, Delete, Touch, Relate }
+pub enum WriteOp { Insert, InsertBatch, Update, Delete, Touch, Relate, Unrelate, Forget, Retain, Supersede, Consolidate, DropNamespace }
 pub enum ErrorKind { Io, Corrupted, Busy, Invalid, TooLarge, UnsupportedVersion, Other }
 ```
+
+> `ErrorKind` 是 `MnemeError` 的粗分类:同名变体直接对应;`DimensionMismatch`/`MetricMismatch`/
+> `DuplicateKey`/`FilterParse`/`KeyNotFound` 归入 `Other`(需要精确定位时宿主仍以 `MnemeError`
+> 为准,见 [02 §2](02-l0-core.md)、[16 §4](16-api-reference.md))。
 
 - 默认 `None`(不注册即零成本);宿主可把事件桥接到 `tracing`/OpenTelemetry/metrics;
 - **不变量 I30**:回调**不得改变引擎行为**;回调 panic 被 `catch_unwind` 隔离并忽略
@@ -139,7 +149,7 @@ pub enum ErrorKind { Io, Corrupted, Busy, Invalid, TooLarge, UnsupportedVersion,
 
 ---
 
-## 5. 层边界契约(L0+ → 外部)
+## 5. 层边界契约(产品能力层 → 外部)
 
 **向上提供**:
 
@@ -147,9 +157,17 @@ pub enum ErrorKind { Io, Corrupted, Busy, Invalid, TooLarge, UnsupportedVersion,
 2. `Storage`/`SegmentSource` 抽象与 WASM/`no_std` 退化路径;
 3. `Observer` 事件钩子(不变量 I30)。
 
-**依赖**:L0(类型)、L2(Manifest/段/write-once 语义)。
+**依赖**:L0(类型)、L2(MANIFEST/段/write-once 语义)。
 
 **不变量**:I29(只读一致)、I30(可观测无副作用);单写者语义不变。
+
+## 本章小结
+
+- 多进程**只读**共享:靠 write-once + 指针,无需与写者通信或文件锁(I29)。
+- `Storage`/`SegmentSource` 抽象支持 WASM/边缘与 `no_std + alloc` 退化。
+- `Observer` 事件流与 `stats()` 快照互补;回调不得改变引擎行为、panic 被隔离(I30)。
+- 单写者语义始终不变。
+- **本章不变量**:I29(只读一致)、I30(可观测无副作用)。
 
 ## 下一章
 

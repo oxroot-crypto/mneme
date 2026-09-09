@@ -28,7 +28,7 @@
 ```rust
 pub fn insert(&self, rec: Record) -> Result<InsertOutcome>;
 pub fn insert_batch(&self, recs: Vec<Record>) -> Result<Vec<InsertOutcome>>;
-pub enum InsertOutcome { Inserted(RowId), Duplicate { existing: RowId, score: f32 } }
+pub enum InsertOutcome { Inserted(RowId), Merged(RowId), Duplicate { existing: RowId, score: f32 } }
 ```
 
 | 规则 | 语义 |
@@ -41,7 +41,7 @@ pub enum InsertOutcome { Inserted(RowId), Duplicate { existing: RowId, score: f3
 | importance | 未指定默认 0.5;范围 [0,1],超范围钳制(clamp) |
 | valid time | `Record::valid_from/valid_to` 可选,构成双时态(valid time + transaction time),见 [09 §3](09-memory-model.md) |
 | confidence | `Record::confidence` 可选,默认 1.0;参与检索打分的可信度因子,见 [10](10-scoring.md) |
-| 批量 | `insert_batch` **整批原子**(I15,定义见 [16 §9](16-api-reference.md)):共用一次组提交 fsync;WAL 侧以 `BatchBegin`/`BatchCommit` 帧包裹([04 §2.3](04-l2-persist.md));任一条校验失败则整批拒绝、不产生部分写入;结果顺序与输入一一对应 |
+| 批量 | `insert_batch` **整批原子**(I15,定义见 [16 §9](16-api-reference.md)):共用一次组提交 fsync;WAL 侧以 `BatchBegin`/`BatchCommit` 帧包裹([04 §2.3](04-l2-persist.md));任一条**校验失败**(维度/数值/限额)则整批拒绝、不产生部分写入;结果顺序与输入一一对应。**去重命中**(`Dedup::Reject`)或 `InsertMode::RejectDuplicate` 属于逐条业务结果,不使整批回滚——命中位置返回 `Duplicate`,其余记录照常写入 |
 
 **局部更新 `update`**(不改变 RowId;不提供向量则不写向量区):
 
@@ -56,14 +56,14 @@ pub enum UpdateOutcome { Updated(RowId), NotFound }
 | `vector` | 提供时替换向量并重建该版本索引;不提供则保留 |
 | `text` / `metadata` / `provenance` | 提供时整体替换(非合并);`Some(None)` 清空 |
 | `importance` / `ttl` / `valid_time` / `confidence` | 提供时覆盖;`ttl(Some(None))` 取消过期 |
-| 可见性 | 更新写入新物理版本(新 seqno),对读者**原子可见**;旧版本遮蔽,compaction 物理清除(I24) |
+| 可见性 | **不变量 I24(更新原子可见)**:更新写入新物理版本(新 seqno),对读者**原子可见**——任一并发查询要么看到旧版本、要么看到新版本,绝不看到字段混合的半更新;旧版本遮蔽,超期版本由 compaction 按 `history_horizon` 物理回收(I26) |
 | 与 upsert 的区别 | upsert 按 key 整体替换、可无既有 key;update 要求已存在,返回 `NotFound` 而非新建 |
 
 ### 2.2 读取:`search` 与 `get`
 
 ```rust
-pub struct SearchBuilder<'a> { /* 链式:vector / text / top_k / ef / filter / dedup /
-                                 fusion / score / diversify / expand / as_of / rerank */ }
+pub struct SearchBuilder<'a> { /* 链式:vector / text / top_k / ef / filter / dedup / fusion /
+                                 score / diversify / expand / as_of / query_id / rerank */ }
 impl SearchBuilder<'_> { pub fn execute(&self) -> Result<Vec<Hit>>; }
 ```
 
@@ -73,7 +73,9 @@ impl SearchBuilder<'_> { pub fn execute(&self) -> Result<Vec<Hit>>; }
   同分按 `RowId` 升序(**排序全等性**:同一快照内任意两次查询结果完全一致);
 - 过滤语义:`filter` 在打分**之前**限定候选集(预过滤),不是"取完再筛"
   ——预过滤保证 top_k 是"过滤后的前 k",这是 Agent 记忆的正确语义
-  ("只要重要度 > 0.5 的前 10 条",而不是"前 10 条里有几条重要的算几条");
+  ("只要重要度 > 0.5 的前 10 条",而不是"前 10 条里有几条重要的算几条")。
+  L3 起 ANN 为保召回会先放大 `ef` 再在结果集上过滤([05 §8](05-l3-hnsw.md) 档①),
+  那是**性能策略**;其语义仍严格等价于"候选位图内暴力",与预过滤不矛盾;
 - `score(Scoring)` 开启时序/重要度/访问感知排序;`diversify(Diversity)` 开启 MMR;
   `expand(RelationExpand)` 沿关系边做联想扩展;`as_of(ts)` 做双时态历史读(在版本链上取
   事务时间 ≤ ts 的可见版本)——四者语义见 [10](10-scoring.md) 与 [09](09-memory-model.md);
@@ -82,6 +84,8 @@ impl SearchBuilder<'_> { pub fn execute(&self) -> Result<Vec<Hit>>; }
   - `get_many(keys: &[&str]) -> Result<Vec<Option<RecordRef<'_>>>>`,
     `get_many_by_rowid(ids: &[RowId]) -> ...`——一次持锁、批量定位,避免 N 次往返;
   - `exists(key) -> Result<bool>`;
+  - `count(filter: Option<Expr>) -> Result<u64>`:统计命中的活记录数,**不物化记录**、复用过滤器/索引;
+    过滤语义与 `search` 一致(预过滤),墓碑与逻辑过期记录不计入(I9);
   - `get_vector(id) -> Result<Option<Vec<f32>>>`(只取向量,不物化记录)。
 - **`RecordRef<'_>` 借用 ReaderView**(见 [16 §1.2](16-api-reference.md)):`vector()` 返回
   `&[f32]` 零拷贝;`iter` 同样不物化向量,需要向量时显式 `get_vector`。
@@ -115,7 +119,11 @@ impl Mneme {
 - `flush` 是 `FsyncPolicy::OnFlush` 的显式触发点,也是备份/compaction 的一致性点;
 - `close` 返回 `Ok` 即代表所有已确认写入持久(I16);`Drop` 只**尽力** `flush`
   并忽略错误,需要确保持久性时必须显式 `close`。崩溃场景的恢复见
-  [04 §7](04-l2-persist.md),用户侧 runbook 见 [16 §7](16-api-reference.md)。
+  [04 §7](04-l2-persist.md),用户侧 runbook 见 [16 §7](16-api-reference.md);
+- **克隆与关闭**:`Mneme` 克隆共享同一底层库;`close(self)` 关闭的是**共享库**而非单个
+  句柄——首个 `close` 完成 `flush` 并释放文件锁,此后所有克隆(及其派生的 `Namespace`)
+  的读写返回 `Invalid("closed")`,再次 `close` 返回 `Ok`(幂等)。因此不要让克隆存活到
+  `close` 之后。
 
 ---
 
@@ -151,7 +159,8 @@ Entry { ns_id, rowid, seqno, key, text, meta, created_at, expires_at, importance
   ([04 §2.2b](04-l2-persist.md)),compaction 时物化([09 §2](09-memory-model.md))。
 
 - `vectors` 与 `entries` 的下标即 `SlotId`,**永不回收**——`Vec` 只增不减,
-  墓碑槽位保留占位(每槽的向量容器与 `Option<Entry>` 固定开销约几十字节,可控);
+  墓碑槽位保留占位(每槽固定开销 = `AlignedVec` 句柄 + 内联 `Entry`(十余个可选字段,约百字节级),
+  随墓碑比例线性增长,由 compaction 物理回收);
   `SlotId → RowId` 的映射即 `Entry.rowid`;
 - 读者先拿 `RwLock` 读锁**复制出扫描所需的视图信息**(活行数、当前 `dead` 位图引用、
   vectors 切片),随即释放锁再扫描——写者等待读者的时间只有"复制视图"的纳秒级,
@@ -168,7 +177,7 @@ Entry { ns_id, rowid, seqno, key, text, meta, created_at, expires_at, importance
 拿个只有 k 个格子的小托盘([02 §5 TopK](02-l0-core.md)),比托盘里最差的好的才放进去。
 简单、精确、没有维护成本——数据少时,这就是**正确**的选择。
 
-### 4.2 【算法】流程(含过滤与并行)
+### 4.2 【工程】流程(含过滤与并行)
 
 ```text
 输入: q, top_k, filter(AST), 有效快照视图
@@ -192,8 +201,8 @@ Entry { ns_id, rowid, seqno, key, text, meta, created_at, expires_at, importance
 | 阶段 | 时间 | 空间 |
 |---|---|---|
 | 元数据过滤求值 | $O(N \cdot \|E\|)$,$\|E\|$ = AST 节点数 | $O(N/8)$ 位图 |
-| 向量打分 | $O(N_c \cdot d)$,$N_c$ = 候选数(无过滤则 $N$) | $O(C_{\text{块}} \cdot k)$ |
-| 归并 | $O(C_{\text{块}} \cdot k \log k)$ | $O(C_{\text{块}} \cdot k)$ |
+| 向量打分 | $O(N_c \cdot d)$,$N_c$ = 候选数(无过滤则 $N$) | $O(C_{\text{block}} \cdot k)$ |
+| 归并 | $O(C_{\text{block}} \cdot k \log k)$ | $O(C_{\text{block}} \cdot k)$ |
 
 **带宽视角**(并行扩展性的物理上限):每查询读 $4 d$ 字节/行,
 1M×1536 维 ≈ 6 GB;双通道内存 ~50 GB/s → **纯暴力下限约 120ms**。
@@ -286,15 +295,18 @@ Agent 会反复遇到相似信息("用户又说了他喜欢深色模式")。
 pub enum Dedup { Off, Reject, Replace, KeepBoth, Merge(fn(&RecordRef<'_>, &RecordRef<'_>) -> Option<Record>) }
 ```
 
-近似判重的余弦阈值由 `Builder::dedup_threshold(f32)` 配置(默认 0.95,
-见 [16 §2](16-api-reference.md)),与检索结果的 `ResultDedup::Near { threshold }` 各自独立;
+近似判重的阈值由 `Builder::dedup_threshold(f32)` 配置(默认 0.95,
+见 [16 §2](16-api-reference.md)),与检索结果的 `ResultDedup::Near { threshold }` 各自独立。
+**该阈值统一按余弦相似度口径**:非余弦度量(`Dot`/`Euclidean`)下引擎先把两侧向量归一化
+再比较,调用方无需换算。
 `RecordRef` 定义见 [16 §1.2](16-api-reference.md)。
 
 - `Reject`:返回 `InsertOutcome::Duplicate { existing, score }`,由调用方决定;
 - `Replace`:旧行墓碑,新行入位(保留新时间戳);
 - `KeepBoth`:照常插入,返回 `Inserted(RowId)`(不返回重复信息;需感知重复请用 `Reject`);
-- `Merge`:回调合并(如"保留旧记忆 + 更新其 last_access"),L4 之后可用元数据索引细化
-  (如只在 `kind == "preference"` 内查重——把判重查询限定在同一语义类别,防误杀)。
+- `Merge`:以命中的旧记录为主体应用回调返回的 `Record`(如保留旧向量、取更高 `importance`、合并 `text`),
+  **保留旧 RowId 就地更新**(符合 I22),返回 `InsertOutcome::Merged(existing)`;回调返回 `None` 等价 `KeepBoth`。
+  L4 之后可用元数据索引细化(如只在 `kind == "preference"` 内查重——把判重查询限定在同一语义类别,防误杀)。
 
 > **注意**:`Dedup` 是**写入期**去重。检索结果的去重是另一套语义与另一个类型
 > `ResultDedup`(`Off / ById / Near { threshold }`,见 [06 §6](06-l4-query.md)),
@@ -329,11 +341,11 @@ Agent 框架层若需事务语义由调用方组织。
 `Mneme / Namespace / Record / Hit / RecordRef<'_> / SearchBuilder / InsertOutcome / UpdateOutcome /
 UpdatePatch / Expr / Dedup / ResultDedup / Retention / Scoring / Diversity / RelationKind / Edge /
 Feedback / ConsolidationPolicy 语义`,
-以及 `insert / insert_batch / update / update_by_rowid / supersede / get / get_by_rowid / get_many /
+以及 `search / insert / insert_batch / update / update_by_rowid / supersede / get / get_by_rowid / get_many /
 get_many_by_rowid / get_vector / exists / count / delete / delete_by_rowid / touch /
-touch_by_rowid / feedback / relate / relate_with_meta / unrelate / neighbors / consolidate /
-forget / retain / iter / iter_with / flush / close / list_namespaces / drop_namespace /
-snapshot / as_of / backup_to / stats / check` 的签名。
+touch_by_rowid / feedback / relate / relate_with_meta / unrelate / neighbors / predecessors / consolidate /
+forget / retain / iter / iter_with / flush / close / namespace / list_namespaces / drop_namespace /
+snapshot / as_of / backup_to / stats / check / compact_control` 的签名。
 
 > **冻结的是签名,不是全部实现**:`relate`/`neighbors`/`supersede`/`consolidate`/`feedback`
 > 等在 L1 即以内存实现提供可用的最小语义(关系边、有效时间、简单摘要);产品能力层
@@ -345,7 +357,7 @@ snapshot / as_of / backup_to / stats / check` 的签名。
 **向 L2 交接的内部接口**(L2 必须实现,以便内存层无痛升级为持久层):
 
 ```rust
-// SearchOpt: 检索参数打包(top_k / ef / filter / dedup / fusion / score / diversify / expand / as_of);
+// SearchOpt: 检索参数打包(top_k / ef / filter / dedup / fusion / score / diversify / expand / as_of / query_id / rerank);
 // Target:    定位目标,`enum Target { Key(Key), RowId(RowId) }`(无 key 记录只能按 RowId);
 // EntryRef:  段内记录只读视图(公开 `RecordRef` 的内部形态,额外带 SlotId/seqno)。
 pub trait VectorStore: Send + Sync {
@@ -356,6 +368,7 @@ pub trait VectorStore: Send + Sync {
     fn search(&self, opt: &SearchOpt) -> Result<Vec<Hit>>;
     fn relate(&self, edge: Edge) -> Result<()>;
     fn neighbors(&self, from: RowId, kinds: &[RelationKind]) -> Result<Vec<Edge>>;
+    fn predecessors(&self, to: RowId, kinds: &[RelationKind]) -> Result<Vec<Edge>>;
     fn scan_alive(&self) -> impl Iterator<Item = (RowId, &EntryRef)>;
 }
 ```
@@ -364,6 +377,14 @@ L2 的 `Database` 即 `VectorStore` 的持久实现;L3 的 HNSW 再替换其 `se
 公开 API 始终不变。**注**:含 `impl Iterator` 返回位置( RPITIT)的 trait 不是
 object-safe,内部按泛型/单态使用(不构造 `dyn VectorStore`);若未来需要动态替换,
 把 `scan_alive` 改为返回 `Box<dyn Iterator<...> + '_>`。
+
+## 本章小结
+
+- **API 是最大的风险**:先在纯内存层把公开 API 打磨冻结,后续层只换实现。
+- 写入/读取/生命周期/落盘四组 API 的语义细则,是后续所有层的**行为规约**。
+- 内存表 = `RowId` 版本链 + `delta` 覆盖层 + `(NsId, key)` 索引;读路径无锁扫描。
+- 暴力扫描**过滤先行** + 分块并行;过滤 AST 采用三值语义;两级去重(FNV-1a + top-1)。
+- **本章不变量**:I15(批量原子)、I16(优雅关闭)、I24(更新原子可见);内部 `VectorStore` trait 衔接 L2。
 
 ## 下一章
 

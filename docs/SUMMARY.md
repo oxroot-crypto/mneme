@@ -15,7 +15,7 @@
 - [05 L3 索引层:HNSW 的完整数学](design/05-l3-hnsw.md)
 - [06 L4 检索层:DSL、BM25 与混合融合](design/06-l4-query.md)
 - [07 L5 生命周期层](design/07-l5-life.md)
-- [08 L6 打磨层:量化、两阶段检索与 async](design/08-l6-quant.md)
+- [08 L6 打磨层:量化、两阶段检索与 async 门面](design/08-l6-quant.md)
 
 ---
 

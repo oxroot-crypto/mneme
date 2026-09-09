@@ -46,8 +46,11 @@ impl Builder {
     pub fn access_flush_interval(self, d: Duration) -> Self; // 默认 30s
     pub fn compression(self, c: Compression) -> Self;       // 文本/元数据压缩,默认 None(见 11)
     pub fn encryption(self, e: Option<Encryption>) -> Self; // 静态加密,feature `encrypt`(见 11)
+    pub fn storage(self, s: Arc<dyn Storage>) -> Self;      // 存储后端,默认 FsStorage;WASM/边缘自定义(见 12 §3)
     pub fn read_only(self, yes: bool) -> Self;              // 只读共享模式(见 12 §2)
     pub fn read_only_probe_interval(self, d: Duration) -> Self; // 只读实例探测新 MANIFEST 的周期,默认 1s
+    pub fn verify_on_open(self, yes: bool) -> Self;         // 打开时全量校验各段 payload CRC,默认 false(见 04 §4.3)
+    pub fn fail_fast_on_corruption(self, yes: bool) -> Self; // 损坏段直接拒绝启动,默认 false = 隔离剔除(见 04 §7)
     pub fn relation_index(self, r: RelationIndex) -> Self;  // 关系反向索引,默认 Outgoing(见 09 §2.3)
     pub fn parallelism(self, n: usize) -> Self;             // 默认 0 = available_parallelism()
     pub fn tuning(self, t: Tuning) -> Self;                 // 进阶调参,默认见 §2
@@ -80,6 +83,22 @@ impl Namespace {
     pub fn update_by_rowid(&self, id: RowId, patch: UpdatePatch) -> Result<UpdateOutcome>;
 }
 
+/// 一条待写入的记忆。字段私有,经链式 setter 构造;`insert` 时统一校验维度与有限性。
+/// `metadata`/`provenance` 缺省存 `null`;读出的 `Hit.metadata` / `RecordRef.metadata` 恒为
+/// `Meta`(无元数据时即 `null`),`provenance` 保持 `Option`。
+pub struct Record {
+    vector: Vec<f32>,             // 必填;维度在 insert 时校验
+    key: Option<String>,
+    text: Option<String>,
+    metadata: Option<Meta>,
+    ttl: Option<Duration>,        // None = 永不过期
+    importance: Option<f32>,      // None = 默认 0.5
+    valid_from: Option<i64>,      // None = created_at(见 09 §3)
+    valid_to: Option<i64>,
+    confidence: Option<f32>,      // None = 默认 1.0
+    provenance: Option<Meta>,
+}
+
 impl Record {
     pub fn new(vector: Vec<f32>) -> Self;                   // 维度在 insert 时校验,故无 Result
     pub fn key(self, k: impl Into<String>) -> Self;         // 可选外部键
@@ -89,7 +108,7 @@ impl Record {
     pub fn importance(self, v: f32) -> Self;                // 可选;默认 0.5,越界钳制
     pub fn valid_from(self, ts_ms: i64) -> Self;            // 可选;有效时间起,缺省 = created_at(见 09 §3)
     pub fn valid_to(self, ts_ms: i64) -> Self;              // 可选;有效时间止(开区间)
-    pub fn confidence(self, v: f32) -> Self;                // 可选;默认 1.0,参与打分(见 10 §2)
+    pub fn confidence(self, v: f32) -> Self;                // 可选;默认 1.0,越界钳制到 [0,1],参与打分(见 10 §2)
     pub fn provenance(self, p: Meta) -> Self;               // 可选;来源/派生链,设置后 RecordRef.provenance = Some(见 09 §4)
 }
 
@@ -109,10 +128,12 @@ impl UpdatePatch { pub fn new() -> Self; /* 各字段的链式 setter */ }
 /// 更新结果。
 pub enum UpdateOutcome { Updated(RowId), NotFound }
 
-/// 写入结果。`Duplicate` 在 `Dedup::Reject` 时返回;`existing` 用 RowId 而非 Key,
+/// 写入结果。`Inserted` = 新建;`Merged` = `Dedup::Merge` 就地更新并保留旧 RowId;
+/// `Duplicate` = `Dedup::Reject` 去重拒绝时返回。`existing` 用 RowId 而非 Key,
 /// 因为近似去重命中的记录可能没有 key(Key 可由 `get_by_rowid` 取回)。
 pub enum InsertOutcome {
     Inserted(RowId),
+    Merged(RowId),
     Duplicate { existing: RowId, score: f32 },
 }
 
@@ -134,6 +155,7 @@ pub struct Hit {
     pub valid_to: Option<i64>,     // 有效时间止
     pub text: Option<String>,
     pub metadata: Meta,
+    pub provenance: Option<Meta>,  // 来源/派生链,见 09 §4(与 RecordRef 保持一致)
     pub via: Option<Edge>,         // 由关系扩展命中时的来源边(见 10 §3),否则 None
 }
 impl Hit {
@@ -232,6 +254,7 @@ impl Namespace {
 
     // ---- 双时态(见 09 §3)----
     /// 信念修订:更新同 key,并把旧版本 `valid_to` 闭合为新版本 `valid_from`。
+    /// 要求该 key 已存在(不存在返回 `UpdateOutcome::NotFound`);首个版本请用 `insert`/upsert。
     pub fn supersede(&self, key: &str, rec: Record) -> Result<UpdateOutcome>;
 
     // ---- 记忆关系(见 09 §2)----
@@ -240,6 +263,9 @@ impl Namespace {
     pub fn relate_with_meta(&self, from: RowId, to: RowId, kind: RelationKind, weight: f32, metadata: Meta) -> Result<()>;
     pub fn unrelate(&self, from: RowId, to: RowId, kind: RelationKind) -> Result<bool>;
     pub fn neighbors(&self, from: RowId, kinds: &[RelationKind]) -> Result<Vec<Edge>>;
+    /// 入边:返回所有 `to == to` 且 `kind ∈ kinds` 的边;默认全段扫描,
+    /// `RelationIndex::Both` 时走反向索引(见 [09 §2.3](09-memory-model.md))。
+    pub fn predecessors(&self, to: RowId, kinds: &[RelationKind]) -> Result<Vec<Edge>>;
 
     // ---- 记忆沉淀(见 09 §5)----
     pub fn consolidate(&self, policy: ConsolidationPolicy) -> Result<ConsolidateReport>;
@@ -250,13 +276,15 @@ impl Namespace {
 
 ```rust
 impl Mneme {
-    pub fn namespace(&self, path: &str) -> Namespace;               // 不存在则隐式创建
+    pub fn namespace(&self, path: &str) -> Namespace;               // 返回句柄;注册表在首次成功写入时惰性登记(见 07 §5)
     pub fn list_namespaces(&self) -> Result<Vec<String>>;           // 前缀树顺序
     pub fn drop_namespace(&self, path: &str) -> Result<usize>;      // 含所有子命名空间
 }
 ```
 
 ### 1.6 快照与运维
+
+> 本节汇总快照句柄、策略类型、运维报告与运行统计的完整定义。
 
 ```rust
 impl Mneme {
@@ -279,17 +307,30 @@ impl SnapshotHandle {
 }
 
 /// 快照上的命名空间只读视图;持有快照视图的 `Arc`,克隆廉价、可跨线程使用。
+/// 读取面与 `Namespace` 对齐(不含任何写方法);`include_deleted` 语义同 `Namespace::iter_with`。
 impl SnapshotNamespace {
     pub fn search(&self) -> SearchBuilder;                 // 在钉住的视图上查询
     pub fn get(&self, key: &str) -> Result<Option<RecordRef<'_>>>;
     pub fn get_by_rowid(&self, id: RowId) -> Result<Option<RecordRef<'_>>>;
     pub fn get_many(&self, keys: &[&str]) -> Result<Vec<Option<RecordRef<'_>>>>;
     pub fn get_vector(&self, id: RowId) -> Result<Option<Vec<f32>>>;
+    pub fn exists(&self, key: &str) -> Result<bool>;
+    pub fn count(&self, filter: Option<Expr>) -> Result<u64>;
     pub fn neighbors(&self, from: RowId, kinds: &[RelationKind]) -> Result<Vec<Edge>>;
+    pub fn predecessors(&self, to: RowId, kinds: &[RelationKind]) -> Result<Vec<Edge>>;
     pub fn iter(&self, filter: Option<Expr>)
+        -> Result<impl Iterator<Item = Result<RecordRef<'_>>> + '_>;
+    pub fn iter_with(&self, filter: Option<Expr>, include_deleted: bool)
         -> Result<impl Iterator<Item = Result<RecordRef<'_>>> + '_>;
 }
 ```
+
+> **`db.as_of(t)` 与 `search().as_of(t)` 的区别**:前者返回**历史快照句柄**(可反复
+> `get`/`iter`/`search`,适合"回看某时刻我知道什么");后者是**单次检索**在版本链上按事务时间
+> 取可见版本,适合"用旧知识做一次检索"。两者语义一致、粒度不同;历史默认永久保留
+> (`history_horizon=None`,[07 §4.2a](07-l5-life.md))。
+
+#### 策略与报告类型
 
 ```rust
 /// 遗忘策略(写入期/后台共用)。`Retention::new()` 默认 half_life=14d、min_importance=0.2、w=0.05。
@@ -315,7 +356,11 @@ pub struct RetainReport { pub scanned: usize, pub forgotten: usize, pub sampled_
 pub struct BackupReport { pub files: usize, pub bytes: u64, pub hardlinked: bool }
 pub struct CheckReport  { pub ok: bool, pub corrupted: Vec<SegmentId>, pub suggestions: Vec<String> }
 pub struct SnapshotStats { pub version: u64, pub segments: usize, pub rows: u64 }
+```
 
+#### 运行统计
+
+```rust
 /// `db.stats()` 的运行统计(字段为稳定契约)。
 pub struct Stats {
     pub segments: Vec<SegmentStat>,
@@ -371,6 +416,10 @@ pub struct AccessStat { pub last_access_ms: i64, pub access_count: u32 }
   所有已确认写入已持久(不变量 I16)。
 - `Drop` 只**尽力** `flush`(忽略错误,无法向调用方报告),并释放锁;
   需要确保持久性时不要依赖析构。
+- **克隆与关闭语义**:`Mneme` 经内部 `Arc` 克隆,`close(self)` 关闭的是**共享库**;
+  首个 `close` 完成 `flush` 并释放文件锁,此后其余克隆(及其 `Namespace`)上的
+  操作返回 `Invalid("closed")`,重复 `close` 返回 `Ok`。多线程长期共享时,应在确认
+  所有使用方结束后再 `close`(见 [03 §2.4](03-l1-memory.md))。
 - 进程被 `abort`/断电时,已 fsync 的写入仍由 WAL 恢复([04 §7](04-l2-persist.md))。
 
 ### 1.8 过滤、去重与重排类型
@@ -399,6 +448,11 @@ impl Expr {
 
 /// 字段组合器(定义见 [03 §5.1](03-l1-memory.md)):`eq/ne/gt/ge/lt/le/is_in` 返回 `Expr`。
 pub struct FieldBuilder { /* field: String */ }
+
+// `filter!` 宏(库根导出):对**写死在代码里的**字面量做运行时解析,失败即 panic
+// (文档化例外);等价于 `Expr::from_str(...).expect("invalid filter literal")`。
+// 处理运行时输入请用 `Expr::from_str`(返回 `Result`,不 panic,I7);
+// 展开形式等价于 `macro_rules! filter { (s:expr) => { Expr::from_str(s).expect(...) } }`。
 
 /// 写入期去重策略(见 [03 §6.3](03-l1-memory.md));`Merge` 回调签名:
 /// `fn(&RecordRef<'_>, &RecordRef<'_>) -> Option<Record>`,返回 None = KeepBoth。
@@ -442,7 +496,8 @@ pub enum Diversity { Off, Mmr { lambda: f32 } }   // lambda∈[0,1],越大越重
 /// max_nodes 默认 4k(封顶扩展延迟)。
 pub struct RelationExpand { pub hops: u8, pub kinds: Vec<RelationKind>, pub decay: f32, pub max_nodes: usize }
 
-/// 关系邻接索引方向(见 [09 §2.3](09-memory-model.md)):`Both` 额外建反向边索引(空间 ×2)。
+/// 关系邻接索引方向(见 [09 §2.3](09-memory-model.md)):`Both` 额外建反向边索引(空间 ×2),
+/// 供 `predecessors` 走 `O(log E + degree)`;`Outgoing` 下 `predecessors` 仍可用但走全段扫描。
 pub enum RelationIndex { Outgoing, Both }
 
 /// 关系类型:内置 + 用户自定义(见 [09 §2](09-memory-model.md))。
@@ -450,7 +505,7 @@ pub struct RelationKind(pub u16);
 impl RelationKind {
     pub const DERIVED_FROM: Self; pub const SUPPORTS: Self;
     pub const CONTRADICTS: Self;  pub const RELATED: Self;
-    pub fn custom(name: &str) -> Self;   // 名称→稳定编号(注册表见 09 §2)
+    pub fn custom(name: &str) -> Result<Self>;   // 名称→稳定编号(注册表见 09 §2;耗尽返回 TooLarge)
 }
 /// 一条关系边。
 pub struct Edge { pub from: RowId, pub to: RowId, pub kind: RelationKind, pub weight: f32, pub metadata: Meta }
@@ -495,7 +550,7 @@ pub struct ConsolidateReport {
 | fsync 策略 | `.fsync` | `Batched(20ms)` | `Always/Batched/OnFlush/Never`,[04 §3](04-l2-persist.md) |
 | 同 key 行为 | `.insert_mode` | `Upsert` | `Upsert/RejectDuplicate` |
 | 去重策略 | `.dedup` | `Off` | `Off/Reject/Replace/KeepBoth/Merge`,[03 §6](03-l1-memory.md) |
-| 去重阈值 | `.dedup_threshold` | `0.95` | 近似去重的余弦阈值(与 `ResultDedup::Near` 独立) |
+| 去重阈值 | `.dedup_threshold` | `0.95` | 近似去重阈值,**统一按余弦相似度口径**(非余弦度量下引擎内部先归一化);与 `ResultDedup::Near` 独立 |
 | 量化格式 | `.quantization` | `F32` | `F32/F16/I8Rescored`,[08](08-l6-quant.md) |
 | HNSW 参数 | `.hnsw` | 见下 | `HnswParams` |
 | compaction | `.compaction` | 见下 | `CompactionPolicy` |
@@ -505,6 +560,7 @@ pub struct ConsolidateReport {
 | 访问统计落盘 | `.access_flush_interval` | `30s` | 内存访问计数批量写 WAL 的周期,见 [07 §2](07-l5-life.md) |
 | 压缩 | `.compression` | `None` | 文本/元数据压缩,见 [11 §3](11-security-storage.md) |
 | 加密 | `.encryption` | `None` | 静态加密(feature `encrypt`),见 [11 §2](11-security-storage.md) |
+| 存储后端 | `.storage` | `FsStorage` | `Arc<dyn Storage>`;WASM/边缘自定义后端,见 [12 §3](12-deployment.md) |
 | 只读共享 | `.read_only` | `false` | 多进程只读打开,见 [12 §2](12-deployment.md) |
 | 只读探测周期 | `.read_only_probe_interval` | `1s` | 只读实例发现新 MANIFEST 的周期,见 [12 §2.1](12-deployment.md) |
 | 关系索引 | `.relation_index` | `Outgoing` | `Outgoing/Both`;`Both` 空间 ×2,见 [09 §2.3](09-memory-model.md) |
@@ -512,6 +568,8 @@ pub struct ConsolidateReport {
 | 可观测 | `.observer` | 无 | 可选事件钩子,见 [12 §4](12-deployment.md) |
 | 进阶调参 | `.tuning` | 见下 | `Tuning` |
 | 数据限额 | `.limits` | 见 §8 | `Limits` |
+| 启动全量校验 | `.verify_on_open` | `false` | `true` 时打开即校验各段 payload CRC(慢),见 [04 §4.3](04-l2-persist.md) |
+| 损坏段 fail-fast | `.fail_fast_on_corruption` | `false` | `true` 时遇损坏段拒绝启动,而非隔离剔除,见 [04 §7](04-l2-persist.md) |
 | 时钟 | `.clock` | `SystemClock` | 测试注入,见 [04 §10](04-l2-persist.md) |
 
 ```rust
@@ -744,6 +802,7 @@ backup/current           ← 内容 "42";改成 "41" 即回滚一个提交点
 | `ef` | 4096 | 仅 L3+ |
 | WAL 单帧 payload | 16 MiB | 撕裂写检测与内存上界 |
 | 命名空间深度 | 32 级 | `a/b/c/...`,对应 `Limits.ns_depth` |
+| 自定义关系类型 | 65520 个 | u16 编号空间,内置占用 0..=15;超限 `TooLarge` |
 
 限额通过 `.limits(Limits { .. })` 调整;调大以内存/恢复时间为代价,请评估后再改。
 
@@ -798,7 +857,7 @@ I18 见 [04 §14](04-l2-persist.md)。为便于查阅,四条一并列出:
 - **I25 关系一致性**:悬挂边不可见,删除级联失效([09 §2](09-memory-model.md));
 - **I26 双时态一致**:`as_of(t)` 结果 = 事务时间 ≤ t 的最新可见版本组成的一致快照,不随后续写入或 compaction 变化;历史版本默认永久保留,受 `CompactionPolicy.history_horizon` 约束([09 §3](09-memory-model.md)、[07 §4.2a](07-l5-life.md));
 - **I27 反馈幂等**:同一 `(rowid, query_id)` 的反馈至多计一次([10 §4](10-scoring.md));
-- **I28 加密不落明文**:开启加密后,磁盘上任何段/WAL/Manifest 不含明文记录字段([11 §2](11-security-storage.md));
+- **I28 加密不落明文**:开启加密后,磁盘上任何段/WAL/MANIFEST 不含明文记录字段([11 §2](11-security-storage.md));
 - **I29 只读一致**:只读实例看到的始终是某个已提交 MANIFEST 版本的完整视图([12 §2](12-deployment.md));
 - **I30 可观测无副作用**:`Observer` 回调不得改变引擎行为,回调 panic 被隔离([12 §4](12-deployment.md))。
 
@@ -841,6 +900,14 @@ Mneme **不引入 `log`/`tracing` 依赖**(与"依赖极简"一致),运行时诊
 
 文本与元数据原样存储、未计入(见 [01 §1.2](01-overview.md) 设计边界);实际磁盘占用
 ≈ 向量 + 图 + 文本 + 元数据 + trash 峰值。
+
+## 本章小结
+
+- 完整 API 清单与签名(L1 冻结)、`Builder` 配置总表与推荐预设。
+- 打开已有库的校验规则、文件锁与陈旧锁接管;错误分类与重试建议。
+- 线程安全保证、嵌入模型/框架集成方式、备份恢复 runbook、数据限额与保留字段。
+- 诊断统一走 `stats()`/`check()`/`Observer`,不引 `log`/`tracing`。
+- **本章定义**:I15、I16;并汇总 I17–I30 的面向使用者表述。
 
 ## 下一章
 

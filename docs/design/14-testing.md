@@ -57,6 +57,7 @@
 **另**:L1 的"排序全等性"([03 §2.2](03-l1-memory.md))已登记为
 `FC-INDEX-POST-003`;L3 的"`ef → ∞` 收敛"([05 §12](05-l3-hnsw.md))对应
 `FC-INDEX-POST-002`;版本链历史保留对应 `FC-MODEL-POST-004`。均作为属性测试断言。
+写入期去重语义(`FC-INDEX-POST-004`)与入边方向(`FC-MODEL-POST-005`)分别在 §2.3/§3.6 验收。
 **契约追溯**:每条不变量在 [spec/contracts.md](../spec/contracts.md) 至少对应一条 `FC-*`
 条目(矩阵另含非不变量类约束,如 POST/ERR/STA);CI 校验无孤儿/无遗漏。
 
@@ -114,6 +115,9 @@ key 索引:   随机 key 集写入 → 重启 → 每个存活 key 的 get(key) 
 陈旧锁:     模拟持锁进程死亡 → 再次 open 能自动接管而非永久 Busy(16 §3)
 稳定RowId:  同 key 连续 update/upsert 多轮 → RowId 始终不变(或按语义稳定),
             访问统计与关系边仍指向同一逻辑记忆(I22)
+去重语义:   Dedup::Merge 就地更新并返回 Merged(old)、保留旧 RowId;Dedup::Replace 生成新 RowId
+            并墓碑旧行;insert_batch 中 RejectDuplicate/Dedup::Reject 逐条返回 Duplicate,
+            其余记录照常写入(不整批回滚)
 ```
 
 ### 2.4 覆盖持久性(I19)
@@ -194,6 +198,8 @@ update(key, patch) 与并发查询交错:任一查询要么看到旧版本、要
 ```text
 建立 A→B、B→C 边 → 删除 B → neighbors(A) 不含 B,且不返回悬挂边;
 as_of(删除前) 在 compaction 回收该版本前仍能看到 A→B(双时态历史);compaction 后物理清除
+方向:neighbors(A) 只含 A 的出边,predecessors(B) 含指向 B 的入边;
+      RelationIndex::Outgoing 与 Both 下两者结果一致(反向索引只加速、不改语义)
 ```
 
 ### 3.7 反馈幂等(I27)
@@ -231,7 +237,7 @@ cargo-fuzz 目标:`fuzz_vsec`、`fuzz_msec`、`fuzz_hidx`、`fuzz_wal_replay`、
 **版本注入**(I18):在上述解码目标中随机改写文件头 `format_version` 的**主版本**为更大值,
 断言返回 `UnsupportedVersion` 而非继续解析;改写为魔数不符的值,断言 `Corrupted`。
 
-发布前本地连续跑总计 ≥ 24h(每个目标 ≥ 1h)。
+发布前本地连续跑:每个目标 ≥ 1h,且全部目标累计 ≥ 24h(可分多轮累计)。
 
 ### 5.1 确定性时间测试(Clock)
 
@@ -254,7 +260,7 @@ fuzz_dsl 补充:任意输入不 panic、错误带位置(I7)
 ### 5.3 加密与压缩(I28)
 
 ```text
-开启加密写入 → 扫描所有段/WAL/Manifest 字节,断言不含明文 text/key 子串;
+开启加密写入 → 扫描所有段/WAL/MANIFEST 字节,断言不含明文 text/key 子串;
 翻转密文 1 bit → 读取返回 Corrupted,绝不返回错误数据;
 错误密钥 → Corrupted;密钥轮换后新旧均可读
 压缩:roundtrip 等价;低于阈值自动存原文
@@ -341,6 +347,14 @@ valid_time 过期不触发物理删除
 **契约追溯(FSVDD 强制)**:[spec/contracts.md](../spec/contracts.md) 是形式化约束的
 唯一真实数据源;每个测试注释必须引用其 `FC-*` 编号。CI 的 `xtask check-contracts`
 校验"契约条目 ↔ 测试套件"100% 映射,任何新增业务逻辑若未登记契约即阻断合并。
+
+## 本章小结
+
+- 测试金字塔:单元 / 属性 / 集成 / 长跑;不变量编号是测试断言的锚点。
+- 崩溃注入用 `FsyncHook` + **前缀不变量**,覆盖撕裂写与位翻转。
+- 召回/等价性用属性测试;性能有明确门槛;fuzz 保证不 panic/不 UB。
+- CI 四档 + 平台矩阵;`db.check()` 与生产复用同一套校验器。
+- 契约追溯由 `xtask check-contracts` 强制 100% 映射。
 
 ## 下一章
 

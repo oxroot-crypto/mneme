@@ -1,6 +1,6 @@
 # Mneme
 
-> **Mneme**(μνήμη,希腊记忆女神)是一个纯 Rust 编写的**嵌入型向量存储引擎**,
+> **Mneme**(μνήμη,古希腊语"记忆";记忆女神 Mnemosyne 的同源词)是一个纯 Rust 编写的**嵌入型向量存储引擎**,
 > 专为 **AI Agent 的超长期记忆层**设计:进程内运行、无需服务端、数据经年累月增长而不失控。
 
 **状态**:设计阶段(尚未发布到 crates.io)。本仓库当前包含完整设计文档,代码实现按
@@ -33,7 +33,7 @@ LLM 每次对话结束就"忘光"上下文之外的一切。要让 Agent 长期�
 | 量化 | i8 / f16 量化副本 + 两阶段重打分,查询带宽 i8 ÷4 / f16 ÷2(f32 原向量保留供精排,故磁盘不缩减) |
 | **存储安全**(可选) | AES-256-GCM 静态加密、文本/元数据压缩 |
 | **部署形态** | 多进程只读共享;`Storage` 抽象支持 WASM/边缘适配;可观测事件钩子 |
-| 依赖极简 | 非 feature 强依赖 4 个小 crate(默认开 `mmap` 共 5 个),复杂算法全部自研;加密/压缩均为可选 feature |
+| 依赖极简 | 非 feature 强依赖 4 个小 crate(默认开 `mmap` 共 5 个;均为直接依赖,`serde_json` 另带入 itoa/ryu/memchr 等极少数传递依赖),复杂算法全部自研;加密/压缩均为可选 feature |
 
 ## 安装
 
@@ -120,13 +120,17 @@ fn main() -> mneme::Result<()> {
 设计文档用 [mdBook](https://rust-lang.github.io/mdBook/) 组织,KaTeX 与 Mermaid 由预处理器渲染:
 
 ```bash
-cargo install mdbook mdbook-katex mdbook-mermaid
+cargo install mdbook mdbook-mermaid
+# Windows MSVC 无法编译 mdbook-katex 默认的 quick-js 后端,必须改用 duktape 后端:
+cargo install mdbook-katex --no-default-features --features duktape
 mdbook-mermaid install .   # 首次运行:复制 mermaid 资源并写入 book.toml
 mdbook serve               # 本地预览 http://localhost:3000
 mdbook build               # 输出到 book/
 ```
 
 ## 开发与测试
+
+> 以下命令在代码实现落地后可用;当前仓库为纯设计文档阶段,尚无 `Cargo.toml`/`src/`。
 
 ```bash
 cargo fmt --all -- --check

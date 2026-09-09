@@ -2,7 +2,7 @@
 
 > **本章目标**:兑现"超长期"承诺——TTL 自动过期、艾宾浩斯式遗忘、
 > size-tiered compaction 保证段数有界,以及快照/备份/统计等运维面。
-> **前置阅读**:[04](04-l2-persist.md)(段与 Manifest)、[05 §7](05-l3-hnsw.md)(墓碑与图重建)、[00 §6.5/§6.7](00-fundamentals.md)(compaction/写放大科普)。
+> **前置阅读**:[04](04-l2-persist.md)(段与 MANIFEST)、[05 §7](05-l3-hnsw.md)(墓碑与图重建)、[00 §6.5/§6.7](00-fundamentals.md)(compaction/写放大科普)。
 > **本章你将学到**:TTL 双阶段过期 → 访问统计的零写放大设计 → 指数遗忘曲线推导 →
 > compaction 写放大分析 → 命名空间 → 快照备份 → stats/fsck。
 
@@ -66,15 +66,11 @@ compaction: 把 Touch 历史并入新 msec 的 last_access / access_count 列([0
 
 $$E(t) = I \cdot 2^{-t/T_{1/2}}$$
 
-(纯文本:`E(t) = I * 2^(-t / T_half)`,I = 初始 importance ∈ [0,1],t = 距上次强化的时长)
-
 等价指数形式 $E(t) = I \cdot e^{-\lambda t}$,$\lambda = \ln 2 / T_{1/2}$。
 
 **为什么用指数(而非线性/阶跃)?** 核心性质——**任意等长时间内衰减相同比例**:
 
 $$\frac{E(t + T_{1/2})}{E(t)} = \frac{I \cdot 2^{-(t+T_{1/2})/T_{1/2}}}{I \cdot 2^{-t/T_{1/2}}} = 2^{-1} = \frac{1}{2}$$
-
-(纯文本:每过一个半衰期,强度减半,与当前强度无关)
 
 这与"遗忘没有终点、只有渐近"的心理现象一致;线性衰减会归零(记忆"死透"),
 阶跃衰减没有"渐淡"过程。半衰期参数 $T_{1/2}$ 比速率 $\lambda$ 直观:
@@ -85,8 +81,6 @@ $$\frac{E(t + T_{1/2})}{E(t)} = \frac{I \cdot 2^{-(t+T_{1/2})/T_{1/2}}}{I \cdot 
 被回忆会刷新 $t$(重置时钟)并计入 $c$(累计次数)。有效强度:
 
 $$E_{\text{eff}} = I \cdot 2^{-t/T_{1/2}} + w \cdot \ln(1 + c)$$
-
-(纯文本:`E_eff = I * 2^(-t / T_half) + w * ln(1 + c)`,c = 累计访问次数)
 
 **为什么增益是 $\ln(1+c)$?** 其导数 $\frac{d}{dc}\ln(1+c) = \frac{1}{1+c}$
 单调递减——第 1 次回忆的强化远大于第 100 次(边际递减),符合直觉;
@@ -113,8 +107,8 @@ ns.retain(policy):  扫描候选(过滤 + protect 白名单豁免)
 记忆 C: I=0.2 的临时记录, 14 天未动 → E_eff = 0.2 × 0.5 = 0.10 → 遗忘 ✓
 ```
 
-**【复杂度】** 一次 retain 扫描 $O(N_{\text{候选}})$(元数据级,不读向量);
-自动模式摊销进后台,周期 = 半衰期/4,单次成本与 compaction 同量级、受同一限速。
+**【复杂度】** 一次 retain 扫描 $O(N_{\text{cand}})$(元数据级,不读向量、不重建索引,远轻于 compaction);
+自动模式摊销进后台,周期 = 半衰期/4,与 compaction 共享同一 IO 预算限速(见 §4.4)。
 
 > **安全默认与可审计(I23)**:自动遗忘**默认关闭**——一个记忆库不应在用户未显式授权时
 > 自行删除记忆。开启后,`RetainReport` 记录 `forgotten` 数量与抽样 `sampled_ids`,
@@ -148,9 +142,7 @@ $r$ = 分级比,默认 4;每行大小近似常数,故行数正比于字节数);
 该层合并次数约 $N / (r \cdot B r^{i})$——**每层总写入都约等于 $N$ 行**;
 共 $L$ 层,故总写入 $\approx N \cdot L$,即每字节期望重写次数:
 
-$$W_{\text{amp}} \;\approx\; \frac{\text{全层总写入}}{N} \;\approx\; L \;=\; \log_r\frac{N}{B}$$
-
-(纯文本:`W_amp ≈ 全层总写入 / N ≈ L = log_r(N/B)`)
+$$W_{\text{amp}} \;\approx\; \frac{\text{total writes}}{N} \;\approx\; L \;=\; \log_r\frac{N}{B}$$
 
 (几何级数各项——每层的总写入——近似相等,是 size-tiered 写放大可控的关键;
 保守上界带常数因子 $\frac{r}{r-1}$。)
@@ -196,6 +188,18 @@ RowId 的版本链:
 3. 对幸存版本并行重建 HNSW(05 §4 的 build,分块并行)+ 重建倒排/zone map
 4. 提交: 新段写完 + CRC → 新 MANIFEST(原子,04 §6)→ 旧段进 trash(04 §9)
 失败: 任意一步崩溃 → 新段是孤儿(下次启动清理), 旧 MANIFEST 完好, 无损回滚
+```
+
+```mermaid
+flowchart LR
+    A["选段组<br/>同层段数 / 死比率 / WAL 压力"] --> B["并行过滤<br/>墓碑 · TTL · retain · horizon"]
+    B --> C["按 RowId 合并版本链<br/>写新 vsec/msec"]
+    C --> D["重建 HNSW + 倒排 + zone map"]
+    D --> E{"新段 CRC 校验"}
+    E -->|通过| F["提交新 MANIFEST<br/>原子替换 current"]
+    E -->|失败| G["孤儿段<br/>启动时清理"]
+    F --> H["旧段 rename → trash/"]
+    H --> I["最后一个读者释放后删除"]
 ```
 
 - **限速**:合并 IO 与前台共享配额(默认磁盘预算 30%),写竞争时主动让路
@@ -268,9 +272,9 @@ db.backup_to(dir) → 先 flush() 形成一致性点, 再在快照视图上:
 neighbors / iter`)见 [16 §1.6](16-api-reference.md);二者均 `Send + Sync`,可交给只读线程
 做长查询而不阻塞前台写入。
 
-- **一致性**:硬链接的文件集来自**同一 Manifest 版本**,而段文件 write-once——
+- **一致性**:硬链接的文件集来自**同一 MANIFEST 版本**,而段文件 write-once——
   备份期间的前台写入不污染备份(它们写的是新段);
-- 成本:同盘硬链接 $O(\text{文件数})$;跨盘复制 = 数据量,可在 `stats()` 里预估;
+- 成本:同盘硬链接 $O(\text{files})$;跨盘复制 = 数据量,可在 `stats()` 里预估;
 - 恢复演练:备份目录 `open` + `check()` 全绿 = 备份有效(写进 CI 的验收项,
   见 [14 §6](14-testing.md));
 - **时间点恢复 / 损坏处置**:MANIFEST 保留最近 2 个版本,把 `current` 指向上一个
@@ -309,7 +313,7 @@ db.check()?   // fsck: 全量 CRC + version_table/RowId 版本链一致性 + key
 `snapshot → SnapshotHandle` / `backup_to / stats / check`、后台 compaction 调度
 (可配可暂停)。
 
-**依赖**:L2(段/Manifest/WAL/trash)、L3(`HnswIndex::build` 重建)、L4(计划器供 retain 扫描)。
+**依赖**:L2(段/MANIFEST/WAL/trash)、L3(`HnswIndex::build` 重建)、L4(计划器供 retain 扫描)。
 
 **不变量**:
 
@@ -325,6 +329,15 @@ db.check()?   // fsck: 全量 CRC + version_table/RowId 版本链一致性 + key
   内保留,默认永久),绝不静默删除(§3.4、§4.2a);
 - **I26 历史保留(存储侧)**:每个 RowId 的最新版本与 `history_horizon` 内的历史版本被保留;
   `as_of(t)` 在保留窗口内不随后续写入/compaction 变化(默认永久);超期版本才可回收(§4.2a)。
+
+## 本章小结
+
+- TTL 两阶段过期:逻辑过期兜住正确性,物理清除摊销进 compaction。
+- 访问统计走"内存累积 + 批量落盘",读路径零写放大;遗忘曲线 = 指数衰减 + 对数访问增益。
+- size-tiered compaction 写放大 ≈ $\log_r(N/B)$,活跃段数 $O(\log_r N)$ 有界(I8)。
+- `history_horizon` 控制历史版本保留,默认**永久**;快照/备份提供一致性视图与时间点恢复。
+- 安全默认:自动遗忘关闭、删除可审计(I23)。
+- **本章不变量**:I8–I11、I17、I23、I26。
 
 ## 下一章
 
