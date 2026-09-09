@@ -114,6 +114,7 @@ fn main() -> mneme::Result<()> {
 | [12 部署形态](docs/design/12-deployment.md) | 多进程只读、WASM 适配、可观测 |
 | [13 记忆模式手册](docs/design/13-cookbook.md) | Agent 记忆配方(可直接照抄) |
 | [spec/contracts.md](docs/spec/contracts.md) | 形式化契约矩阵(FC-Matrix) |
+| [rust/README.md](docs/rust/README.md) | **Rust 零基础教学**(10 章):以 mneme 源码为教材,面向没有 Rust 基础的开发者 |
 
 ## 构建文档站点
 
@@ -130,14 +131,13 @@ mdbook build               # 输出到 book/
 
 ## 开发与测试
 
-> 当前已实现 L0 原语层,下列命令即可运行;`--features async` 等 feature 相关命令
-> 待对应层(含 `[features]` 定义)落地后可用。
+> 当前已实现 L0 原语层,下列命令即可运行;`cargo test --features async`(async 门面
+> 等价性)等 feature 相关命令待对应层(含 `[features]` 定义)落地后加入。
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test                       # 单测 + 集成测试
-cargo test --features async      # async 门面等价性
+cargo test                       # 单测 + 集成测试 + doctest
 cargo doc --no-deps              # 公开项 100% 文档覆盖(#![deny(missing_docs)])
 cargo bench                      # criterion 基准(L3 起)
 ```
@@ -147,7 +147,7 @@ Windows(x86_64),详见 [14 §7](docs/design/14-testing.md)。
 
 ## MSRV
 
-最低支持的 Rust 版本:**最新稳定版 − 2**(在 `Cargo.toml` 的 `rust-version` 中声明)。
+最低支持的 Rust 版本(MSRV)在 `Cargo.toml` 的 `rust-version` 中声明。
 
 ## 贡献
 

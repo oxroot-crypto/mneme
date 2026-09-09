@@ -198,6 +198,10 @@
 | backup_to | 同盘 $O(\text{files})$;跨盘 $O(\text{bytes})$ | 目标目录 | [07 §6](07-l5-life.md) |
 | check(fsck) | $O(\text{total bytes})$ CRC + 对账 | — | [07 §7](07-l5-life.md) |
 
+> **复杂度即契约**:上表每条复杂度均由 [spec/contracts.md §9](../spec/contracts.md)
+> 的 `FC-*-CPLX-*` 契约保证(时间/空间上界、口径标注与回归门禁见该节 §9.3);
+> 本表是阅读视图,冲突时以契约矩阵为准。
+
 **性能承诺汇总**:Recall@10 ≥ 0.95(ef=128);1M×1536 量化后 P99 < 10ms;
 批量插入 ≥ 50k 向量/秒;冷启动 < 1s;活跃段数有界。验收方法见 [14](14-testing.md)。
 
