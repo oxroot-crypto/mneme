@@ -91,10 +91,16 @@ flowchart TD
 | [15-glossary.md](design/15-glossary.md) | 术语表(中英对照)、符号表、复杂度速查总表 | 所有人 |
 | [16-api-reference.md](design/16-api-reference.md) | 完整公开 API、配置总表、打开校验、错误/重试、线程安全、集成、备份恢复 runbook、数据限额 | 所有人 |
 | [spec/contracts.md](spec/contracts.md) | 形式化契约矩阵(FC-Matrix)与测试追溯 | 贡献者 |
+| [rust/README.md](rust/README.md) | **Rust 零基础教学**(10 章):以 mneme 源码为教材,覆盖读懂 L0 所需的全部 Rust 语法 | 无 Rust 基础者 |
 
 ---
 
 ## 阅读路线
+
+**我完全没写过 Rust**(零基础,约 6–10 小时):
+先读 [Rust 零基础教学](rust/README.md) 的 10 章(以 `src/core/` 源码为教材,边读边敲),
+再回到这里按"贡献者"路线阅读。教学文档与源码的映射总表见
+[rust/README.md §4](rust/README.md)。
 
 **我只想用这个库**(使用者,约 30 分钟):
 [00 基础篇 §1–§3](design/00-fundamentals.md) → [01 总览的 API 清单](design/01-overview.md) →
