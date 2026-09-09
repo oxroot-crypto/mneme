@@ -1,0 +1,290 @@
+# 08 模块、可见性与文档
+
+> **本章目标**:理解 `mod` / `pub` / `pub use` / `use` 如何组织代码与暴露 API,
+> 以及 `//!` 模块文档、`///` 条目文档和 doctest 怎么写。
+> **前置**:[03 章](03-structs-enums-impl.md)。
+> **对应源码**:[`src/lib.rs`](../../src/lib.rs)、[`src/core/mod.rs`](../../src/core/mod.rs)、
+> [`src/core/options/mod.rs`](../../src/core/options/mod.rs)、[`src/core/metric.rs`](../../src/core/metric.rs)。
+
+Rust 用**模块(module)**组织命名空间,用**可见性(visibility)**控制谁能访问。
+mneme 的模块划分直接对应架构分层,读模块结构就能读出设计。
+
+---
+
+## 1. crate 根:`src/lib.rs`
+
+`src/lib.rs` 是库 crate 的根。mneme 的它做了三件事:
+
+```rust
+//! Mneme:面向 AI Agent 超长期记忆层的嵌入型向量存储引擎。
+//! ...(模块文档)
+
+#![deny(missing_docs)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
+pub mod core;
+
+pub use crate::core::error::{MnemeError, Result};
+pub use crate::core::heap::TopK;
+pub use crate::core::meta;
+...
+```
+
+见 [`src/lib.rs`](../../src/lib.rs)。
+
+- `//!` 是**内部文档注释**,写在文件/模块开头,描述这个 crate。
+- `#![...]` 是**crate 级属性**(注意 `#!` 而非 `#`):
+  - `#![deny(missing_docs)]`:任何公开项缺文档就**编译失败**;
+  - `#![deny(unsafe_op_in_unsafe_fn)]`:在 `unsafe fn` 里做不安全操作必须再包一层 `unsafe` 块,
+    强制显式(见 [09 章](09-cfg-unsafe-simd.md))。
+- `pub mod core;` 声明一个公开子模块。
+- `pub use ...` 是**重导出(re-export)**:把深层路径的项提升到 crate 根,
+  让用户能写 `use mneme::Metric;` 而不是 `use mneme::core::metric::Metric;`。
+
+---
+
+## 2. 模块与文件
+
+一个模块可以:
+
+- 写成单独文件 `foo.rs`;
+- 或写成目录 `foo/` + `foo/mod.rs`(旧风格)或 `foo.rs` + `foo/`(新风格,`foo.rs` 作为目录入口)。
+
+mneme 的 `core` 模块用目录:
+
+```text
+src/
+  lib.rs          # crate 根,声明 pub mod core;
+  core/
+    mod.rs        # 声明子模块:error, heap, meta, ...
+    types.rs
+    error.rs
+    metric.rs
+    simd.rs
+    heap.rs
+    varint.rs
+    meta.rs
+    options/
+      mod.rs
+      clock.rs
+      dimension.rs
+      ...
+```
+
+`src/core/mod.rs` 只做模块声明与文档:
+
+```rust
+//! L0 原语层:类型、错误、距离数学与基础算法。
+//! ...
+pub mod error;
+pub mod heap;
+pub mod meta;
+pub mod metric;
+pub mod options;
+pub mod simd;
+pub mod types;
+pub mod varint;
+```
+
+见 [`src/core/mod.rs`](../../src/core/mod.rs)。**规范要求 `mod.rs` 只做组织与 `pub use`,不写业务逻辑。**
+
+---
+
+## 3. 可见性:默认私有
+
+- 不带 `pub` 的项**仅在本模块及其子模块可见**。
+- `pub` 表示对所有能访问到该模块的地方可见。
+- `pub(crate)` 表示**仅在本 crate 内可见**,不对外暴露。
+- `pub(super)` 仅父模块可见。
+
+mneme 的 `options/mod.rs` 是很好的例子:
+
+```rust
+mod clock;         // 私有子模块
+mod dimension;
+...
+
+pub use clock::{Clock, SystemClock};   // 但把类型重导出为公开
+pub use dimension::Dimension;
+...
+```
+
+见 [`src/core/options/mod.rs:16-30`](../../src/core/options/mod.rs)。
+
+**设计意图**:内部按主题拆成小文件(满足单一职责),但对外只暴露统一的类型路径。
+用户可以 `use mneme::Clock;`,而 `options::clock` 这个路径是隐藏的——将来重构文件结构不会破坏用户。
+
+> **注意**:`#![deny(missing_docs)]` 只要求**公开**项有文档;私有项和 `pub(crate)` 项不强制
+> (但 mneme 规范仍要求都写)。把内部类型设为 `pub(crate)` 而不是 `pub`,也能避免把实现细节
+> 写进公开 API 文档。
+
+---
+
+## 4. `use` 导入
+
+```rust
+use std::fmt;
+use std::sync::Arc;
+
+use crate::core::metric::Metric;
+use crate::core::types::{Key, SegmentId};
+```
+
+见 [`src/core/types.rs:9-10`](../../src/core/types.rs) 与 [`src/core/error.rs:9-10`](../../src/core/error.rs)。
+
+导入顺序规范(组间空行):
+
+1. `std` / `core` / `alloc`
+2. 外部 crate(如 `serde_json`)
+3. `crate::`
+4. `super::` / `self::`
+
+路径前缀:
+
+| 前缀 | 含义 |
+|---|---|
+| `crate::` | 从当前 crate 根开始 |
+| `super::` | 父模块 |
+| `self::` | 当前模块 |
+| `std::` | 标准库 |
+
+mneme 规范优先 `crate::` 绝对路径,避免 `../../..` 这种脆弱写法。
+
+---
+
+## 5. 文档:rustdoc
+
+Rust 的文档注释会被 `cargo doc` 渲染成 HTML,也是 doctest 的来源。
+
+### 5.1 模块文档 `//!`
+
+放在文件顶部,描述模块职责与边界:
+
+```rust
+//! L0 距离度量。
+//!
+//! 三种度量 [`Metric::Cosine`] / [`Metric::Dot`] / [`Metric::Euclidean`] 统一归结为
+//! **一次点积**:范数列存储的是**范数平方**……
+//!
+//! 方向由 [`Metric::better`] 统一——所有 TopK、归并与排序都必须经 `better()` 比较,
+//! **绝不直接比较 `score` 的数值大小**。
+```
+
+见 [`src/core/metric.rs:1-11`](../../src/core/metric.rs)。
+
+### 5.2 条目文档 `///`
+
+放在函数/类型/字段上方。mneme 规范要求导出成员**按需**包含以下段落(没有就省略):
+
+| 段落 | 内容 |
+|---|---|
+| 首行 | 一句话功能描述 |
+| `# Arguments` | 每个参数一行,写明含义、单位、约束 |
+| `# Returns` | 返回值语义;`None`/`Err` 的触发条件 |
+| `# Errors` | `Result` 返回时的错误变体及触发条件 |
+| `# Panics` | 可能 panic 的条件 |
+| `# Safety` | `unsafe fn` 的前置条件 |
+| `# Examples` | 可运行的 doctest |
+
+完整示例见 [`src/core/metric.rs:33-56`](../../src/core/metric.rs):
+
+```rust
+/// 计算原始分数。
+///
+/// # Arguments
+///
+/// * `a`、`b` - 两个等长向量。
+/// * `a_norm`、`b_norm` - 两向量的**范数平方**(`‖a‖²`、`‖b‖²`)。仅
+///   [`Metric::Dot`] 不需要,可传 `0.0`。
+///
+/// # Returns
+///
+/// `Dot` 返回 `a·b`;`Cosine` 返回 `a·b / sqrt(a_norm * b_norm)`,分母低于
+/// `1e-12` 时返回 `0`;`Euclidean` 返回 `a_norm + b_norm - 2 * a·b`。
+///
+/// # Panics
+///
+/// 当 `a` 与 `b` 长度不等时,在 debug 构建下 panic;release 构建下按较短者计算。
+///
+/// # Examples
+///
+/// ```
+/// use mneme::Metric;
+///
+/// assert_eq!(Metric::Dot.score(&[1.0, 2.0], &[3.0, 4.0], 0.0, 0.0), 11.0);
+/// ```
+```
+
+### 5.3 doctest:文档里的代码会被测试
+
+````rust
+/// # Examples
+///
+/// ```
+/// use mneme::Metric;
+/// assert_eq!(Metric::Dot.score(&[1.0, 2.0], &[3.0, 4.0], 0.0, 0.0), 11.0);
+/// ```
+````
+
+- `cargo test` 会**提取并运行**所有 ``` 代码块。
+- 因此文档示例**永远不会过期**——示例错,测试就红。
+- 这是 mneme "文档与实现同步"的硬保障。
+
+### 5.3.1 doctest 的隐藏开关
+
+代码块开头的语言标记后可以加修饰词,控制 `cargo test` 的行为:
+
+| 语言标记 | 行为 |
+|---|---|
+| `rust` | 正常编译并运行 |
+| `rust,no_run` | 只编译,不运行(适合写文件/联网的示例) |
+| `rust,ignore` | 编译和运行都跳过(尽量避免,示例会腐烂) |
+| `rust,should_panic` | 运行且必须 panic,否则测试失败 |
+| `rust,compile_fail` | 必须编译失败(用来演示"这样写会报错") |
+
+两个容易忽略的细节:
+
+- 每个 doctest 会被自动包进一个隐式的 `fn main() { ... }`,示例里不用自己写 `main`。
+- doctest 支持 `?`:当示例返回 `Result` 时可直接用 `?`,但最后要有 `Ok(())`(可用行首 `#` 把它藏起来)。
+- 行首的 `#` 把样板代码从渲染结果里隐藏,但仍参与编译。
+
+### 5.4 文档内链接
+
+```rust
+/// 见 [`Metric::better`] 与 [`MnemeError::Corrupted`](crate::core::error::MnemeError::Corrupted)。
+```
+
+方括号里的路径会被 rustdoc 变成可点击链接。mneme 文档里大量使用。
+
+---
+
+## 6. 你会遇到的编译器报错
+
+| 报错关键词 | 原因 | 修法 |
+|---|---|---|
+| `missing documentation for ...` | 公开项没写 `///` | 补文档,或设为私有 |
+| `unresolved import` | 路径写错 | 检查 `crate::`/`super::` 与模块是否 `pub` |
+| `private ... in public interface` | 公开函数用了私有类型 | 把类型也设为 `pub` |
+| `unused import` | 导入了没用 | 删除 |
+| `cannot find function ... in module` | 模块没 `pub` 或没 `mod` 声明 | 检查声明与可见性 |
+
+---
+
+## 7. 本章小结
+
+- `src/lib.rs` 是 crate 根,声明模块、重导出公共 API、写 crate 级属性。
+- 模块用 `mod` 声明,可拆成文件/目录;`mod.rs` 只做组织与 `pub use`。
+- 默认私有;`pub` / `pub(crate)` / `pub(super)` 逐级放开。
+- `pub use` 重导出让用户只依赖稳定路径,文件结构可自由重构。
+- `//!` 模块文档 + `///` 条目文档 + doctest 让文档可渲染、可测试、不过期;
+  `#![deny(missing_docs)]` 强制公开项 100% 有文档。
+
+## 动手练习
+
+1. 在 `examples/` 下新建一个模块文件 `greet.rs`,在 `hello.rs` 里 `mod greet;` 并调用其中的 `pub fn`。
+2. 给 [03 章练习](03-structs-enums-impl.md)的 `Shape` 每个变体和 `area` 方法加上 `///` 文档。
+3. 在 `area` 的文档里写一个 doctest 并运行 `cargo test` 确认它通过。
+
+## 下一章
+
+[09 条件编译、unsafe 与 SIMD](09-cfg-unsafe-simd.md):跨平台代码与手写向量指令。
