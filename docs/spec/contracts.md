@@ -31,10 +31,33 @@
 | 2026-09 | 口径修订:统一 I21(BM25 统计一致性);新增 FC-INDEX-POST-003(排序全等性) |
 | 2026-09 | 设计变更:引入 RowId 版本链,`as_of`/`supersede` 历史默认永久保留(受 `history_horizon` 约束);重写 I26,新增 FC-MODEL-POST-004 |
 | 2026-09 | 补充:`predecessors` 入边 API(FC-MODEL-POST-005)、写入期去重语义(FC-INDEX-POST-004);段状态统一为 `Building` |
+| 2026-09 | 新增 L0 原语层契约(FC-CORE-*):类型/度量/SIMD/TopK/varint/meta |
 
 ---
 
-## 1. 持久层(persist)
+## 1. 原语层(core / L0)
+
+> 无 I/O、无全局状态、无锁的纯类型与纯函数;唯一 `unsafe` 在 `simd.rs` 的 arch 内联。
+> 层边界契约见 [02 §9](../design/02-l0-core.md)。
+
+| 编号 | 类型 | 形式化规范 | 对应测试 | 状态 |
+|---|---|---|---|---|
+| FC-CORE-PRE-001 | PRE | `Dimension::new(d)` 仅接受 `d ∈ [1, 65536]`;越界返回 `Invalid`,内部不再使用裸整数 | `tests/core_contracts.rs::dimension_bounds` | Passed |
+| FC-CORE-POST-001 | POST | `Metric::score` 严格映射:Dot = a·b;Cosine = a·b / √(a_norm·b_norm);Euclidean = a_norm + b_norm − 2·a·b(其中 norm 为**范数平方**) | `tests/core_contracts.rs::metric_score_mapping` | Passed |
+| FC-CORE-POST-002 | POST | `Metric::better(x,y)` 给出统一方向:Cosine/Dot 分数越大越优,Euclidean 越小越优;TopK/归并/排序一律经此比较 | `tests/core_contracts.rs::metric_better_direction` | Passed |
+| FC-CORE-POST-003 | POST | `Metric::needs_norm()` 仅 `Dot` 返回 `false`;`Cosine`/`Euclidean` 返回 `true` | `tests/core_contracts.rs::metric_needs_norm` | Passed |
+| FC-CORE-POST-004 | POST | `TopK<T: Ord>` 恒保留按 `better` 方向最优的 k 个;同分按载荷升序稳定;`merge` 结果 ≡ 顺序 `push` 全部元素;`into_sorted_vec` 最优在前 | `tests/core_contracts.rs::topk_equivalence` | Passed |
+| FC-CORE-POST-005 | POST | varint 编解码往返:`decode(encode(x)) == x` 且编码为最小编码(无多余 continuation 字节) | `tests/core_contracts.rs::varint_roundtrip_minimal` | Passed |
+| FC-CORE-POST-006 | POST | `meta::get_path` 按 `.` 分段遍历对象,缺失/类型不符返回 `None`;`as_f64/as_i64/as_bool/as_str/as_ts` 仅匹配对应 JSON 类型 | `tests/core_contracts.rs::meta_accessors` | Passed |
+| FC-CORE-POST-007 | POST | `RelationKind` 内置常量 `DERIVED_FROM=0`、`SUPPORTS=1`、`CONTRADICTS=2`、`RELATED=3`;自定义编号从 16 起 | `tests/core_contracts.rs::relation_kind_builtins` | Passed |
+| FC-CORE-INV-001 | INV | `simd::dot(a,b)` 与标量参考实现等价(容差内),覆盖长度非 LANE 倍数与空切片 | `tests/core_contracts.rs::dot_matches_scalar_reference` | Passed |
+| FC-CORE-INV-002 | INV | L0 公开 API 对任意输入不 panic、无 UB(畸形 varint、空向量、越界维度等) | `tests/core_contracts.rs::no_panic` | Passed |
+| FC-CORE-ERR-001 | ERR | varint 解码遇截断或超长(> 10 字节)返回结构化 `Corrupted`,绝不 panic、绝不静默跳过 | `tests/core_contracts.rs::varint_malformed` | Passed |
+| FC-CORE-ERR-002 | ERR | 余弦分母 `a_norm·b_norm < ε`(零向量)时返回 `0`,绝不返回 `NaN` | `tests/core_contracts.rs::cosine_zero_vector` | Passed |
+
+---
+
+## 2. 持久层(persist)
 
 | 编号 | 类型 | 形式化规范 | 对应测试 | 状态 |
 |---|---|---|---|---|
@@ -54,7 +77,7 @@
 
 ---
 
-## 2. 索引与检索(index/query/score)
+## 3. 索引与检索(index/query/score)
 
 | 编号 | 类型 | 形式化规范 | 对应测试 | 状态 |
 |---|---|---|---|---|
@@ -74,7 +97,7 @@
 
 ---
 
-## 3. 记忆模型(model)
+## 4. 记忆模型(model)
 
 | 编号 | 类型 | 形式化规范 | 对应测试 | 状态 |
 |---|---|---|---|---|
@@ -91,7 +114,7 @@
 
 ---
 
-## 4. 生命周期(life)
+## 5. 生命周期(life)
 
 | 编号 | 类型 | 形式化规范 | 对应测试 | 状态 |
 |---|---|---|---|---|
@@ -105,7 +128,7 @@
 
 ---
 
-## 5. 量化与门面(quant)
+## 6. 量化与门面(quant)
 
 | 编号 | 类型 | 形式化规范 | 对应测试 | 状态 |
 |---|---|---|---|---|
@@ -116,7 +139,7 @@
 
 ---
 
-## 6. 安全与部署(security/deploy)
+## 7. 安全与部署(security/deploy)
 
 | 编号 | 类型 | 形式化规范 | 对应测试 | 状态 |
 |---|---|---|---|---|
@@ -128,7 +151,7 @@
 
 ---
 
-## 7. 边界与极值(全局)
+## 8. 边界与极值(全局)
 
 | 编号 | 类型 | 形式化规范 | 对应测试 | 状态 |
 |---|---|---|---|---|
@@ -141,7 +164,7 @@
 
 ---
 
-## 8. 追溯规则(FSVDD 强制)
+## 9. 追溯规则(FSVDD 强制)
 
 1. **无孤儿实现**:任何新增业务逻辑必须在本矩阵登记至少一条约束;
 2. **无失效契约**:本矩阵条目若与代码不符,以"先改契约、再改测试、再改代码"为准;
