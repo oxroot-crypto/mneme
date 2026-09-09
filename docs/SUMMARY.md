@@ -34,3 +34,17 @@
 ---
 
 - [形式化契约矩阵(FC-Matrix)](spec/contracts.md)
+
+---
+
+- [Rust 零基础教学:导读](rust/README.md)
+- [01 工具链与 Cargo](rust/01-toolchain.md)
+- [02 值、类型与所有权](rust/02-values-and-ownership.md)
+- [03 结构体、枚举与 impl](rust/03-structs-enums-impl.md)
+- [04 引用、借用、生命周期与字符串](rust/04-borrowing-strings-slices.md)
+- [05 错误处理](rust/05-errors.md)
+- [06 泛型与 trait](rust/06-generics-traits.md)
+- [07 迭代器与闭包](rust/07-iterators-closures.md)
+- [08 模块、可见性与文档](rust/08-modules-docs.md)
+- [09 条件编译、unsafe 与 SIMD](rust/09-cfg-unsafe-simd.md)
+- [10 测试与属性测试](rust/10-testing.md)
