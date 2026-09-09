@@ -11,9 +11,16 @@ keywords = ["vector", "embedding", "database", "hnsw", "memory"]
 categories = ["database"]
 
 [dependencies]
+# 元数据与后续 DSL 序列化的基础;L0 阶段仅经 serde_json 使用,直接声明以对齐依赖白名单
+# (docs/design/01-overview.md §5),避免 L4 引入时再改依赖清单。
 serde = "1"
 serde_json = "1"
 thiserror = "2"
 
 [dev-dependencies]
 proptest = "1"
+
+[profile.release]
+# L0 为纯函数库,lto 收益有限;thin LTO 在跨 crate 内联与编译时间间折中,
+# L2 持久层落地后按 bench 数据再调。
+lto = "thin"

@@ -66,6 +66,16 @@ impl Metric {
     ///
     /// `Cosine` / `Dot` 分数越大越优;`Euclidean`(距离平方)越小越优。
     ///
+    /// # Arguments
+    ///
+    /// * `x` - 待比较的分数。
+    /// * `y` - 基准分数。
+    ///
+    /// # Returns
+    ///
+    /// `x` 更优时返回 `true`:Cosine / Dot 下即 `x > y`,Euclidean 下即 `x < y`;
+    /// 相等时返回 `false`。
+    ///
     /// # Examples
     ///
     /// ```
@@ -82,6 +92,10 @@ impl Metric {
     }
 
     /// 是否需要范数列:`Cosine` / `Euclidean` 为 `true`,仅 `Dot` 为 `false`。
+    ///
+    /// # Returns
+    ///
+    /// `Dot` 返回 `false`;`Cosine` / `Euclidean` 返回 `true`。
     ///
     /// # Examples
     ///
@@ -104,12 +118,22 @@ impl Metric {
 ///
 /// # Returns
 ///
-/// `a·b / sqrt(a_norm * b_norm)`;当 `a_norm * b_norm < 1e-12`(含零向量)时返回 `0`,
-/// 绝不返回 `NaN`。
+/// `a·b / sqrt(a_norm * b_norm)`;当分母 `sqrt(a_norm * b_norm) = ‖a‖·‖b‖ < 1e-12`
+/// (含零向量)时返回 `0`,绝不返回 `NaN`。
 ///
 /// # Panics
 ///
 /// 当 `a` 与 `b` 长度不等时,在 debug 构建下 panic。
+///
+/// # Examples
+///
+/// ```
+/// use mneme::core::metric::cosine;
+///
+/// // ‖a‖² = 5,‖b‖² = 5,a·b = 4 → cos = 4 / 5 = 0.8
+/// let s = cosine(&[1.0, 2.0], &[2.0, 1.0], 5.0, 5.0);
+/// assert!((s - 0.8).abs() < 1e-6);
+/// ```
 pub fn cosine(a: &[f32], b: &[f32], a_norm: f32, b_norm: f32) -> Score {
     let denominator = (a_norm * b_norm).sqrt();
     if denominator < COSINE_EPSILON {
@@ -132,6 +156,16 @@ pub fn cosine(a: &[f32], b: &[f32], a_norm: f32, b_norm: f32) -> Score {
 /// # Panics
 ///
 /// 当 `a` 与 `b` 长度不等时,在 debug 构建下 panic。
+///
+/// # Examples
+///
+/// ```
+/// use mneme::core::metric::euclidean_sq;
+///
+/// // ‖a‖² = 5,‖b‖² = 52,a·b = 16 → ‖a−b‖² = 5 + 52 − 32 = 25
+/// let d = euclidean_sq(&[1.0, 2.0], &[4.0, 6.0], 5.0, 52.0);
+/// assert_eq!(d, 25.0);
+/// ```
 pub fn euclidean_sq(a: &[f32], b: &[f32], a_norm: f32, b_norm: f32) -> Score {
     a_norm + b_norm - 2.0 * simd::dot(a, b)
 }

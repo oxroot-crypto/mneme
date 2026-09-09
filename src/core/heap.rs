@@ -60,16 +60,28 @@ impl<T: Ord> TopK<T> {
     }
 
     /// 当前保留的元素个数。
+    ///
+    /// # Returns
+    ///
+    /// 已保留个数,恒 ≤ 容量 `k`。
     pub fn len(&self) -> usize {
         self.heap.len()
     }
 
     /// 是否未保留任何元素。
+    ///
+    /// # Returns
+    ///
+    /// 未保留任何元素时返回 `true`。
     pub fn is_empty(&self) -> bool {
         self.heap.is_empty()
     }
 
     /// 容量 `k`。
+    ///
+    /// # Returns
+    ///
+    /// 构造时传入的保留个数 `k`(语义容量,非内部缓冲区分配量)。
     pub fn capacity(&self) -> usize {
         self.k
     }
@@ -114,6 +126,10 @@ impl<T: Ord> TopK<T> {
     /// 归并另一个同容量堆。
     ///
     /// 结果 ≡ 把两者保留的元素按序 `push` 回本堆;用于并行扫描后的 k 路归并。
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - 被归并的同容量堆;归并后其保留元素被移入本堆并被消费。
     ///
     /// # Examples
     ///

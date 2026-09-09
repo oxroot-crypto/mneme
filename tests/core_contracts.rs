@@ -124,6 +124,13 @@ fn cosine_zero_vector() {
     let score = Metric::Cosine.score(&zero, &other, 0.0, 14.0);
     assert!(score.is_finite(), "零向量不得产生 NaN/Inf");
     assert_eq!(score, 0.0);
+
+    // 阈值作用于范数乘积 ‖a‖·‖b‖,而非范数平方乘积 a_norm·b_norm:
+    // ‖a‖=‖b‖=1e-5 时 ‖a‖·‖b‖ = 1e-10 ≥ ε(不判零),而 a_norm·b_norm = 1e-20 < ε。
+    let tiny = [1e-5_f32, 0.0, 0.0];
+    let tiny_norm = 1e-10_f32;
+    let score = Metric::Cosine.score(&tiny, &tiny, tiny_norm, tiny_norm);
+    assert!((score - 1.0).abs() < 1e-6, "got {score}");
 }
 
 /// FC-CORE-INV-002(确定性极值输入不 panic)

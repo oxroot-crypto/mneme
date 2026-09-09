@@ -9,6 +9,18 @@
 
 use crate::core::error::{MnemeError, Result};
 
+/// varint 续位标志:除最后一组外,每组字节最高位置 1(设计 02 §6.2)。
+const CONTINUATION_BIT: u8 = 0x80;
+
+/// varint 有效载荷掩码:取每字节的低 7 位。
+const PAYLOAD_MASK: u8 = 0x7f;
+
+/// u64 末组(第 10 字节)的最大有效值:仅剩 `64 − 9×7 = 1` 个有效位。
+const U64_LAST_GROUP_MAX: u64 = 1;
+
+/// u32 末组(第 5 字节)的最大有效值:仅剩 `32 − 4×7 = 4` 个有效位。
+const U32_LAST_GROUP_MAX: u32 = 0x0f;
+
 /// 将 `u64` 以 varint 追加到 `out`。
 ///
 /// # Arguments
@@ -27,8 +39,8 @@ use crate::core::error::{MnemeError, Result};
 /// assert_eq!(decode_u64(&buf).unwrap(), (300, 2));
 /// ```
 pub fn encode_u64(mut value: u64, out: &mut Vec<u8>) {
-    while value >= 0x80 {
-        out.push(((value as u8) & 0x7f) | 0x80);
+    while value >= u64::from(CONTINUATION_BIT) {
+        out.push(((value as u8) & PAYLOAD_MASK) | CONTINUATION_BIT);
         value >>= 7;
     }
     out.push(value as u8);
@@ -52,8 +64,8 @@ pub fn encode_u64(mut value: u64, out: &mut Vec<u8>) {
 /// assert_eq!(decode_u32(&buf).unwrap(), (300, 2));
 /// ```
 pub fn encode_u32(mut value: u32, out: &mut Vec<u8>) {
-    while value >= 0x80 {
-        out.push(((value as u8) & 0x7f) | 0x80);
+    while value >= u32::from(CONTINUATION_BIT) {
+        out.push(((value as u8) & PAYLOAD_MASK) | CONTINUATION_BIT);
         value >>= 7;
     }
     out.push(value as u8);
@@ -82,15 +94,16 @@ pub fn decode_u64(input: &[u8]) -> Result<(u64, usize)> {
     let mut result: u64 = 0;
     let mut shift: u32 = 0;
     for (index, &byte) in input.iter().enumerate() {
-        let low = u64::from(byte & 0x7f);
-        if shift == 63 && low > 1 {
+        let low = u64::from(byte & PAYLOAD_MASK);
+        // 末组(shift=63)只剩 1 个有效位,更高位属 u64 溢出。
+        if shift == 63 && low > U64_LAST_GROUP_MAX {
             return Err(corrupted("varint 数值溢出 u64"));
         }
         if shift > 63 {
             return Err(corrupted("varint 超过 u64 最长 10 字节"));
         }
         result |= low << shift;
-        if byte & 0x80 == 0 {
+        if byte & CONTINUATION_BIT == 0 {
             return Ok((result, index + 1));
         }
         shift += 7;
@@ -120,15 +133,16 @@ pub fn decode_u32(input: &[u8]) -> Result<(u32, usize)> {
     let mut result: u32 = 0;
     let mut shift: u32 = 0;
     for (index, &byte) in input.iter().enumerate() {
-        let low = u32::from(byte & 0x7f);
-        if shift == 28 && low > 0x0f {
+        let low = u32::from(byte & PAYLOAD_MASK);
+        // 末组(shift=28)只剩 4 个有效位,更高位属 u32 溢出。
+        if shift == 28 && low > U32_LAST_GROUP_MAX {
             return Err(corrupted("varint 数值溢出 u32"));
         }
         if shift > 28 {
             return Err(corrupted("varint 超过 u32 最长 5 字节"));
         }
         result |= low << shift;
-        if byte & 0x80 == 0 {
+        if byte & CONTINUATION_BIT == 0 {
             return Ok((result, index + 1));
         }
         shift += 7;

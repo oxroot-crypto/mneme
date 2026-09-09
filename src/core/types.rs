@@ -17,11 +17,23 @@ pub struct RowId(u64);
 
 impl RowId {
     /// 由原始整数构造。
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - 底层整数值;分配与递增语义由上层负责。
+    ///
+    /// # Returns
+    ///
+    /// 包装该整数的 [`RowId`]。
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
 
     /// 返回内部整数值。
+    ///
+    /// # Returns
+    ///
+    /// 构造时传入的原始 `u64`。
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -48,11 +60,23 @@ pub struct SlotId(u32);
 
 impl SlotId {
     /// 由原始整数构造。
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - 底层整数值;分配与递增语义由上层负责。
+    ///
+    /// # Returns
+    ///
+    /// 包装该整数的 [`SlotId`]。
     pub const fn new(value: u32) -> Self {
         Self(value)
     }
 
     /// 返回内部整数值。
+    ///
+    /// # Returns
+    ///
+    /// 构造时传入的原始 `u32`。
     pub const fn get(self) -> u32 {
         self.0
     }
@@ -76,11 +100,23 @@ pub struct SeqNo(u64);
 
 impl SeqNo {
     /// 由原始整数构造。
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - 底层整数值;分配与递增语义由上层负责。
+    ///
+    /// # Returns
+    ///
+    /// 包装该整数的 [`SeqNo`]。
     pub const fn new(value: u64) -> Self {
         Self(value)
     }
 
     /// 返回内部整数值。
+    ///
+    /// # Returns
+    ///
+    /// 构造时传入的原始 `u64`。
     pub const fn get(self) -> u64 {
         self.0
     }
@@ -104,11 +140,23 @@ pub struct SegmentId(u32);
 
 impl SegmentId {
     /// 由原始整数构造。
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - 底层整数值;分配与递增语义由上层负责。
+    ///
+    /// # Returns
+    ///
+    /// 包装该整数的 [`SegmentId`]。
     pub const fn new(value: u32) -> Self {
         Self(value)
     }
 
     /// 返回内部整数值。
+    ///
+    /// # Returns
+    ///
+    /// 构造时传入的原始 `u32`。
     pub const fn get(self) -> u32 {
         self.0
     }
@@ -132,11 +180,23 @@ pub struct NsId(u32);
 
 impl NsId {
     /// 由原始整数构造。
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - 底层整数值;分配与递增语义由上层负责。
+    ///
+    /// # Returns
+    ///
+    /// 包装该整数的 [`NsId`]。
     pub const fn new(value: u32) -> Self {
         Self(value)
     }
 
     /// 返回内部整数值。
+    ///
+    /// # Returns
+    ///
+    /// 构造时传入的原始 `u32`。
     pub const fn get(self) -> u32 {
         self.0
     }
@@ -168,11 +228,19 @@ impl Key {
     /// * `value` - 任意可转换为 [`Arc<str>`] 的字符串(如 `&str`、`String`)。
     ///
     /// 长度限额在写入入口校验(见设计 16 §8),本构造函数不做校验。
+    ///
+    /// # Returns
+    ///
+    /// 包装该字符串的 [`Key`]。
     pub fn new(value: impl Into<Arc<str>>) -> Self {
         Self(value.into())
     }
 
     /// 以 `&str` 形式返回内部值。
+    ///
+    /// # Returns
+    ///
+    /// 内部字符串的 `&str` 形式。
     pub fn as_str(&self) -> &str {
         &self.0
     }
