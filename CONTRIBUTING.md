@@ -35,13 +35,25 @@ cargo doc --no-deps          # 公开项必须 100% 文档覆盖(#![deny(missing
 
 ## 提交信息
 
-使用祈使句、首行 ≤ 72 字符,并在正文引用相关章节或文档,例如:
+遵循 [Conventional Commits](https://www.conventionalcommits.org/),首行 ≤ 72 字符:
 
 ```
-persist: reject WAL frames with unknown type
+<type>(<scope>): <祈使句描述>
+```
 
-Per 04 §13, an unrecognized frame type must abort replay rather than be
-skipped. Adds regression test covering invariant I2.
+- `type`:`feat` / `fix` / `docs` / `refactor` / `test` / `perf` / `build` / `ci` / `chore` 等;
+- `scope`:受影响的层或模块(如 `core`、`persist`、`index`);
+- 一次提交只做一件事,重构与功能不得混合;
+- 正文说明"为什么"而非"改了什么"(diff 已说明后者),并引用相关章节或文档;
+- 改动公开 API(参数、返回值、错误类型)时,须同步更新 rustdoc、所有调用点与测试,
+  并在 `type` 后加 `!` 标注 breaking。
+
+示例:
+
+```
+fix(persist): 拒绝未知类型的 WAL 帧
+
+Per 04 §13,未知帧类型必须在回放时中止而非跳过。补充覆盖不变量 I2 的回归测试。
 ```
 
 ## 契约维护(FSVDD 强制)
@@ -52,8 +64,10 @@ skipped. Adds regression test covering invariant I2.
    [spec/contracts.md](docs/spec/contracts.md),再改测试,最后改代码;
 2. 禁止"先写实现、后补契约";禁止契约漂移(改了代码/测试却不更新契约);
 3. 新增业务逻辑必须至少登记一条 `FC-*` 约束,并给出 1:1 测试;
-4. 破坏性变更需在契约文件顶部"变更记录"标注版本与兼容性迁移约束;
-5. 交付前自查:无孤儿实现、无失效契约、无孤立测试。
+4. 涉及算法/数据结构的改动必须同步维护 [spec/contracts.md §9](docs/spec/contracts.md)
+   的 `FC-*-CPLX-*` 复杂度契约:先更新上界,再改测试与实现;复杂度渐进退化视为破坏性变更;
+5. 破坏性变更需在契约文件顶部"变更记录"标注版本与兼容性迁移约束;
+6. 交付前自查:无孤儿实现、无失效契约、无孤立测试。
 
 ## 文档修改
 

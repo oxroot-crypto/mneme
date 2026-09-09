@@ -226,6 +226,10 @@ as_of(删除前) 在 compaction 回收该版本前仍能看到 A→B(双时态�
 
 基线入库(`benches/` + 夜间趋势图),回归 > 10% 阻断合并。
 
+**复杂度契约**:本节门槛同时验收 [spec/contracts.md §9](../spec/contracts.md) 的
+`FC-*-CPLX-*` 条目;复杂度**渐进**退化(如 $O(\log k)\to O(k)$)即使基准回归 < 10%
+也阻断合并,并须先更新对应 `CPLX` 契约(契约优先)。
+
 ---
 
 ## 5. Fuzz(I7,I18 的鲁棒性;L2/L4;L6 起 nightly)
