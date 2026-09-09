@@ -46,21 +46,93 @@ pub fn get_path<'v>(value: &'v Meta, path: &str) -> Option<&'v Meta> {
 }
 
 /// 若 `value` 是 JSON 数字,返回其 `f64` 形式。
+///
+/// # Arguments
+///
+/// * `value` - 待读取的 JSON 值。
+///
+/// # Returns
+///
+/// 是 JSON 数字时返回 `Some(f64)`,否则返回 `None`。
+///
+/// # Examples
+///
+/// ```
+/// use mneme::json;
+/// use mneme::meta::as_f64;
+///
+/// assert_eq!(as_f64(&json!(1.5)), Some(1.5));
+/// assert_eq!(as_f64(&json!("x")), None);
+/// ```
 pub fn as_f64(value: &Meta) -> Option<f64> {
     value.as_f64()
 }
 
 /// 若 `value` 是 JSON 整数(或可无损转换的 `u64`),返回其 `i64` 形式。
+///
+/// # Arguments
+///
+/// * `value` - 待读取的 JSON 值。
+///
+/// # Returns
+///
+/// 是 JSON 整数时返回 `Some(i64)`,否则返回 `None`。
+///
+/// # Examples
+///
+/// ```
+/// use mneme::json;
+/// use mneme::meta::as_i64;
+///
+/// assert_eq!(as_i64(&json!(42)), Some(42));
+/// assert_eq!(as_i64(&json!(1.5)), None);
+/// ```
 pub fn as_i64(value: &Meta) -> Option<i64> {
     value.as_i64()
 }
 
 /// 若 `value` 是 JSON 布尔值,返回其 `bool` 形式。
+///
+/// # Arguments
+///
+/// * `value` - 待读取的 JSON 值。
+///
+/// # Returns
+///
+/// 是 JSON 布尔值时返回 `Some(bool)`,否则返回 `None`。
+///
+/// # Examples
+///
+/// ```
+/// use mneme::json;
+/// use mneme::meta::as_bool;
+///
+/// assert_eq!(as_bool(&json!(true)), Some(true));
+/// assert_eq!(as_bool(&json!(0)), None);
+/// ```
 pub fn as_bool(value: &Meta) -> Option<bool> {
     value.as_bool()
 }
 
 /// 若 `value` 是 JSON 字符串,返回其 `&str` 形式。
+///
+/// # Arguments
+///
+/// * `value` - 待读取的 JSON 值。
+///
+/// # Returns
+///
+/// 是 JSON 字符串时返回 `Some(&str)`,否则返回 `None`。
+///
+/// # Examples
+///
+/// ```
+/// use mneme::json;
+/// use mneme::meta::as_str;
+///
+/// assert_eq!(as_str(&json!("text")), Some("text"));
+/// assert_eq!(as_str(&json!(1)), None);
+/// ```
 pub fn as_str(value: &Meta) -> Option<&str> {
     value.as_str()
 }
@@ -68,6 +140,23 @@ pub fn as_str(value: &Meta) -> Option<&str> {
 /// 若 `value` 是 JSON 整数,按 Unix 毫秒时间戳返回。
 ///
 /// 与 [`as_i64`] 等价,单独命名以表达时间语义。
+///
+/// # Arguments
+///
+/// * `value` - 待读取的 JSON 值。
+///
+/// # Returns
+///
+/// 是 JSON 整数时返回 `Some(i64)`(Unix 毫秒),否则返回 `None`。
+///
+/// # Examples
+///
+/// ```
+/// use mneme::json;
+/// use mneme::meta::as_ts;
+///
+/// assert_eq!(as_ts(&json!(1_700_000_000_000_i64)), Some(1_700_000_000_000));
+/// ```
 pub fn as_ts(value: &Meta) -> Option<i64> {
     value.as_i64()
 }

@@ -46,6 +46,14 @@ impl Metric {
     /// # Panics
     ///
     /// 当 `a` 与 `b` 长度不等时,在 debug 构建下 panic;release 构建下按较短者计算。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mneme::Metric;
+    ///
+    /// assert_eq!(Metric::Dot.score(&[1.0, 2.0], &[3.0, 4.0], 0.0, 0.0), 11.0);
+    /// ```
     pub fn score(&self, a: &[f32], b: &[f32], a_norm: f32, b_norm: f32) -> Score {
         match self {
             Metric::Dot => simd::dot(a, b),
@@ -57,6 +65,15 @@ impl Metric {
     /// 归一比较方向:`true` 表示 `x` 比 `y` 更优。
     ///
     /// `Cosine` / `Dot` 分数越大越优;`Euclidean`(距离平方)越小越优。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mneme::Metric;
+    ///
+    /// assert!(Metric::Cosine.better(0.9, 0.1));
+    /// assert!(Metric::Euclidean.better(0.1, 0.9));
+    /// ```
     pub fn better(&self, x: Score, y: Score) -> bool {
         match self {
             Metric::Cosine | Metric::Dot => x > y,
@@ -65,6 +82,15 @@ impl Metric {
     }
 
     /// 是否需要范数列:`Cosine` / `Euclidean` 为 `true`,仅 `Dot` 为 `false`。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mneme::Metric;
+    ///
+    /// assert!(!Metric::Dot.needs_norm());
+    /// assert!(Metric::Cosine.needs_norm());
+    /// ```
     pub const fn needs_norm(&self) -> bool {
         !matches!(self, Metric::Dot)
     }

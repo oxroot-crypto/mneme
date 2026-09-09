@@ -40,6 +40,17 @@ pub fn encode_u64(mut value: u64, out: &mut Vec<u8>) {
 ///
 /// * `value` - 待编码的整数。
 /// * `out` - 输出缓冲区,按低位组在前追加字节。
+///
+/// # Examples
+///
+/// ```
+/// use mneme::varint::{decode_u32, encode_u32};
+///
+/// let mut buf = Vec::new();
+/// encode_u32(300, &mut buf);
+/// assert_eq!(buf, vec![0xAC, 0x02]);
+/// assert_eq!(decode_u32(&buf).unwrap(), (300, 2));
+/// ```
 pub fn encode_u32(mut value: u32, out: &mut Vec<u8>) {
     while value >= 0x80 {
         out.push(((value as u8) & 0x7f) | 0x80);

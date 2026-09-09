@@ -17,6 +17,9 @@ struct Entry<T> {
     payload: T,
 }
 
+/// `TopK` 初始预分配容量的上限:避免 `k` 极大时一次性占用过多内存。
+const TOPK_MAX_PREALLOC: usize = 1024;
+
 /// 只保留最优 k 个元素的有界堆。
 ///
 /// 载荷类型 `T` 需实现 [`Ord`]:同分时以载荷升序作为稳定的次级排序键。
@@ -34,11 +37,25 @@ impl<T: Ord> TopK<T> {
     ///
     /// * `k` - 保留的最优元素个数;`0` 表示不保留任何元素。
     /// * `metric` - 决定"更优"方向的度量。
+    ///
+    /// # Returns
+    ///
+    /// 一个空的有界堆,容量为 `k`。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mneme::{Metric, TopK};
+    ///
+    /// let top: TopK<u32> = TopK::new(3, Metric::Dot);
+    /// assert_eq!(top.capacity(), 3);
+    /// assert!(top.is_empty());
+    /// ```
     pub fn new(k: usize, metric: Metric) -> Self {
         Self {
             k,
             metric,
-            heap: Vec::with_capacity(k.min(1024)),
+            heap: Vec::with_capacity(k.min(TOPK_MAX_PREALLOC)),
         }
     }
 
@@ -63,6 +80,18 @@ impl<T: Ord> TopK<T> {
     ///
     /// * `score` - 该候选的原始分数。
     /// * `payload` - 随分数保留的载荷(如行标识)。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mneme::{Metric, TopK};
+    ///
+    /// let mut top = TopK::new(2, Metric::Dot);
+    /// top.push(1.0, 1_u32);
+    /// top.push(3.0, 3_u32);
+    /// top.push(2.0, 2_u32);
+    /// assert_eq!(top.into_sorted_vec(), vec![3, 2]);
+    /// ```
     pub fn push(&mut self, score: Score, payload: T) {
         if self.k == 0 {
             return;
@@ -85,6 +114,19 @@ impl<T: Ord> TopK<T> {
     /// 归并另一个同容量堆。
     ///
     /// 结果 ≡ 把两者保留的元素按序 `push` 回本堆;用于并行扫描后的 k 路归并。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mneme::{Metric, TopK};
+    ///
+    /// let mut left = TopK::new(2, Metric::Dot);
+    /// left.push(1.0, 1_u32);
+    /// let mut right = TopK::new(2, Metric::Dot);
+    /// right.push(5.0, 5_u32);
+    /// left.merge(right);
+    /// assert_eq!(left.into_sorted_vec(), vec![5, 1]);
+    /// ```
     pub fn merge(&mut self, other: Self) {
         for entry in other.heap {
             self.push(entry.score, entry.payload);
@@ -94,6 +136,17 @@ impl<T: Ord> TopK<T> {
     /// 消费堆,按"最优在前"返回载荷。
     ///
     /// 同分按载荷升序。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mneme::{Metric, TopK};
+    ///
+    /// let mut top = TopK::new(2, Metric::Euclidean);
+    /// top.push(0.5, 5_u32);
+    /// top.push(0.1, 1_u32);
+    /// assert_eq!(top.into_sorted_vec(), vec![1, 5]);
+    /// ```
     pub fn into_sorted_vec(mut self) -> Vec<T> {
         let metric = self.metric;
         self.heap.sort_by(|a, b| {
