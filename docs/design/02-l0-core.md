@@ -53,16 +53,23 @@ pub enum MnemeError {
     DuplicateKey(Key),                                  // InsertMode::RejectDuplicate 时
     FilterParse(String),                                // DSL 语法错误,带位置信息
     Busy(&'static str),                                 // 独占锁被占/备份中
-    Invalid(&'static str),                              // 参数非法(如维度超上限)
     TooLarge { field: &'static str, limit: usize, got: usize }, // 数据超限额,见 16 §8
+    LimitExceeded { field: &'static str, limit: usize, got: usize }, // 参数越上限(维度/top_k/ef)
+    MetaTooDeep { limit: usize, got: usize },           // metadata 嵌套过深
     UnsupportedVersion { file: &'static str, found: u16, max: u16 }, // 文件格式过新
+    Closed,                                             // 库已关闭后经任意句柄读写
+    NonFinite,                                          // 向量分量 NaN/±Inf
+    Config { reason: &'static str },                    // 建库/查询配置非法
+    Unsupported { feature: &'static str },              // 能力延后到后续层,绝不静默降级
+    Inconsistent { reason: &'static str },              // 内部不变量被破坏
 }
 pub type Result<T> = std::result::Result<T, MnemeError>;
 ```
 
 设计约定:错误信息面向**排查**——`Corrupted` 必须带段号(文件级损坏时为 `None`)与原因;
 `FilterParse` 必须带出错位置;不在错误里嵌套第二层错误类型(避免错误地狱)。
-各错误的可重试性与处置建议见 [16 §4](16-api-reference.md)。
+**每个语义类都有专属变体**(错误分类矩阵见 [spec/contracts.md §0.2](../spec/contracts.md)),
+禁止用泛化变体承载多种失败。各错误的可重试性与处置建议见 [16 §4](16-api-reference.md)。
 
 ---
 
@@ -116,7 +123,7 @@ $\|\mathbf{q}\|^2$ 是常数,于是**三种度量全部归结为一次点积**(n
 
 - 分母下限保护:`‖a‖·‖b‖ < ε`(如 1e-12,零向量)时余弦返回 0,不返回 NaN;
 - **非有限值在入口拒绝**:`insert` 时校验每个分量为有限值,`NaN`/`±Inf` 返回
-  `Invalid`(见 [03 §2.1](03-l1-memory.md)、[16 §8](16-api-reference.md));
+  `NonFinite`(见 [03 §2.1](03-l1-memory.md)、[16 §8](16-api-reference.md));
   距离函数本身不做该检查,以保持内层循环零分支;
 - 点积用 f32 累加即可(嵌入分量量级 ~0.1,1536 维累加误差远小于嵌入模型自身噪声);
   不用 Kahan/双精度——索引场景要的是**排序稳定性**而非绝对精度,

@@ -29,7 +29,7 @@
 
 ```rust
 let db = Mneme::builder().path("./agent_memory").read_only(true).build()?;
-// db 只能读;任何写操作返回 Invalid("read-only")
+// db 只能读;任何写操作返回 Unsupported { feature: "只读模式写入" }
 ```
 
 - 只读实例**不创建/不争抢写锁文件**([16 §3](16-api-reference.md));它只校验写者是否存活;
@@ -130,12 +130,12 @@ pub enum Event {
     Error { kind: ErrorKind, context: &'static str },
 }
 pub enum WriteOp { Insert, InsertBatch, Update, Delete, Touch, Relate, Unrelate, Forget, Retain, Supersede, Consolidate, DropNamespace }
-pub enum ErrorKind { Io, Corrupted, Busy, Invalid, TooLarge, UnsupportedVersion, Other }
+pub enum ErrorKind { Io, Corrupted, Busy, TooLarge, LimitExceeded, UnsupportedVersion, Closed, Config, Unsupported, Other }
 ```
 
 > `ErrorKind` 是 `MnemeError` 的粗分类:同名变体直接对应;`DimensionMismatch`/`MetricMismatch`/
-> `DuplicateKey`/`FilterParse`/`KeyNotFound` 归入 `Other`(需要精确定位时宿主仍以 `MnemeError`
-> 为准,见 [02 §2](02-l0-core.md)、[16 §4](16-api-reference.md))。
+> `DuplicateKey`/`FilterParse`/`KeyNotFound`/`NonFinite`/`MetaTooDeep`/`Inconsistent` 归入 `Other`
+> (需要精确定位时宿主仍以 `MnemeError` 为准,见 [02 §2](02-l0-core.md)、[16 §4](16-api-reference.md))。
 
 - 默认 `None`(不注册即零成本);宿主可把事件桥接到 `tracing`/OpenTelemetry/metrics;
 - **不变量 I30**:回调**不得改变引擎行为**;回调 panic 被 `catch_unwind` 隔离并忽略

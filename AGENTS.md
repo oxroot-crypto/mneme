@@ -1,7 +1,7 @@
 # AGENTS.md
 
 Mneme:纯 Rust 的嵌入式向量存储引擎(面向 AI Agent 超长期记忆)。单 crate,edition 2024,
-MSRV 1.93。**当前只实现了 L0 原语层 `src/core/`**;L1–L6 目前仅有设计文档,`src/` 下没有对应代码。
+MSRV 1.93。**当前实现了 L0 原语层 `src/core/` 与 L1 内存引擎 `src/memory/`**;L2–L6 目前仅有设计文档,`src/` 下没有对应代码。
 
 ## 契约优先工作流(FSVDD,强制)
 
@@ -43,13 +43,13 @@ cargo doc --no-deps        # 公开项须 100% 文档覆盖
 
 - `[features]` 还没定义;`cargo test --features async` 会报错(README/CONTRIBUTING 已注明待对应层落地)。
 - 没有 `benches/`、criterion 未引入;`cargo bench` 是 L3 起的事。
-- `CONTRIBUTING.md`/`14-testing.md` 提到的 `xtask check-contracts` 目前**仓库内不存在**(无 `xtask/`、无 `[[bin]]`),不要试图运行。
+- 契约追溯门禁为 `tests/contract_traceability.rs`(随 `cargo test` 运行,校验契约↔测试双向映射);仓库内**没有** `xtask/` 或 `xtask check-contracts`,不要试图运行。
 - 仓库内没有 CI 配置文件(`.gitlab-ci.yml` 等均缺失);CI 四档定义只在 `docs/design/14-testing.md §7`。
 
 ## 测试
 
-- 现有测试仅 `tests/core_contracts.rs`(L0 契约验收);属性测试用 `proptest`(dev-dependency)。
-- 测试即文档:文件头列不变量编号,断言处引用 `FC-*`,与 `contracts.md` 双向可追溯。
+- 契约测试:`tests/core_contracts.rs`(L0)、`tests/memory_contracts.rs`(L1);追溯门禁 `tests/contract_traceability.rs`;属性测试用 `proptest`(dev-dependency)。
+- 测试即文档:文件头列不变量编号,断言处引用 `FC-*`,与 `contracts.md` 双向可追溯(门禁强制:无悬空引用、无孤立测试)。
 
 ## 文档
 

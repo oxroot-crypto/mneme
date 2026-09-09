@@ -165,24 +165,25 @@ impl Hit {
 pub struct ScoreBreakdown { pub sim: f32, pub recency: f32, pub importance: f32, pub access: f32, pub confidence: f32, pub boost: f32 }
 
 /// 存储记录的只读视图,**用于 `get` / `iter` / `get_many`(没有查询,故没有 `score`)**。
-/// 借用 ReaderView:`key`/`text`/`vector` 零拷贝指向段文件(mm)，`metadata` 因需解析 JSON
-/// 而为 owned。需要高吞吐只取向量时用 `get_vector`。生命周期修正见 [03 §2.2](03-l1-memory.md)。
+/// 内部以 `Arc` 持有物理版本,故 `get() -> RecordRef<'_>` 在安全 Rust 下成立;
+/// `key()`/`text()`/`vector()` 访问器零拷贝(仅 `Arc` 引用计数),`metadata()` 借用
+/// 已解析的 JSON。需要高吞吐只取向量时用 `get_vector`。详见 [03 §2.2](03-l1-memory.md)。
 pub struct RecordRef<'a> {
-    pub rowid: RowId,
-    pub key: Option<&'a str>,
-    pub created_at: i64,
-    pub expires_at: Option<i64>,
-    pub importance: f32,
-    pub text: Option<&'a str>,
-    pub metadata: Meta,
-    pub valid_from: i64,
-    pub valid_to: Option<i64>,
-    pub confidence: f32,
-    pub provenance: Option<Meta>,
-    vector: &'a [f32],
+    /* private: Arc<SlotData> + PhantomData<&'a ()> */
 }
 impl<'a> RecordRef<'a> {
-    pub fn vector(&self) -> &'a [f32];   // 零拷贝
+    pub fn rowid(&self) -> RowId;
+    pub fn key(&self) -> Option<&str>;
+    pub fn created_at(&self) -> i64;
+    pub fn expires_at(&self) -> Option<i64>;
+    pub fn importance(&self) -> f32;
+    pub fn text(&self) -> Option<&str>;
+    pub fn metadata(&self) -> &Meta;
+    pub fn valid_from(&self) -> i64;
+    pub fn valid_to(&self) -> Option<i64>;
+    pub fn confidence(&self) -> f32;
+    pub fn provenance(&self) -> Option<&Meta>;
+    pub fn vector(&self) -> &[f32];      // 零拷贝
     pub fn to_record(&self) -> Record;   // 克隆为可写 Record(去重 Merge 回调等用)
 }
 
@@ -238,7 +239,7 @@ impl SearchBuilder<'_> {
     pub fn as_of(self, ts_ms: i64) -> Self;                 // 双时态历史读(见 09 §3)
     pub fn query_id(self, id: QueryId) -> Self;             // 指定本次查询的幂等标识;默认由 execute() 生成(见 10 §4)
     pub fn rerank(self, r: Arc<dyn Reranker>) -> Self;      // 可选精排钩子
-    pub fn execute(&self) -> Result<Vec<Hit>>;              // 至少一个通道非空,否则 Invalid;查询向量维度不符返回 DimensionMismatch
+    pub fn execute(&self) -> Result<Vec<Hit>>;              // 至少一个通道非空,否则 Config;查询向量维度不符返回 DimensionMismatch
 }
 ```
 
@@ -418,7 +419,7 @@ pub struct AccessStat { pub last_access_ms: i64, pub access_count: u32 }
   需要确保持久性时不要依赖析构。
 - **克隆与关闭语义**:`Mneme` 经内部 `Arc` 克隆,`close(self)` 关闭的是**共享库**;
   首个 `close` 完成 `flush` 并释放文件锁,此后其余克隆(及其 `Namespace`)上的
-  操作返回 `Invalid("closed")`,重复 `close` 返回 `Ok`。多线程长期共享时,应在确认
+  操作返回 `Closed`,重复 `close` 返回 `Ok`。多线程长期共享时,应在确认
   所有使用方结束后再 `close`(见 [03 §2.4](03-l1-memory.md))。
 - 进程被 `abort`/断电时,已 fsync 的写入仍由 WAL 恢复([04 §7](04-l2-persist.md))。
 
@@ -668,7 +669,12 @@ pub struct Tuning {
 | `DimensionMismatch` | ❌ | 调用方 bug:向量长度 ≠ 建库维度 |
 | `MetricMismatch` | ❌ | 打开参数与库不一致;去掉显式 metric 或改对 |
 | `FilterParse` | ❌ | DSL 语法错误,错误携带位置;修正表达式 |
-| `Invalid` / `TooLarge` | ❌ | 参数或数据超限,见 §8 |
+| `TooLarge` / `LimitExceeded` / `MetaTooDeep` | ❌ | 数据/参数超限,见 §8 |
+| `NonFinite` | ❌ | 向量分量含 `NaN`/`±Inf`,会污染排序;修正输入 |
+| `Closed` | ❌ | 库已关闭;不要再使用该库的任何克隆句柄 |
+| `Config` | ❌ | 建库/查询配置非法(缺维度、无查询通道) |
+| `Unsupported` | ❌ | 该能力延后到后续层(open/backup/text/Fusion);按版本升级 |
+| `Inconsistent` | ❌ | 内部不变量被破坏(应为 bug);上报并附上下文 |
 | `UnsupportedVersion` | ❌ | 库由更新版本的 Mneme 写入;升级库,勿降级读 |
 | `Corrupted` | ❌ | 数据损坏:立即停止写入,跑 `db.check()`,按 §7 恢复 |
 
@@ -690,7 +696,7 @@ pub struct Tuning {
 | `AsyncNamespace` | ✅ | ✅ | async 门面,共享同一底层句柄(feature `async`) |
 | `SearchBuilder` | ✅ | ❌ | 短生命周期构建器,通常单线程用完即 `execute` |
 | `Record` / `Hit` / `InsertOutcome` / `UpdatePatch` / `QueryId` | ✅ | ✅ | 值类型 |
-| `RecordRef<'_>` | ✅ | ✅ | 借用 ReaderView 的只读视图 |
+| `RecordRef<'_>` | ✅ | ✅ | 以 `Arc` 持有记录数据的只读视图 |
 | `Reranker` / `Clock` / `Summarizer` / `KeyProvider` / `Observer` | ✅ | ✅ | 宿主实现需满足 |
 | `Storage` | ✅ | ✅ | 平台存储后端(见 12 §3) |
 
@@ -743,7 +749,7 @@ Mneme 提供引擎级支撑——命名空间隔离、去重、TTL/遗忘、混�
 db.backup_to("./backup")?;   // 一致性快照:硬链接同版本段文件(跨盘回退复制)
 ```
 
-**目标目录语义**:目标必须不存在或为空;若已含库内容则返回 `Invalid`(不合并、不覆盖),
+**目标目录语义**:目标必须不存在或为空;若已含库内容则返回 `Unsupported`/`Busy`(不合并、不覆盖),
 避免把两次备份混在一起。备份写入是"先写全部文件、最后写 `current`/MANIFEST"的顺序,
 中途失败会留下一个不含合法 `current` 的目录——它无法被打开,重新备份即可(不污染源库)。
 `BackupReport.hardlinked` 标明是否走了硬链接路径。
@@ -789,7 +795,7 @@ backup/current           ← 内容 "42";改成 "41" 即回滚一个提交点
 
 ## 8. 数据限额与校验
 
-超限一律返回 `TooLarge { field, limit, got }` 或 `Invalid`,**绝不静默截断**。
+超限一律返回 `TooLarge` / `LimitExceeded` / `MetaTooDeep`,**绝不静默截断**。
 
 | 项 | 默认上限 | 备注 |
 |---|---|---|
@@ -806,7 +812,7 @@ backup/current           ← 内容 "42";改成 "41" 即回滚一个提交点
 
 限额通过 `.limits(Limits { .. })` 调整;调大以内存/恢复时间为代价,请评估后再改。
 
-> **向量取值校验**:插入时逐个分量检查是否为有限值,`NaN`/`±Inf` 一律返回 `Invalid`
+> **向量取值校验**:插入时逐个分量检查是否为有限值,`NaN`/`±Inf` 一律返回 `NonFinite`
 > (否则会污染 `Metric::better` 的排序与 TopK)。零向量合法:余弦按 [02 §3.3](02-l0-core.md)
 > 返回 0,但语义上是"无方向",调用方自行判断是否需要拒绝。
 

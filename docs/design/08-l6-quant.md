@@ -103,7 +103,7 @@ IEEE 754 half:1 位符号 + 5 位指数 + 10 位尾数。相对精度 $2^{-11} \
 **F16 同样走两阶段重打分**([08 §4](08-l6-quant.md)):粗排用 f16 副本,精排回 f32——
 因此 `Hit.score` 的口径与 i8 一致(不变量 I12),不是"f16 分数直接返回"。
 `half` crate 只在 `quant-f16` 下编译。**未开启该 feature 时**:`Builder::quantization(VectorFormat::F16)`
-在构造期即返回 `Invalid("quant-f16 feature disabled")`,绝不静默降级;`F32` 与 `I8Rescored`
+在构造期即返回 `Unsupported { feature: "quant-f16" }`,绝不静默降级;`F32` 与 `I8Rescored`
 不依赖任何 feature。
 
 ---
@@ -138,7 +138,7 @@ IEEE 754 half:1 位符号 + 5 位指数 + 10 位尾数。相对精度 $2^{-11} \
 
 > **常见误区**:① 以为开量化后磁盘变小——f32 原向量始终保留,省的只是**查询带宽**;
 > ② 以为 `Hit.score` 是量化分——始终是 f32 精排分(I12);
-> ③ 配置了 `VectorFormat::F16` 却未开 `quant-f16` feature——构造期即返回 `Invalid`,
+> ③ 配置了 `VectorFormat::F16` 却未开 `quant-f16` feature——构造期即返回 `Unsupported`,
 > 不会静默降级。
 
 ---

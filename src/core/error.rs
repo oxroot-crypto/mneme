@@ -10,6 +10,9 @@ use crate::core::metric::Metric;
 use crate::core::types::{Key, SegmentId};
 
 /// Mneme 统一错误枚举。
+///
+/// 每个偏离形式化约束的语义类都有专属变体(错误分类矩阵见
+/// `docs/spec/contracts.md` §0.2),**禁止用一个泛化变体承载多种失败**。
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum MnemeError {
@@ -52,9 +55,6 @@ pub enum MnemeError {
     /// 资源忙:独占锁被占 / 备份中。
     #[error("资源忙: {0}")]
     Busy(&'static str),
-    /// 参数非法(如维度超上限)。
-    #[error("参数非法: {0}")]
-    Invalid(&'static str),
     /// 数据超限额(见设计 16 §8)。
     #[error("字段过大: {field} 上限 {limit},实际 {got}")]
     TooLarge {
@@ -63,6 +63,24 @@ pub enum MnemeError {
         /// 允许的上限。
         limit: usize,
         /// 实际大小。
+        got: usize,
+    },
+    /// 参数越上限(维度、`top_k`、`ef` 等)。
+    #[error("参数越界: {field} 上限 {limit},实际 {got}")]
+    LimitExceeded {
+        /// 越界参数名。
+        field: &'static str,
+        /// 允许的上限。
+        limit: usize,
+        /// 实际取值。
+        got: usize,
+    },
+    /// metadata 嵌套深度超限。
+    #[error("metadata 嵌套过深:上限 {limit},实际 {got}")]
+    MetaTooDeep {
+        /// 允许的最大深度。
+        limit: usize,
+        /// 实际深度。
         got: usize,
     },
     /// 文件格式主版本过新,拒绝打开(不变量 I18)。
@@ -74,6 +92,30 @@ pub enum MnemeError {
         found: u16,
         /// 本库支持的最高格式版本。
         max: u16,
+    },
+    /// 库已关闭后经任意句柄读写。
+    #[error("库已关闭")]
+    Closed,
+    /// 向量分量含 `NaN`/`±Inf`(会污染 `Metric::better` 排序)。
+    #[error("向量分量必须是有限值")]
+    NonFinite,
+    /// 建库 / 查询配置非法(缺维度、无查询通道等)。
+    #[error("配置非法: {reason}")]
+    Config {
+        /// 人类可读的原因。
+        reason: &'static str,
+    },
+    /// 能力延后到后续层;绝不静默降级。
+    #[error("暂不支持: {feature}")]
+    Unsupported {
+        /// 尚未落地的能力名。
+        feature: &'static str,
+    },
+    /// 内部不变量被破坏(逻辑上不可达,出现即为 bug)。
+    #[error("内部不一致: {reason}")]
+    Inconsistent {
+        /// 被破坏的不变量说明。
+        reason: &'static str,
     },
 }
 

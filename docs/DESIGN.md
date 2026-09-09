@@ -145,7 +145,7 @@ HNSW 与 BM25 两章是全书数学最密集的部分,但每一步推导都不�
 7. **不变量编号**:跨层契约用 `I1–I30` 编号(定义散见 02/03/04/06/07/08/09/10/11/12 与
    [16 §9](design/16-api-reference.md),汇总映射见 [14 §1.1](design/14-testing.md)),
    测试代码必须引用编号;每条不变量在 [spec/contracts.md](spec/contracts.md) 有对应
-   `FC-*` 契约条目,CI 校验 100% 追溯(FSVDD 强制)。
+   `FC-*` 契约条目,由 `tests/contract_traceability.rs` 在 `cargo test` 中校验双向追溯(FSVDD 强制)。
 8. **站点构建**:文档用 mdBook 组织(`book.toml` + [SUMMARY.md](SUMMARY.md)),
    KaTeX/Mermaid 由预处理器渲染;本地预览见仓库根目录的 `README.md`。
 9. **阅读时长**:各章不强制标注预计阅读;仅 [00 零基础篇](design/00-fundamentals.md) 给出参考

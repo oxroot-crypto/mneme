@@ -5,9 +5,12 @@
 > **前置阅读**:[01 §6](01-overview.md)(API 速览)、[02](02-l0-core.md)。
 > **本章你将学到**:API 语义细则 → 内存表结构 → 暴力扫描 → 过滤 AST → 去重预检。
 
-模块:`memory/{table.rs, engine.rs, search.rs, pred.rs, dedup.rs}`——`engine.rs` 承载
-公开类型 `Mneme` / `Namespace` / `SearchBuilder` 的内存实现,本章 §2 的语义即其行为规约;
-其余小节逐个展开数据结构与算法。
+模块:`memory/{engine.rs, builder.rs, namespace/, snapshot.rs, search_builder.rs, expand.rs,
+table.rs, search.rs, pred.rs, pred_eval.rs, record.rs, write_helpers.rs, mutate_helpers.rs,
+dedup.rs, relation.rs, temporal.rs, score.rs, lifecycle.rs, ops.rs, config.rs}`——`engine.rs`
+承载库句柄 `Mneme`,`namespace/` 承载 `Namespace` 的写/读/访问/生命周期/关系方法,
+`search_builder.rs` 与 `expand.rs` 承载 `SearchBuilder` 执行流程及联想扩展/结果去重;
+本章 §2 的语义即其行为规约,其余小节逐个展开数据结构与算法。
 
 ---
 
@@ -34,7 +37,7 @@ pub enum InsertOutcome { Inserted(RowId), Merged(RowId), Duplicate { existing: R
 | 规则 | 语义 |
 |---|---|
 | 维度校验 | 向量长度 ≠ 建库维度 → `DimensionMismatch`(故 `Record::new` 不返回 `Result`) |
-| 数值校验 | 任一分量为 `NaN`/`±Inf` → `Invalid`(否则污染 `Metric::better` 排序;见 [16 §8](16-api-reference.md)) |
+| 数值校验 | 任一分量为 `NaN`/`±Inf` → `NonFinite`(否则污染 `Metric::better` 排序;见 [16 §8](16-api-reference.md)) |
 | 同 key | `InsertMode::Upsert`(默认):**保留既有 RowId**,写入新物理版本(seqno+1),旧版本被遮蔽;`RejectDuplicate`:报错。RowId 因此是跨更新稳定的逻辑身份(02 §1) |
 | seqno | 每次成功写入分配新 `SeqNo`,全库单调递增 |
 | TTL | 相对时长即刻换算为绝对 `expires_at`(Unix 毫秒,经 `Clock` 取值) |
@@ -87,8 +90,11 @@ impl SearchBuilder<'_> { pub fn execute(&self) -> Result<Vec<Hit>>; }
   - `count(filter: Option<Expr>) -> Result<u64>`:统计命中的活记录数,**不物化记录**、复用过滤器/索引;
     过滤语义与 `search` 一致(预过滤),墓碑与逻辑过期记录不计入(I9);
   - `get_vector(id) -> Result<Option<Vec<f32>>>`(只取向量,不物化记录)。
-- **`RecordRef<'_>` 借用 ReaderView**(见 [16 §1.2](16-api-reference.md)):`vector()` 返回
-  `&[f32]` 零拷贝;`iter` 同样不物化向量,需要向量时显式 `get_vector`。
+- **`RecordRef<'_>` 以 `Arc` 持有物理版本**(见 [16 §1.2](16-api-reference.md)):`vector()`
+  返回 `&[f32]` 零拷贝(仅 `Arc` 引用计数,不复制向量字节),字段经访问器读取;
+  `iter` 同样不物化向量,需要向量时显式 `get_vector`。这是 L1 在安全 Rust 下满足
+  `get() -> RecordRef<'_>` 签名的实现方式;L2 段文件 + mmap 落地后,`Arc` 内部指向
+  不可变段数据,签名与调用方均不变。
 
 ### 2.3 生命周期:`touch / forget / delete / iter`
 
@@ -122,7 +128,7 @@ impl Mneme {
   [04 §7](04-l2-persist.md),用户侧 runbook 见 [16 §7](16-api-reference.md);
 - **克隆与关闭**:`Mneme` 克隆共享同一底层库;`close(self)` 关闭的是**共享库**而非单个
   句柄——首个 `close` 完成 `flush` 并释放文件锁,此后所有克隆(及其派生的 `Namespace`)
-  的读写返回 `Invalid("closed")`,再次 `close` 返回 `Ok`(幂等)。因此不要让克隆存活到
+  的读写返回 `Closed`,再次 `close` 返回 `Ok`(幂等)。因此不要让克隆存活到
   `close` 之后。
 
 ---
@@ -135,37 +141,64 @@ Table
 ├── reader:  RwLock<Arc<ReaderView>>     ← 读路径短暂持读锁
 └── config:  Arc<Config>                 (dimension / metric / 默认去重阈值…)
 WriterState
-├── vectors:   Vec<AlignedVec<f32>>      ← 下标 = SlotId(物理版本),32B 对齐
-├── entries:   Vec<Option<Entry>>        ← None = 从未使用/已物理清出
-├── key_index: HashMap<(NsId, Key), RowId>  ← key → 稳定 RowId(不再是 SlotId)
-├── versions:  HashMap<RowId, Vec<VersionRef>> ← 版本链(按 seqno 升序,含墓碑版本;L2 持久化)
-├── latest:    HashMap<RowId, SlotId>    ← 每个 RowId 当前可见版本(版本链尾的非墓碑)
-├── dead:      BitSet                    ← 当前不可见版本位图(按 SlotId;被遮蔽/删除;as_of 仍可读)
-├── seqno:     SeqNo                     ← 下一个可分配序号
-├── next_rowid: RowId                    ← 稳定逻辑标识水位(L2 起持久化)
-├── relations: HashMap<(RowId, RelationKind), Vec<Edge>>  ← 出边(内存叠加 delta)
-├── delta:     DeltaOverlay              ← 尚未 flush 的覆盖操作(墓碑/更新/访问/关系)
-└── access:    HashMap<RowId, AccessStat> ← touch 累积区(L5 落盘;RowId 稳定,跨更新/compaction 不失效)
-Entry { ns_id, rowid, seqno, key, text, meta, created_at, expires_at, importance,
-        last_access, access_count, valid_from, valid_to, confidence, provenance }
+├── slots:      Arc<Vec<Arc<SlotData>>>  ← 下标 = SlotId(物理版本),只增不减
+├── dead:       Arc<BitSet>              ← 当前不可见版本位图(按 SlotId;被遮蔽/删除;as_of 仍可读)
+├── key_index:  Arc<HashMap<(NsId, Key), RowId>>  ← key → 稳定 RowId
+├── text_index: Arc<HashMap<(NsId, u64), RowId>>  ← 文本 FNV-1a 哈希 → RowId(精确去重)
+├── versions:   Arc<HashMap<RowId, Vec<SlotId>>>  ← 版本链(按 seqno 升序,含墓碑版本;L2 持久化)
+├── latest:     Arc<HashMap<RowId, SlotId>>       ← 每个 RowId 当前可见版本
+├── out_edges / in_edges: Arc<HashMap<RowId, Vec<Edge>>>  ← 关系邻接表(双向)
+├── access:     Arc<HashMap<RowId, AccessStat>>   ← touch 累积区(L5 落盘)
+├── seqno:      SeqNo                    ← 下一个可分配序号
+├── next_rowid / next_ns_id: u64 / u32   ← 标识水位
+├── ns_registry / ns_by_path: Arc<HashMap<…>>     ← 命名空间路径 ↔ NsId 双向注册表
+├── feedback_seen: HashSet<(RowId, u64)> ← 反馈幂等键(I27)
+└── closed:     bool                     ← 关闭标记
+SlotData { rowid, ns_id, ns_path, seqno, key, vector: Arc<[f32]>, norm_sq,
+           text, text_hash, meta, created_at, expires_at, importance, confidence,
+           valid_from, valid_to, provenance, tx_ms, deleted }
+ReaderView = WriterState 的不可变快照(仅克隆 Arc 句柄):slots / dead / key_index /
+             versions / latest / out_edges / in_edges / access / ns_registry / seqno / closed
 ```
 
 - **一个 RowId 是一条版本链**:`versions[RowId]` 按 seqno 升序保存全部保留版本(记录体或墓碑),
   `latest` 指向当前可见版本;读取时按"`seqno ≤ W 且 tx_ms ≤ T` 的最新版本"解析可见性
   ([04 §2.2](04-l2-persist.md)),`as_of(T)` 即取历史水位;超期版本由 compaction 回收;`get_by_rowid` 先查 `latest`;
-- **delta 覆盖层**:作用于旧段记录的删除/更新/访问/关系先进入 `delta`,flush 时写入新段
-  delta 区([04 §2.2a](04-l2-persist.md));它是 I19 在内存侧的对应物;
-- **关系边**:`relations` 是内存增量,flush 时并入新段 relations 区
-  ([04 §2.2b](04-l2-persist.md)),compaction 时物化([09 §2](09-memory-model.md))。
+- **`dead` 位图**:被遮蔽/删除的物理槽位置位;`as_of` 重建视图时仍可经版本链读取历史,
+  `SlotData.deleted` 标记墓碑版本本身;
+- **关系边**:`out_edges`/`in_edges` 双向邻接表,以 `(from, to, kind)` 为唯一键;flush 时并入新段
+  relations 区([04 §2.2b](04-l2-persist.md)),compaction 时物化([09 §2](09-memory-model.md))。
 
-- `vectors` 与 `entries` 的下标即 `SlotId`,**永不回收**——`Vec` 只增不减,
-  墓碑槽位保留占位(每槽固定开销 = `AlignedVec` 句柄 + 内联 `Entry`(十余个可选字段,约百字节级),
-  随墓碑比例线性增长,由 compaction 物理回收);
-  `SlotId → RowId` 的映射即 `Entry.rowid`;
-- 读者先拿 `RwLock` 读锁**复制出扫描所需的视图信息**(活行数、当前 `dead` 位图引用、
-  vectors 切片),随即释放锁再扫描——写者等待读者的时间只有"复制视图"的纳秒级,
-  而不是整个扫描。此简化依赖一个事实:暴力扫描 O(N·d) 毫秒级,做 COW 版本管理得不偿失;
-   L2 引入段结构后,同样的模式升级为"ReaderView 视图 + 不可变段"(见 [04 §8](04-l2-persist.md))。
+- `slots` 的下标即 `SlotId`,**永不回收**——`Vec` 只增不减,
+  墓碑槽位保留占位(每槽 = `Arc<SlotData>` 句柄 + 记录体,约百字节级),
+  随墓碑比例线性增长,由 compaction 物理回收;
+  `SlotId → RowId` 的映射即 `SlotData.rowid`;
+- 读者先拿 `RwLock` 读锁**克隆 `Arc<ReaderView>`**,随即释放锁再扫描——写者等待读者的时间
+  只有"克隆视图句柄"的纳秒级,而不是整个扫描。此简化依赖一个事实:暴力扫描 O(N·d) 毫秒级,
+  做 COW 版本管理得不偿失;
+    L2 引入段结构后,同样的模式升级为"ReaderView 视图 + 不可变段"(见 [04 §8](04-l2-persist.md))。
+
+### 3.1 版本状态机(FC-MODEL-STA-001)
+
+一个 `RowId` 的物理版本在生命周期内只经历三种状态,形式化五元组:
+
+```text
+M = (S, E, δ, s0, F)
+S = { Active, Shadowed, Reclaimed }
+E = { Update, Upsert, Delete, AsOf, Compact }
+δ(Active, Update|Upsert|Delete) = Shadowed(旧版本) ∧ Active(新版本 / 无)
+δ(Shadowed, AsOf)               = Shadowed(历史可见,仅 as_of)
+δ(Shadowed, Compact)            = Reclaimed(物理回收,history_horizon 外)
+s0 = Active
+F  = { Reclaimed }
+```
+
+- **合法转移**:`Active → Shadowed`(更新/删除)、`Shadowed → Reclaimed`(compaction);
+- **非法转移**:`Shadowed` 出现在当前读路径(`get`/`search`/`iter`/`count`)——必须不可见并
+  显式拦截,绝不静默返回;`Reclaimed` 不可再被任何读路径访问。L1 无 compaction,`Reclaimed`
+  不出现;回收语义随 L2/L5 落地。
+- **复杂度验证口径**(§9.3):L1 无 criterion 基准,CPLX 以「操作计数单测 + 解析证明」验证
+  (见 [spec/contracts.md §9.2.2](../spec/contracts.md)),基准自 L3 起引入。
 
 ---
 
@@ -221,7 +254,7 @@ r2 [1,1] imp=0.7 → 候选; r3 [2,0] imp=0.8 → 候选
 
 ---
 
-## 5. 过滤 AST:`pred.rs`
+## 5. 过滤 AST 与求值:`pred.rs` / `pred_eval.rs`
 
 ### 5.1 AST 定义(与 L4 共用,此处定型)
 
@@ -264,6 +297,7 @@ impl FieldBuilder {
 
 ### 5.2 求值复杂度
 
+求值器位于 `pred_eval.rs`(AST 与组合器在 `pred.rs`)。
 单行求值 $O(|E|)$;短路求值:`And` 左支 false 即停,`Or` 左支 true 即停——
 AST 构造时**把高选择性条件放左边**(L4 计划器自动做重排,见 [06 §2](06-l4-query.md))。
 

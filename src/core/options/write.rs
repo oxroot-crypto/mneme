@@ -71,6 +71,54 @@ impl UpdatePatch {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// 设置新向量(链式)。
+    pub fn vector(mut self, vector: Vec<f32>) -> Self {
+        self.vector = Some(vector);
+        self
+    }
+
+    /// 设置新文本;`Some(None)` 清空。
+    pub fn text(mut self, text: Option<String>) -> Self {
+        self.text = Some(text);
+        self
+    }
+
+    /// 设置新元数据;`Some(None)` 清空。
+    pub fn metadata(mut self, metadata: Option<Meta>) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+
+    /// 设置新重要度。
+    pub fn importance(mut self, importance: f32) -> Self {
+        self.importance = Some(importance);
+        self
+    }
+
+    /// 设置新 TTL;`Some(None)` 取消过期。
+    pub fn ttl(mut self, ttl: Option<Duration>) -> Self {
+        self.ttl = Some(ttl);
+        self
+    }
+
+    /// 设置新有效时间区间。
+    pub fn valid_time(mut self, from: i64, to: Option<i64>) -> Self {
+        self.valid_time = Some((from, to));
+        self
+    }
+
+    /// 设置新可信度。
+    pub fn confidence(mut self, confidence: f32) -> Self {
+        self.confidence = Some(confidence);
+        self
+    }
+
+    /// 设置新来源/派生链;`Some(None)` 清空。
+    pub fn provenance(mut self, provenance: Option<Meta>) -> Self {
+        self.provenance = Some(provenance);
+        self
+    }
 }
 
 /// 文本 / 元数据压缩策略(实现见 L2 可选 feature)。

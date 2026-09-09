@@ -249,7 +249,7 @@ ns.iter(None)?;                 // 遍历/导出一个命名空间的全部活�
   仅调用过 `namespace()` 但从未写入的空空间不会出现(它也不占物理空间);
 - **路径规范**:路径为 `/` 分隔的段序列;`namespace(path)` 会规范化(去除首尾 `/`、
   合并连续 `/`),规范化后为空视为根命名空间,最多 `Limits.ns_depth` 级。由于
-  `namespace()` 不返回 `Result`,超深/含非法字符等错误在**首次写入**时以 `Invalid` 报告;
+  `namespace()` 不返回 `Result`,超深/含非法字符等错误在**首次写入**时以 `Config` 报告;
 - per-NS 统计:来自 msec 的 `ns_stats`(每段每命名空间的 `doc_count`/`total_doc_len`,
   [04 §5.6](04-l2-persist.md))聚合(`db.stats()` 的 `per_namespace`)。
 

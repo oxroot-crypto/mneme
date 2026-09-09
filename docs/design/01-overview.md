@@ -175,7 +175,7 @@ mneme/
 ├── src/
 │   ├── lib.rs          # 门面:Mneme / Namespace / Builder;pub use 公开类型
 │   ├── core/           # L0:types.rs error.rs metric.rs simd.rs varint.rs meta.rs heap.rs options/
-│   ├── memory/         # L1:table.rs engine.rs search.rs pred.rs dedup.rs
+│   ├── memory/         # L1:engine.rs builder.rs namespace/ snapshot.rs search_builder.rs expand.rs table.rs search.rs pred.rs pred_eval.rs record.rs write_helpers.rs mutate_helpers.rs dedup.rs
 │   ├── persist/        # L2:wal.rs vsec.rs msec.rs delta.rs edges.rs manifest.rs recover.rs flush.rs source.rs storage.rs trash.rs
 │   ├── index/          # L3:hnsw.rs graph.rs filtered.rs merge.rs rebuild.rs
 │   ├── query/          # L4:parse.rs plan.rs zmap.rs bm25.rs fusion.rs result_dedup.rs exec.rs
@@ -189,7 +189,7 @@ mneme/
 │   └── obs/            # observer.rs                                                      (12)
 ├── benches/            # criterion 基准(L3 起)
 ├── fuzz/               # cargo-fuzz 目标(L6 起)
-├── xtask/              # check-contracts 等 CI 校验
+├── tests/              # 契约验收 + contract_traceability.rs 追溯门禁
 ├── docs/               # 本文档
 │   └── spec/           # FC-Matrix 形式化契约
 └── Cargo.toml

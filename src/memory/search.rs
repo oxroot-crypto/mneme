@@ -1,0 +1,242 @@
+//! 暴力扫描检索(`search.rs`)。
+//!
+//! **过滤先行**:先用元数据求值得到候选位图(不读向量),再分块并行打分、
+//! `TopK` 归并。这是设计 03 §4 的 L1 落地,也是 L3/L4 计划器的雏形。
+
+use crate::core::heap::TopK;
+use crate::core::metric::{Metric, Score};
+use crate::core::simd;
+use crate::core::types::{NsId, RowId, SlotId};
+use crate::memory::pred::{self, EvalCtx, Expr};
+use crate::memory::table::ReaderView;
+
+// 单测操作计数:统计扫描阶段的打分次数(线程局部,避免测试间干扰)。
+#[cfg(test)]
+thread_local! {
+    static SCORE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn bump_score_calls() {
+    SCORE_CALLS.with(|calls| calls.set(calls.get() + 1));
+}
+
+/// 一条被打分的候选。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Scored {
+    /// 物理槽位。
+    pub(crate) slot: SlotId,
+    /// 稳定逻辑标识。
+    pub(crate) rowid: RowId,
+    /// 原始相似度分。
+    pub(crate) score: Score,
+}
+
+/// 计算向量范数平方。
+pub(crate) fn norm_sq(vector: &[f32]) -> f32 {
+    simd::dot(vector, vector)
+}
+
+/// 一次暴力扫描的全部输入。
+pub(crate) struct SearchParams<'a> {
+    /// 不可变读视图。
+    pub(crate) view: &'a ReaderView,
+    /// 目标命名空间。
+    pub(crate) ns_id: NsId,
+    /// 查询向量。
+    pub(crate) query: &'a [f32],
+    /// 距离度量。
+    pub(crate) metric: Metric,
+    /// 返回条数。
+    pub(crate) top_k: usize,
+    /// 预过滤表达式。
+    pub(crate) filter: Option<&'a Expr>,
+    /// 当前时刻(Unix 毫秒)。
+    pub(crate) now_ms: i64,
+    /// 并行分块行数。
+    pub(crate) block: usize,
+    /// 线程数;`0` = 自动。
+    pub(crate) parallelism: usize,
+}
+
+/// 分块扫描的输入(顺序与并行共用)。
+struct ScanParams<'a> {
+    view: &'a ReaderView,
+    candidates: &'a [u32],
+    query: &'a [f32],
+    query_norm: f32,
+    metric: Metric,
+    k: usize,
+    chunk: usize,
+    threads: usize,
+}
+
+/// 在给定快照上做过滤 + 暴力打分,返回按 `Metric::better` 排序的 top-k。
+pub(crate) fn search(params: &SearchParams<'_>) -> Vec<Scored> {
+    let query_norm = if params.metric.needs_norm() {
+        norm_sq(params.query)
+    } else {
+        0.0
+    };
+
+    let candidates = collect_candidates(params);
+    let k = params.top_k.min(candidates.len());
+    if k == 0 {
+        return Vec::new();
+    }
+
+    let (chunk, threads) = plan_scan(params);
+    let scan = ScanParams {
+        view: params.view,
+        candidates: &candidates,
+        query: params.query,
+        query_norm,
+        metric: params.metric,
+        k,
+        chunk,
+        threads,
+    };
+    let top = if candidates.len() <= chunk || threads <= 1 {
+        scan_sequential(&scan)
+    } else {
+        scan_parallel(&scan)
+    };
+
+    rescore(params, top, query_norm)
+}
+
+/// 过滤先行:只求值元数据,得到候选槽位(不读向量)。
+fn collect_candidates(params: &SearchParams<'_>) -> Vec<u32> {
+    let mut candidates: Vec<u32> = Vec::new();
+    for (idx, slot) in params.view.slots.iter().enumerate() {
+        if params.view.dead.get(idx) || slot.ns_id != params.ns_id || !slot.is_live(params.now_ms) {
+            continue;
+        }
+        if let Some(expr) = params.filter {
+            let ctx = EvalCtx {
+                slot,
+                access: params.view.access.get(&slot.rowid).copied(),
+            };
+            if !pred::matches(expr, &ctx) {
+                continue;
+            }
+        }
+        candidates.push(u32::try_from(idx).unwrap_or(u32::MAX));
+    }
+    candidates
+}
+
+/// 根据候选规模决定分块大小与线程数。
+fn plan_scan(params: &SearchParams<'_>) -> (usize, usize) {
+    let chunk = params.block.max(1);
+    let threads = if params.parallelism == 0 {
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
+    } else {
+        params.parallelism
+    };
+    (chunk, threads)
+}
+
+/// 重新取分:TopK 只返回载荷,分数在候选集内 O(1) 重算。
+fn rescore(params: &SearchParams<'_>, top: TopK<(RowId, SlotId)>, query_norm: f32) -> Vec<Scored> {
+    top.into_sorted_vec()
+        .into_iter()
+        .map(|(rowid, slot)| {
+            let slot_data = &params.view.slots[slot.get() as usize];
+            let score = params.metric.score(
+                params.query,
+                &slot_data.vector,
+                query_norm,
+                slot_data.norm_sq,
+            );
+            Scored { slot, rowid, score }
+        })
+        .collect()
+}
+
+fn scan_sequential(params: &ScanParams<'_>) -> TopK<(RowId, SlotId)> {
+    let mut top = TopK::new(params.k, params.metric);
+    for &idx in params.candidates {
+        let (rowid, slot, score) = score_slot(params, idx);
+        top.push(score, (rowid, slot));
+    }
+    top
+}
+
+/// 对候选 `idx` 打分;单测时累计操作计数(FC-MEM-CPLX-001)。
+fn score_slot(params: &ScanParams<'_>, idx: u32) -> (RowId, SlotId, Score) {
+    let slot = SlotId::new(idx);
+    let slot_data = &params.view.slots[idx as usize];
+    let score = params.metric.score(
+        params.query,
+        &slot_data.vector,
+        params.query_norm,
+        slot_data.norm_sq,
+    );
+    #[cfg(test)]
+    bump_score_calls();
+    (slot_data.rowid, slot, score)
+}
+
+fn scan_parallel(params: &ScanParams<'_>) -> TopK<(RowId, SlotId)> {
+    let chunk = params
+        .chunk
+        .max(params.candidates.len().div_ceil(params.threads));
+    let partials = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for part in params.candidates.chunks(chunk) {
+            handles.push(scope.spawn(move || {
+                let mut local = TopK::new(params.k, params.metric);
+                for &idx in part {
+                    let (rowid, slot, score) = score_slot(params, idx);
+                    local.push(score, (rowid, slot));
+                }
+                local
+            }));
+        }
+        handles
+            .into_iter()
+            .map(|handle| match handle.join() {
+                Ok(local) => local,
+                Err(_) => TopK::new(0, params.metric),
+            })
+            .collect::<Vec<_>>()
+    });
+
+    let mut top = TopK::new(params.k, params.metric);
+    for partial in partials {
+        top.merge(partial);
+    }
+    top
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn norm_sq_of_unit_basis_is_one() {
+        assert!((norm_sq(&[1.0, 0.0, 0.0]) - 1.0).abs() < 1e-6);
+    }
+
+    /// FC-MEM-CPLX-001(操作计数:扫描打分次数 = 候选数,无隐藏全扫)
+    #[test]
+    fn scan_touches_each_candidate_once() {
+        let db = crate::memory::Mneme::in_memory(2).expect("in_memory");
+        let ns = db.namespace("n");
+        for index in 0..8 {
+            ns.insert(crate::memory::Record::new(vec![1.0, 0.0]).key(format!("k{index}")))
+                .expect("insert");
+        }
+        SCORE_CALLS.with(|calls| calls.set(0));
+        let hits = ns
+            .search()
+            .vector(&[1.0, 0.0])
+            .top_k(4)
+            .execute()
+            .expect("search");
+        assert_eq!(hits.len(), 4);
+        let calls = SCORE_CALLS.with(std::cell::Cell::get);
+        assert_eq!(calls, 8, "扫描打分次数必须等于候选数(线性,无隐藏全扫)");
+    }
+}

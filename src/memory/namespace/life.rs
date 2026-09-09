@@ -1,0 +1,298 @@
+//! `Namespace` 生命周期:主动遗忘与记忆沉淀(`namespace/life.rs`)。
+
+use std::sync::Arc;
+
+use crate::core::error::{MnemeError, Result};
+use crate::core::meta::Meta;
+use crate::core::options::RelationKind;
+use crate::core::types::{NsId, RowId};
+use crate::memory::lifecycle::{RetainReport, Retention, retention_score};
+use crate::memory::mutate_helpers::{build_summary, is_consolidated};
+use crate::memory::pred::{self, EvalCtx, Expr};
+use crate::memory::relation::{self, Edge};
+use crate::memory::score::{self, ConsolidateReport, ConsolidationPolicy};
+use crate::memory::table::{SlotData, WriterState};
+use crate::memory::write_helpers::{SlotSpec, build_slot};
+
+use super::Namespace;
+
+impl Namespace {
+    /// 主动遗忘:对过滤器命中的每行打墓碑,返回删除数。
+    ///
+    /// # Examples
+    /// ```
+    /// use mneme::{Expr, Mneme, Record};
+    /// let db = Mneme::in_memory(2).unwrap();
+    /// let ns = db.namespace("demo");
+    /// ns.insert(Record::new(vec![1.0, 0.0]).key("a")).unwrap();
+    /// assert_eq!(ns.forget(Expr::field("key").eq("a")).unwrap(), 1);
+    /// ```
+    pub fn forget(&self, filter: Expr) -> Result<usize> {
+        let mut ws = self.table.write();
+        if ws.closed {
+            return Err(MnemeError::Closed);
+        }
+        let Some(ns_id) = ws.ns_id_of(&self.ns_path) else {
+            return Ok(0);
+        };
+        let now = self.config.clock.now_unix_ms();
+        let victims: Vec<RowId> = ws
+            .slots
+            .iter()
+            .enumerate()
+            .filter(|(idx, slot)| {
+                !ws.dead.get(*idx)
+                    && slot.ns_id == ns_id
+                    && !slot.deleted
+                    && pred::matches(
+                        &filter,
+                        &EvalCtx {
+                            slot,
+                            access: ws.access.get(&slot.rowid).copied(),
+                        },
+                    )
+            })
+            .map(|(_, slot)| slot.rowid)
+            .collect();
+        let count = victims.len();
+        for rowid in victims {
+            let seqno = ws.alloc_seqno();
+            ws.tombstone(rowid, now, seqno)?;
+        }
+        self.table.publish(&ws);
+        Ok(count)
+    }
+
+    /// 按遗忘策略回收低保留分记录。
+    ///
+    /// # Examples
+    /// ```
+    /// use mneme::{Mneme, Record, Retention};
+    /// let db = Mneme::in_memory(2).unwrap();
+    /// let ns = db.namespace("demo");
+    /// ns.insert(Record::new(vec![1.0, 0.0])).unwrap();
+    /// let report = ns.retain(Retention::new()).unwrap();
+    /// assert_eq!(report.scanned, 1);
+    /// ```
+    pub fn retain(&self, policy: Retention) -> Result<RetainReport> {
+        let mut ws = self.table.write();
+        if ws.closed {
+            return Err(MnemeError::Closed);
+        }
+        let Some(ns_id) = ws.ns_id_of(&self.ns_path) else {
+            return Ok(RetainReport::default());
+        };
+        let now = self.config.clock.now_unix_ms();
+        let mut report = RetainReport::default();
+        let (scanned, victims) = collect_retain_victims(&ws, ns_id, now, &policy);
+        report.scanned = scanned;
+        for rowid in victims {
+            let seqno = ws.alloc_seqno();
+            if ws.tombstone(rowid, now, seqno)? {
+                report.forgotten += 1;
+                report.sampled_ids.push(rowid);
+            }
+        }
+        self.table.publish(&ws);
+        Ok(report)
+    }
+
+    /// 记忆沉淀:把近似重复的记忆聚簇、合并/摘要,并链接来源(设计 09 §5)。
+    ///
+    /// # Examples
+    /// ```
+    /// use mneme::{ConsolidationPolicy, Mneme, Record};
+    /// let db = Mneme::in_memory(2).unwrap();
+    /// let ns = db.namespace("demo");
+    /// ns.insert(Record::new(vec![1.0, 0.0])).unwrap();
+    /// ns.insert(Record::new(vec![1.0, 0.001])).unwrap();
+    /// let report = ns.consolidate(ConsolidationPolicy::default()).unwrap();
+    /// assert_eq!(report.clusters, 1);
+    /// ```
+    pub fn consolidate(&self, policy: ConsolidationPolicy) -> Result<ConsolidateReport> {
+        let mut ws = self.table.write();
+        if ws.closed {
+            return Err(MnemeError::Closed);
+        }
+        let Some(ns_id) = ws.ns_id_of(&self.ns_path) else {
+            return Ok(ConsolidateReport::default());
+        };
+        let now = self.config.clock.now_unix_ms();
+        let candidates = collect_consolidation_candidates(&ws, ns_id, &policy);
+        let vectors: Vec<&[f32]> = candidates
+            .iter()
+            .map(|slot_data| slot_data.vector.as_ref())
+            .collect();
+        let clusters = score::cluster_by_similarity(&vectors, policy.threshold);
+        let target_path = consolidation_target(&self.ns_path, &policy);
+        let target_id = ws.register_ns(&target_path);
+
+        let mut report = ConsolidateReport::default();
+        {
+            let mut ctx = ConsolidationCtx {
+                ws: &mut ws,
+                policy: &policy,
+                candidates: &candidates,
+                target_id,
+                target_path: &target_path,
+                now,
+            };
+            for cluster in clusters {
+                if cluster.len() >= 2 {
+                    ctx.merge_cluster(&cluster, &mut report)?;
+                }
+            }
+        }
+        self.table.publish(&ws);
+        Ok(report)
+    }
+}
+
+/// 收集低于保留分、且未被 `protect` 豁免的记录;返回 `(扫描数, 待遗忘 RowId)`。
+fn collect_retain_victims(
+    ws: &WriterState,
+    ns_id: NsId,
+    now: i64,
+    policy: &Retention,
+) -> (usize, Vec<RowId>) {
+    let mut scanned = 0;
+    let mut victims = Vec::new();
+    for (idx, slot) in ws.slots.iter().enumerate() {
+        if ws.dead.get(idx) || slot.ns_id != ns_id || !slot.is_live(now) {
+            continue;
+        }
+        scanned += 1;
+        if let Some(protect) = &policy.protect
+            && pred::matches(
+                protect,
+                &EvalCtx {
+                    slot,
+                    access: ws.access.get(&slot.rowid).copied(),
+                },
+            )
+        {
+            continue;
+        }
+        let access = ws.access.get(&slot.rowid).copied().unwrap_or_default();
+        let age = now - slot.valid_from.max(access.last_access_ms);
+        let score = retention_score(
+            slot.importance,
+            age,
+            policy.half_life,
+            policy.w,
+            access.access_count,
+        );
+        if score < policy.min_importance {
+            victims.push(slot.rowid);
+        }
+    }
+    (scanned, victims)
+}
+
+/// 收集满足过滤的活记录作为沉淀候选。
+fn collect_consolidation_candidates(
+    ws: &WriterState,
+    ns_id: NsId,
+    policy: &ConsolidationPolicy,
+) -> Vec<Arc<SlotData>> {
+    ws.slots
+        .iter()
+        .enumerate()
+        .filter(|(idx, slot)| {
+            !ws.dead.get(*idx)
+                && slot.ns_id == ns_id
+                && !slot.deleted
+                && policy.filter.as_ref().is_none_or(|expr| {
+                    pred::matches(
+                        expr,
+                        &EvalCtx {
+                            slot,
+                            access: ws.access.get(&slot.rowid).copied(),
+                        },
+                    )
+                })
+        })
+        .map(|(_, slot)| Arc::clone(slot))
+        .collect()
+}
+
+/// 摘要写入的目标命名空间路径。
+fn consolidation_target(ns_path: &Arc<str>, policy: &ConsolidationPolicy) -> Arc<str> {
+    policy
+        .target
+        .as_ref()
+        .map_or_else(|| Arc::clone(ns_path), |path| Arc::from(path.as_str()))
+}
+
+/// 单次 `consolidate` 的可变上下文(写状态 + 策略 + 候选)。
+struct ConsolidationCtx<'a> {
+    ws: &'a mut WriterState,
+    policy: &'a ConsolidationPolicy,
+    candidates: &'a [Arc<SlotData>],
+    target_id: NsId,
+    target_path: &'a Arc<str>,
+    now: i64,
+}
+
+impl ConsolidationCtx<'_> {
+    /// 合并一个连通分量:生成摘要、链接来源、按需墓碑来源。
+    fn merge_cluster(&mut self, cluster: &[usize], report: &mut ConsolidateReport) -> Result<()> {
+        let candidates = self.candidates;
+        let policy = self.policy;
+        let mut members: Vec<&Arc<SlotData>> =
+            cluster.iter().map(|idx| &candidates[*idx]).collect();
+        if members.len() > policy.max_cluster {
+            members.sort_by(|a, b| {
+                b.importance
+                    .partial_cmp(&a.importance)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            members.truncate(policy.max_cluster);
+        }
+        if members
+            .iter()
+            .any(|slot_data| is_consolidated(self.ws, slot_data.rowid))
+        {
+            return Ok(());
+        }
+        let source_ids: Vec<RowId> = members.iter().map(|slot_data| slot_data.rowid).collect();
+        let summary = build_summary(policy, &members);
+        let summary_rowid = self.ws.alloc_rowid();
+        let seqno = self.ws.alloc_seqno();
+        let slot_data = build_slot(SlotSpec {
+            ns_id: self.target_id,
+            ns_path: Arc::clone(self.target_path),
+            rowid: summary_rowid,
+            seqno,
+            tx_ms: self.now,
+            rec: summary,
+        });
+        self.ws.commit_version(summary_rowid, slot_data)?;
+        self.link_sources(summary_rowid, &source_ids);
+        if !policy.keep_sources {
+            for source in &source_ids {
+                let seqno = self.ws.alloc_seqno();
+                self.ws.tombstone(*source, self.now, seqno)?;
+            }
+        }
+        report.clusters += 1;
+        report.merged += source_ids.len();
+        report.created.push(summary_rowid);
+        Ok(())
+    }
+
+    /// 以 `DERIVED_FROM` 边把摘要链接到各来源。
+    fn link_sources(&mut self, summary_rowid: RowId, source_ids: &[RowId]) {
+        for source in source_ids {
+            let edge = Edge {
+                from: summary_rowid,
+                to: *source,
+                kind: RelationKind::DERIVED_FROM,
+                weight: 1.0,
+                metadata: Meta::Null,
+            };
+            relation::upsert_edge(Arc::make_mut(&mut self.ws.out_edges), edge.clone());
+            relation::upsert_edge(Arc::make_mut(&mut self.ws.in_edges), edge);
+        }
+    }
+}

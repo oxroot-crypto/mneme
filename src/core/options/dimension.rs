@@ -26,7 +26,7 @@ impl Dimension {
     ///
     /// # Errors
     ///
-    /// 越界时返回 [`MnemeError::Invalid`]。
+    /// 越界时返回 [`MnemeError::LimitExceeded`]。
     ///
     /// # Examples
     ///
@@ -41,7 +41,11 @@ impl Dimension {
         if (Self::MIN..=Self::MAX).contains(&value) {
             Ok(Self(value))
         } else {
-            Err(MnemeError::Invalid("维度必须在 1..=65536 之间"))
+            Err(MnemeError::LimitExceeded {
+                field: "dimension",
+                limit: Self::MAX as usize,
+                got: value as usize,
+            })
         }
     }
 
@@ -63,10 +67,19 @@ mod tests {
     fn dimension_accepts_bounds_and_rejects_outside() {
         assert_eq!(Dimension::new(Dimension::MIN).unwrap().get(), 1);
         assert_eq!(Dimension::new(Dimension::MAX).unwrap().get(), 65_536);
-        assert!(matches!(Dimension::new(0), Err(MnemeError::Invalid(_))));
+        assert!(matches!(
+            Dimension::new(0),
+            Err(MnemeError::LimitExceeded {
+                field: "dimension",
+                ..
+            })
+        ));
         assert!(matches!(
             Dimension::new(65_537),
-            Err(MnemeError::Invalid(_))
+            Err(MnemeError::LimitExceeded {
+                field: "dimension",
+                ..
+            })
         ));
     }
 }
