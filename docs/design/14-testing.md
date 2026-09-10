@@ -342,6 +342,7 @@ valid_time 过期不触发物理删除
 | middle | L2 崩溃抽样 + L3 召回 + L4 集成 | 每次 MR |
 | heavy | 全量崩溃注入 + criterion + 长跑 | 每夜/每周 |
 | fuzz | cargo-fuzz | 每夜 |
+| mutation | `cargo-mutants`(配置见根目录 `mutants.toml`):存活变异体 = 约束遗漏测试,须补测试后重跑 | L2 起,每夜 |
 
 矩阵平台:Linux(x86_64/aarch64)+ Windows(x86_64,重点覆盖
 [04 §6](04-l2-persist.md)/[04 §9](04-l2-persist.md) 的平台专项)。

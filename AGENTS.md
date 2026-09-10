@@ -48,7 +48,9 @@ cargo doc --no-deps        # 公开项须 100% 文档覆盖
 
 ## 测试
 
-- 契约测试:`tests/core_contracts.rs`(L0)、`tests/memory_contracts.rs`(L1);追溯门禁 `tests/contract_traceability.rs`;属性测试用 `proptest`(dev-dependency)。
+- 契约测试:`tests/core_contracts.rs`(L0)、`tests/memory_contracts.rs`、
+  `tests/query_contracts.rs`、`tests/model_contracts.rs`、`tests/life_contracts.rs`(L1);
+  追溯门禁 `tests/contract_traceability.rs`;属性测试用 `proptest`(dev-dependency)。
 - 测试即文档:文件头列不变量编号,断言处引用 `FC-*`,与 `contracts.md` 双向可追溯(门禁强制:无悬空引用、无孤立测试)。
 
 ## 文档

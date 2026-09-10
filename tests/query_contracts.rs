@@ -3,19 +3,20 @@
 //! 覆盖 `docs/spec/contracts.md` 的以下条目:
 //!
 //! * FC-MEM-CPLX-001..003/005(暴力扫描、过滤求值、并行归并、iter 过滤/排序)
-//! * FC-INDEX-POST-003/004、FC-QUERY-ERR-002、FC-QUERY-POST-001
-//! * FC-SCORE-INV-027、FC-SCORE-POST-001
+//! * FC-MEM-PRE-003/004、FC-MEM-POST-005、FC-MEM-INV-003
+//! * FC-INDEX-POST-003、FC-QUERY-ERR-002、FC-QUERY-POST-001
+//! * FC-SCORE-INV-027、FC-SCORE-POST-001、FC-GLOBAL-PRE-001/004
 
 use std::sync::Arc;
 
-use mneme::{Expr, Feedback, Metric, Mneme, Record, Scoring};
+use mneme::{Diversity, Expr, Feedback, Metric, Mneme, Record, Scoring};
 use proptest::prelude::*;
 
 mod common;
 
 use common::{FakeClock, inserted, mem, reference_dot};
 
-/// FC-MEM-CPLX-001 / FC-MEM-INV-003(暴力检索 ≡ 参考实现)
+/// FC-MEM-CPLX-001(暴力检索 ≡ 参考实现)
 #[test]
 fn brute_force_matches_reference() {
     let ns = mem(4).namespace("n");
@@ -311,6 +312,66 @@ fn default_scoring_matches_similarity_order() {
     assert_eq!(plain, scored);
 }
 
+/// FC-MEM-PRE-003(综合打分各因子钳制到 [0,1]:访问频次因子超基准后恒为 1.0;
+/// MMR lambda 越界钳制,5.0 ≡ 1.0、-2.0 ≡ 0.0)
+#[test]
+fn scoring_composite_factors_clamped() {
+    let ns = mem(2).namespace("n");
+    ns.insert(Record::new(vec![1.0, 0.0]).key("none"))
+        .expect("insert");
+    ns.insert(Record::new(vec![0.0, 1.0]).key("bound"))
+        .expect("insert");
+    ns.insert(Record::new(vec![1.0, 1.0]).key("far"))
+        .expect("insert");
+    // 访问 101 次与 250 次均超过 c_norm=100 → 因子钳制为 1.0,得分相同;
+    // 未访问记录因子为 0(三点:0 / Bound / 远超上界)。
+    for _ in 0..101 {
+        ns.touch("bound", None).expect("touch");
+    }
+    for _ in 0..250 {
+        ns.touch("far", None).expect("touch");
+    }
+    let scoring = Scoring {
+        w_sim: 0.0,
+        w_access: 1.0,
+        ..Scoring::default()
+    };
+    let hits = ns
+        .search()
+        .vector(&[1.0, 0.0])
+        .score(scoring)
+        .top_k(3)
+        .execute()
+        .expect("search");
+    let scores: Vec<f32> = hits.iter().map(|hit| hit.score).collect();
+    assert_eq!(scores[0], 1.0, "Bound+1(101 次)钳制为 1.0");
+    assert_eq!(scores[1], 1.0, "远超上限(250 次)同样钳制为 1.0");
+    assert_eq!(scores[2], 0.0, "未访问记录访问因子为 0");
+
+    // MMR lambda 越界钳制:超界值与对应边界值的命中序列全等(同快照排序全等)。
+    for vector in [
+        vec![1.0, 0.0],
+        vec![1.0, 0.0],
+        vec![0.0, 1.0],
+        vec![0.0, 1.0],
+    ] {
+        ns.insert(Record::new(vector)).expect("insert");
+    }
+    let order = |lambda: f32| -> Vec<u64> {
+        ns.search()
+            .vector(&[1.0, 0.0])
+            .top_k(4)
+            .diversify(Diversity::Mmr { lambda })
+            .execute()
+            .expect("search")
+            .iter()
+            .map(|hit| hit.rowid.get())
+            .collect()
+    };
+    assert_eq!(order(5.0), order(1.0), "lambda 越上界钳制为 1.0");
+    assert_eq!(order(-2.0), order(0.0), "负 lambda 钳制为 0.0");
+}
+
 proptest! {
     /// FC-MEM-CPLX-001(随机向量下暴力检索 ≡ 参考实现)
     #[test]
@@ -331,7 +392,7 @@ proptest! {
         prop_assert_eq!(got, reference_dot(&query, &expected, k));
     }
 
-    /// FC-MEM-POST-005 / FC-MEM-CPLX-002(count 与过滤语义一致)
+    /// FC-MEM-POST-005(count 与过滤语义一致)
     #[test]
     fn filter_matches_bruteforce_prop(
         importances in prop::collection::vec(0.0f32..1.0, 1..32),

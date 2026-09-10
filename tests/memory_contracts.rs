@@ -2,18 +2,20 @@
 //!
 //! 覆盖 `docs/spec/contracts.md` 的以下条目:
 //!
-//! * FC-MEM-PRE-001/002/003、FC-MEM-POST-001..007、FC-MEM-INV-001..003
-//! * FC-GLOBAL-PRE-001..004
+//! * FC-MEM-PRE-001/002/003、FC-MEM-POST-001..007、FC-MEM-INV-001/002
+//! * FC-GLOBAL-PRE-001..004、FC-MEM-CPLX-004(delete 复杂度哨兵)
+//! * 跨族条目:FC-INDEX-POST-004、FC-MODEL-INV-022/024、FC-LIFE-INV-009
 //!
-//! 检索/过滤/打分(FC-QUERY-*/FC-INDEX-*/FC-SCORE-*)、记忆模型(FC-MODEL-*)、
-//! 遗忘与库生命周期(FC-LIFE-*、FC-MEM-ERR/STA)分见 `query_contracts.rs`、
-//! `model_contracts.rs`、`life_contracts.rs`。复杂度/公式类契约的操作计数单测位于
-//! 源码内(`src/memory/{search,table,lifecycle}.rs`),见 `contracts.md` §9.2.2。
+//! 检索/过滤/打分、记忆模型、遗忘与库生命周期的专项测试分见
+//! `query_contracts.rs`、`model_contracts.rs`、`life_contracts.rs`。复杂度/公式类
+//! 契约的操作计数单测位于源码内(`src/memory/{search,table,lifecycle}.rs`),见
+//! `contracts.md` §9.2.2,不属本文件的覆盖声明范围。
 
 use std::sync::Arc;
 
 use mneme::{
-    Dedup, Expr, InsertMode, InsertOutcome, Limits, Mneme, Record, UpdateOutcome, UpdatePatch,
+    Dedup, Expr, InsertMode, InsertOutcome, Limits, Mneme, Record, RowId, UpdateOutcome,
+    UpdatePatch,
 };
 use proptest::prelude::*;
 
@@ -306,6 +308,51 @@ fn batch_point_reads_preserve_order_and_count() {
     assert_eq!(ns.count(Some(filter)).expect("count"), 1);
 }
 
+/// FC-MEM-POST-005(`get_many_by_rowid` 顺序一一对应;未命中与逻辑过期以 None 占位)
+#[test]
+fn batch_rowid_reads_preserve_order() {
+    let clock = FakeClock::default();
+    clock.set(1_000);
+    let db = Mneme::builder()
+        .dimension(2)
+        .clock(Arc::new(clock.clone()))
+        .build()
+        .expect("build");
+    let ns = db.namespace("n");
+    let id_a = inserted(
+        ns.insert(Record::new(vec![1.0, 0.0]).key("a"))
+            .expect("insert"),
+    );
+    let id_b = inserted(
+        ns.insert(Record::new(vec![0.0, 1.0]).key("b"))
+            .expect("insert"),
+    );
+    let id_ttl = inserted(
+        ns.insert(
+            Record::new(vec![1.0, 1.0])
+                .key("ttl")
+                .ttl(std::time::Duration::from_millis(500)),
+        )
+        .expect("insert"),
+    );
+    // 顺序与输入一一对应;不存在的 RowId 以 None 占位。
+    let reads = ns
+        .get_many_by_rowid(&[id_b, RowId::new(999), id_a, id_ttl])
+        .expect("get_many_by_rowid");
+    assert_eq!(reads.len(), 4);
+    assert_eq!(reads[0].as_ref().map(|rec| rec.rowid()), Some(id_b));
+    assert!(reads[1].is_none(), "不存在的 RowId 以 None 占位");
+    assert_eq!(reads[2].as_ref().map(|rec| rec.rowid()), Some(id_a));
+    assert!(reads[3].is_some(), "TTL 未到期仍可见");
+    // 逻辑过期后占位 None(I9:常规读路径不可见)。
+    clock.set(1_501);
+    let reads = ns
+        .get_many_by_rowid(&[id_a, id_ttl])
+        .expect("get_many_by_rowid");
+    assert!(reads[0].is_some());
+    assert!(reads[1].is_none(), "已过期记录在批量点读中不可见");
+}
+
 /// FC-MEM-POST-006
 #[test]
 fn ttl_is_converted_to_expires_at() {
@@ -517,6 +564,73 @@ fn importance_confidence_boundary_three_point() {
     let over = ns.get("over").expect("get").expect("present");
     assert_eq!(over.importance(), 1.0, "Bound+1 钳到上界");
     assert_eq!(over.confidence(), 1.0);
+}
+
+/// FC-MEM-PRE-002 / FC-GLOBAL-PRE-003(supersede 与 merge 产物同限额口径,失败零部分写入)
+#[test]
+fn supersede_and_merge_enforce_write_limits() {
+    // supersede:新版本 text 超限 → TooLarge,旧记录保持原样(valid_to 未闭合)。
+    let db = Mneme::builder()
+        .dimension(2)
+        .limits(Limits {
+            text_bytes: 4,
+            ..Limits::default()
+        })
+        .build()
+        .expect("build");
+    let ns = db.namespace("n");
+    ns.insert(Record::new(vec![1.0, 0.0]).key("k").text("old"))
+        .expect("insert");
+    assert!(matches!(
+        ns.supersede("k", Record::new(vec![0.0, 1.0]).text("toolong")),
+        Err(mneme::MnemeError::TooLarge { field: "text", .. })
+    ));
+    assert_eq!(
+        ns.get("k").expect("get").expect("present").text(),
+        Some("old"),
+        "失败的 supersede 不得部分写入"
+    );
+    // 合法新版本重试成功。
+    ns.supersede("k", Record::new(vec![1.0, 1.0]).text("new"))
+        .expect("supersede");
+    assert_eq!(
+        ns.get("k").expect("get").expect("present").text(),
+        Some("new")
+    );
+
+    // Dedup::Merge:回调产出的合并记录超限 → TooLarge,原记录不变。
+    fn merge_oversized(
+        _existing: &mneme::RecordRef<'_>,
+        incoming: &mneme::RecordRef<'_>,
+    ) -> Option<Record> {
+        Some(incoming.to_record().text("toolong"))
+    }
+    let db = Mneme::builder()
+        .dimension(2)
+        .limits(Limits {
+            text_bytes: 4,
+            ..Limits::default()
+        })
+        .dedup(Dedup::Merge(merge_oversized))
+        .build()
+        .expect("build");
+    let ns = db.namespace("n");
+    let base = inserted(
+        ns.insert(Record::new(vec![1.0, 0.0]).text("a"))
+            .expect("insert"),
+    );
+    assert!(
+        matches!(
+            ns.insert(Record::new(vec![1.0, 0.0]).text("b")),
+            Err(mneme::MnemeError::TooLarge { field: "text", .. })
+        ),
+        "合并产物超限必须拒绝"
+    );
+    assert_eq!(
+        ns.get_by_rowid(base).expect("get").expect("present").text(),
+        Some("a"),
+        "合并失败时旧记录保持原样"
+    );
 }
 
 proptest! {

@@ -2,9 +2,10 @@
 //!
 //! 覆盖 `docs/spec/contracts.md` 的以下条目:
 //!
-//! * FC-LIFE-INV-023、FC-LIFE-POST-001
+//! * FC-LIFE-INV-023、FC-LIFE-POST-001/002
 //! * FC-MEM-ERR-001/002、FC-MEM-STA-001
-//! * FC-GLOBAL-ERR-001(冒烟:任何公开 API 路径不 panic)
+//! * FC-GLOBAL-ERR-001/002、FC-GLOBAL-PRE-004
+//!   (冒烟:任何公开 API 路径不 panic;错误分类变体语义互不混淆;策略参数非法 → Config)
 
 use mneme::{Diversity, Expr, Mneme, Record, Retention};
 
@@ -115,7 +116,8 @@ fn database_lifecycle_open_closed() {
     clone.close().expect("close idempotent");
 }
 
-/// §0.2 错误分类矩阵(变体语义互不混淆)
+/// FC-GLOBAL-ERR-002 / FC-LIFE-POST-002 / FC-GLOBAL-PRE-004
+/// (§0.2 错误分类矩阵:变体语义互不混淆;策略参数非有限值/越界 → Config)
 #[test]
 fn error_taxonomy_is_specific() {
     let ns = mem(2).namespace("n");

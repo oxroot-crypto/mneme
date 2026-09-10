@@ -14,6 +14,7 @@
 //! * FC-CORE-INV-002  —— 公开 API 不 panic
 //! * FC-CORE-ERR-001  —— varint 畸形输入结构化报错
 //! * FC-CORE-ERR-002  —— 余弦零向量返回 0
+//! * FC-CORE-CPLX-005 —— varint 编解码 10 字节上界与最小编码(§9.2.1)
 
 use std::cmp::Ordering;
 
@@ -224,7 +225,16 @@ proptest! {
         let b = &b[..len];
         let vectorized = dot(a, b);
         let scalar = dot_scalar(a, b);
-        let tolerance = 1e-4 * (1.0 + scalar.abs());
+        // 两种实现的差异来自 f32 累加的舍入顺序,上界 ≈ γ_n · Σ|a_i·b_i|
+        // (γ_n = n·ε/(1 − n·ε));固定容差在长向量下会偶发误报,按 4 倍余量随长度缩放。
+        let sum_abs: f32 = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| x.abs() * y.abs())
+            .sum();
+        let n = a.len() as f32;
+        let gamma = (n * f32::EPSILON) / (1.0 - n * f32::EPSILON);
+        let tolerance = 4.0 * gamma * sum_abs + 1e-5;
         prop_assert!(
             (vectorized - scalar).abs() <= tolerance,
             "dot={vectorized} scalar={scalar}"

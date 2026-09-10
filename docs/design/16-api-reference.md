@@ -21,6 +21,7 @@
 impl Mneme {
     /// 打开一个已初始化的本地目录记忆库。等价于 builder().path(dir).build()。
     /// 维度与度量从 MANIFEST 读回,无需重复指定;新建请用 builder().dimension(d).path(dir).build()。
+    /// L1 阶段(无持久化)恒返回 Unsupported{feature}(见 §4 错误表),L2 起生效。
     pub fn open(path: impl AsRef<Path>) -> Result<Mneme>;
 
     /// 纯内存库(易失),维度必填。等价于 builder().dimension(d).build()(不设 path)。
@@ -292,7 +293,7 @@ impl Mneme {
 impl Mneme {
     pub fn snapshot(&self) -> SnapshotHandle;   // 钉住当前 ReaderView(含可变表快照)
     pub fn as_of(&self, ts_ms: i64) -> Result<SnapshotHandle>;  // 双时态历史读:版本链上取 tx_ms ≤ ts 的可见版本(默认永久保留,见 07 §4.2a)
-    pub fn backup_to(&self, dir: impl AsRef<Path>) -> Result<BackupReport>;  // 先 flush 再备份
+    pub fn backup_to(&self, dir: impl AsRef<Path>) -> Result<BackupReport>;  // 先 flush 再备份;L1 阶段恒返回 Unsupported(见 §4 错误表)
     pub fn stats(&self) -> Result<Stats>;
     pub fn check(&self) -> Result<CheckReport>;  // fsck:CRC + 索引一致性 + 对账
     pub fn compact_control(&self) -> CompactionControl;  // pause()/resume()/state()
@@ -527,6 +528,8 @@ impl RelateOptions {
 pub enum Feedback { Used, Ignored, Corrected { by: RowId } }
 
 /// 一次检索的幂等标识;`execute()` 生成并随 `Hit` 返回,反馈时原样回传(见 [10 §4](10-scoring.md))。
+/// `execute()` 缺省生成的 `QueryId` 由进程级全局分配器分配(跨库实例共享编号空间,保证不冲突);
+/// 调用方显式指定时须自行保证唯一性。
 pub struct QueryId(pub u64);
 
 /// 记忆沉淀策略与报告(见 [09 §5](09-memory-model.md))。

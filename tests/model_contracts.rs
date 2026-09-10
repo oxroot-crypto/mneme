@@ -2,7 +2,9 @@
 //!
 //! 覆盖 `docs/spec/contracts.md` 的以下条目:
 //!
-//! * FC-MODEL-INV-024/025/026、FC-MODEL-POST-001..006、FC-MODEL-STA-001
+//! * FC-MODEL-INV-024/025/026、FC-MODEL-POST-001..003/005/006、FC-MODEL-STA-001
+//! * FC-GLOBAL-PRE-004(关系边权:非有限值拒绝、越界钳制)
+//! * FC-MODEL-CPLX-002(consolidate 两两余弦复杂度哨兵,§9.2.8)
 
 use std::sync::Arc;
 
@@ -65,6 +67,48 @@ fn predecessors_returns_incoming_edges() {
             .expect("preds")
             .is_empty()
     );
+}
+
+/// FC-GLOBAL-PRE-004(关系边权:非有限值拒绝、越界钳制到 [0,1])
+#[test]
+fn relate_weight_rejects_non_finite_and_clamps() {
+    let ns = mem(2).namespace("n");
+    let a = inserted(
+        ns.insert(Record::new(vec![1.0, 0.0]).key("a"))
+            .expect("insert"),
+    );
+    let b = inserted(
+        ns.insert(Record::new(vec![0.0, 1.0]).key("b"))
+            .expect("insert"),
+    );
+    // 非有限值(NaN/±Inf)拒绝,不产生任何边(FC-GLOBAL-PRE-004)。
+    assert!(matches!(
+        ns.relate(a, b, RelationKind::SUPPORTS, f32::NAN),
+        Err(mneme::MnemeError::NonFinite)
+    ));
+    assert!(matches!(
+        ns.relate(a, b, RelationKind::SUPPORTS, f32::INFINITY),
+        Err(mneme::MnemeError::NonFinite)
+    ));
+    assert!(
+        ns.neighbors(a, &[RelationKind::SUPPORTS])
+            .expect("neighbors")
+            .is_empty(),
+        "被拒绝的 relate 不得残留边"
+    );
+    // 越界有限值钳制到 [0,1](Bound-1 / Bound+1)。
+    ns.relate(a, b, RelationKind::SUPPORTS, -0.5)
+        .expect("relate");
+    let edges = ns
+        .neighbors(a, &[RelationKind::SUPPORTS])
+        .expect("neighbors");
+    assert_eq!(edges[0].weight, 0.0, "负权重钳制到下界");
+    ns.relate(a, b, RelationKind::SUPPORTS, 1.5)
+        .expect("relate");
+    let edges = ns
+        .neighbors(a, &[RelationKind::SUPPORTS])
+        .expect("neighbors");
+    assert_eq!(edges[0].weight, 1.0, "超 1 权重钳制到上界");
 }
 
 /// FC-MODEL-POST-003
