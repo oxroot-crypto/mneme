@@ -24,7 +24,8 @@ impl Namespace {
     ///   `d` 含非有限值(NaN)→ `NonFinite`。
     ///
     /// # Returns
-    /// 命中活记录返回 `true`(计数已更新);命名空间未注册或 key 不存在返回 `false`。
+    /// 命中可见记录(未墓碑、未逻辑过期)返回 `true`(计数已更新);命名空间未注册、
+    /// key 不存在或记录不可见返回 `false`(FC-MEM-POST-009)。
     ///
     /// # Errors
     /// 库已关闭 → [`MnemeError::Closed`];`boost` 含非有限值 → [`MnemeError::NonFinite`]。
@@ -61,7 +62,8 @@ impl Namespace {
     /// * `boost` - 重要度增量;语义同 [`Namespace::touch`]。
     ///
     /// # Returns
-    /// 命中活记录返回 `true`;`RowId` 不存在或已墓碑返回 `false`。
+    /// 命中可见记录返回 `true`;`RowId` 不存在、已墓碑或已逻辑过期返回 `false`
+    /// (FC-MEM-POST-009)。
     ///
     /// # Errors
     /// 库已关闭 → [`MnemeError::Closed`];`boost` 含非有限值 → [`MnemeError::NonFinite`]。

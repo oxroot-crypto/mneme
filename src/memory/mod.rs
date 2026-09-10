@@ -18,6 +18,7 @@
 //! * `rerank` —— 融合器 `Fusion` 与精排钩子 `Reranker`。
 //! * `expand` —— 关系联想扩展与结果级去重。
 //! * `table` —— 内存表、写状态与不可变读视图。
+//! * `bitset` —— 标记不可见物理版本的可增长位图。
 //! * `search` —— 过滤先行的暴力扫描与并行归并。
 //! * `pred` / `pred_eval` —— 过滤 AST 与三值求值。
 //! * `dedup` —— 写入期两级去重。
@@ -30,6 +31,7 @@
 //! * `ops` —— 运维报告与运行统计类型。
 //! * `config` —— 建库配置。
 
+mod bitset;
 mod builder;
 mod config;
 mod dedup;

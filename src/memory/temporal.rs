@@ -7,7 +7,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::core::types::SeqNo;
-use crate::memory::table::{BitSet, ReaderView};
+use crate::memory::bitset::BitSet;
+use crate::memory::table::ReaderView;
 
 /// 按事务时间上界 `tx_ms` 重建一份读视图。
 ///

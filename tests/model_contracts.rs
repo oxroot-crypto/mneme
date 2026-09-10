@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use mneme::{Mneme, Record, RelationKind, UpdatePatch};
+use mneme::{Mneme, Record, RelationKind, UpdateOutcome, UpdatePatch};
 use proptest::prelude::*;
 
 mod common;
@@ -179,6 +179,26 @@ fn supersede_preserves_key_and_rejects_conflict() {
         ns.get("os").expect("get").expect("present").text(),
         Some("macos")
     );
+    assert!(db.check().expect("check").ok);
+}
+
+/// FC-MODEL-POST-003(`supersede` 对已墓碑记录返回 `NotFound`,绝不复活)
+#[test]
+fn supersede_after_delete_returns_not_found() {
+    let db = mem(2);
+    let ns = db.namespace("n");
+    ns.insert(Record::new(vec![1.0, 0.0]).key("a").text("v1"))
+        .expect("insert");
+    assert!(ns.delete("a").expect("delete"));
+    assert!(matches!(
+        ns.supersede("a", Record::new(vec![0.0, 1.0]).text("v2")),
+        Ok(UpdateOutcome::NotFound)
+    ));
+    assert!(
+        !ns.exists("a").expect("exists"),
+        "墓碑不得因 supersede 复活"
+    );
+    assert!(ns.get("a").expect("get").is_none());
     assert!(db.check().expect("check").ok);
 }
 

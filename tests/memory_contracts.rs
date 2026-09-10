@@ -2,7 +2,7 @@
 //!
 //! 覆盖 `docs/spec/contracts.md` 的以下条目:
 //!
-//! * FC-MEM-PRE-001/002/003、FC-MEM-POST-001..007、FC-MEM-INV-001/002
+//! * FC-MEM-PRE-001/002/003、FC-MEM-POST-001..007/009、FC-MEM-INV-001/002
 //! * FC-GLOBAL-PRE-001..004、FC-MEM-CPLX-004(delete 复杂度哨兵)
 //! * 跨族条目:FC-INDEX-POST-004、FC-MODEL-INV-022/024、FC-LIFE-INV-009
 //!
@@ -504,6 +504,43 @@ fn ttl_is_converted_to_expires_at() {
     assert!(ns.get("k").expect("get").is_none(), "到期即不可见");
 }
 
+/// FC-MEM-POST-009(`touch` 仅对可见记录生效;墓碑/逻辑过期返回 `false`)
+#[test]
+fn touch_only_affects_visible_records() {
+    let clock = FakeClock::default();
+    clock.set(1_000);
+    let db = Mneme::builder()
+        .dimension(2)
+        .clock(Arc::new(clock.clone()))
+        .build()
+        .expect("build");
+    let ns = db.namespace("n");
+    let rowid = inserted(
+        ns.insert(
+            Record::new(vec![1.0, 0.0])
+                .key("k")
+                .ttl(std::time::Duration::from_millis(500)),
+        )
+        .expect("insert"),
+    );
+    assert!(ns.touch("k", Some(0.1)).expect("touch"), "存活记录可强化");
+    clock.set(1_500);
+    assert!(
+        !ns.touch("k", Some(0.1)).expect("touch"),
+        "逻辑过期记录不得被强化"
+    );
+    assert!(
+        !ns.touch_by_rowid(rowid, Some(0.1)).expect("touch"),
+        "逻辑过期记录不得被强化"
+    );
+    ns.delete("k").expect("delete");
+    assert!(
+        !ns.touch_by_rowid(rowid, None).expect("touch"),
+        "墓碑记录不得被强化"
+    );
+    assert!(!ns.touch("k", None).expect("touch"), "墓碑记录不得被强化");
+}
+
 /// FC-MEM-POST-007 / FC-INDEX-POST-004
 #[test]
 fn dedup_reject_replace_and_merge() {
@@ -590,6 +627,63 @@ fn dedup_merge_key_change_migrates_index() {
         Some("new")
     );
     assert!(db.check().expect("check").ok, "merge 改 key 后索引不应悬挂");
+}
+
+/// FC-MEM-POST-007(合并/替换产物 key 与另一可见记录冲突 → `DuplicateKey` 且整体回滚)
+#[test]
+fn key_migration_rejects_live_key_conflict() {
+    fn merge(_existing: &mneme::RecordRef<'_>, incoming: &mneme::RecordRef<'_>) -> Option<Record> {
+        Some(incoming.to_record())
+    }
+    // Merge:命中相似记录后,回调把 key 改成另一存活记录已占用的 key。
+    let db = Mneme::builder()
+        .dimension(2)
+        .dedup(Dedup::Merge(merge))
+        .build()
+        .expect("build");
+    let ns = db.namespace("n");
+    ns.insert(Record::new(vec![1.0, 0.0]).key("a"))
+        .expect("insert a");
+    ns.insert(Record::new(vec![0.0, 1.0]).key("b"))
+        .expect("insert b");
+    assert!(matches!(
+        ns.insert(Record::new(vec![1.0, 0.0]).key("b")),
+        Err(mneme::MnemeError::DuplicateKey(_))
+    ));
+    assert_eq!(
+        ns.get("b")
+            .expect("get b")
+            .expect("present")
+            .vector()
+            .to_vec(),
+        vec![0.0, 1.0],
+        "b 的向量不得被合并产物覆盖"
+    );
+    assert!(ns.get("a").expect("get a").is_some());
+    assert_eq!(ns.count(None).expect("count"), 2);
+    assert!(db.check().expect("check").ok);
+
+    // Replace:相似记录被墓碑后,新行 key 与另一存活记录冲突同样拒绝并整体回滚。
+    let db = Mneme::builder()
+        .dimension(2)
+        .dedup(Dedup::Replace)
+        .build()
+        .expect("build");
+    let ns = db.namespace("n");
+    ns.insert(Record::new(vec![1.0, 0.0]).key("a"))
+        .expect("insert a");
+    ns.insert(Record::new(vec![0.0, 1.0]).key("b"))
+        .expect("insert b");
+    assert!(matches!(
+        ns.insert(Record::new(vec![1.0, 0.0]).key("b")),
+        Err(mneme::MnemeError::DuplicateKey(_))
+    ));
+    assert!(
+        ns.get("a").expect("get a").is_some(),
+        "失败的 Replace 不得留下墓碑"
+    );
+    assert_eq!(ns.count(None).expect("count"), 2);
+    assert!(db.check().expect("check").ok);
 }
 
 /// FC-MEM-POST-007(`Replace` 即使带同 key 也生成新 RowId)

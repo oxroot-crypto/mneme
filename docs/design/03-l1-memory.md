@@ -6,7 +6,7 @@
 > **本章你将学到**:API 语义细则 → 内存表结构 → 暴力扫描 → 过滤 AST → 去重预检。
 
 模块:`memory/{engine.rs, engine_ops.rs, builder.rs, namespace/, snapshot.rs, snapshot_scan.rs,
-search_builder.rs, search_exec.rs, expand.rs, rerank.rs, table.rs, search.rs, pred.rs,
+search_builder.rs, search_exec.rs, expand.rs, rerank.rs, table.rs, bitset.rs, search.rs, pred.rs,
 pred_eval.rs, record.rs, write_helpers.rs, mutate_helpers.rs, dedup.rs, relation.rs,
 temporal.rs, score.rs, lifecycle.rs, ops.rs, config.rs}`——`engine.rs` 承载库句柄 `Mneme`
 (统计/fsck/落盘门面在 `engine_ops.rs`),`namespace/` 承载 `Namespace` 的写/读/访问/
@@ -104,6 +104,8 @@ impl SearchBuilder<'_> { pub fn execute(&self) -> Result<Vec<Hit>>; }
 - `touch(key, boost)` / `touch_by_rowid(rowid, boost)`:访问计数 +1、`last_access = now`
   (为 [07 遗忘曲线](07-l5-life.md) 供数);`boost` 为 `Some(d)` 时同时提升 importance
   (`importance += d`,clamp 到 [0,1];`d` 为非有限值(NaN)→ `NonFinite`);按 rowid 的版本用于无 key 记录;
+  **仅对可见记录生效**:不存在/已墓碑/已逻辑过期 → 返回 `false` 且不计访问统计
+  (与读路径/`feedback` 同口径,FC-MEM-POST-009);
 - `delete(key)` / `delete_by_rowid(rowid)`:墓碑;`forget(filter)`:对过滤器命中的每行打墓碑,返回删除数;
 - `iter(filter)`:按过滤条件遍历(导出/审计/重建用),快照一致、不参与 ANN;
   逐行返回 `Result<RecordRef<'_>>`——迭代中途的 I/O 错误必须能被调用方看到([16 §1.3](16-api-reference.md));

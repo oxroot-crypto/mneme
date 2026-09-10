@@ -13,11 +13,9 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuar
 use crate::core::error::{MnemeError, Result};
 use crate::core::meta::Meta;
 use crate::core::types::{Key, NsId, RowId, SeqNo, SlotId};
+use crate::memory::bitset::BitSet;
 use crate::memory::config::Config;
 use crate::memory::relation::Edge;
-
-/// 位图每个字(`u64`)的位数。
-const BITS_PER_WORD: usize = u64::BITS as usize;
 
 /// 把槽位下标映射为 `SlotId`;超出 `u32::MAX` 时返回结构化错误,绝不静默饱和
 /// (FC-MEM-INV-004)。
@@ -38,37 +36,6 @@ pub struct AccessStat {
     pub last_access_ms: i64,
     /// 累计访问次数。
     pub access_count: u32,
-}
-
-/// 可增长的位图,用于标记不可见物理版本。
-#[derive(Debug, Clone, Default)]
-pub(crate) struct BitSet {
-    words: Vec<u64>,
-}
-
-impl BitSet {
-    /// 置位第 `idx` 位,必要时扩容。
-    pub(crate) fn set(&mut self, idx: usize) {
-        let word = idx / BITS_PER_WORD;
-        if word >= self.words.len() {
-            self.words.resize(word + 1, 0);
-        }
-        self.words[word] |= 1_u64 << (idx % BITS_PER_WORD);
-    }
-
-    /// 读取第 `idx` 位。
-    pub(crate) fn get(&self, idx: usize) -> bool {
-        self.words
-            .get(idx / BITS_PER_WORD)
-            .is_some_and(|word| (word >> (idx % BITS_PER_WORD)) & 1 == 1)
-    }
-
-    /// 清除第 `idx` 位。
-    pub(crate) fn clear(&mut self, idx: usize) {
-        if let Some(word) = self.words.get_mut(idx / BITS_PER_WORD) {
-            *word &= !(1_u64 << (idx % BITS_PER_WORD));
-        }
-    }
 }
 
 /// 一个物理版本(不可变,`Arc` 共享)。下标即 `SlotId`。
@@ -226,10 +193,12 @@ impl WriterState {
 
     /// 提交一个新物理版本:遮蔽旧版本、追加、登记版本链。
     ///
-    /// 容量校验在遮蔽旧版本**之前**完成:槽位溢出(`u32::MAX`)时返回结构化错误且
-    /// 不改动旧版本,消除「已遮蔽但无新版本」的半写(FC-MEM-PRE-002 零部分写入)。
+    /// 容量校验与 key 占用校验都在遮蔽旧版本**之前**完成:槽位溢出(`u32::MAX`)
+    /// 或新版本 key 已被另一可见记录占用时返回结构化错误且不改动旧版本,消除
+    /// 「已遮蔽但无新版本」的半写(FC-MEM-PRE-002 零部分写入、FC-MEM-POST-007)。
     pub(crate) fn commit_version(&mut self, rowid: RowId, slot_data: SlotData) -> Result<SlotId> {
         let slot = slot_id_for(self.slots.len())?;
+        ensure_key_available(self, &slot_data)?;
         self.hide_latest(rowid);
         Arc::make_mut(&mut self.slots).push(Arc::new(slot_data));
         self.link_version(rowid, slot);
@@ -269,6 +238,29 @@ impl WriterState {
             closed: self.closed,
         }
     }
+}
+
+/// 校验新版本的 key 未被另一**可见**记录占用:占用者的最新版本已墓碑或逻辑
+/// 过期时视为不存在(与读路径/FC-MEM-POST-001 同口径),否则返回
+/// [`MnemeError::DuplicateKey`],绝不静默覆盖他人 `key_index`(FC-MEM-POST-007)。
+fn ensure_key_available(ws: &WriterState, slot_data: &SlotData) -> Result<()> {
+    let Some(key) = &slot_data.key else {
+        return Ok(());
+    };
+    let Some(owner) = ws.key_index.get(&(slot_data.ns_id, key.clone())).copied() else {
+        return Ok(());
+    };
+    if owner == slot_data.rowid {
+        return Ok(());
+    }
+    let owner_visible = ws.latest.get(&owner).is_some_and(|slot| {
+        let data = &ws.slots[slot.get() as usize];
+        data.is_live(slot_data.tx_ms)
+    });
+    if owner_visible {
+        return Err(MnemeError::DuplicateKey(key.clone()));
+    }
+    Ok(())
 }
 
 /// 不可变读视图:读者克隆后无锁扫描。

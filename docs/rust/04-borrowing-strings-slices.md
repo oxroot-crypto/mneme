@@ -4,7 +4,8 @@
 > 以及生命周期标注到底在标注什么。
 > **前置**:[02](02-values-and-ownership.md)、[03](03-structs-enums-impl.md) 章。
 > **对应源码**:[`src/core/types.rs`](../../src/core/types.rs)、[`src/core/simd.rs`](../../src/core/simd.rs)、
-> [`src/core/meta.rs`](../../src/core/meta.rs)、[`src/core/options/clock.rs`](../../src/core/options/clock.rs)。
+> [`src/core/meta.rs`](../../src/core/meta.rs)、[`src/core/options/clock.rs`](../../src/core/options/clock.rs)、
+> [`src/memory/table.rs`](../../src/memory/table.rs)。
 
 [02 章](02-values-and-ownership.md)说,把值传给函数会**移动所有权**。但大多数时候我们只想"看一眼"
 数据,不想把所有权交出去。这就是**借用(borrowing)**:用引用 `&` 借用,用完还回去。
@@ -276,6 +277,43 @@ pub trait Clock: Send + Sync {
 > 用 `Cell`/`RefCell`(单线程)或 `Mutex`/`RwLock`/原子类型(多线程)把"可变性"藏进类型内部,
 > 让 `&self` 也能改。`Clock` 本身不改状态,所以用 `&self`;而像缓存、计数器这类共享状态才会用到
 > 内部可变性。注意:`RefCell` 不是 `Sync`,不能跨线程;跨线程共享要用 `Mutex` 或原子类型。
+
+### 5.1 锁与守卫:L1 怎么把可变状态藏进 `&self`
+
+L1 的 `Table` 正是"用 `&self` 改内部状态"的实例:
+
+```rust
+pub(crate) struct Table {
+    pub(crate) writer: Mutex<WriterState>,
+    pub(crate) reader: RwLock<Arc<ReaderView>>,
+    pub(crate) config: Arc<Config>,
+}
+```
+
+见 [`src/memory/table.rs`](../../src/memory/table.rs)。
+
+- `Mutex<T>`(互斥锁)保证同一时刻只有一个写者;`RwLock<T>`(读写锁)允许多个读者**并发**、
+  写者独占。写路径慢且要串行,读路径要尽可能并发——所以各用一把合适的锁。
+- `.lock()` / `.read()` / `.write()` 返回**守卫(guard)**:`MutexGuard<'_, T>`、
+  `RwLockReadGuard<'_, T>`。守卫像智能指针一样实现 `Deref`/`DerefMut`,用起来和 `&T`/`&mut T`
+  差不多;它离开作用域时**自动解锁**(RAII),不需要手写 unlock。
+- 守卫的生命周期绑定到 `&self`,因此借用检查器会阻止你把锁"忘了放"或把里面数据带出锁外。
+
+```rust
+pub(crate) fn write(&self) -> MutexGuard<'_, WriterState> {
+    self.writer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+```
+
+见 [`src/memory/table.rs`](../../src/memory/table.rs)。
+
+- `lock()` 返回 `LockResult`:持锁线程 panic 会让锁**中毒(poisoned)**,后续 `lock()` 得到 `Err`。
+  mneme 的选择是**恢复数据继续**(不让一次 panic 永久废掉整库),所以用
+  `unwrap_or_else(|poisoned| poisoned.into_inner())` 取出内部值,而不是 `unwrap()` 再 panic。
+- 推论:持锁期间尽量只做必要工作。L1 的读路径克隆一个 `Arc<ReaderView>` 后**立刻释放读锁**,
+  真正的扫描在锁外进行(见 [02 §3.7](02-values-and-ownership.md))。
 
 ---
 

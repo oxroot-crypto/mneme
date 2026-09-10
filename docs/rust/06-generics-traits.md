@@ -4,7 +4,8 @@
 > 并会自己实现标准 trait(`From`、`Display`、`Default`)。
 > **前置**:[03 章](03-structs-enums-impl.md)(`impl`)、[05 章](05-errors.md)。
 > **对应源码**:[`src/core/heap.rs`](../../src/core/heap.rs)、[`src/core/options/clock.rs`](../../src/core/options/clock.rs)、
-> [`src/core/types.rs`](../../src/core/types.rs)、[`src/core/metric.rs`](../../src/core/metric.rs)。
+> [`src/core/types.rs`](../../src/core/types.rs)、[`src/core/metric.rs`](../../src/core/metric.rs)、
+> [`src/memory/score.rs`](../../src/memory/score.rs)、[`src/memory/dedup.rs`](../../src/memory/dedup.rs)。
 
 **泛型(generics)** 让一套代码适配多种类型;**trait** 定义"一个类型能做什么";
 **trait bound** 给泛型参数加上"必须能做什么"的限制。三者合起来,是 Rust 的抽象与复用机制。
@@ -187,7 +188,7 @@ impl fmt::Display for RowId {
 - **trait 对象**(动态分发):`Box<dyn Clock>`——运行期通过虚表调用,可存放不同类型,但有间接开销。
 
 mneme 的 `Clock` 是 trait;需要"运行时可替换的时钟"时,可以用 `Box<dyn Clock>` 或泛型参数。
-本教程不必深入,记住:**优先泛型,trait 对象用于确需异构集合时**。
+原则是:**优先泛型,trait 对象用于运行期才确定类型或确需异构集合的场景**——L1 的策略注入正是后者。
 
 ### 4.1 单态化:泛型"零成本"是怎么来的,代价又是什么
 
@@ -206,6 +207,44 @@ identity(1_u64);       // 再生成 identity::<u64>
 
 **取舍**:热路径、类型集合已知时用泛型;需要"同一个容器装不同类型"或想控制代码体积时用 trait 对象。
 mneme 的 `TopK<T: Ord>` 是热路径泛型;`Clock` 只在边界注入,两种都可。
+
+### 4.2 L1 的 trait 对象与函数指针
+
+L1 里两类"可替换策略"都是动态分发:
+
+```rust
+// ConsolidationPolicy 的字段(摘要器由宿主注入)
+pub summarizer: Option<Arc<dyn Summarizer>>,
+// SearchBuilder 的方法(精排钩子由宿主注入)
+pub fn rerank(mut self, rerank: Arc<dyn Reranker>) -> Self { ... }
+```
+
+见 [`src/memory/score.rs`](../../src/memory/score.rs) 与 [`src/memory/rerank.rs`](../../src/memory/rerank.rs)。
+
+- `dyn Trait` 是 **trait 对象**:只保留"实现了哪个 trait",不保留具体类型;`Arc<dyn Trait>`
+  让它可共享、可跨线程(`Summarizer: Send + Sync`)。
+- 这里不用泛型的原因:策略是**运行期**由调用方塞进来的,类型不固定;用泛型会把类型参数传染给
+  整条 API(变成 `Namespace<TSummarizer, ...>`),显然不可取。
+- trait 要能当 `dyn` 用,必须满足 **对象安全(object safety)**:不能有泛型方法、不能有返回
+  `Self` 的方法等——否则虚表放不下。
+
+另一类是**函数指针**。`Dedup::Merge` 直接存一个函数地址:
+
+```rust
+Merge(fn(&RecordRef<'_>, &RecordRef<'_>) -> Option<Record>),
+```
+
+见 [`src/memory/dedup.rs`](../../src/memory/dedup.rs)。与 trait 对象相比:函数指针是 `Copy`、
+零分配,但**不能捕获环境**;需要在回调里访问外部数据时,得用 trait 对象或装箱闭包
+(`Box<dyn Fn(...)>`)。选哪个取决于"策略要不要带状态"。
+
+> 阅读时记住这张对照表:
+>
+> | 写法 | 分发 | 能捕获环境 | mneme 里的例子 |
+> |---|---|---|---|
+> | `fn(...) -> ...`(函数指针) | 静态(直接调用) | 否 | `Dedup::Merge` |
+> | `Arc<dyn Trait>` / `Box<dyn Trait>` | 动态(虚表) | 依赖实现类型 | `Summarizer`、`Reranker` |
+> | 泛型 `<T: Trait>` | 静态(单态化) | 不适用 | 热路径(`TopK<T: Ord>`) |
 
 ---
 
@@ -232,6 +271,7 @@ trait Iterator {
 | `the method ... exists for ... but its trait bounds were not satisfied` | 缺少某个 trait 实现 | `derive` 或手写 `impl` |
 | `no method named X found for type T` | `T` 没有该 trait 的方法 | 加对应 trait bound |
 | `the trait `Copy` cannot be implemented for this type` | 字段含非 `Copy` 类型 | 去掉 `Copy`,改用 `Clone` |
+| `the trait `X` cannot be made into an object` | trait 不满足对象安全(含泛型方法/返回 `Self`) | 去掉 `dyn` 改泛型,或修改 trait 定义 |
 | `conflicting implementations` | 同一 trait 对同一类型实现两次 | 删除重复实现 |
 
 ---
@@ -242,7 +282,9 @@ trait Iterator {
 - trait 定义"能做什么",`impl Trait for Type` 实现;trait 可带默认实现和 supertrait 约束。
 - trait bound(`T: Ord` 或 `where T: Ord`)给泛型加能力要求;`impl Trait` 是简写。
 - `From`/`Into` 互推、`Display` 手写、`Send`/`Sync` 是线程安全标记。
-- mneme 的 `TopK<T: Ord>` 依赖 `Ord` 做同分排序;`Clock: Send + Sync` 保证跨线程安全。
+- 动态分发用 `dyn Trait`(常配 `Box`/`Arc`),适合运行期注入策略;函数指针 `fn(...)` 零分配但不能捕获环境。
+- mneme 的 `TopK<T: Ord>` 依赖 `Ord` 做同分排序;`Clock: Send + Sync` 保证跨线程安全;
+  L1 的 `Summarizer`/`Reranker` 是 trait 对象,`Dedup::Merge` 是函数指针。
 
 ## 动手练习
 

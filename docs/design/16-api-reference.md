@@ -15,12 +15,16 @@
 签名在 L1 冻结([01 §6](01-overview.md))。`Mneme` 是库句柄,`Namespace` 是逻辑分区,
 二者都通过内部 `Arc` 共享、可自由克隆并跨线程传递(见 §5)。
 
+> **L1 实现状态**:本参考按冻结签名描述目标语义;标注「L1 未落地」的方法在当前
+> 版本返回 `Unsupported{feature}`(FC-MEM-ERR-002),不静默降级,见 §4 错误表。
+
 ### 1.1 构建与打开
 
 ```rust
 impl Mneme {
     /// 打开一个已初始化的本地目录记忆库。等价于 builder().path(dir).build()。
     /// 维度与度量从 MANIFEST 读回,无需重复指定;新建请用 builder().dimension(d).path(dir).build()。
+    /// L1 未落地:当前恒返回 `Unsupported`(见 §4),L2 起生效。
     pub fn open(path: impl AsRef<Path>) -> Result<Mneme>;
 
     /// 纯内存库(易失),维度必填。等价于 builder().dimension(d).build()(不设 path)。
@@ -233,7 +237,7 @@ impl SearchBuilder<'_> {
     pub fn ef(self, ef: usize) -> Self;                     // 仅 L3+ 生效;上限 4096
     pub fn filter(self, e: Expr) -> Self;                   // 预过滤(语义见 03 §2.2)
     pub fn dedup(self, d: ResultDedup) -> Self;             // 结果级去重(见 06 §6)
-    pub fn fusion(self, f: Fusion) -> Self;                 // 双通道融合(见 06 §4)
+    pub fn fusion(self, f: Fusion) -> Self;                 // 双通道融合(见 06 §4);L1 未落地:设置即 `Unsupported`(L4)
     pub fn score(self, s: Scoring) -> Self;                 // 时序/重要度/访问感知打分(见 10 §2)
     pub fn diversify(self, d: Diversity) -> Self;           // MMR 多样性(见 10 §5)
     pub fn expand(self, e: RelationExpand) -> Self;         // 关系联想扩展(见 10 §3)
@@ -293,9 +297,9 @@ impl Mneme {
 impl Mneme {
     pub fn snapshot(&self) -> SnapshotHandle;   // 钉住当前 ReaderView(含可变表快照)
     pub fn as_of(&self, ts_ms: i64) -> Result<SnapshotHandle>;  // 双时态历史读:版本链上取 tx_ms ≤ ts 的可见版本(默认永久保留,见 07 §4.2a)
-    pub fn backup_to(&self, dir: impl AsRef<Path>) -> Result<BackupReport>;  // 先 flush 再备份(见 §7)
+    pub fn backup_to(&self, dir: impl AsRef<Path>) -> Result<BackupReport>;  // 先 flush 再备份(见 §7);L1 未落地:当前恒返回 `Unsupported`(见 §4)
     pub fn stats(&self) -> Result<Stats>;
-    pub fn check(&self) -> Result<CheckReport>;  // fsck:CRC + 索引一致性 + 对账
+    pub fn check(&self) -> Result<CheckReport>;  // fsck:L1 做 key 索引 ↔ 最新版本对账(FC-MEM-POST-008);L2 起扩展段 CRC/版本链等全量校验
     pub fn compact_control(&self) -> CompactionControl;  // pause()/resume()/state()
     pub fn flush(&self) -> Result<()>;           // 把可变表落成段并 fsync WAL
     pub fn close(self) -> Result<()>;            // flush + 释放文件锁;幂等(对已关闭的库经其他句柄再调返回 Ok)

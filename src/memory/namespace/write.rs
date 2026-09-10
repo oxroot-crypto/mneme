@@ -251,8 +251,9 @@ impl Namespace {
     /// 新记录维度不符 → [`MnemeError::DimensionMismatch`];向量分量或
     /// `importance`/`confidence` 非有限值 → [`MnemeError::NonFinite`];超限 →
     /// [`MnemeError::TooLarge`]/[`MnemeError::MetaTooDeep`];库已关闭 →
-    /// [`MnemeError::Closed`]。key 不存在时返回
-    /// `Ok(UpdateOutcome::NotFound)`,不算错误。
+    /// [`MnemeError::Closed`]。key 不存在或已墓碑时返回
+    /// `Ok(UpdateOutcome::NotFound)`,不算错误;墓碑绝不因 `supersede` 复活
+    /// (与 `update` 同口径,FC-MODEL-POST-003)。
     ///
     /// # Examples
     /// ```
@@ -279,6 +280,11 @@ impl Namespace {
             let Some(latest) = ws.latest.get(&rowid).copied() else {
                 return Ok(UpdateOutcome::NotFound);
             };
+            // 信念修订是 update 同 key 的语义糖:已墓碑记录与 `update` 同口径返回
+            // `NotFound`,绝不复活(FC-MODEL-POST-003);逻辑过期不阻止修订。
+            if ws.slots[latest.get() as usize].deleted {
+                return Ok(UpdateOutcome::NotFound);
+            }
             // 信念修订 = update 同 key:新版本沿用目标 key;显式冲突 → `KeyMismatch`。
             let rec = reconcile_supersede_key(rec, key)?;
             validate_insert(&config, &rec)?;

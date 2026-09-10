@@ -105,6 +105,10 @@ pub(crate) fn touch_rowid(
     let Some(base) = latest_live(ws, rowid) else {
         return Ok(false);
     };
+    // 墓碑/逻辑过期记录不可被强化,与 `feedback`/读路径同口径(FC-MEM-POST-009)。
+    if !base.is_live(now) {
+        return Ok(false);
+    }
     if let Some(boost) = boost {
         let mut slot_data = (*base).clone();
         slot_data.importance = (slot_data.importance + boost).clamp(0.0, 1.0);
