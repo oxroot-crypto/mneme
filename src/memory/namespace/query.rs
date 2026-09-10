@@ -9,12 +9,16 @@ use crate::core::types::{Key, NsId, RowId};
 use crate::memory::dedup::ResultDedup;
 use crate::memory::pred::{self, EvalCtx, Expr};
 use crate::memory::record::RecordRef;
-use crate::memory::search_builder::{Fusion, SearchBuilder};
+use crate::memory::rerank::Fusion;
+use crate::memory::search_builder::SearchBuilder;
 use crate::memory::table::ReaderView;
 
 use super::{DEFAULT_TOP_K, Namespace};
 impl Namespace {
     /// 开始一次检索。
+    ///
+    /// # Returns
+    /// 链式配置检索参数的 [`SearchBuilder`]。
     ///
     /// # Examples
     /// ```
@@ -50,6 +54,15 @@ impl Namespace {
 
     /// 按 key 点读(快照一致)。
     ///
+    /// # Arguments
+    /// * `key` - 记录键;按当前命名空间隔离查找。
+    ///
+    /// # Returns
+    /// 命中时返回记录只读视图;命名空间未注册或 key 不存在返回 `None`。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
+    ///
     /// # Examples
     /// ```
     /// use mneme::{Mneme, Record};
@@ -78,6 +91,15 @@ impl Namespace {
 
     /// 按 `RowId` 点读。
     ///
+    /// # Arguments
+    /// * `id` - 目标 `RowId`;全库共享同一编号空间。
+    ///
+    /// # Returns
+    /// 命中活记录时返回只读视图;`RowId` 不存在、已墓碑或已逻辑过期返回 `None`。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
+    ///
     /// # Examples
     /// ```
     /// use mneme::{InsertOutcome, Mneme, Record};
@@ -103,6 +125,15 @@ impl Namespace {
     }
 
     /// 批量点读,返回顺序与输入一一对应。
+    ///
+    /// # Arguments
+    /// * `keys` - 记录键列表;未命中的位置以 `None` 占位。
+    ///
+    /// # Returns
+    /// 与 `keys` 等长、顺序一致的命中视图列表。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
     ///
     /// # Examples
     /// ```
@@ -134,6 +165,15 @@ impl Namespace {
     }
 
     /// 批量按 `RowId` 点读,返回顺序与输入一一对应。
+    ///
+    /// # Arguments
+    /// * `ids` - `RowId` 列表;未命中的位置以 `None` 占位。
+    ///
+    /// # Returns
+    /// 与 `ids` 等长、顺序一致的命中视图列表。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
     pub fn get_many_by_rowid(&self, ids: &[RowId]) -> Result<Vec<Option<RecordRef<'_>>>> {
         let view = self.table.view();
         if view.closed {
@@ -153,6 +193,15 @@ impl Namespace {
 
     /// 存在性判定。
     ///
+    /// # Arguments
+    /// * `key` - 记录键;按当前命名空间隔离查找。
+    ///
+    /// # Returns
+    /// 存在活记录时返回 `true`。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
+    ///
     /// # Examples
     /// ```
     /// use mneme::{Mneme, Record};
@@ -166,6 +215,15 @@ impl Namespace {
     }
 
     /// 单独取回原始向量。
+    ///
+    /// # Arguments
+    /// * `id` - 目标 `RowId`;仅活记录可见。
+    ///
+    /// # Returns
+    /// 命中活记录时返回向量拷贝;不可见时返回 `None`。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
     ///
     /// # Examples
     /// ```
@@ -192,6 +250,15 @@ impl Namespace {
     }
 
     /// 统计命中活记录数(不物化记录)。
+    ///
+    /// # Arguments
+    /// * `filter` - 三值过滤表达式;`None` 表示不过滤。
+    ///
+    /// # Returns
+    /// 命中过滤条件的活记录数;命名空间未注册返回 `0`。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
     ///
     /// # Examples
     /// ```
@@ -239,6 +306,15 @@ impl Namespace {
 
     /// 按过滤条件流式遍历(不含墓碑/过期记录)。
     ///
+    /// # Arguments
+    /// * `filter` - 三值过滤表达式;`None` 表示不过滤。
+    ///
+    /// # Returns
+    /// 按 `RowId` 升序产出 `Ok(RecordRef)` 的迭代器(内层 `Err` 为 L2 预留)。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
+    ///
     /// # Examples
     /// ```
     /// use mneme::{Mneme, Record};
@@ -260,6 +336,16 @@ impl Namespace {
     }
 
     /// 按过滤条件流式遍历;`include_deleted=true` 时包含墓碑/过期记录(仅审计)。
+    ///
+    /// # Arguments
+    /// * `filter` - 三值过滤表达式;`None` 表示不过滤。
+    /// * `include_deleted` - `true` 时包含墓碑/已逻辑过期记录。
+    ///
+    /// # Returns
+    /// 按 `RowId` 升序产出 `Ok(RecordRef)` 的迭代器(内层 `Err` 为 L2 预留)。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
     pub fn iter_with(
         &self,
         filter: Option<Expr>,

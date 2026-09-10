@@ -47,18 +47,30 @@ fn apply_patch(
     now: i64,
 ) -> Result<()> {
     if let Some(vector) = &patch.vector {
-        if vector.len() != config.dimension.get() as usize {
-            return Err(MnemeError::DimensionMismatch {
-                expected: config.dimension.get(),
-                got: vector.len(),
-            });
-        }
-        if vector.iter().any(|value| !value.is_finite()) {
-            return Err(MnemeError::NonFinite);
-        }
-        slot_data.vector = Arc::from(vector.clone().into_boxed_slice());
-        slot_data.norm_sq = search::norm_sq(&slot_data.vector);
+        apply_vector_patch(slot_data, vector, config)?;
     }
+    apply_scalar_patch(slot_data, patch, now);
+    Ok(())
+}
+
+/// 应用补丁的向量字段:校验维度与非有限值后整体替换,并重算范数平方。
+fn apply_vector_patch(slot_data: &mut SlotData, vector: &[f32], config: &Config) -> Result<()> {
+    if vector.len() != config.dimension.get() as usize {
+        return Err(MnemeError::DimensionMismatch {
+            expected: config.dimension.get(),
+            got: vector.len(),
+        });
+    }
+    if vector.iter().any(|value| !value.is_finite()) {
+        return Err(MnemeError::NonFinite);
+    }
+    slot_data.vector = Arc::from(vector.to_vec().into_boxed_slice());
+    slot_data.norm_sq = search::norm_sq(&slot_data.vector);
+    Ok(())
+}
+
+/// 应用补丁的文本/元数据/标量字段(时间语义经 `now` 注入,不可失败)。
+fn apply_scalar_patch(slot_data: &mut SlotData, patch: &UpdatePatch, now: i64) {
     if let Some(text) = &patch.text {
         match text {
             Some(text) => {
@@ -90,7 +102,6 @@ fn apply_patch(
     if let Some(provenance) = &patch.provenance {
         slot_data.provenance = provenance.clone();
     }
-    Ok(())
 }
 
 pub(crate) fn touch_rowid(

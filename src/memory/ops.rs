@@ -56,6 +56,9 @@ pub struct Histogram {
 impl Histogram {
     /// 记录一次延迟样本(毫秒),超范围钳制到端点桶。
     ///
+    /// # Arguments
+    /// * `latency_ms` - 延迟样本(毫秒);≤ 1ms 记入首桶,≥ 1s 记入末桶,其余按对数刻度分桶。
+    ///
     /// # Examples
     /// ```
     /// use mneme::Histogram;

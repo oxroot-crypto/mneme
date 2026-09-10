@@ -48,7 +48,7 @@ pub use crate::memory::{
     AccessStat, BackupReport, Builder, CheckReport, CmpOp, CompactionControl, CompactionState,
     ConsolidateReport, ConsolidationPolicy, Dedup, Edge, Expr, FieldBuilder, Fusion, Histogram,
     HistoryStat, Hit, InsertOutcome, Mneme, Namespace, NsStat, QuantStat, QueryCtx, Record,
-    RecordRef, RelationExpand, Reranker, ResultDedup, RetainReport, Retention, ScoreBreakdown,
-    SearchBuilder, SegmentStat, SnapshotHandle, SnapshotNamespace, Stats, StorageStat, Summarizer,
-    UpdateOutcome, Val,
+    RecordRef, RelateOptions, RelationExpand, Reranker, ResultDedup, RetainReport, Retention,
+    ScoreBreakdown, SearchBuilder, SegmentStat, SnapshotHandle, SnapshotNamespace, Stats,
+    StorageStat, Summarizer, UpdateOutcome, Val,
 };

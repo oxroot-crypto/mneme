@@ -29,7 +29,7 @@ pub struct Retention {
     /// 保留分下限,低于则候选遗忘,默认 0.2。
     pub min_importance: f32,
     /// 访问增益权重,默认 0.05。
-    pub w: f32,
+    pub access_weight: f32,
     /// 白名单:命中者豁免遗忘。
     pub protect: Option<Expr>,
 }
@@ -48,24 +48,56 @@ impl Retention {
     }
 
     /// 设置半衰期。
+    ///
+    /// # Arguments
+    ///
+    /// * `half_life` - 遗忘曲线半衰期。
+    ///
+    /// # Returns
+    ///
+    /// 携带半衰期的策略(链式)。
     pub fn half_life(mut self, half_life: Duration) -> Self {
         self.half_life = half_life;
         self
     }
 
     /// 设置保留分下限。
+    ///
+    /// # Arguments
+    ///
+    /// * `min_importance` - 保留分下限;低于则候选遗忘。
+    ///
+    /// # Returns
+    ///
+    /// 携带下限的策略(链式)。
     pub fn min_importance(mut self, min_importance: f32) -> Self {
         self.min_importance = min_importance;
         self
     }
 
     /// 设置访问增益权重。
-    pub fn w(mut self, w: f32) -> Self {
-        self.w = w;
+    ///
+    /// # Arguments
+    ///
+    /// * `access_weight` - 访问增益权重(公式 $w\cdot\ln(1+c)$ 的系数)。
+    ///
+    /// # Returns
+    ///
+    /// 携带访问增益权重的策略(链式)。
+    pub fn access_weight(mut self, access_weight: f32) -> Self {
+        self.access_weight = access_weight;
         self
     }
 
     /// 设置保护过滤器。
+    ///
+    /// # Arguments
+    ///
+    /// * `protect` - 白名单表达式;命中者豁免遗忘。
+    ///
+    /// # Returns
+    ///
+    /// 携带保护过滤器的策略(链式)。
     pub fn protect(mut self, protect: Expr) -> Self {
         self.protect = Some(protect);
         self
@@ -77,7 +109,7 @@ impl Default for Retention {
         Self {
             half_life: Duration::from_secs(DEFAULT_HALF_LIFE_DAYS * SECS_PER_DAY),
             min_importance: DEFAULT_MIN_IMPORTANCE,
-            w: DEFAULT_ACCESS_WEIGHT,
+            access_weight: DEFAULT_ACCESS_WEIGHT,
             protect: None,
         }
     }
@@ -99,23 +131,21 @@ pub struct RetainReport {
 /// # Arguments
 /// * `importance` - 重要度,`[0,1]`。
 /// * `age_ms` - 距最近有效时间的毫秒数(负值按 0 处理)。
-/// * `half_life` - 半衰期;为 0 时衰减系数按 0 处理。
-/// * `w` - 访问增益权重。
 /// * `access_count` - 累计访问次数。
+/// * `policy` - 遗忘策略(提供半衰期 `half_life` 与访问增益权重 `access_weight`)。
 pub(crate) fn retention_score(
     importance: f32,
     age_ms: i64,
-    half_life: Duration,
-    w: f32,
     access_count: u32,
+    policy: &Retention,
 ) -> f32 {
-    let half_life_ms = half_life.as_millis() as f64;
+    let half_life_ms = policy.half_life.as_millis() as f64;
     let decay = if half_life_ms <= 0.0 {
         0.0
     } else {
         2.0_f64.powf(-(age_ms.max(0) as f64) / half_life_ms)
     };
-    let access_gain = f64::from(w) * (1.0 + f64::from(access_count)).ln();
+    let access_gain = f64::from(policy.access_weight) * (1.0 + f64::from(access_count)).ln();
     (f64::from(importance) * decay + access_gain) as f32
 }
 
@@ -128,17 +158,20 @@ mod tests {
     fn retention_score_formula() {
         let half_life = Duration::from_secs(14 * 24 * 60 * 60);
         let half_life_ms = half_life.as_millis() as i64;
+        let policy = Retention::new().half_life(half_life);
         // 无访问、无衰减(w=0, age=0)→ 等于 importance
-        assert!((retention_score(0.8, 0, half_life, 0.0, 0) - 0.8).abs() < 1e-6);
+        assert!((retention_score(0.8, 0, 0, &policy) - 0.8).abs() < 1e-6);
         // 恰好一个半衰期 → 衰减为一半
-        assert!((retention_score(1.0, half_life_ms, half_life, 0.0, 0) - 0.5).abs() < 1e-4);
+        assert!((retention_score(1.0, half_life_ms, 0, &policy) - 0.5).abs() < 1e-4);
         // 负 age 按 0 处理
-        assert!((retention_score(1.0, -1_000, half_life, 0.0, 0) - 1.0).abs() < 1e-6);
+        assert!((retention_score(1.0, -1_000, 0, &policy) - 1.0).abs() < 1e-6);
         // T½ = 0 → 衰减项为 0
-        let zero_half = retention_score(1.0, 1_000, Duration::ZERO, 0.0, 0);
+        let zero_policy = Retention::new().half_life(Duration::ZERO);
+        let zero_half = retention_score(1.0, 1_000, 0, &zero_policy);
         assert!(zero_half.abs() < 1e-6, "got {zero_half}");
         // 访问增益 w·ln(1+c):w=1、c=1 → ln 2
-        let with_access = retention_score(0.0, 0, half_life, 1.0, 1);
+        let access_policy = Retention::new().half_life(half_life).access_weight(1.0);
+        let with_access = retention_score(0.0, 0, 1, &access_policy);
         assert!(
             (with_access - 2.0_f32.ln()).abs() < 1e-4,
             "got {with_access}"

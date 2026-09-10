@@ -13,6 +13,9 @@ use super::Namespace;
 impl Namespace {
     /// 单条写入。
     ///
+    /// # Arguments
+    /// * `rec` - 待写入记录;向量维度须与建库维度一致,分量必须是有限值。
+    ///
     /// # Errors
     /// 维度不符 → [`MnemeError::DimensionMismatch`];分量非有限值 → [`MnemeError::NonFinite`];
     /// 超限 → [`MnemeError::TooLarge`]/[`MnemeError::MetaTooDeep`];`RejectDuplicate` 命中 →
@@ -53,6 +56,15 @@ impl Namespace {
     ///
     /// 任一条维度/数值/限额校验失败则整批拒绝;去重命中与 `RejectDuplicate`
     /// 为逐条结果,不回滚整批。
+    ///
+    /// # Arguments
+    /// * `recs` - 批量记录;按顺序逐条求值,返回顺序与输入一致。
+    ///
+    /// # Errors
+    /// 任一条维度不符 → [`MnemeError::DimensionMismatch`];分量非有限值 →
+    /// [`MnemeError::NonFinite`];超限 → [`MnemeError::TooLarge`]/[`MnemeError::MetaTooDeep`];
+    /// 库已关闭 → [`MnemeError::Closed`]。批内 key 重复(`RejectDuplicate`)以
+    /// [`InsertOutcome::Duplicate`] 结果返回,不算错误。
     ///
     /// # Examples
     /// ```
@@ -98,6 +110,15 @@ impl Namespace {
 
     /// 按 key 删除,返回是否命中活记录。
     ///
+    /// # Arguments
+    /// * `key` - 记录键;按当前命名空间隔离查找。
+    ///
+    /// # Returns
+    /// 命中活记录并写入墓碑返回 `true`;命名空间未注册或 key 不存在返回 `false`。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
+    ///
     /// # Examples
     /// ```
     /// use mneme::{Mneme, Record};
@@ -126,6 +147,15 @@ impl Namespace {
     }
 
     /// 按 `RowId` 删除,返回是否命中活记录。
+    ///
+    /// # Arguments
+    /// * `id` - 目标 `RowId`;全库共享同一编号空间,不区分命名空间。
+    ///
+    /// # Returns
+    /// 命中活记录并写入墓碑返回 `true`;`RowId` 不存在或已是墓碑返回 `false`。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
     pub fn delete_by_rowid(&self, id: RowId) -> Result<bool> {
         let mut ws = self.table.write();
         if ws.closed {
@@ -139,6 +169,15 @@ impl Namespace {
     }
 
     /// 保留 `RowId` 的局部更新(按 key 定位)。
+    ///
+    /// # Arguments
+    /// * `key` - 记录键;按当前命名空间隔离查找。
+    /// * `patch` - 局部补丁;仅 `Some` 字段生效,向量字段受维度与非有限值校验。
+    ///
+    /// # Errors
+    /// 库已关闭 → [`MnemeError::Closed`];补丁向量维度不符 →
+    /// [`MnemeError::DimensionMismatch`];分量非有限值 → [`MnemeError::NonFinite`]。
+    /// key 不存在时返回 `Ok(UpdateOutcome::NotFound)`,不算错误。
     ///
     /// # Examples
     /// ```
@@ -172,6 +211,15 @@ impl Namespace {
     }
 
     /// 保留 `RowId` 的局部更新(按 `RowId` 定位)。
+    ///
+    /// # Arguments
+    /// * `id` - 目标 `RowId`;不存在或已墓碑时返回 `NotFound`。
+    /// * `patch` - 局部补丁;仅 `Some` 字段生效。
+    ///
+    /// # Errors
+    /// 库已关闭 → [`MnemeError::Closed`];补丁向量维度不符 →
+    /// [`MnemeError::DimensionMismatch`];分量非有限值 → [`MnemeError::NonFinite`]。
+    /// `RowId` 不存在时返回 `Ok(UpdateOutcome::NotFound)`,不算错误。
     pub fn update_by_rowid(&self, id: RowId, patch: UpdatePatch) -> Result<UpdateOutcome> {
         let mut ws = self.table.write();
         if ws.closed {
@@ -183,6 +231,16 @@ impl Namespace {
     }
 
     /// 信念修订:更新同 key,并把旧版本 `valid_to` 闭合为新版本 `valid_from`。
+    ///
+    /// # Arguments
+    /// * `key` - 要修订的记录键;不存在时返回 `NotFound`。
+    /// * `rec` - 新版本记录;其 `valid_from`(缺省为当前时刻)同时作为旧版本的 `valid_to`。
+    ///
+    /// # Errors
+    /// 新记录维度不符 → [`MnemeError::DimensionMismatch`];分量非有限值 →
+    /// [`MnemeError::NonFinite`];超限 → [`MnemeError::TooLarge`]/[`MnemeError::MetaTooDeep`];
+    /// 库已关闭 → [`MnemeError::Closed`]。key 不存在时返回
+    /// `Ok(UpdateOutcome::NotFound)`,不算错误。
     ///
     /// # Examples
     /// ```

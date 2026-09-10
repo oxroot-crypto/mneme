@@ -6,12 +6,13 @@
 use std::sync::Arc;
 
 use crate::core::metric::{Metric, Score};
+use crate::core::options::{Scoring, TimeAxis};
 use crate::core::simd;
 use crate::core::types::RowId;
 use crate::memory::pred::Expr;
 use crate::memory::record::{Record, RecordRef};
 use crate::memory::search::Scored;
-use crate::memory::table::ReaderView;
+use crate::memory::table::{AccessStat, ReaderView, SlotData};
 
 /// 沉淀聚类的缺省相似度阈值。
 const DEFAULT_CONSOLIDATION_THRESHOLD: f32 = 0.95;
@@ -106,88 +107,128 @@ pub(crate) fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
     }
 }
 
+/// 求候选分数的归一化区间(Euclidean 取负后口径统一为"越大越优")。
+fn normalize_span(candidates: &[Scored], metric: Metric) -> (f32, f32) {
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    for candidate in candidates {
+        let star = to_star(metric, candidate.score);
+        min = min.min(star);
+        max = max.max(star);
+    }
+    (min, max)
+}
+
+/// Euclidean 分数越小越近,取负统一到"越大越优"的排序口径。
+fn to_star(metric: Metric, score: Score) -> f32 {
+    if metric == Metric::Euclidean {
+        -score
+    } else {
+        score
+    }
+}
+
+/// 单候选综合打分器(聚合视图/策略/归一化区间,避免超长参数列表)。
+struct CompositeRanker<'a> {
+    view: &'a ReaderView,
+    scoring: &'a Scoring,
+    metric: Metric,
+    /// 相似度归一化下界(已统一到"越大越优"口径)。
+    min: f32,
+    /// 相似度归一化区间宽度;`0` 表示所有候选同分(归一化为 1)。
+    span: f32,
+    now_ms: i64,
+}
+
+impl CompositeRanker<'_> {
+    /// 相似度归一化贡献(`[0,1]`)。
+    fn sim_norm(&self, candidate: &Scored) -> f32 {
+        if self.span > 0.0 {
+            ((to_star(self.metric, candidate.score) - self.min) / self.span).clamp(0.0, 1.0)
+        } else {
+            1.0
+        }
+    }
+
+    /// 新鲜度因子:距最近有效时间按半衰期指数衰减。
+    fn recency(&self, slot_data: &SlotData, access: &AccessStat) -> f32 {
+        let last_access = if access.access_count == 0 {
+            slot_data.created_at
+        } else {
+            access.last_access_ms
+        };
+        let anchor = match self.scoring.time_axis {
+            TimeAxis::ValidTime => slot_data.valid_from.max(last_access),
+            TimeAxis::TransactionTime => slot_data.created_at.max(last_access),
+        };
+        let age = (self.now_ms - anchor).max(0) as f64;
+        let half_life_ms = self.scoring.half_life.as_millis().max(1) as f64;
+        2.0_f64.powf(-age / half_life_ms) as f32
+    }
+
+    /// 访问频次因子:对数归一,基准 `c_norm`。
+    fn access_factor(&self, access: &AccessStat) -> f32 {
+        let c_norm = f64::from(self.scoring.c_norm.max(1));
+        (((1.0 + f64::from(access.access_count)).ln() / (1.0 + c_norm).ln()).clamp(0.0, 1.0)) as f32
+    }
+
+    /// 打一个候选:各因子加权求和;相似度低于保底 `floor` 时综合分清零。
+    fn score_candidate(&self, candidate: &Scored) -> (Scored, ScoreBreakdown) {
+        let slot_data = &self.view.slots[candidate.slot.get() as usize];
+        let access = self
+            .view
+            .access
+            .get(&candidate.rowid)
+            .copied()
+            .unwrap_or_default();
+        let sim_norm = self.sim_norm(candidate);
+        let breakdown = ScoreBreakdown {
+            sim: self.scoring.w_sim * sim_norm,
+            recency: self.scoring.w_recency * self.recency(slot_data, &access),
+            importance: self.scoring.w_importance * slot_data.importance,
+            access: self.scoring.w_access * self.access_factor(&access),
+            confidence: self.scoring.w_confidence * slot_data.confidence,
+            boost: 0.0,
+        };
+        let mut total = breakdown.sim
+            + breakdown.recency
+            + breakdown.importance
+            + breakdown.access
+            + breakdown.confidence;
+        if sim_norm < self.scoring.floor {
+            total = 0.0;
+        }
+        (
+            Scored {
+                score: total,
+                ..*candidate
+            },
+            breakdown,
+        )
+    }
+}
+
 /// 对候选做综合重排,返回按综合分降序(同分 `RowId` 升序)的结果。
 pub(crate) fn rerank_composite(
     view: &ReaderView,
     candidates: &[Scored],
-    scoring: &crate::core::options::Scoring,
+    scoring: &Scoring,
     metric: Metric,
     now_ms: i64,
 ) -> Vec<(Scored, ScoreBreakdown)> {
-    let to_star = |score: Score| {
-        if metric == Metric::Euclidean {
-            -score
-        } else {
-            score
-        }
+    let (min, max) = normalize_span(candidates, metric);
+    let ranker = CompositeRanker {
+        view,
+        scoring,
+        metric,
+        min,
+        span: max - min,
+        now_ms,
     };
-    let mut min = f32::INFINITY;
-    let mut max = f32::NEG_INFINITY;
-    for candidate in candidates {
-        let star = to_star(candidate.score);
-        min = min.min(star);
-        max = max.max(star);
-    }
-    let span = max - min;
-    let half_life_ms = scoring.half_life.as_millis().max(1) as f64;
-
     let mut ranked: Vec<(Scored, ScoreBreakdown)> = candidates
         .iter()
-        .map(|candidate| {
-            let slot_data = &view.slots[candidate.slot.get() as usize];
-            let star = to_star(candidate.score);
-            let sim_norm = if span > 0.0 {
-                ((star - min) / span).clamp(0.0, 1.0)
-            } else {
-                1.0
-            };
-            let access = view
-                .access
-                .get(&candidate.rowid)
-                .copied()
-                .unwrap_or_default();
-            let last_access = if access.access_count == 0 {
-                slot_data.created_at
-            } else {
-                access.last_access_ms
-            };
-            let anchor = match scoring.time_axis {
-                crate::core::options::TimeAxis::ValidTime => slot_data.valid_from.max(last_access),
-                crate::core::options::TimeAxis::TransactionTime => {
-                    slot_data.created_at.max(last_access)
-                }
-            };
-            let age = (now_ms - anchor).max(0) as f64;
-            let recency = 2.0_f64.powf(-age / half_life_ms) as f32;
-            let c_norm = f64::from(scoring.c_norm.max(1));
-            let acc = ((1.0 + f64::from(access.access_count)).ln() / (1.0 + c_norm).ln())
-                .clamp(0.0, 1.0) as f32;
-            let breakdown = ScoreBreakdown {
-                sim: scoring.w_sim * sim_norm,
-                recency: scoring.w_recency * recency,
-                importance: scoring.w_importance * slot_data.importance,
-                access: scoring.w_access * acc,
-                confidence: scoring.w_confidence * slot_data.confidence,
-                boost: 0.0,
-            };
-            let mut total = breakdown.sim
-                + breakdown.recency
-                + breakdown.importance
-                + breakdown.access
-                + breakdown.confidence;
-            if sim_norm < scoring.floor {
-                total = 0.0;
-            }
-            (
-                Scored {
-                    score: total,
-                    ..*candidate
-                },
-                breakdown,
-            )
-        })
+        .map(|candidate| ranker.score_candidate(candidate))
         .collect();
-
     ranked.sort_by(|a, b| {
         b.0.score
             .partial_cmp(&a.0.score)
@@ -238,6 +279,10 @@ pub(crate) fn mmr_select(
 /// 以并查集把候选按「相似度 ≥ threshold」聚成连通分量。
 ///
 /// 返回每个连通分量的成员下标;单元素簇也会返回,由调用方过滤。
+///
+/// 复杂度(FC-MODEL-CPLX-002):两两余弦为 $O(n^2\cdot d)$(n = 候选数),并查集近似线性;
+/// 空间 $O(n)$。候选规模受单库内存与 `ConsolidationPolicy.filter` 约束,预期 n 为
+/// 单命名空间活记录量级;渐进劣化须先修订该契约(FC-GLOBAL-CPLX-001)。
 pub(crate) fn cluster_by_similarity(vectors: &[&[f32]], threshold: f32) -> Vec<Vec<usize>> {
     let n = vectors.len();
     let mut parent: Vec<usize> = (0..n).collect();

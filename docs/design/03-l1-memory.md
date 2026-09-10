@@ -107,7 +107,7 @@ impl SearchBuilder<'_> { pub fn execute(&self) -> Result<Vec<Hit>>; }
 - `feedback(rowid, Feedback, query_id)`:检索反馈闭环([10 §4](10-scoring.md)),把"这条记忆是否被
   采用/纠正"回写为访问增益或重要度修正;幂等键 `(rowid, query_id)` 防重复计分
   (`query_id` 由 `execute()` 生成并随 `Hit` 返回,见 [10 §4.2](10-scoring.md));
-- `relate(from, to, kind, weight)` / `relate_with_meta(from, to, kind, weight, meta)` /
+- `relate(from, to, kind, weight)` / `relate_with_options(from, to, RelateOptions)` /
   `unrelate(...)`:建立/删除记忆关系边
   ([09 §2](09-memory-model.md));关系边随记录墓碑级联失效;
 - `consolidate(policy)`:对满足过滤的近似重复记忆做聚类→合并/摘要→链接来源
@@ -377,7 +377,7 @@ UpdatePatch / Expr / Dedup / ResultDedup / Retention / Scoring / Diversity / Rel
 Feedback / ConsolidationPolicy 语义`,
 以及 `search / insert / insert_batch / update / update_by_rowid / supersede / get / get_by_rowid / get_many /
 get_many_by_rowid / get_vector / exists / count / delete / delete_by_rowid / touch /
-touch_by_rowid / feedback / relate / relate_with_meta / unrelate / neighbors / predecessors / consolidate /
+touch_by_rowid / feedback / relate / relate_with_options / unrelate / neighbors / predecessors / consolidate /
 forget / retain / iter / iter_with / flush / close / namespace / list_namespaces / drop_namespace /
 snapshot / as_of / backup_to / stats / check / compact_control` 的签名。
 

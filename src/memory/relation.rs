@@ -33,6 +33,39 @@ pub struct Edge {
     pub metadata: Meta,
 }
 
+/// `relate_with_options` 的参数结构(参数收敛,见设计 16 §1.4)。
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelateOptions {
+    /// 关系类型。
+    pub kind: RelationKind,
+    /// 边权;写入时钳制到 `[0,1]`。
+    pub weight: f32,
+    /// 边元数据(开放 JSON)。
+    pub metadata: Meta,
+}
+
+impl RelateOptions {
+    /// 以关系类型与边权构造;metadata 缺省 `Meta::Null`。
+    ///
+    /// # Arguments
+    ///
+    /// * `kind` - 关系类型。
+    /// * `weight` - 边权;越界值在写入入口钳制到 `[0,1]`。
+    pub fn new(kind: RelationKind, weight: f32) -> Self {
+        Self {
+            kind,
+            weight,
+            metadata: Meta::Null,
+        }
+    }
+
+    /// 设置边元数据(链式)。
+    pub fn metadata(mut self, metadata: Meta) -> Self {
+        self.metadata = metadata;
+        self
+    }
+}
+
 /// 关系联想扩展参数(实现见 L10;L1 提供最小内存实现)。
 #[derive(Debug, Clone, PartialEq)]
 pub struct RelationExpand {

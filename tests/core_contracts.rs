@@ -20,7 +20,7 @@ use std::cmp::Ordering;
 use mneme::meta::{as_bool, as_f64, as_i64, as_str, as_ts, get_path};
 use mneme::simd::{dot, dot_scalar};
 use mneme::varint::{decode_u32, decode_u64, encode_u32, encode_u64};
-use mneme::{Dimension, Metric, RelationKind, TopK, json};
+use mneme::{Dimension, Metric, MnemeError, RelationKind, TopK, json};
 use proptest::prelude::*;
 
 /// 参照实现:按"最优在前、同分载荷升序"排序后取前 k 个。
@@ -106,14 +106,26 @@ fn relation_kind_builtins() {
     assert_eq!(RelationKind::FIRST_CUSTOM, 16);
 }
 
-/// FC-CORE-ERR-001
+/// FC-CORE-ERR-001(畸形输入必须返回结构化的 `Corrupted` 变体,而非其他错误类)
 #[test]
 fn varint_malformed() {
-    assert!(decode_u64(&[0x80]).is_err(), "截断必须报错");
-    assert!(decode_u64(&[]).is_err(), "空输入必须报错");
-    assert!(decode_u64(&[0x80; 11]).is_err(), "超长必须报错");
-    assert!(decode_u64(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02]).is_err());
-    assert!(decode_u32(&[0x80, 0x80, 0x80, 0x80, 0x10]).is_err());
+    assert!(
+        matches!(decode_u64(&[0x80]), Err(MnemeError::Corrupted { .. })),
+        "截断必须报 Corrupted"
+    );
+    assert!(matches!(decode_u64(&[]), Err(MnemeError::Corrupted { .. })));
+    assert!(matches!(
+        decode_u64(&[0x80; 11]),
+        Err(MnemeError::Corrupted { .. })
+    ));
+    assert!(matches!(
+        decode_u64(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02]),
+        Err(MnemeError::Corrupted { .. })
+    ));
+    assert!(matches!(
+        decode_u32(&[0x80, 0x80, 0x80, 0x80, 0x10]),
+        Err(MnemeError::Corrupted { .. })
+    ));
 }
 
 /// FC-CORE-ERR-002

@@ -7,6 +7,9 @@ use std::time::Duration;
 
 use crate::core::meta::Meta;
 
+/// 批量 fsync 的缺省时间窗口(毫秒;来源:设计 00 §6.1)。
+const DEFAULT_FSYNC_BATCH_MS: u64 = 20;
+
 /// 落盘同步(fsync)策略。
 ///
 /// 语义与权衡见设计 00 §6.1 与 04 §3。
@@ -24,7 +27,7 @@ pub enum FsyncPolicy {
 
 impl Default for FsyncPolicy {
     fn default() -> Self {
-        Self::Batched(Duration::from_millis(20))
+        Self::Batched(Duration::from_millis(DEFAULT_FSYNC_BATCH_MS))
     }
 }
 
@@ -73,48 +76,113 @@ impl UpdatePatch {
     }
 
     /// 设置新向量(链式)。
+    ///
+    /// # Arguments
+    ///
+    /// * `vector` - 新向量;维度与有限性在 `update` 入口校验。
+    ///
+    /// # Returns
+    ///
+    /// 携带新向量的补丁(链式)。
     pub fn vector(mut self, vector: Vec<f32>) -> Self {
         self.vector = Some(vector);
         self
     }
 
     /// 设置新文本;`Some(None)` 清空。
+    ///
+    /// # Arguments
+    ///
+    /// * `text` - 新文本;`None` 表示清空该字段。
+    ///
+    /// # Returns
+    ///
+    /// 携带文本变更的补丁(链式)。
     pub fn text(mut self, text: Option<String>) -> Self {
         self.text = Some(text);
         self
     }
 
     /// 设置新元数据;`Some(None)` 清空。
+    ///
+    /// # Arguments
+    ///
+    /// * `metadata` - 新元数据;`None` 表示清空该字段。
+    ///
+    /// # Returns
+    ///
+    /// 携带元数据变更的补丁(链式)。
     pub fn metadata(mut self, metadata: Option<Meta>) -> Self {
         self.metadata = Some(metadata);
         self
     }
 
     /// 设置新重要度。
+    ///
+    /// # Arguments
+    ///
+    /// * `importance` - 新重要度,`[0,1]`。
+    ///
+    /// # Returns
+    ///
+    /// 携带重要度的补丁(链式)。
     pub fn importance(mut self, importance: f32) -> Self {
         self.importance = Some(importance);
         self
     }
 
     /// 设置新 TTL;`Some(None)` 取消过期。
+    ///
+    /// # Arguments
+    ///
+    /// * `ttl` - 新 TTL;`None` 表示取消过期。
+    ///
+    /// # Returns
+    ///
+    /// 携带 TTL 变更的补丁(链式)。
     pub fn ttl(mut self, ttl: Option<Duration>) -> Self {
         self.ttl = Some(ttl);
         self
     }
 
     /// 设置新有效时间区间。
+    ///
+    /// # Arguments
+    ///
+    /// * `from` - 有效时间起(Unix 毫秒)。
+    /// * `to` - 有效时间止(开区间);`None` = 开放右端。
+    ///
+    /// # Returns
+    ///
+    /// 携带有效时间区间的补丁(链式)。
     pub fn valid_time(mut self, from: i64, to: Option<i64>) -> Self {
         self.valid_time = Some((from, to));
         self
     }
 
     /// 设置新可信度。
+    ///
+    /// # Arguments
+    ///
+    /// * `confidence` - 新可信度,`[0,1]`。
+    ///
+    /// # Returns
+    ///
+    /// 携带可信度的补丁(链式)。
     pub fn confidence(mut self, confidence: f32) -> Self {
         self.confidence = Some(confidence);
         self
     }
 
     /// 设置新来源/派生链;`Some(None)` 清空。
+    ///
+    /// # Arguments
+    ///
+    /// * `provenance` - 新来源/派生链;`None` 表示清空该字段。
+    ///
+    /// # Returns
+    ///
+    /// 携带来源/派生链的补丁(链式)。
     pub fn provenance(mut self, provenance: Option<Meta>) -> Self {
         self.provenance = Some(provenance);
         self

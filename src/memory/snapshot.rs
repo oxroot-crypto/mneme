@@ -11,7 +11,8 @@ use crate::memory::namespace::{DEFAULT_TOP_K, point_get};
 use crate::memory::pred::{self, EvalCtx, Expr};
 use crate::memory::record::RecordRef;
 use crate::memory::relation::Edge;
-use crate::memory::search_builder::{Fusion, SearchBuilder};
+use crate::memory::rerank::Fusion;
+use crate::memory::search_builder::SearchBuilder;
 use crate::memory::table::{ReaderView, Table};
 
 /// 快照句柄:钉住某个读视图。
@@ -44,6 +45,12 @@ impl SnapshotHandle {
 
     /// 在钉住的快照上取命名空间只读视图。
     ///
+    /// # Arguments
+    /// * `path` - 命名空间路径,按 `/` 分层;不校验是否已注册。
+    ///
+    /// # Returns
+    /// 指向 `path` 的 [`SnapshotNamespace`];不校验路径是否已注册。
+    ///
     /// # Examples
     /// ```
     /// use mneme::{Mneme, Record};
@@ -70,6 +77,14 @@ pub struct SnapshotNamespace {
     ns_path: Arc<str>,
 }
 
+impl std::fmt::Debug for SnapshotNamespace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnapshotNamespace")
+            .field("ns_path", &self.ns_path)
+            .finish_non_exhaustive()
+    }
+}
+
 impl SnapshotNamespace {
     fn ns_id(&self) -> Option<NsId> {
         self.view.ns_registry.iter().find_map(|(id, path)| {
@@ -82,6 +97,9 @@ impl SnapshotNamespace {
     }
 
     /// 在钉住的视图上查询。
+    ///
+    /// # Returns
+    /// 在钉住视图上配置检索参数的 [`SearchBuilder`]。
     ///
     /// # Examples
     /// ```
@@ -119,6 +137,15 @@ impl SnapshotNamespace {
 
     /// 按 key 点读。
     ///
+    /// # Arguments
+    /// * `key` - 记录键;按当前命名空间隔离查找。
+    ///
+    /// # Returns
+    /// 命中时返回记录只读视图;命名空间未注册或 key 不存在返回 `None`。
+    ///
+    /// # Errors
+    /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
+    ///
     /// # Examples
     /// ```
     /// use mneme::{Mneme, Record};
@@ -136,6 +163,15 @@ impl SnapshotNamespace {
     }
 
     /// 按 `RowId` 点读。
+    ///
+    /// # Arguments
+    /// * `id` - 目标 `RowId`;全库共享同一编号空间。
+    ///
+    /// # Returns
+    /// 命中活记录时返回只读视图;`RowId` 不存在、已墓碑或已逻辑过期返回 `None`。
+    ///
+    /// # Errors
+    /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
     pub fn get_by_rowid(&self, id: RowId) -> Result<Option<RecordRef<'_>>> {
         let now = self.table.config.clock.now_unix_ms();
         Ok(self
@@ -147,6 +183,15 @@ impl SnapshotNamespace {
     }
 
     /// 批量点读。
+    ///
+    /// # Arguments
+    /// * `keys` - 记录键列表;未命中的位置以 `None` 占位。
+    ///
+    /// # Returns
+    /// 与 `keys` 等长、顺序一致的命中视图列表。
+    ///
+    /// # Errors
+    /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
     pub fn get_many(&self, keys: &[&str]) -> Result<Vec<Option<RecordRef<'_>>>> {
         let now = self.table.config.clock.now_unix_ms();
         let ns_id = self.ns_id();
@@ -157,6 +202,15 @@ impl SnapshotNamespace {
     }
 
     /// 单独取回原始向量。
+    ///
+    /// # Arguments
+    /// * `id` - 目标 `RowId`;仅活记录可见。
+    ///
+    /// # Returns
+    /// 命中活记录时返回向量拷贝;不可见时返回 `None`。
+    ///
+    /// # Errors
+    /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
     pub fn get_vector(&self, id: RowId) -> Result<Option<Vec<f32>>> {
         let now = self.table.config.clock.now_unix_ms();
         Ok(self
@@ -168,11 +222,29 @@ impl SnapshotNamespace {
     }
 
     /// 存在性判定。
+    ///
+    /// # Arguments
+    /// * `key` - 记录键;按当前命名空间隔离查找。
+    ///
+    /// # Returns
+    /// 存在活记录时返回 `true`。
+    ///
+    /// # Errors
+    /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
     pub fn exists(&self, key: &str) -> Result<bool> {
         Ok(self.get(key)?.is_some())
     }
 
     /// 统计命中活记录数。
+    ///
+    /// # Arguments
+    /// * `filter` - 三值过滤表达式;`None` 表示不过滤。
+    ///
+    /// # Returns
+    /// 命中过滤条件的活记录数;命名空间未注册返回 `0`。
+    ///
+    /// # Errors
+    /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
     pub fn count(&self, filter: Option<Expr>) -> Result<u64> {
         let Some(ns_id) = self.ns_id() else {
             return Ok(0);
@@ -198,6 +270,16 @@ impl SnapshotNamespace {
     }
 
     /// 出边(两端存活)。
+    ///
+    /// # Arguments
+    /// * `from` - 出边源 `RowId`。
+    /// * `kinds` - 关系类型过滤;空切片表示不过滤。
+    ///
+    /// # Returns
+    /// 过滤 `kinds` 且两端仍存活的出边列表;悬挂边不可见。
+    ///
+    /// # Errors
+    /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
     pub fn neighbors(&self, from: RowId, kinds: &[RelationKind]) -> Result<Vec<Edge>> {
         Ok(self
             .view
@@ -218,6 +300,16 @@ impl SnapshotNamespace {
     }
 
     /// 入边(两端存活)。
+    ///
+    /// # Arguments
+    /// * `to` - 入边目标 `RowId`。
+    /// * `kinds` - 关系类型过滤;空切片表示不过滤。
+    ///
+    /// # Returns
+    /// 过滤 `kinds` 且 `edge.to == to`、两端存活的边列表。
+    ///
+    /// # Errors
+    /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
     pub fn predecessors(&self, to: RowId, kinds: &[RelationKind]) -> Result<Vec<Edge>> {
         Ok(self
             .view
@@ -235,6 +327,15 @@ impl SnapshotNamespace {
     }
 
     /// 流式遍历(不含墓碑/过期记录)。
+    ///
+    /// # Arguments
+    /// * `filter` - 三值过滤表达式;`None` 表示不过滤。
+    ///
+    /// # Returns
+    /// 按 `RowId` 升序产出 `Ok(RecordRef)` 的迭代器(内层 `Err` 为 L2 预留)。
+    ///
+    /// # Errors
+    /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
     pub fn iter(
         &self,
         filter: Option<Expr>,
@@ -243,6 +344,16 @@ impl SnapshotNamespace {
     }
 
     /// 流式遍历;`include_deleted=true` 时包含墓碑/过期记录。
+    ///
+    /// # Arguments
+    /// * `filter` - 三值过滤表达式;`None` 表示不过滤。
+    /// * `include_deleted` - `true` 时包含墓碑/已逻辑过期记录。
+    ///
+    /// # Returns
+    /// 按 `RowId` 升序产出 `Ok(RecordRef)` 的迭代器(内层 `Err` 为 L2 预留)。
+    ///
+    /// # Errors
+    /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
     pub fn iter_with(
         &self,
         filter: Option<Expr>,

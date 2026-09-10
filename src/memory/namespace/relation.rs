@@ -3,14 +3,25 @@
 use std::sync::Arc;
 
 use crate::core::error::{MnemeError, Result};
-use crate::core::meta::Meta;
 use crate::core::options::RelationKind;
 use crate::core::types::RowId;
-use crate::memory::relation::{self, Edge};
+use crate::memory::relation::{self, Edge, RelateOptions};
 
 use super::Namespace;
 impl Namespace {
     /// 建立/更新一条关系边(`(from,to,kind)` 幂等)。
+    ///
+    /// # Arguments
+    /// * `from` - 出边源 `RowId`。
+    /// * `to` - 出边目标 `RowId`。
+    /// * `kind` - 关系类型。
+    /// * `weight` - 边权重;钳制到 `[0.0, 1.0]`。
+    ///
+    /// # Returns
+    /// 恒 `Ok`;幂等键为 `(from, to, kind)`,重复 relate 覆盖 weight(metadata 不变)。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
     ///
     /// # Examples
     /// ```
@@ -29,17 +40,27 @@ impl Namespace {
     /// assert_eq!(ns.neighbors(from, &[]).unwrap().len(), 1);
     /// ```
     pub fn relate(&self, from: RowId, to: RowId, kind: RelationKind, weight: f32) -> Result<()> {
-        self.relate_with_meta(from, to, kind, weight, Meta::Null)
+        self.relate_with_options(from, to, RelateOptions::new(kind, weight))
     }
 
-    /// 建立/更新一条关系边并写入边元数据。
-    pub fn relate_with_meta(
+    /// 建立/更新一条关系边并写入边元数据;参数经 [`RelateOptions`] 打包
+    /// (幂等键仍为 `(from, to, kind)`,重复 relate 为 upsert)。
+    ///
+    /// # Arguments
+    /// * `from` - 出边源 `RowId`。
+    /// * `to` - 出边目标 `RowId`。
+    /// * `options` - 关系参数(类型、权重、边元数据);`weight` 钳制到 `[0.0, 1.0]`。
+    ///
+    /// # Returns
+    /// 恒 `Ok`。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
+    pub fn relate_with_options(
         &self,
         from: RowId,
         to: RowId,
-        kind: RelationKind,
-        weight: f32,
-        metadata: Meta,
+        options: RelateOptions,
     ) -> Result<()> {
         let mut ws = self.table.write();
         if ws.closed {
@@ -48,9 +69,9 @@ impl Namespace {
         let edge = Edge {
             from,
             to,
-            kind,
-            weight: weight.clamp(0.0, 1.0),
-            metadata,
+            kind: options.kind,
+            weight: options.weight.clamp(0.0, 1.0),
+            metadata: options.metadata,
         };
         relation::upsert_edge(Arc::make_mut(&mut ws.out_edges), edge.clone());
         relation::upsert_edge(Arc::make_mut(&mut ws.in_edges), edge);
@@ -59,6 +80,17 @@ impl Namespace {
     }
 
     /// 删除一条关系边,返回是否命中。
+    ///
+    /// # Arguments
+    /// * `from` - 出边源 `RowId`。
+    /// * `to` - 出边目标 `RowId`。
+    /// * `kind` - 关系类型;须与建立时相同才可删除。
+    ///
+    /// # Returns
+    /// 命中并移除出边时返回 `true`(入边同步移除);不存在该边返回 `false`。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
     ///
     /// # Examples
     /// ```
@@ -88,6 +120,16 @@ impl Namespace {
     }
 
     /// 返回 `from` 的出边(两端存活,不变量 I25)。
+    ///
+    /// # Arguments
+    /// * `from` - 出边源 `RowId`。
+    /// * `kinds` - 关系类型过滤;空切片表示不过滤。
+    ///
+    /// # Returns
+    /// 过滤 `kinds` 且两端仍存活的出边列表;悬挂边不可见。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
     ///
     /// # Examples
     /// ```
@@ -128,6 +170,16 @@ impl Namespace {
     }
 
     /// 返回指向 `to` 的入边(两端存活)。
+    ///
+    /// # Arguments
+    /// * `to` - 入边目标 `RowId`。
+    /// * `kinds` - 关系类型过滤;空切片表示不过滤。
+    ///
+    /// # Returns
+    /// 过滤 `kinds` 且 `edge.to == to`、两端存活的边列表。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
     ///
     /// # Examples
     /// ```

@@ -19,6 +19,15 @@ use super::Namespace;
 impl Namespace {
     /// 主动遗忘:对过滤器命中的每行打墓碑,返回删除数。
     ///
+    /// # Arguments
+    /// * `filter` - 命中即遗忘的三值过滤表达式。
+    ///
+    /// # Returns
+    /// 打墓碑的记录数(命中的活记录数)。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
+    ///
     /// # Examples
     /// ```
     /// use mneme::{Expr, Mneme, Record};
@@ -65,6 +74,15 @@ impl Namespace {
 
     /// 按遗忘策略回收低保留分记录。
     ///
+    /// # Arguments
+    /// * `policy` - 遗忘策略(保留分阈值与下限)。
+    ///
+    /// # Returns
+    /// 执行报告:扫描数、遗忘数与抽样 `RowId`(可审计,I23)。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
+    ///
     /// # Examples
     /// ```
     /// use mneme::{Mneme, Record, Retention};
@@ -98,6 +116,15 @@ impl Namespace {
     }
 
     /// 记忆沉淀:把近似重复的记忆聚簇、合并/摘要,并链接来源(设计 09 §5)。
+    ///
+    /// # Arguments
+    /// * `policy` - 沉淀策略(聚类阈值、簇上限与可选摘要器)。
+    ///
+    /// # Returns
+    /// 沉淀报告:簇数、被合并来源数与新摘要的 `RowId` 列表。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
     ///
     /// # Examples
     /// ```
@@ -175,13 +202,7 @@ fn collect_retain_victims(
         }
         let access = ws.access.get(&slot.rowid).copied().unwrap_or_default();
         let age = now - slot.valid_from.max(access.last_access_ms);
-        let score = retention_score(
-            slot.importance,
-            age,
-            policy.half_life,
-            policy.w,
-            access.access_count,
-        );
+        let score = retention_score(slot.importance, age, access.access_count, policy);
         if score < policy.min_importance {
             victims.push(slot.rowid);
         }

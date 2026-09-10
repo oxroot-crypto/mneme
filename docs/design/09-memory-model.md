@@ -54,7 +54,10 @@ impl RelationKind {
 pub struct Edge { pub from: RowId, pub to: RowId, pub kind: RelationKind, pub weight: f32, pub metadata: Meta }
 
 ns.relate(from, to, kind, weight)?;        // 幂等:同 (from,to,kind) 覆盖 weight(metadata 不变)
-ns.relate_with_meta(from, to, kind, weight, meta)?;  // 幂等:同时覆盖 weight 与 metadata
+ns.relate_with_options(
+    from, to,
+    RelateOptions::new(kind, weight).metadata(meta),
+)?;                                        // 幂等:同时覆盖 weight 与 metadata
 ns.unrelate(from, to, kind)?;              // 返回是否命中
 let edges: Vec<Edge> = ns.neighbors(from, &[RelationKind::SUPPORTS])?;       // 出边
 let in_edges: Vec<Edge> = ns.predecessors(to, &[RelationKind::SUPPORTS])?;  // 入边(见 §2.3)
@@ -235,7 +238,7 @@ DERIVED_FROM: S→m1, S→m2, S→m4
 
 **向上提供**:
 
-1. 关系:类型注册表、`relate/relate_with_meta/unrelate/neighbors/predecessors`、联想扩展的数据源(不变量 I25);
+1. 关系:类型注册表、`relate/relate_with_options/unrelate/neighbors/predecessors`、联想扩展的数据源(不变量 I25);
 2. 双时态:`valid_from/valid_to`、`as_of(ts)`、`supersede`(不变量 I26);
 3. 来源/可信度:`confidence`/`provenance` 字段与过滤;
 4. 沉淀:`consolidate(policy)` 与 `ConsolidateReport`。

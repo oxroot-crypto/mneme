@@ -11,8 +11,21 @@ use crate::memory::relation::{self, Edge};
 
 use super::Namespace;
 
+/// `Feedback::Used` 对重要度的提升量(轻度强化;来源:设计 10 §4,δ_up 默认 +0.02)。
+const FEEDBACK_USED_IMPORTANCE_BOOST: f32 = 0.02;
+
 impl Namespace {
     /// 访问强化:计数 +1、刷新最近访问;`boost=Some(d)` 同时提升 importance。
+    ///
+    /// # Arguments
+    /// * `key` - 记录键;按当前命名空间隔离查找。
+    /// * `boost` - 重要度增量;`Some(d)` 时 `importance += d` 后钳制到 `[0.0, 1.0]`。
+    ///
+    /// # Returns
+    /// 命中活记录返回 `true`(计数已更新);命名空间未注册或 key 不存在返回 `false`。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
     ///
     /// # Examples
     /// ```
@@ -40,6 +53,16 @@ impl Namespace {
     }
 
     /// 按 `RowId` 访问强化。
+    ///
+    /// # Arguments
+    /// * `id` - 目标 `RowId`;不存在或已墓碑返回 `false`。
+    /// * `boost` - 重要度增量;语义同 [`Namespace::touch`]。
+    ///
+    /// # Returns
+    /// 命中活记录返回 `true`;`RowId` 不存在或已墓碑返回 `false`。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
     pub fn touch_by_rowid(&self, id: RowId, boost: Option<f32>) -> Result<bool> {
         let mut ws = self.table.write();
         if ws.closed {
@@ -52,6 +75,18 @@ impl Namespace {
     }
 
     /// 检索反馈闭环(幂等键 `(rowid, query_id)`,不变量 I27)。
+    ///
+    /// # Arguments
+    /// * `id` - 被反馈的 `RowId`。
+    /// * `feedback` - 反馈类型:`Used` 强化重要度、`Ignored` 不生效、
+    ///   `Corrected { by }` 建立 `CONTRADICTS` 边并降低可信度。
+    /// * `query_id` - 查询幂等标识;与 `id` 组成幂等键。
+    ///
+    /// # Returns
+    /// 首次收到该 `(rowid, query_id)` 返回 `true` 并生效;重复反馈返回 `false`(幂等)。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
     ///
     /// # Examples
     /// ```
@@ -76,7 +111,7 @@ impl Namespace {
         let now = self.config.clock.now_unix_ms();
         match feedback {
             Feedback::Used => {
-                touch_rowid(&mut ws, id, Some(0.02), now)?;
+                touch_rowid(&mut ws, id, Some(FEEDBACK_USED_IMPORTANCE_BOOST), now)?;
             }
             Feedback::Ignored => {}
             Feedback::Corrected { by } => {

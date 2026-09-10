@@ -41,90 +41,123 @@ impl Tri {
     }
 }
 
+/// 字符串模式匹配算子(`StartsWith`/`EndsWith`/`Glob` 三个分支同构,合并求值)。
+enum StringOp {
+    StartsWith,
+    EndsWith,
+    Glob,
+}
+
+impl StringOp {
+    fn matches(self, text: &str, needle: &Arc<str>) -> bool {
+        match self {
+            StringOp::StartsWith => text.starts_with(&**needle),
+            StringOp::EndsWith => text.ends_with(&**needle),
+            StringOp::Glob => glob_match(needle, text),
+        }
+    }
+}
+
 /// 求值表达式;仅当结果为 `True` 时命中。
 pub(crate) fn matches(expr: &Expr, ctx: &EvalCtx<'_>) -> bool {
     eval(expr, ctx) == Tri::True
 }
 
+/// 逻辑与的短路求值:任一分量确定 `False` 立即返回。
+fn eval_and(parts: &[Expr], ctx: &EvalCtx<'_>) -> Tri {
+    let mut acc = Tri::True;
+    for part in parts {
+        acc = acc.and(eval(part, ctx));
+        if acc == Tri::False {
+            return Tri::False;
+        }
+    }
+    acc
+}
+
+/// 逻辑或的短路求值:任一分量确定 `True` 立即返回。
+fn eval_or(parts: &[Expr], ctx: &EvalCtx<'_>) -> Tri {
+    let mut acc = Tri::False;
+    for part in parts {
+        acc = acc.or(eval(part, ctx));
+        if acc == Tri::True {
+            return Tri::True;
+        }
+    }
+    acc
+}
+
+/// `Cmp` 分支:字段缺失或类型不可比时保持 `Unknown`(三值逻辑,绝不按 `False` 处理)。
+fn eval_cmp(op: CmpOp, field: &str, val: &Val, ctx: &EvalCtx<'_>) -> Tri {
+    match resolve(field, ctx).and_then(|fv| to_val(&fv)) {
+        Some(left) => tri_opt(cmp_vals(op, &left, val)),
+        None => Tri::Unknown,
+    }
+}
+
+/// `In` 分支:命中任一元素即 `True`,字段缺失保持 `Unknown`。
+fn eval_in(field: &str, vals: &[Val], ctx: &EvalCtx<'_>) -> Tri {
+    match resolve(field, ctx).and_then(|fv| to_val(&fv)) {
+        Some(left)
+            if vals
+                .iter()
+                .any(|candidate| cmp_vals(CmpOp::Eq, &left, candidate) == Some(true)) =>
+        {
+            Tri::True
+        }
+        Some(_) => Tri::False,
+        None => Tri::Unknown,
+    }
+}
+
+/// `Contains` 分支:数组命中任一元素,字符串含子串;其余类型 `Unknown`。
+fn eval_contains(field: &str, val: &Val, ctx: &EvalCtx<'_>) -> Tri {
+    match resolve(field, ctx) {
+        Some(FieldValue::Meta(Meta::Array(items))) => tri_bool(
+            items
+                .iter()
+                .filter_map(json_to_val)
+                .any(|item| cmp_vals(CmpOp::Eq, &item, val) == Some(true)),
+        ),
+        Some(fv) => match to_val(&fv) {
+            Some(Val::Str(text)) => match val {
+                Val::Str(needle) => tri_bool(text.contains(&**needle)),
+                _ => Tri::Unknown,
+            },
+            _ => Tri::Unknown,
+        },
+        None => Tri::Unknown,
+    }
+}
+
+/// `StartsWith`/`EndsWith`/`Glob` 分支:字段须解析为字符串,否则 `Unknown`。
+fn eval_string_op(field: &str, needle: &Arc<str>, op: StringOp, ctx: &EvalCtx<'_>) -> Tri {
+    match resolve(field, ctx) {
+        Some(FieldValue::Reserved(Val::Str(text))) => tri_bool(op.matches(&text, needle)),
+        Some(FieldValue::Meta(Meta::String(text))) => tri_bool(op.matches(text, needle)),
+        _ => Tri::Unknown,
+    }
+}
+
+/// AST 分派;各分支委托给小型求值函数,保证单函数体量可控。
 fn eval(expr: &Expr, ctx: &EvalCtx<'_>) -> Tri {
     match expr {
         Expr::Always => Tri::True,
         Expr::Never => Tri::False,
-        Expr::And(parts) => {
-            let mut acc = Tri::True;
-            for part in parts.iter() {
-                acc = acc.and(eval(part, ctx));
-                if acc == Tri::False {
-                    return Tri::False;
-                }
-            }
-            acc
-        }
-        Expr::Or(parts) => {
-            let mut acc = Tri::False;
-            for part in parts.iter() {
-                acc = acc.or(eval(part, ctx));
-                if acc == Tri::True {
-                    return Tri::True;
-                }
-            }
-            acc
-        }
+        Expr::And(parts) => eval_and(parts, ctx),
+        Expr::Or(parts) => eval_or(parts, ctx),
         Expr::Not(inner) => eval(inner, ctx).not(),
         Expr::Exists(field) => tri_bool(resolve(field, ctx).is_some()),
-        Expr::IsNull(field) => match resolve(field, ctx) {
-            Some(FieldValue::Meta(Meta::Null)) => Tri::True,
-            Some(_) => Tri::False,
-            None => Tri::False,
-        },
-        Expr::Cmp { op, field, val } => match resolve(field, ctx).and_then(|fv| to_val(&fv)) {
-            Some(left) => tri_opt(cmp_vals(*op, &left, val)),
-            None => Tri::Unknown,
-        },
-        Expr::In(field, vals) => match resolve(field, ctx).and_then(|fv| to_val(&fv)) {
-            Some(left) => {
-                if vals
-                    .iter()
-                    .any(|candidate| cmp_vals(CmpOp::Eq, &left, candidate) == Some(true))
-                {
-                    Tri::True
-                } else {
-                    Tri::False
-                }
-            }
-            None => Tri::Unknown,
-        },
-        Expr::Contains(field, val) => match resolve(field, ctx) {
-            Some(FieldValue::Meta(Meta::Array(items))) => tri_bool(
-                items
-                    .iter()
-                    .filter_map(json_to_val)
-                    .any(|item| cmp_vals(CmpOp::Eq, &item, val) == Some(true)),
-            ),
-            Some(fv) => match to_val(&fv) {
-                Some(Val::Str(text)) => match val {
-                    Val::Str(needle) => tri_bool(text.contains(&**needle)),
-                    _ => Tri::Unknown,
-                },
-                _ => Tri::Unknown,
-            },
-            None => Tri::Unknown,
-        },
-        Expr::StartsWith(field, prefix) => match resolve(field, ctx) {
-            Some(FieldValue::Reserved(Val::Str(text))) => tri_bool(text.starts_with(&**prefix)),
-            Some(FieldValue::Meta(Meta::String(text))) => tri_bool(text.starts_with(&**prefix)),
-            _ => Tri::Unknown,
-        },
-        Expr::EndsWith(field, suffix) => match resolve(field, ctx) {
-            Some(FieldValue::Reserved(Val::Str(text))) => tri_bool(text.ends_with(&**suffix)),
-            Some(FieldValue::Meta(Meta::String(text))) => tri_bool(text.ends_with(&**suffix)),
-            _ => Tri::Unknown,
-        },
-        Expr::Glob(field, pattern) => match resolve(field, ctx) {
-            Some(FieldValue::Reserved(Val::Str(text))) => tri_bool(glob_match(pattern, &text)),
-            Some(FieldValue::Meta(Meta::String(text))) => tri_bool(glob_match(pattern, text)),
-            _ => Tri::Unknown,
-        },
+        Expr::IsNull(field) => tri_bool(matches!(
+            resolve(field, ctx),
+            Some(FieldValue::Meta(Meta::Null))
+        )),
+        Expr::Cmp { op, field, val } => eval_cmp(*op, field, val, ctx),
+        Expr::In(field, vals) => eval_in(field, vals, ctx),
+        Expr::Contains(field, val) => eval_contains(field, val, ctx),
+        Expr::StartsWith(field, prefix) => eval_string_op(field, prefix, StringOp::StartsWith, ctx),
+        Expr::EndsWith(field, suffix) => eval_string_op(field, suffix, StringOp::EndsWith, ctx),
+        Expr::Glob(field, pattern) => eval_string_op(field, pattern, StringOp::Glob, ctx),
     }
 }
 

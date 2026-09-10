@@ -3,10 +3,11 @@
 //! 在 `cargo test` 中机械校验 `docs/spec/contracts.md` 与测试的双向映射:
 //!
 //! 1. 每个契约引用的 `*.rs::<test>` 必须在源码中真实存在(无悬空引用);
-//! 2. 两个契约测试文件中的每个 `#[test]` 必须被至少一条契约引用(无孤立测试)。
+//! 2. 各契约测试文件中的每个 `#[test]` 必须被至少一条契约引用(无孤立测试)。
 //!
 //! 说明:源码内的单元测试(操作计数 / 公式)可被契约引用,但不强制每个单元测试
 //! 都登记 FC 编号——它们是实现细节测试,契约门禁只对集成契约测试文件做孤立检查。
+//! L1 契约测试按 FC 模块族拆分(memory/query/model/life),门禁统一纳入。
 
 use std::collections::HashSet;
 
@@ -14,12 +15,27 @@ use std::collections::HashSet;
 const CONTRACTS: &str = include_str!("../docs/spec/contracts.md");
 /// L0 契约验收测试。
 const CORE_TESTS: &str = include_str!("core_contracts.rs");
-/// L1 契约验收测试。
+/// L1 契约验收测试(写入/更新/删除/去重/限额)。
 const MEMORY_TESTS: &str = include_str!("memory_contracts.rs");
+/// L1 契约验收测试(检索/过滤/打分/反馈)。
+const QUERY_TESTS: &str = include_str!("query_contracts.rs");
+/// L1 契约验收测试(关系/双时态/版本状态机/沉淀)。
+const MODEL_TESTS: &str = include_str!("model_contracts.rs");
+/// L1 契约验收测试(遗忘/库生命周期/错误分类)。
+const LIFE_TESTS: &str = include_str!("life_contracts.rs");
 /// 承载操作计数单测的源码文件。
 const SRC_SEARCH: &str = include_str!("../src/memory/search.rs");
 const SRC_TABLE: &str = include_str!("../src/memory/table.rs");
 const SRC_LIFECYCLE: &str = include_str!("../src/memory/lifecycle.rs");
+
+/// 全部契约测试文件(孤立检查的范围)。
+const CONTRACT_TEST_FILES: [&str; 5] = [
+    CORE_TESTS,
+    MEMORY_TESTS,
+    QUERY_TESTS,
+    MODEL_TESTS,
+    LIFE_TESTS,
+];
 
 /// 提取源码中所有 `#[test]` 之后的函数名。
 fn test_fns(source: &str) -> Vec<String> {
@@ -78,8 +94,9 @@ fn referenced_tests() -> Vec<String> {
 #[test]
 fn every_referenced_test_exists() {
     let mut defined: HashSet<String> = HashSet::new();
-    defined.extend(test_fns(CORE_TESTS));
-    defined.extend(test_fns(MEMORY_TESTS));
+    for file in CONTRACT_TEST_FILES {
+        defined.extend(test_fns(file));
+    }
     defined.extend(test_fns(SRC_SEARCH));
     defined.extend(test_fns(SRC_TABLE));
     defined.extend(test_fns(SRC_LIFECYCLE));
@@ -98,9 +115,9 @@ fn every_referenced_test_exists() {
 #[test]
 fn no_orphan_contract_tests() {
     let referenced: HashSet<String> = referenced_tests().into_iter().collect();
-    let orphans: Vec<String> = test_fns(CORE_TESTS)
+    let orphans: Vec<String> = CONTRACT_TEST_FILES
         .into_iter()
-        .chain(test_fns(MEMORY_TESTS))
+        .flat_map(test_fns)
         .filter(|name| !referenced.contains(name))
         .collect();
     assert!(

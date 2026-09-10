@@ -130,6 +130,9 @@ pub enum Expr {
 impl Expr {
     /// 字段组合器入口:`Expr::field("importance").gt(0.5)`。
     ///
+    /// # Arguments
+    /// * `name` - 字段名;内置保留字段优先于同名 metadata。
+    ///
     /// # Examples
     /// ```
     /// use mneme::Expr;
@@ -151,6 +154,9 @@ pub struct FieldBuilder {
 
 impl FieldBuilder {
     /// 构造 `field == val`。
+    ///
+    /// # Arguments
+    /// * `val` - 比较取值;经 `Into<Val>` 转换,类型规则见 `FC-QUERY-POST-001`。
     pub fn eq(self, val: impl Into<Val>) -> Expr {
         Expr::Cmp {
             op: CmpOp::Eq,
@@ -160,6 +166,9 @@ impl FieldBuilder {
     }
 
     /// 构造 `field != val`。
+    ///
+    /// # Arguments
+    /// * `val` - 比较取值;经 `Into<Val>` 转换。
     pub fn ne(self, val: impl Into<Val>) -> Expr {
         Expr::Cmp {
             op: CmpOp::Ne,
@@ -169,6 +178,9 @@ impl FieldBuilder {
     }
 
     /// 构造 `field > val`。
+    ///
+    /// # Arguments
+    /// * `val` - 比较取值;经 `Into<Val>` 转换。
     pub fn gt(self, val: impl Into<Val>) -> Expr {
         Expr::Cmp {
             op: CmpOp::Gt,
@@ -178,6 +190,9 @@ impl FieldBuilder {
     }
 
     /// 构造 `field >= val`。
+    ///
+    /// # Arguments
+    /// * `val` - 比较取值;经 `Into<Val>` 转换。
     pub fn ge(self, val: impl Into<Val>) -> Expr {
         Expr::Cmp {
             op: CmpOp::Ge,
@@ -187,6 +202,9 @@ impl FieldBuilder {
     }
 
     /// 构造 `field < val`。
+    ///
+    /// # Arguments
+    /// * `val` - 比较取值;经 `Into<Val>` 转换。
     pub fn lt(self, val: impl Into<Val>) -> Expr {
         Expr::Cmp {
             op: CmpOp::Lt,
@@ -196,6 +214,9 @@ impl FieldBuilder {
     }
 
     /// 构造 `field <= val`。
+    ///
+    /// # Arguments
+    /// * `val` - 比较取值;经 `Into<Val>` 转换。
     pub fn le(self, val: impl Into<Val>) -> Expr {
         Expr::Cmp {
             op: CmpOp::Le,
@@ -205,6 +226,9 @@ impl FieldBuilder {
     }
 
     /// 构造集合判定 `field ∈ {vs}`(`in` 是关键字,故方法名为 `is_in`)。
+    ///
+    /// # Arguments
+    /// * `vs` - 候选值集合;重复值自动去重。
     pub fn is_in(self, vs: impl IntoIterator<Item = Val>) -> Expr {
         let mut vals: Vec<Val> = Vec::new();
         for val in vs {

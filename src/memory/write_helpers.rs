@@ -238,7 +238,7 @@ fn apply_dedup(
             ws.tombstone(existing, ctx.now, seqno)?;
             Ok(None)
         }
-        Dedup::Merge(callback) => merge_duplicate(ws, config, ctx, existing, callback),
+        Dedup::Merge(_) => merge_duplicate(ws, config, ctx, existing),
         Dedup::Off | Dedup::KeepBoth => Ok(None),
     }
 }
@@ -249,8 +249,11 @@ fn merge_duplicate(
     config: &Config,
     ctx: &InsertCtx,
     existing: RowId,
-    callback: &fn(&RecordRef<'_>, &RecordRef<'_>) -> Option<Record>,
 ) -> Result<Option<InsertOutcome>> {
+    // 回调是 `Dedup::Merge` 自身携带的函数指针,从配置取回即可,不作为第 5 个参数透传。
+    let Dedup::Merge(callback) = &config.dedup else {
+        return Ok(None);
+    };
     let existing_data = latest_live(ws, existing).ok_or(MnemeError::Inconsistent {
         reason: "去重命中但记录不可见",
     })?;

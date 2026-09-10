@@ -40,6 +40,10 @@ impl std::fmt::Debug for Mneme {
 impl Mneme {
     /// 打开一个已初始化的本地目录记忆库(持久化在 L2 实现)。
     ///
+    /// # Arguments
+    /// * `_path` - 已初始化库的目录路径;L1 阶段忽略,恒返回 `Unsupported`,
+    ///   L2 持久层落地后生效。
+    ///
     /// # Errors
     /// 当前恒返回 [`MnemeError::Unsupported`]。
     ///
@@ -56,6 +60,12 @@ impl Mneme {
 
     /// 创建纯内存库(易失),维度必填。
     ///
+    /// # Arguments
+    /// * `dimension` - 向量维度;取值 `[1, 65536]`,建库后锁定不可变。
+    ///
+    /// # Errors
+    /// 维度超出 `[1, 65536]` 时返回 [`MnemeError::LimitExceeded`]。
+    ///
     /// # Examples
     /// ```
     /// use mneme::Mneme;
@@ -67,11 +77,21 @@ impl Mneme {
     }
 
     /// 返回建库器。
+    ///
+    /// # Returns
+    /// 全默认配置的 [`Builder`]。
     pub fn builder() -> Builder {
         Builder::default()
     }
 
     /// 返回命名空间句柄;注册表在首次成功写入时惰性登记。
+    ///
+    /// # Arguments
+    /// * `path` - 命名空间路径,按 `/` 分层(如 `"project/session"`),
+    ///   前缀关系供 `drop_namespace` 级联删除;不校验是否已注册。
+    ///
+    /// # Returns
+    /// 指向 `path` 的命名空间句柄;不校验路径是否已注册。
     ///
     /// # Examples
     /// ```
@@ -90,6 +110,12 @@ impl Mneme {
     }
 
     /// 列出已注册的命名空间路径(字典序,即前缀树顺序)。
+    ///
+    /// # Returns
+    /// 已注册命名空间路径的字典序列表。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
     ///
     /// # Examples
     /// ```
@@ -113,6 +139,13 @@ impl Mneme {
     }
 
     /// 删除命名空间及其所有子命名空间,返回删除的命名空间数。
+    ///
+    /// # Arguments
+    /// * `path` - 要删除的命名空间路径;精确匹配该路径及全部 `path/` 前缀子命名空间。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`];槽位编号溢出 `u32::MAX` 时返回
+    /// [`MnemeError::LimitExceeded`]——仅超大规模库(槽位数 > `u32::MAX`)可达。
     ///
     /// # Examples
     /// ```
@@ -160,6 +193,9 @@ impl Mneme {
 
     /// 钉住当前读视图,返回一致快照句柄。
     ///
+    /// # Returns
+    /// 钉住当前读视图的 [`SnapshotHandle`],`as_of_ms` 为当前时刻。
+    ///
     /// # Examples
     /// ```
     /// use mneme::{Mneme, Record};
@@ -179,6 +215,9 @@ impl Mneme {
     }
 
     /// 双时态历史读:取事务时间 ≤ `ts_ms` 的可见版本组成一致快照。
+    ///
+    /// # Arguments
+    /// * `ts_ms` - 事务时间上界(Unix 毫秒);仅包含 `tx_ms <= ts_ms` 的版本。
     ///
     /// # Errors
     /// 库已关闭时返回 [`MnemeError::Closed`]。
@@ -205,6 +244,9 @@ impl Mneme {
 
     /// 备份到目录(持久化在 L2 实现)。
     ///
+    /// # Arguments
+    /// * `_dir` - 备份目标目录;L1 阶段忽略,恒返回 `Unsupported`。
+    ///
     /// # Errors
     /// 当前恒返回 [`MnemeError::Unsupported`]。
     ///
@@ -221,6 +263,9 @@ impl Mneme {
     }
 
     /// 返回运行统计。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
     ///
     /// # Examples
     /// ```
@@ -282,6 +327,9 @@ impl Mneme {
 
     /// fsck:校验内部索引一致性。
     ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
+    ///
     /// # Examples
     /// ```
     /// use mneme::{Mneme, Record};
@@ -316,11 +364,20 @@ impl Mneme {
     }
 
     /// 返回后台合并控制句柄(与库共享同一状态)。
+    ///
+    /// # Returns
+    /// 与库共享同一合并状态的 [`CompactionControl`]。
     pub fn compact_control(&self) -> CompactionControl {
         self.control.clone()
     }
 
     /// 显式落盘(L1 无持久化,为空操作)。
+    ///
+    /// # Returns
+    /// 恒 `Ok`(L1 无持久化,无 I/O)。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`]。
     pub fn flush(&self) -> Result<()> {
         let view = self.table.view();
         if view.closed {
@@ -330,6 +387,9 @@ impl Mneme {
     }
 
     /// 关闭共享库:标记关闭并释放资源;幂等。
+    ///
+    /// # Errors
+    /// 恒 `Ok`(L1 关闭不产生 I/O;`Result` 为 L2 持久化错误预留)。
     ///
     /// # Examples
     /// ```

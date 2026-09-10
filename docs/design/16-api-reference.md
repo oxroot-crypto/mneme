@@ -260,8 +260,8 @@ impl Namespace {
 
     // ---- 记忆关系(见 09 §2)----
     pub fn relate(&self, from: RowId, to: RowId, kind: RelationKind, weight: f32) -> Result<()>;
-    /// 同 `relate`,但同时写入边元数据(幂等键仍为 `(from, to, kind)`)。
-    pub fn relate_with_meta(&self, from: RowId, to: RowId, kind: RelationKind, weight: f32, metadata: Meta) -> Result<()>;
+    /// 同 `relate`,经 `RelateOptions` 打包 kind/weight/metadata(幂等键仍为 `(from, to, kind)`)。
+    pub fn relate_with_options(&self, from: RowId, to: RowId, options: RelateOptions) -> Result<()>;
     pub fn unrelate(&self, from: RowId, to: RowId, kind: RelationKind) -> Result<bool>;
     pub fn neighbors(&self, from: RowId, kinds: &[RelationKind]) -> Result<Vec<Edge>>;
     /// 入边:返回所有 `to == to` 且 `kind ∈ kinds` 的边;默认全段扫描,
@@ -334,18 +334,18 @@ impl SnapshotNamespace {
 #### 策略与报告类型
 
 ```rust
-/// 遗忘策略(写入期/后台共用)。`Retention::new()` 默认 half_life=14d、min_importance=0.2、w=0.05。
+/// 遗忘策略(写入期/后台共用)。`Retention::new()` 默认 half_life=14d、min_importance=0.2、access_weight=0.05。
 pub struct Retention {
     pub half_life: Duration,
     pub min_importance: f32,
-    pub w: f32,                         // 访问增益权重(公式见 07 §3.3),默认 0.05
+    pub access_weight: f32,             // 访问增益权重(公式见 07 §3.3),默认 0.05
     pub protect: Option<Expr>,          // 白名单:命中者豁免
 }
 impl Retention {
     pub fn new() -> Self;
     pub fn half_life(self, d: Duration) -> Self;
     pub fn min_importance(self, v: f32) -> Self;
-    pub fn w(self, v: f32) -> Self;
+    pub fn access_weight(self, v: f32) -> Self;
     pub fn protect(self, e: Expr) -> Self;
 }
 
@@ -510,6 +510,17 @@ impl RelationKind {
 }
 /// 一条关系边。
 pub struct Edge { pub from: RowId, pub to: RowId, pub kind: RelationKind, pub weight: f32, pub metadata: Meta }
+
+/// `relate_with_options` 的参数结构(参数收敛,见 [09 §2.2](09-memory-model.md))。
+pub struct RelateOptions {
+    pub kind: RelationKind,             // 关系类型
+    pub weight: f32,                    // 边权;写入时钳制到 [0,1]
+    pub metadata: Meta,                 // 边元数据,默认 Meta::Null
+}
+impl RelateOptions {
+    pub fn new(kind: RelationKind, weight: f32) -> Self;
+    pub fn metadata(self, m: Meta) -> Self;
+}
 
 /// 检索反馈(见 [10 §4](10-scoring.md))。
 pub enum Feedback { Used, Ignored, Corrected { by: RowId } }

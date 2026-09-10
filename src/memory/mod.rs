@@ -11,7 +11,9 @@
 //! * `namespace` —— `Namespace` 及其写(`write`)/读(`query`)/访问(`access`)/
 //!   生命周期(`life`)/关系(`relation`)方法。
 //! * `snapshot` —— `SnapshotHandle` 与快照只读视图。
-//! * `search_builder` —— `SearchBuilder` 与精排/融合钩子。
+//! * `search_builder` —— `SearchBuilder` 链式配置与公开入口 `execute()`。
+//! * `search_exec` —— `execute()` 内部执行流水线(视图/扫描/扩展/排序/去重)。
+//! * `rerank` —— 融合器 `Fusion` 与精排钩子 `Reranker`。
 //! * `expand` —— 关系联想扩展与结果级去重。
 //! * `table` —— 内存表、写状态与不可变读视图。
 //! * `search` —— 过滤先行的暴力扫描与并行归并。
@@ -39,9 +41,11 @@ mod pred;
 mod pred_eval;
 mod record;
 mod relation;
+mod rerank;
 mod score;
 mod search;
 mod search_builder;
+mod search_exec;
 mod snapshot;
 mod table;
 mod temporal;
@@ -58,8 +62,9 @@ pub use ops::{
 };
 pub use pred::{CmpOp, Expr, FieldBuilder, Val};
 pub use record::{Hit, InsertOutcome, Record, RecordRef, UpdateOutcome};
-pub use relation::{Edge, RelationExpand};
+pub use relation::{Edge, RelateOptions, RelationExpand};
+pub use rerank::{Fusion, QueryCtx, Reranker};
 pub use score::{ConsolidateReport, ConsolidationPolicy, ScoreBreakdown, Summarizer};
-pub use search_builder::{Fusion, QueryCtx, Reranker, SearchBuilder};
+pub use search_builder::SearchBuilder;
 pub use snapshot::{SnapshotHandle, SnapshotNamespace};
 pub use table::AccessStat;

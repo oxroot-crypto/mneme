@@ -300,7 +300,10 @@ for row in ns.iter(Some(filter!("kind == \"scratch\"")))? { let rec = row?; /* .
 
 // ---- 记忆模型(关系 / 双时态 / 沉淀) ----
 ns.relate(a, b, RelationKind::SUPPORTS, 0.8)?;
-ns.relate_with_meta(a, b, RelationKind::SUPPORTS, 0.8, json!({"reason":"user"}))?; // 带边元数据
+ns.relate_with_options(
+    a, b,
+    RelateOptions::new(RelationKind::SUPPORTS, 0.8).metadata(json!({"reason":"user"})),
+)?; // 带边元数据
 let edges = ns.neighbors(a, &[RelationKind::SUPPORTS])?;          // 出边
 let in_edges = ns.predecessors(b, &[RelationKind::SUPPORTS])?;    // 入边(开 relation_index(Both) 时更快)
 ns.supersede("pref.theme", Record::new(vector))?; // 信念修订:要求同 key 已存在;旧版本 valid_to 闭合
