@@ -284,8 +284,10 @@ impl Mneme {
         }
         let mut per_namespace: HashMap<String, NsStat> = HashMap::new();
         let mut live_rows = 0_u64;
+        let now = self.config.clock.now_unix_ms();
         for (idx, slot) in view.slots.iter().enumerate() {
-            if view.dead.get(idx) || slot.deleted {
+            // 逻辑过期记录与墓碑一样不计入统计(FC-LIFE-INV-009)。
+            if view.dead.get(idx) || !slot.is_live(now) {
                 continue;
             }
             live_rows += 1;

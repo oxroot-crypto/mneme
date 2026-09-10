@@ -1,8 +1,8 @@
 //! 数据限额(见设计 16 §8)。
 //!
-//! 超限一律返回 `TooLarge` 或 `Invalid`,绝不静默截断。
+//! 超限一律返回 `TooLarge`/`LimitExceeded`/`MetaTooDeep`,绝不静默截断。
 
-/// 数据限额(见设计 16 §8)。超限一律返回 `TooLarge` 或 `Invalid`,绝不静默截断。
+/// 数据限额(见设计 16 §8)。超限一律返回 `TooLarge`/`LimitExceeded`/`MetaTooDeep`,绝不静默截断。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Limits {
     /// key 最大字节数(UTF-8),默认 1024。

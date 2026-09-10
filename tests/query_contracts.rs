@@ -370,6 +370,18 @@ fn scoring_composite_factors_clamped() {
     };
     assert_eq!(order(5.0), order(1.0), "lambda 越上界钳制为 1.0");
     assert_eq!(order(-2.0), order(0.0), "负 lambda 钳制为 0.0");
+
+    // 非有限 lambda:`clamp` 对 NaN 失效,会静默退化为固定取首项,入口必须拒绝
+    // (FC-MEM-PRE-003 / FC-GLOBAL-PRE-004,拒绝静默失败)。
+    for lambda in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        assert!(matches!(
+            ns.search()
+                .vector(&[1.0, 0.0])
+                .diversify(Diversity::Mmr { lambda })
+                .execute(),
+            Err(mneme::MnemeError::Config { .. })
+        ));
+    }
 }
 
 proptest! {

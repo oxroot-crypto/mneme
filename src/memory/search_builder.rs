@@ -230,6 +230,7 @@ impl SearchBuilder<'_> {
     /// * 设置 `text`/`Fusion`(L4 前未实现)→ [`MnemeError::Unsupported`];
     /// * 查询向量维度不符 → [`MnemeError::DimensionMismatch`];
     /// * `top_k`/`ef` 超上限 → [`MnemeError::LimitExceeded`];
+    /// * MMR `lambda` 含非有限值 → [`MnemeError::Config`](`clamp` 对 NaN 失效会静默退化);
     /// * 库已关闭 → [`MnemeError::Closed`]。
     ///
     /// # Examples
@@ -249,6 +250,7 @@ impl SearchBuilder<'_> {
             });
         };
         self.validate_query(query)?;
+        self.validate_diversify()?;
         let Some(ns_id) = self.resolve_ns_id(&view) else {
             return Ok(Vec::new());
         };

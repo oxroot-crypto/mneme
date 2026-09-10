@@ -52,7 +52,7 @@ impl Namespace {
             .filter(|(idx, slot)| {
                 !ws.dead.get(*idx)
                     && slot.ns_id == ns_id
-                    && !slot.deleted
+                    && slot.is_live(now)
                     && pred::matches(
                         &filter,
                         &EvalCtx {
@@ -81,7 +81,7 @@ impl Namespace {
     /// 执行报告:扫描数、遗忘数与抽样 `RowId`(可审计,I23)。
     ///
     /// # Errors
-    /// 库已关闭 → [`MnemeError::Closed`];`min_importance` 含非有限值(NaN)→
+    /// 库已关闭 → [`MnemeError::Closed`];`min_importance` 或 `access_weight` 含非有限值(NaN)→
     /// [`MnemeError::Config`]。
     ///
     /// # Examples
@@ -98,10 +98,11 @@ impl Namespace {
         if ws.closed {
             return Err(MnemeError::Closed);
         }
-        // 非有限值阈值会让「score < 阈值」恒为假、遗忘静默失效,显式拒绝(FC-LIFE-POST-002)。
-        if !policy.min_importance.is_finite() {
+        // 非有限值阈值会让「score < 阈值」恒为假、遗忘静默失效;`access_weight` 非有限值
+        // 同样会让保留分恒为 NaN,一并显式拒绝(FC-LIFE-POST-002 / FC-GLOBAL-PRE-004)。
+        if !policy.min_importance.is_finite() || !policy.access_weight.is_finite() {
             return Err(MnemeError::Config {
-                reason: "min_importance 必须是有限值",
+                reason: "min_importance 与 access_weight 必须是有限值",
             });
         }
         let Some(ns_id) = ws.ns_id_of(&self.ns_path) else {
@@ -162,7 +163,7 @@ impl Namespace {
             return Ok(ConsolidateReport::default());
         };
         let now = self.config.clock.now_unix_ms();
-        let candidates = collect_consolidation_candidates(&ws, ns_id, &policy);
+        let candidates = collect_consolidation_candidates(&ws, ns_id, now, &policy);
         let vectors: Vec<&[f32]> = candidates
             .iter()
             .map(|slot_data| slot_data.vector.as_ref())
@@ -227,10 +228,11 @@ fn collect_retain_victims(
     (scanned, victims)
 }
 
-/// 收集满足过滤的活记录作为沉淀候选。
+/// 收集满足过滤的活记录作为沉淀候选(逻辑过期/墓碑记录一律排除,I9)。
 fn collect_consolidation_candidates(
     ws: &WriterState,
     ns_id: NsId,
+    now: i64,
     policy: &ConsolidationPolicy,
 ) -> Vec<Arc<SlotData>> {
     ws.slots
@@ -239,7 +241,7 @@ fn collect_consolidation_candidates(
         .filter(|(idx, slot)| {
             !ws.dead.get(*idx)
                 && slot.ns_id == ns_id
-                && !slot.deleted
+                && slot.is_live(now)
                 && policy.filter.as_ref().is_none_or(|expr| {
                     pred::matches(
                         expr,

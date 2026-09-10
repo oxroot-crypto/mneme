@@ -55,8 +55,9 @@ impl Namespace {
 
     /// 批量写入,整批原子(不变量 I15)。
     ///
-    /// 任一条维度/数值/限额校验失败则整批拒绝;去重命中与 `RejectDuplicate`
-    /// 为逐条结果,不回滚整批。
+    /// 任一条维度/数值/限额校验失败则整批拒绝;预校验后逐条求值阶段仍失败时
+    /// (如 `Dedup::Merge` 回调产物超限)以写状态快照回滚,保证零部分写入;
+    /// 去重命中与 `RejectDuplicate` 为逐条结果,不回滚整批。
     ///
     /// # Arguments
     /// * `recs` - 批量记录;按顺序逐条求值,返回顺序与输入一致。
@@ -91,9 +92,13 @@ impl Namespace {
         let ns_id = ws.register_ns(&self.ns_path);
         let ns_path = Arc::clone(&self.ns_path);
         let now = self.config.clock.now_unix_ms();
+        // 事务快照:预校验之后,`insert_one` 仍可能失败(`Dedup::Merge` 回调产物
+        // 超限、槽位容量溢出)。失败即回滚到批前状态,保证整批零部分写入
+        // (FC-MEM-POST-002)。集合字段均为 `Arc`,`clone` 仅复制句柄。
+        let snapshot = ws.clone();
         let mut outcomes = Vec::with_capacity(recs.len());
         for rec in recs {
-            outcomes.push(insert_one(
+            match insert_one(
                 &mut ws,
                 &self.config,
                 InsertCtx {
@@ -103,7 +108,13 @@ impl Namespace {
                     now,
                     in_batch: true,
                 },
-            )?);
+            ) {
+                Ok(outcome) => outcomes.push(outcome),
+                Err(error) => {
+                    *ws = snapshot.clone();
+                    return Err(error);
+                }
+            }
         }
         self.table.publish(&ws);
         Ok(outcomes)

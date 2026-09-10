@@ -112,8 +112,9 @@ key 索引:   随机 key 集写入 → 重启 → 每个存活 key 的 get(key) 
 命名空间:   建多个嵌套 NS 并写入 → 重启 → list_namespaces() 与写入前完全一致;
             drop_namespace 后其路径从注册表移除, NsId 不再被新空间复用
 非法输入:   含 NaN/Inf 的向量或 NaN importance/confidence insert → NonFinite;
-            策略参数 NaN(dedup_threshold/min_importance/threshold、max_cluster=0)→ Config;
-            dedup_threshold/threshold 越界 [0,1] → Config;
+            策略参数 NaN(dedup_threshold/min_importance/access_weight/threshold、max_cluster=0)→ Config;
+            MMR lambda 非有限值、dedup_threshold/threshold 越界 [0,1] → Config;
+            insert_batch 中 Merge 回调产物超限 → 整批回滚、零部分写入(FC-MEM-POST-002);
             update 超限 patch → TooLarge/MetaTooDeep 且保持原版本;库内数据不被污染(03 §2.1)
 陈旧锁:     模拟持锁进程死亡 → 再次 open 能自动接管而非永久 Busy(16 §3)
 稳定RowId:  同 key 连续 update/upsert 多轮 → RowId 始终不变(或按语义稳定),

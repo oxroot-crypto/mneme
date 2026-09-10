@@ -249,6 +249,41 @@ fn insert_batch_is_atomic_with_per_row_duplicates() {
     assert!(matches!(outcomes[0], InsertOutcome::Duplicate { .. }));
     assert!(matches!(outcomes[1], InsertOutcome::Inserted(_)));
     assert!(ns.exists("b").expect("exists"));
+
+    // 预校验后仍失败(Dedup::Merge 回调产物超限)→ 整批回滚;且残留版本不得在
+    // 下一次 publish 时复活(FC-MEM-POST-002)。
+    fn merge_oversized(
+        _existing: &mneme::RecordRef<'_>,
+        _incoming: &mneme::RecordRef<'_>,
+    ) -> Option<Record> {
+        Some(Record::new(vec![1.0, 0.0]).text("toolong"))
+    }
+    let db = Mneme::builder()
+        .dimension(2)
+        .limits(Limits {
+            text_bytes: 4,
+            ..Limits::default()
+        })
+        .dedup(Dedup::Merge(merge_oversized))
+        .build()
+        .expect("build");
+    let ns = db.namespace("n");
+    assert!(matches!(
+        ns.insert_batch(vec![
+            Record::new(vec![1.0, 0.0]).text("aaaa"),
+            Record::new(vec![1.0, 0.0]).text("aaaa"),
+        ]),
+        Err(mneme::MnemeError::TooLarge { field: "text", .. })
+    ));
+    assert_eq!(ns.count(None).expect("count"), 0, "失败整批不得残留");
+    // 后续成功写入触发 publish:回滚必须已清除批内残留,count 只能为 1。
+    ns.insert(Record::new(vec![0.0, 1.0]).text("bbbb"))
+        .expect("insert");
+    assert_eq!(
+        ns.count(None).expect("count"),
+        1,
+        "回滚后不得复活批内残留版本"
+    );
 }
 
 /// FC-MEM-POST-003 / FC-MODEL-INV-024
@@ -631,6 +666,76 @@ fn supersede_and_merge_enforce_write_limits() {
         Some("a"),
         "合并失败时旧记录保持原样"
     );
+}
+
+/// FC-LIFE-INV-009(内部辅助路径同样排除逻辑过期记录:dedup 判重、`stats` 计数、
+/// `consolidate` 候选、`forget` 目标)
+#[test]
+fn logically_expired_hidden_from_internal_paths() {
+    let clock = FakeClock::default();
+    clock.set(1_000);
+
+    // 1) dedup:过期记录不得参与判重(独立库开启 Dedup::Reject)。
+    let dedup_db = Mneme::builder()
+        .dimension(2)
+        .clock(Arc::new(clock.clone()))
+        .dedup(Dedup::Reject)
+        .build()
+        .expect("build");
+    let dns = dedup_db.namespace("n");
+    dns.insert(
+        Record::new(vec![1.0, 0.0])
+            .key("e")
+            .text("expired")
+            .ttl(std::time::Duration::from_millis(500)),
+    )
+    .expect("insert");
+    clock.set(1_501);
+    // 同文本命中过期记录:不得判为重复(改用不同向量,仅文本相同)。
+    assert!(matches!(
+        dns.insert(Record::new(vec![0.0, 1.0]).key("e2").text("expired")),
+        Ok(InsertOutcome::Inserted(_))
+    ));
+
+    // 2) stats / forget / consolidate:默认关闭去重,让 E 与 L 同向量共存。
+    clock.set(1_000);
+    let db = Mneme::builder()
+        .dimension(2)
+        .clock(Arc::new(clock.clone()))
+        .build()
+        .expect("build");
+    let ns = db.namespace("n");
+    ns.insert(
+        Record::new(vec![1.0, 0.0])
+            .key("e")
+            .text("expired")
+            .ttl(std::time::Duration::from_millis(500)),
+    )
+    .expect("insert");
+    ns.insert(Record::new(vec![1.0, 0.0]).key("l").text("live"))
+        .expect("insert");
+    clock.set(1_501);
+
+    // 过期记录不计入 doc_count(仅 L,共 1)。
+    let stats = db.stats().expect("stats");
+    assert_eq!(
+        stats.per_namespace["n"].doc_count, 1,
+        "过期记录不得计入 stats"
+    );
+    // 过期记录已不可见,不计入 forget 命中数。
+    assert_eq!(
+        ns.forget(Expr::field("key").eq("e")).expect("forget"),
+        0,
+        "过期记录不得被 forget 命中"
+    );
+    // 过期记录不得作为聚类候选(E 若入选会与同向量的 L 聚为一簇)。
+    let report = ns
+        .consolidate(mneme::ConsolidationPolicy {
+            threshold: 0.9,
+            ..Default::default()
+        })
+        .expect("consolidate");
+    assert_eq!(report.clusters, 0, "过期记录不得进入沉淀候选");
 }
 
 proptest! {

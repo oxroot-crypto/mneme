@@ -103,6 +103,10 @@ impl SlotData {
 }
 
 /// 写路径的可变状态;字段均为 `Arc`,写入经 `Arc::make_mut` 触发 COW。
+///
+/// 实现 `Clone` 以便批量写入在失败时快照回滚(集合字段为 `Arc`,`clone` 仅复制
+/// 句柄;回滚后首次写入经 COW 触发一次深拷贝,见 `Namespace::insert_batch`)。
+#[derive(Clone)]
 pub(crate) struct WriterState {
     pub(crate) slots: Arc<Vec<Arc<SlotData>>>,
     pub(crate) dead: Arc<BitSet>,

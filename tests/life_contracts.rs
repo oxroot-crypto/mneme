@@ -162,4 +162,14 @@ fn error_taxonomy_is_specific() {
         ns.retain(Retention::new().min_importance(f32::NAN)),
         Err(mneme::MnemeError::Config { .. })
     ));
+    // access_weight 含非有限值同样必须拒绝:NaN 会让保留分恒为 NaN、
+    // `score < min_importance` 恒假,从而静默永不遗忘(FC-LIFE-POST-002/FC-GLOBAL-PRE-004)。
+    assert!(matches!(
+        ns.retain(Retention::new().access_weight(f32::NAN)),
+        Err(mneme::MnemeError::Config { .. })
+    ));
+    assert!(matches!(
+        ns.retain(Retention::new().access_weight(f32::INFINITY)),
+        Err(mneme::MnemeError::Config { .. })
+    ));
 }

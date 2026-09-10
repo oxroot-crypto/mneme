@@ -77,6 +77,19 @@ impl SearchBuilder<'_> {
         Ok(())
     }
 
+    /// 校验多样性策略参数:非有限 `lambda` 会让 MMR 的 `clamp` 对 NaN 失效并静默退化
+    /// (固定取首项),故入口显式拒绝(FC-MEM-PRE-003,拒绝静默失败)。
+    pub(super) fn validate_diversify(&self) -> Result<()> {
+        if let Diversity::Mmr { lambda } = self.diversify
+            && !lambda.is_finite()
+        {
+            return Err(MnemeError::Config {
+                reason: "MMR lambda 必须是 [0,1] 内的有限值",
+            });
+        }
+        Ok(())
+    }
+
     /// 解析命名空间路径对应的 `NsId`(未注册则 `None`)。
     pub(super) fn resolve_ns_id(&self, view: &ReaderView) -> Option<NsId> {
         view.ns_registry.iter().find_map(|(id, path)| {

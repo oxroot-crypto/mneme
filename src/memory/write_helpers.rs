@@ -216,11 +216,13 @@ pub(crate) fn find_duplicate(
     config: &Config,
     ns_id: NsId,
     rec: &Record,
+    now: i64,
 ) -> Option<(RowId, f32)> {
     if let Some(text) = &rec.text {
         let hash = dedup::fnv1a64(text.as_bytes());
         if let Some(rowid) = ws.text_index.get(&(ns_id, hash)).copied()
             && let Some(slot_data) = latest_live(ws, rowid)
+            && slot_data.is_live(now)
             && slot_data.text.as_deref() == Some(text.as_str())
         {
             return Some((rowid, 1.0));
@@ -228,7 +230,8 @@ pub(crate) fn find_duplicate(
     }
     let mut best: Option<(RowId, f32)> = None;
     for (idx, slot) in ws.slots.iter().enumerate() {
-        if ws.dead.get(idx) || slot.ns_id != ns_id || slot.deleted {
+        // 逻辑过期记录与墓碑一样不可见,不得参与判重(FC-LIFE-INV-009)。
+        if ws.dead.get(idx) || slot.ns_id != ns_id || !slot.is_live(now) {
             continue;
         }
         let sim = score::cosine_sim(&rec.vector, &slot.vector);
@@ -249,7 +252,7 @@ pub(crate) fn insert_one(
     let duplicate = if matches!(config.dedup, Dedup::Off | Dedup::KeepBoth) {
         None
     } else {
-        find_duplicate(ws, config, ctx.ns_id, &ctx.rec)
+        find_duplicate(ws, config, ctx.ns_id, &ctx.rec, ctx.now)
     };
     // `Replace` 语义要求生成新 RowId,即使新记录带同 key 也不能复用旧行。
     let force_new_rowid = duplicate.is_some() && matches!(config.dedup, Dedup::Replace);

@@ -71,7 +71,7 @@ impl Namespace {
 
     /// 批量写入,单次原子:要么整批可见,要么整批不可见(不变量 I15)。
     /// 整批共用一次 fsync 组提交;任一条校验失败 → 整批拒绝,不产生部分写入。
-    pub fn insert_batch(&self, recs: Vec<Record>) -> Result<Vec<InsertOutcome>>;
+    pub fn insert_batch(&self, recs: Vec<Record>) -> Result<Vec<InsertOutcome>>;  // 整批原子:校验失败或 Merge 回调产物超限 → 整批回滚零部分写入
 
     /// 显式删除。返回是否命中活记录。
     pub fn delete(&self, key: &str) -> Result<bool>;
@@ -241,7 +241,7 @@ impl SearchBuilder<'_> {
     pub fn as_of(self, ts_ms: i64) -> Self;                 // 双时态历史读(见 09 §3)
     pub fn query_id(self, id: QueryId) -> Self;             // 指定本次查询的幂等标识;默认由 execute() 生成(见 10 §4)
     pub fn rerank(self, r: Arc<dyn Reranker>) -> Self;      // 可选精排钩子
-    pub fn execute(&self) -> Result<Vec<Hit>>;              // 至少一个通道非空,否则 Config;查询向量维度不符返回 DimensionMismatch
+    pub fn execute(&self) -> Result<Vec<Hit>>;              // 至少一个通道非空,否则 Config;查询向量维度不符返回 DimensionMismatch;MMR lambda 非有限值返回 Config
 }
 ```
 
@@ -340,7 +340,7 @@ impl SnapshotNamespace {
 pub struct Retention {
     pub half_life: Duration,
     pub min_importance: f32,
-    pub access_weight: f32,             // 访问增益权重(公式见 07 §3.3),默认 0.05
+    pub access_weight: f32,             // 访问增益权重(公式见 07 §3.3),默认 0.05;须为有限值,否则 retain 返回 Config
     pub protect: Option<Expr>,          // 白名单:命中者豁免
 }
 impl Retention {
@@ -493,7 +493,7 @@ impl Scoring { pub fn new() -> Self; /* 链式 setter */ }
 pub enum TimeAxis { ValidTime, TransactionTime }
 
 /// 结果多样性(见 [10 §5](10-scoring.md))。
-pub enum Diversity { Off, Mmr { lambda: f32 } }   // lambda∈[0,1],越大越重相关性,默认 0.7
+pub enum Diversity { Off, Mmr { lambda: f32 } }   // lambda∈[0,1],越大越重相关性,默认 0.7;非有限值 execute() 返回 Config
 
 /// 关系联想扩展(见 [10 §3](10-scoring.md)):hops 默认 1(最大 3),decay 默认 0.5/跳,
 /// max_nodes 默认 4k(封顶扩展延迟)。
@@ -687,7 +687,7 @@ pub struct Tuning {
 | `TooLarge` / `LimitExceeded` / `MetaTooDeep` | ❌ | 数据/参数超限,见 §8 |
 | `NonFinite` | ❌ | 向量分量或 `importance`/`confidence`/边权/`boost` 含 `NaN`/`±Inf`,会污染排序与打分;修正输入 |
 | `Closed` | ❌ | 库已关闭;不要再使用该库的任何克隆句柄 |
-| `Config` | ❌ | 建库/查询配置非法(缺维度、无查询通道),策略参数含非有限值或非法(如 `max_cluster = 0`) |
+| `Config` | ❌ | 建库/查询配置非法(缺维度、无查询通道、MMR `lambda` 非有限值),策略参数含非有限值(`min_importance`/`access_weight`/`threshold`/`dedup_threshold`)或非法(如 `max_cluster = 0`) |
 | `Unsupported` | ❌ | 该能力延后到后续层(open/backup/text/Fusion;`Fusion` 单独设置即拒绝);按版本升级 |
 | `Inconsistent` | ❌ | 内部不变量被破坏(应为 bug);上报并附上下文 |
 | `UnsupportedVersion` | ❌ | 库由更新版本的 Mneme 写入;升级库,勿降级读 |

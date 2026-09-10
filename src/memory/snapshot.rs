@@ -325,7 +325,8 @@ impl SnapshotNamespace {
             .collect())
     }
 
-    /// 流式遍历(不含墓碑/过期记录)。
+    /// 遍历(不含墓碑/过期记录),调用前物化命中行的 `Arc` 句柄、不复制记录体
+    /// (FC-MEM-CPLX-005,非流式)。
     ///
     /// # Arguments
     /// * `filter` - 三值过滤表达式;`None` 表示不过滤。
