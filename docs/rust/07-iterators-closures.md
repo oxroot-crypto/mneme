@@ -3,7 +3,7 @@
 > **本章目标**:掌握 `for` 循环、迭代器链式调用(adapter)、闭包,以及 `sort_by` + `Ordering`。
 > **前置**:[04 章](04-borrowing-strings-slices.md)(引用)、[06 章](06-generics-traits.md)(trait)。
 > **对应源码**:[`src/core/simd.rs`](../../src/core/simd.rs)、[`src/core/heap.rs`](../../src/core/heap.rs)、
-> [`src/core/varint.rs`](../../src/core/varint.rs)。
+> [`src/core/varint.rs`](../../src/core/varint.rs)、[`src/memory/namespace/access.rs`](../../src/memory/namespace/access.rs)。
 
 Rust 的迭代器是**惰性(lazy)**的:你写一串转换,只有到"消费"时(如 `sum`、`collect`、`for`)
 才真正执行。它既表达力强,又能被编译器优化到和手写循环一样快。
@@ -174,6 +174,60 @@ self.heap.sort_by(|a, b| {
 闭包默认按"最小权限"捕获:只读就借 `&`,要改就借 `&mut`,要所有权就 `move`。
 这依然受 [04 章](04-borrowing-strings-slices.md)的借用规则约束。
 
+### 4.3 闭包作为回调:`FnOnce` 与写事务
+
+上面是"写闭包";反过来,当**函数接收**一个闭包时,也要声明"我打算怎么调用它"。Rust 用三个
+trait 表达调用次数与捕获方式:
+
+| trait | 能调用几次 | 捕获方式 |
+|---|---|---|
+| `FnOnce` | 至多一次(可能消费捕获值) | 移动 / 借用 / 复制 |
+| `FnMut` | 多次,且可改捕获值 | 可变借用 |
+| `Fn` | 任意多次 | 只读借用 |
+
+L1 的写事务 `Table::write_tx` 接收"执行一次、可失败"的闭包:
+
+```rust
+pub(crate) fn write_tx<T>(&self, f: impl FnOnce(&mut WriterState) -> Result<T>) -> Result<T> {
+    let mut ws = self.write();
+    let snapshot = ws.clone();
+    match f(&mut ws) {
+        Ok(value) => {
+            self.publish(&ws);
+            Ok(value)
+        }
+        Err(error) => {
+            *ws = snapshot;
+            Err(error)
+        }
+    }
+}
+```
+
+见 [`src/memory/table.rs`](../../src/memory/table.rs)。`impl FnOnce(...)` 是 `F: FnOnce(...)`
+的简写(见 [06 §2.3](06-generics-traits.md)):闭包只调用一次,所以用**最宽松**的 `FnOnce`;
+若写成 `Fn`,那些会移动捕获值的闭包反而用不了。
+
+调用方的惯例是 `move` 闭包 + 提前 `Arc::clone`:
+
+```rust
+let config = Arc::clone(&self.config);
+let ns_path = Arc::clone(&self.ns_path);
+self.table.write_tx(move |ws| {
+    if ws.closed {
+        return Err(MnemeError::Closed);
+    }
+    // ... 在闭包内完成整个写操作:失败时由 write_tx 统一回滚
+})
+```
+
+见 [`src/memory/namespace/access.rs`](../../src/memory/namespace/access.rs)。`move` 把两个
+`Arc` 的所有权移进闭包,闭包因此不借用 `self`,可以自由地和 `self.table` 的借用共存;
+事务语义(失败回滚、成功发布读视图)则完全收敛在 `write_tx` 一处,各写方法只需关心业务。
+
+> 编译器报 `closure may outlive the current function` 就是在提醒你:这个闭包可能活得比借用久,
+> 需要 `move`(或调整生命周期)。
+
 ---
 
 ## 5. `Option` 与数组:都是"可迭代"的(常见组合)
@@ -216,6 +270,8 @@ mneme 的测试里也常见 `for (score, id) in [...]` 直接遍历数组,见
 - `for` + Range 是基本循环;`iter`/`iter_mut`/`into_iter` 决定借用还是消耗。
 - 迭代器适配器(`map`/`filter`/`zip`/`enumerate`)+ 消费器(`sum`/`collect`/`fold`)链式组合,惰性零开销。
 - 闭包 `|x| ...` 能捕获环境;`move` 强制转移所有权。
+- 接收闭包的函数用 `FnOnce`/`FnMut`/`Fn` 声明调用方式;L1 写事务 `write_tx` 用 `FnOnce` 执行一次、
+  失败整体回滚。
 - `sort_by` 配 `Ordering::{Less, Greater, Equal}` 做自定义排序;mneme 的 `TopK` 借此实现度量感知排序。
 
 ## 动手练习

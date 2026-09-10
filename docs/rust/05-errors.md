@@ -116,7 +116,11 @@ pub fn new(value: u32) -> Result<Self> {
     if (Self::MIN..=Self::MAX).contains(&value) {
         Ok(Self(value))
     } else {
-        Err(MnemeError::Invalid("维度必须在 1..=65536 之间"))
+        Err(MnemeError::LimitExceeded {
+            field: "dimension",
+            limit: Self::MAX as usize,
+            got: value as usize,
+        })
     }
 }
 ```

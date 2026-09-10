@@ -5,19 +5,4 @@
 格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/),
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
-
-<!--
-模板(发布时替换):
-
-## [0.1.0] - YYYY-MM-DD
-
-### Added
-- ...
-
-### Changed
-- ...
-
-### Fixed
-- ...
--->
+<!-- 开发期间保持为空,正式发布时按 Keep a Changelog 格式补充条目。 -->

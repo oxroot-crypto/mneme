@@ -2,7 +2,8 @@
 
 > **本章目标**:会写单元测试、集成测试、doctest,理解 `proptest` 属性测试与 mneme 的契约追溯方式。
 > **前置**:[05 章](05-errors.md)(`Result`)、[07 章](07-iterators-closures.md)。
-> **对应源码**:各 `src/core/*.rs` 底部的 `mod tests`,以及 [`tests/core_contracts.rs`](../../tests/core_contracts.rs)。
+> **对应源码**:各 `src/core/*.rs` 底部的 `mod tests`,以及 [`tests/core_contracts.rs`](../../tests/core_contracts.rs)、
+> [`tests/contract_traceability.rs`](../../tests/contract_traceability.rs)。
 
 mneme 把测试当作**形式化约束的证明**:每个公开行为都要有测试,每个测试要能追溯到一条契约
 (`FC-*`)。本项目的开发流程是"先写契约 → 再写测试 → 再写实现"(FSVDD,见
@@ -224,6 +225,31 @@ mneme 的集成测试文件头部列出它覆盖的契约编号:
 
 > 这就是 FSVDD(形式化规范与验证驱动开发)在 mneme 的落地方式。
 
+### 5.1 门禁:`include_str!` 元测试
+
+追溯光靠自觉会漂移,所以 mneme 用一段**元测试**机械校验。它在编译期把契约与测试源码
+整个嵌进测试二进制:
+
+```rust
+const CONTRACTS: &str = include_str!("../docs/spec/contracts.md");
+const MEMORY_TESTS: &str = include_str!("memory_contracts.rs");
+```
+
+见 [`tests/contract_traceability.rs`](../../tests/contract_traceability.rs)。然后在测试里做字符串解析,
+校验四件事:
+
+- 契约引用的每个 `文件.rs::测试名` 必须真实存在(路径级匹配,无悬空引用);
+- 测试文件里每个 `#[test]` 必须被至少一条契约引用(无孤立测试);
+- 状态为 `Passed` 的契约必须登记真实测试(禁止"声称通过却没有证据");
+- 测试文件头声明的 `FC-*` 集合与契约覆盖该文件的条目**双向相等**(无多报、无漏报)。
+
+L1 的契约测试按 FC 模块族拆分为 `tests/memory_contracts.rs`、`query_contracts.rs`、
+`model_contracts.rs`、`life_contracts.rs`,统一纳入这道门禁。它随 `cargo test` 一起跑——
+契约漂移会让测试变红,而不是等人工审查发现。
+
+> `include_str!` 是"把别的文件当字符串嵌入当前源码"的编译期宏;配合 `env!("CARGO_PKG_VERSION")`
+> 之类的 `include_*!` 家族,常用来做配置/模板/契约的机械校验。
+
 ---
 
 ## 6. 运行测试
@@ -263,7 +289,8 @@ cargo test --release                # release 模式跑(测优化后的行为)
 - 单元测试放 `#[cfg(test)] mod tests`,用 `#[test]` 和断言宏;遵循 AAA,测试名描述行为。
 - 集成测试放 `tests/`,只能访问公开 API;doctest 让文档示例自动运行。
 - `proptest` 自动生成随机输入验证不变量,失败会收缩到最小反例;常用"参照实现"对照优化实现。
-- mneme 用 `FC-*` 契约编号把约束、实现、测试串成 1:1 追溯矩阵(FSVDD)。
+- mneme 用 `FC-*` 契约编号把约束、实现、测试串成 1:1 追溯矩阵(FSVDD),并由
+  `tests/contract_traceability.rs` 机械校验(含 `include_str!` 元测试)。
 - `cargo test` 一次跑齐单测、集成、doctest。
 
 ## 动手练习
@@ -275,6 +302,8 @@ cargo test --release                # release 模式跑(测优化后的行为)
 
 ## 结语
 
-到这里,你已经掌握了读懂 mneme L0 所需的全部 Rust 基础。建议现在从头再读一遍
+到这里,你已经掌握了读懂 mneme L0 所需的全部 Rust 基础。L1( [`src/memory/`](../../src/memory) )
+新引入的共享所有权、锁与写事务等特性已回填到 02/03/04/06/07 章对应小节。建议现在从头再读一遍
 [`src/core/`](../../src/core) 的源码,把每处语法对应回相应章节。之后可以按
-[DESIGN.md](../DESIGN.md) 的分层路线继续读 L1–L6 的设计文档,并参考 [README 的通用资料](README.md#5-学完之后的下一步通用资料)继续深入 Rust。
+[DESIGN.md](../DESIGN.md) 的分层路线,从 [03 L1 内存引擎](../design/03-l1-memory.md)
+起继续读各层设计文档,并参考 [README 的通用资料](README.md#5-学完之后的下一步通用资料)继续深入 Rust。

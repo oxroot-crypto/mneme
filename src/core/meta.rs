@@ -137,6 +137,36 @@ pub fn as_str(value: &Meta) -> Option<&str> {
     value.as_str()
 }
 
+/// 计算 JSON 值的最大嵌套深度(标量深度为 0)。
+///
+/// # Arguments
+///
+/// * `value` - 待测量的 JSON 值。
+///
+/// # Returns
+///
+/// 数组/对象每嵌套一层加 1,标量为 0。
+pub(crate) fn depth(value: &Meta) -> usize {
+    match value {
+        Meta::Array(items) => 1 + items.iter().map(depth).max().unwrap_or(0),
+        Meta::Object(map) => 1 + map.values().map(depth).max().unwrap_or(0),
+        _ => 0,
+    }
+}
+
+/// 估算 JSON 值序列化后的字节数(用于限额校验)。
+///
+/// # Arguments
+///
+/// * `value` - 待估算的 JSON 值。
+///
+/// # Returns
+///
+/// 序列化字节数;序列化不可能失败,失败时保守返回 `usize::MAX`。
+pub(crate) fn size_bytes(value: &Meta) -> usize {
+    serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
+}
+
 /// 若 `value` 是 JSON 整数,按 Unix 毫秒时间戳返回。
 ///
 /// 与 [`as_i64`] 等价,单独命名以表达时间语义。

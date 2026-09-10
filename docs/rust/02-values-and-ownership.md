@@ -3,7 +3,7 @@
 > **本章目标**:掌握 Rust 的变量、基本类型,以及最重要的**所有权(ownership)**。
 > **前置**:读过 [01 章](01-toolchain.md),会 `cargo build`。
 > **对应源码**:[`src/core/types.rs`](../../src/core/types.rs)、[`src/core/varint.rs`](../../src/core/varint.rs)、
-> [`src/core/metric.rs`](../../src/core/metric.rs)。
+> [`src/core/metric.rs`](../../src/core/metric.rs)、[`src/memory/table.rs`](../../src/memory/table.rs)。
 
 这是全书**最关键**的一章。所有权是 Rust 区别于其他语言的核心,也是初学者最容易卡住的地方。
 读完本章你能理解 mneme 里为什么大量使用 `u32`/`u64`/`f32`、为什么 `newtype` 里直接包一个整数。
@@ -237,6 +237,50 @@ L0 原语层尽量用 `Copy` 的小类型(`u32`、`u64`、`f32`、`Metric`),让"
 这些类型复制即可,没有生命周期烦恼。等到需要共享字符串时,才引入 `Arc<str>`(见 [04 章](04-borrowing-strings-slices.md))。
 这是**用类型选择降低复杂度**的典型工程取舍。
 
+### 3.7 共享所有权:`Arc<T>` 与写时复制(COW)
+
+L0 靠 `Copy` 小类型回避了所有权问题,但 L1(`src/memory/`)要在多个句柄、多个线程之间
+共享同一份库状态:克隆一个 `Mneme` 不能把整个库复制一遍。这时用 **`Arc<T>`**
+(Atomically Reference Counted,原子引用计数):
+
+```rust
+pub struct Mneme {
+    pub(crate) table: Arc<Table>,
+    pub(crate) config: Arc<Config>,
+    pub(crate) control: CompactionControl,
+}
+```
+
+见 [`src/memory/engine.rs`](../../src/memory/engine.rs)。`Mneme::clone()` 只是把每个 `Arc`
+的计数 +1,所有克隆共享同一张表。用 `Arc::clone(&x)` 而不是 `x.clone()` 是刻意的:后者
+容易让人误以为发生了深拷贝。
+
+> `Arc` 与 `Rc` 的区别只在**引用计数是否原子**。原子操作略慢,但 `Arc` 能跨线程;
+> mneme 面向并发,一律用 `Arc`。
+
+**写时复制(clone-on-write)**:`Arc::make_mut(&mut x)` 是修改共享数据的入口——
+
+- 若该 `Arc` 只有**一个所有者**,直接返回 `&mut`,原地改;
+- 若**还有别处持有**(引用计数 > 1),先深拷贝一份、让当前所有者独享新副本,其他持有者
+  继续看旧数据。
+
+L1 写状态 `WriterState` 的全部容器字段都是 `Arc`,让"读者看到的永远是某个完整旧版本"成为可能:
+
+```rust
+pub(crate) fn hide_latest(&mut self, rowid: RowId) {
+    if let Some(slot) = self.latest.get(&rowid).copied() {
+        Arc::make_mut(&mut self.dead).set(slot.get() as usize);
+    }
+}
+```
+
+见 [`src/memory/table.rs`](../../src/memory/table.rs)。因此"给写状态拍快照"(`WriterState::clone`)
+只是复制一批 `Arc` 句柄,非常廉价——这是写事务失败回滚与读者无锁扫描的共同前提
+(用法见 [04 §5.1](04-borrowing-strings-slices.md) 与 [07 §4.3](07-iterators-closures.md))。
+
+> 记录体里的向量也用 `Arc<[f32]>`(`SlotData::vector`):克隆一条记录只加计数,只有真正
+> 替换向量时才分配新数组。
+
 ---
 
 ## 4. 类型系统如何"让非法状态不可表示"
@@ -275,6 +319,7 @@ pub struct SlotId(u32);
 - 数组定长、元组可异构;需要可增长列表用 `Vec`。
 - **所有权**:每个值一个所有者,离开作用域自动释放;赋值对堆类型是**移动**,对 `Copy` 类型是复制;
   想复制堆数据用 `.clone()`。
+- **共享所有权**用 `Arc<T>`(`Arc::clone` 只加计数);要改共享数据用 `Arc::make_mut` 写时复制。
 - newtype 用类型区分语义,把错误挡在编译期。
 
 ## 动手练习

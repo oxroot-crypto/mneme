@@ -4,7 +4,8 @@
 > 并理解 `#[derive(...)]`、`Default`、`#[non_exhaustive]` 这些 mneme 里随处可见的写法。
 > **前置**:[02 章](02-values-and-ownership.md)。
 > **对应源码**:[`src/core/types.rs`](../../src/core/types.rs)、[`src/core/metric.rs`](../../src/core/metric.rs)、
-> [`src/core/error.rs`](../../src/core/error.rs)、[`src/core/options/`](../../src/core/options)。
+> [`src/core/error.rs`](../../src/core/error.rs)、[`src/core/options/`](../../src/core/options)、
+> [`src/memory/builder.rs`](../../src/memory/builder.rs)。
 
 Rust 没有"类(class)",而是把数据和行为分开:
 
@@ -146,6 +147,34 @@ pub fn into_sorted_vec(mut self) -> Vec<T> {
 `mut self` 不是一种新的接收者,而是"`self`(值接收) + 一个可变的局部绑定"。调用后原 `TopK`
 被**移动**进函数,不能再使用——这正是 `into_*` 命名的语义。见
 [`src/core/heap.rs:166`](../../src/core/heap.rs)。
+
+#### 2.2.3 链式方法:`mut self -> Self` 与构建者模式
+
+`mut self` 的另一个常见用法是**链式构建**:每个 setter 消费构建器、返回更新后的构建器。
+
+```rust
+pub fn dimension(mut self, dimension: u32) -> Self {
+    self.dimension = Some(dimension);
+    self
+}
+```
+
+见 [`src/memory/builder/options.rs`](../../src/memory/builder/options.rs)。于是可以一口气写:
+
+```rust
+let db = Builder::default()
+    .dimension(2)
+    .metric(Metric::Cosine)
+    .build()
+    .unwrap();
+```
+
+要点:
+
+- 每个 setter 都是"消费 + 返回",所以链式调用后**原构建器变量不能再使用**(它已被移动)。
+- setter 只写字段、不做校验;**校验收敛在 `build()` 一处**,见
+  [`src/memory/builder.rs`](../../src/memory/builder.rs)。
+- 这是 Rust 里最常用的"可选参数"方案:比 `new(a, b, c, ...)` 好读,也比到处传 `Option` 清晰。
 
 ### 2.3 关联常量
 

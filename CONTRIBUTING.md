@@ -17,7 +17,7 @@
    [16 API 参考](docs/design/16-api-reference.md)。
 4. **不变量即测试锚点**:每个测试文件头部列出其覆盖的不变量编号(I1–I30)与
    [spec/contracts.md](docs/spec/contracts.md) 的 `FC-*` 编号,测试代码注释引用编号,
-   防止"测了个寂寞";CI 的 `xtask check-contracts` 校验契约 100% 追溯。
+   防止"测了个寂寞";`tests/contract_traceability.rs` 在 `cargo test` 中校验契约↔测试双向映射。
 5. **无 panic 契约**:L0 所有函数返回 `Result` 或数学上可证明不 panic;
    `unsafe` 仅允许出现在 `simd.rs` 的 arch 内联中。
 
@@ -67,7 +67,9 @@ Per 04 §13,未知帧类型必须在回放时中止而非跳过。补充覆盖�
 4. 涉及算法/数据结构的改动必须同步维护 [spec/contracts.md §9](docs/spec/contracts.md)
    的 `FC-*-CPLX-*` 复杂度契约:先更新上界,再改测试与实现;复杂度渐进退化视为破坏性变更;
 5. 破坏性变更需在契约文件顶部"变更记录"标注版本与兼容性迁移约束;
-6. 交付前自查:无孤儿实现、无失效契约、无孤立测试。
+6. 交付前自查:无孤儿实现、无失效契约、无孤立测试;
+7. 证伪原则:每条 ERR/INV 契约须配备专项失败测试(放宽约束必有测试变红);
+   机械化变异测试 `cargo-mutants`(配置见根目录 `mutants.toml`)列入 L2 阶段 CI 任务。
 
 ## 文档修改
 

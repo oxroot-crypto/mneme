@@ -1,0 +1,23 @@
+# cargo-mutants 配置(FSVDD §10-6「证伪原则」)。
+#
+# 运行:`cargo install cargo-mutants && cargo mutants`
+# 验收规则:故意放宽/破坏任一形式化约束时,必须至少有一个测试变红;
+# 存活变异体(surviving mutant)即为「约束遗漏测试」,须补测试后重跑。
+#
+# 机械化变异测试正式纳入 CI 的时点为 L2(见 docs/design/14-testing.md §7)。
+
+# 排除非源码目录,避免对文档/构建产物做无意义变异。
+exclude_globs = [
+    "book/**",
+    "docs/**",
+    "target/**",
+]
+
+# 排除 SIMD 内联汇编中的等价实现细节:不同指令选择不改变数值语义,
+# 其正确性已由 FC-CORE-INV-001(对标量参考实现)覆盖。
+exclude_re = [
+    "src/core/simd.rs: replace .* with .*",
+]
+
+# 单测较快的 crate 用默认超时即可;留出余量给属性测试。
+timeout_multiplier = 2.0

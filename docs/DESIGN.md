@@ -91,14 +91,14 @@ flowchart TD
 | [15-glossary.md](design/15-glossary.md) | 术语表(中英对照)、符号表、复杂度速查总表 | 所有人 |
 | [16-api-reference.md](design/16-api-reference.md) | 完整公开 API、配置总表、打开校验、错误/重试、线程安全、集成、备份恢复 runbook、数据限额 | 所有人 |
 | [spec/contracts.md](spec/contracts.md) | 形式化契约矩阵(FC-Matrix)与测试追溯 | 贡献者 |
-| [rust/README.md](rust/README.md) | **Rust 零基础教学**(10 章):以 mneme 源码为教材,覆盖读懂 L0 所需的全部 Rust 语法 | 无 Rust 基础者 |
+| [rust/README.md](rust/README.md) | **Rust 零基础教学**(10 章):以 mneme 源码为教材,覆盖读懂 L0 与 L1 所需的全部 Rust 语法(L1 新特性回填至各章) | 无 Rust 基础者 |
 
 ---
 
 ## 阅读路线
 
 **我完全没写过 Rust**(零基础,约 6–10 小时):
-先读 [Rust 零基础教学](rust/README.md) 的 10 章(以 `src/core/` 源码为教材,边读边敲),
+先读 [Rust 零基础教学](rust/README.md) 的 10 章(以 `src/core/` 源码为教材、L1 新特性回填至各章,边读边敲),
 再回到这里按"贡献者"路线阅读。教学文档与源码的映射总表见
 [rust/README.md §4](rust/README.md)。
 
@@ -145,7 +145,7 @@ HNSW 与 BM25 两章是全书数学最密集的部分,但每一步推导都不�
 7. **不变量编号**:跨层契约用 `I1–I30` 编号(定义散见 02/03/04/06/07/08/09/10/11/12 与
    [16 §9](design/16-api-reference.md),汇总映射见 [14 §1.1](design/14-testing.md)),
    测试代码必须引用编号;每条不变量在 [spec/contracts.md](spec/contracts.md) 有对应
-   `FC-*` 契约条目,CI 校验 100% 追溯(FSVDD 强制)。
+   `FC-*` 契约条目,由 `tests/contract_traceability.rs` 在 `cargo test` 中校验双向追溯(FSVDD 强制)。
 8. **站点构建**:文档用 mdBook 组织(`book.toml` + [SUMMARY.md](SUMMARY.md)),
    KaTeX/Mermaid 由预处理器渲染;本地预览见仓库根目录的 `README.md`。
 9. **阅读时长**:各章不强制标注预计阅读;仅 [00 零基础篇](design/00-fundamentals.md) 给出参考

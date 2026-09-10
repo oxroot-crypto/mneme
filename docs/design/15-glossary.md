@@ -192,7 +192,7 @@
 | 单点读(get_by_rowid) | $O(\log n)$(版本链定位) | — | [04 §2.2](04-l2-persist.md) |
 | as_of(t) 历史读 | $O(S \cdot \log n)$ 定位版本链 + 查询;窗口受 `history_horizon` 约束 | 历史版本随窗口增长 | [04 §5.5](04-l2-persist.md) |
 | delete / touch | $O(\log n)$ 定位 + 墓碑/统计更新 | — | [03 §2.3](03-l1-memory.md) |
-| iter(filter) | $O(N_c)$($N_c$ = 命中行) | 流式 | [03 §2.3](03-l1-memory.md) |
+| iter(filter) | $O(N_c)$($N_c$ = 命中行) + $O(N_c\log N_c)$ 排序 | $O(N_c)$ `Arc` 句柄 | [03 §2.3](03-l1-memory.md) |
 | neighbors / predecessors | $O(\log E + \text{degree})$(`predecessors` 默认全段扫描) | $O(\text{degree})$ | [09 §2.3](09-memory-model.md) |
 | snapshot | $O(1)$(clone Arc 视图) | 按引用 | [07 §6](07-l5-life.md) |
 | backup_to | 同盘 $O(\text{files})$;跨盘 $O(\text{bytes})$ | 目标目录 | [07 §6](07-l5-life.md) |
