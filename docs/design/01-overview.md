@@ -175,7 +175,7 @@ mneme/
 ├── src/
 │   ├── lib.rs          # 门面:Mneme / Namespace / Builder;pub use 公开类型
 │   ├── core/           # L0:types.rs error.rs metric.rs simd.rs varint.rs meta.rs heap.rs options/
-│   ├── memory/         # L1:table.rs engine.rs search.rs pred.rs dedup.rs
+│   ├── memory/         # L1:engine.rs engine_ops.rs builder.rs namespace/ snapshot.rs snapshot_scan.rs search_builder.rs search_exec.rs expand.rs rerank.rs table.rs bitset.rs search.rs pred.rs pred_eval.rs record.rs write_helpers.rs mutate_helpers.rs dedup.rs relation.rs temporal.rs score.rs lifecycle.rs ops.rs config.rs
 │   ├── persist/        # L2:wal.rs vsec.rs msec.rs delta.rs edges.rs manifest.rs recover.rs flush.rs source.rs storage.rs trash.rs
 │   ├── index/          # L3:hnsw.rs graph.rs filtered.rs merge.rs rebuild.rs
 │   ├── query/          # L4:parse.rs plan.rs zmap.rs bm25.rs fusion.rs result_dedup.rs exec.rs
@@ -189,7 +189,7 @@ mneme/
 │   └── obs/            # observer.rs                                                      (12)
 ├── benches/            # criterion 基准(L3 起)
 ├── fuzz/               # cargo-fuzz 目标(L6 起)
-├── xtask/              # check-contracts 等 CI 校验
+├── tests/              # 契约验收 + contract_traceability.rs 追溯门禁
 ├── docs/               # 本文档
 │   └── spec/           # FC-Matrix 形式化契约
 └── Cargo.toml
@@ -300,7 +300,10 @@ for row in ns.iter(Some(filter!("kind == \"scratch\"")))? { let rec = row?; /* .
 
 // ---- 记忆模型(关系 / 双时态 / 沉淀) ----
 ns.relate(a, b, RelationKind::SUPPORTS, 0.8)?;
-ns.relate_with_meta(a, b, RelationKind::SUPPORTS, 0.8, json!({"reason":"user"}))?; // 带边元数据
+ns.relate_with_options(
+    a, b,
+    RelateOptions::new(RelationKind::SUPPORTS, 0.8).metadata(json!({"reason":"user"})),
+)?; // 带边元数据
 let edges = ns.neighbors(a, &[RelationKind::SUPPORTS])?;          // 出边
 let in_edges = ns.predecessors(b, &[RelationKind::SUPPORTS])?;    // 入边(开 relation_index(Both) 时更快)
 ns.supersede("pref.theme", Record::new(vector))?; // 信念修订:要求同 key 已存在;旧版本 valid_to 闭合

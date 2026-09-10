@@ -17,6 +17,12 @@ struct Entry<T> {
     payload: T,
 }
 
+/// 堆内候选的比较视图:聚合分数与载荷引用,收敛 `is_better` 的参数个数。
+struct Candidate<'a, T> {
+    score: Score,
+    payload: &'a T,
+}
+
 /// `TopK` 初始预分配容量的上限:避免 `k` 极大时一次性占用过多内存。
 const TOPK_MAX_PREALLOC: usize = 1024;
 
@@ -116,7 +122,18 @@ impl<T: Ord> TopK<T> {
         }
         // 根是当前最差者;新候选必须更优才替换。
         let root = &self.heap[0];
-        if !Self::is_better(self.metric, score, &payload, root.score, &root.payload) {
+        let worse = Candidate {
+            score: root.score,
+            payload: &root.payload,
+        };
+        if !Self::is_better(
+            self.metric,
+            Candidate {
+                score,
+                payload: &payload,
+            },
+            worse,
+        ) {
             return;
         }
         self.heap[0] = Entry { score, payload };
@@ -166,9 +183,9 @@ impl<T: Ord> TopK<T> {
     pub fn into_sorted_vec(mut self) -> Vec<T> {
         let metric = self.metric;
         self.heap.sort_by(|a, b| {
-            if Self::is_better(metric, a.score, &a.payload, b.score, &b.payload) {
+            if Self::is_better(metric, Self::candidate_view(a), Self::candidate_view(b)) {
                 std::cmp::Ordering::Less
-            } else if Self::is_better(metric, b.score, &b.payload, a.score, &a.payload) {
+            } else if Self::is_better(metric, Self::candidate_view(b), Self::candidate_view(a)) {
                 std::cmp::Ordering::Greater
             } else {
                 std::cmp::Ordering::Equal
@@ -178,19 +195,21 @@ impl<T: Ord> TopK<T> {
     }
 
     /// `a` 是否优于 `b`:先比分数方向,同分比载荷升序。
-    fn is_better(
-        metric: Metric,
-        a_score: Score,
-        a_payload: &T,
-        b_score: Score,
-        b_payload: &T,
-    ) -> bool {
-        if metric.better(a_score, b_score) {
+    fn is_better(metric: Metric, a: Candidate<'_, T>, b: Candidate<'_, T>) -> bool {
+        if metric.better(a.score, b.score) {
             true
-        } else if metric.better(b_score, a_score) {
+        } else if metric.better(b.score, a.score) {
             false
         } else {
-            a_payload < b_payload
+            a.payload < b.payload
+        }
+    }
+
+    /// 以引用视图看待堆内元素(不复制)。
+    fn candidate_view(entry: &Entry<T>) -> Candidate<'_, T> {
+        Candidate {
+            score: entry.score,
+            payload: &entry.payload,
         }
     }
 
@@ -198,10 +217,8 @@ impl<T: Ord> TopK<T> {
     fn is_better_at(&self, a: usize, b: usize) -> bool {
         Self::is_better(
             self.metric,
-            self.heap[a].score,
-            &self.heap[a].payload,
-            self.heap[b].score,
-            &self.heap[b].payload,
+            Self::candidate_view(&self.heap[a]),
+            Self::candidate_view(&self.heap[b]),
         )
     }
 

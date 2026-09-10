@@ -832,7 +832,7 @@ pub trait SegmentSource: Send + Sync {
 | 故障 | 触发 | 引擎行为 | 调用方处置 |
 |---|---|---|---|
 | 磁盘满(ENOSPC) | write/fsync 返回错误 | 写入返回 `Io`;compaction **暂停**而非损坏;WAL 不推进 | 清理 `trash/` 或扩容,重试 `flush()` |
-| 只读文件系统 / 只读模式 | `read_only(true)` 打开 | 打开成功(不创建锁文件);任何写操作返回 `Invalid("read-only")`(模式检查先于 I/O) | 换可写目录或保持只读 |
+| 只读文件系统 / 只读模式 | `read_only(true)` 打开 | 打开成功(不创建锁文件);任何写操作返回 `Unsupported { feature: "只读模式写入" }`(模式检查先于 I/O) | 换可写目录或保持只读 |
 | 只读文件系统 | 可写打开 | 创建锁文件失败 → `Io`(未创建任何数据) | 换可写目录或改用 `read_only(true)` |
 | 目录被占用 | 第二个实例打开 | `Busy` | 确保单进程独占([16 §3](16-api-reference.md)) |
 | 全部 MANIFEST 损坏 | 扫描 `MANIFEST.*` 无合法版本 | `Corrupted` | 从备份恢复([16 §7](16-api-reference.md)) |

@@ -1,27 +1,36 @@
 //! Mneme:面向 AI Agent 超长期记忆层的嵌入型向量存储引擎。
 //!
-//! 本 crate 采用 L0–L6 渐进式分层;当前实现为 **L0 原语层**([`core`]):
-//! 无 I/O、无全局状态、无锁的类型与纯函数,是后续各层的地基。
+//! 本 crate 采用 L0–L6 渐进式分层;当前实现为 **L0 原语层**([`core`])与
+//! **L1 内存引擎**([`memory`])。L1 提供全内存的完整公开 API(易失),
+//! 后续层只替换实现、不改变签名。
 //!
 //! # 模块
 //!
 //! * [`core`] —— 标识类型、错误、距离度量、SIMD 点积、TopK 堆、varint、元数据与配置类型。
+//! * [`memory`] —— 内存表、暴力检索、过滤 AST、去重与记忆生命周期。
 //!
 //! # 示例
 //!
 //! ```
-//! use mneme::{Metric, simd};
+//! use mneme::{Metric, Record, simd};
 //!
 //! let a = [1.0_f32, 2.0, 3.0, 4.0];
 //! let b = [1.0_f32, 1.0, 1.0, 1.0];
 //! assert_eq!(simd::dot(&a, &b), 10.0);
 //! assert_eq!(Metric::Dot.score(&a, &b, 0.0, 0.0), 10.0);
+//!
+//! let db = mneme::Mneme::in_memory(2).unwrap();
+//! let ns = db.namespace("demo");
+//! ns.insert(Record::new(vec![1.0, 0.0]).key("a")).unwrap();
+//! let hits = ns.search().vector(&[1.0, 0.0]).top_k(1).execute().unwrap();
+//! assert_eq!(hits.len(), 1);
 //! ```
 
 #![deny(missing_docs)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod core;
+pub mod memory;
 
 pub use crate::core::error::{MnemeError, Result};
 pub use crate::core::heap::TopK;
@@ -35,3 +44,11 @@ pub use crate::core::options::{
 };
 pub use crate::core::types::{Key, NsId, RowId, SegmentId, SeqNo, SlotId};
 pub use crate::core::{simd, varint};
+pub use crate::memory::{
+    AccessStat, BackupReport, Builder, CheckReport, CmpOp, CompactionControl, CompactionState,
+    ConsolidateReport, ConsolidationPolicy, Dedup, Edge, Expr, FieldBuilder, Fusion, Histogram,
+    HistoryStat, Hit, InsertOutcome, Mneme, Namespace, NsStat, QuantStat, QueryCtx, Record,
+    RecordRef, RelateOptions, RelationExpand, Reranker, ResultDedup, RetainReport, Retention,
+    ScoreBreakdown, SearchBuilder, SegmentStat, SnapshotHandle, SnapshotNamespace, Stats,
+    StorageStat, Summarizer, UpdateOutcome, Val,
+};

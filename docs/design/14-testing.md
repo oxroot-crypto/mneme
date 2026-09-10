@@ -111,7 +111,11 @@ key 索引:   随机 key 集写入 → 重启 → 每个存活 key 的 get(key) 
             delete(key) 后所有旧版本不可见;compaction 后仍一致(04 §5.5)
 命名空间:   建多个嵌套 NS 并写入 → 重启 → list_namespaces() 与写入前完全一致;
             drop_namespace 后其路径从注册表移除, NsId 不再被新空间复用
-非法输入:   含 NaN/Inf 的向量 insert 返回 Invalid;库内数据不被污染(03 §2.1)
+非法输入:   含 NaN/Inf 的向量或 NaN importance/confidence insert → NonFinite;
+            策略参数 NaN(dedup_threshold/min_importance/access_weight/threshold、max_cluster=0)→ Config;
+            MMR lambda 非有限值、dedup_threshold/threshold 越界 [0,1] → Config;
+            insert_batch 中 Merge 回调产物超限 → 整批回滚、零部分写入(FC-MEM-POST-002);
+            update 超限 patch → TooLarge/MetaTooDeep 且保持原版本;库内数据不被污染(03 §2.1)
 陈旧锁:     模拟持锁进程死亡 → 再次 open 能自动接管而非永久 Busy(16 §3)
 稳定RowId:  同 key 连续 update/upsert 多轮 → RowId 始终不变(或按语义稳定),
             访问统计与关系边仍指向同一逻辑记忆(I22)
@@ -206,7 +210,9 @@ as_of(删除前) 在 compaction 回收该版本前仍能看到 A→B(双时态�
 
 ```text
 同一 (rowid, query_id) 重复 feedback(Used) n 次 → access_count 只 +1;
-不同 query_id 则各自计数;崩溃后重放不重复计分
+不同 query_id 则各自计数;崩溃后重放不重复计分;
+不可见记录(不存在/已墓碑/已过期)feedback → false 且不占用幂等键——
+该键随后对可见记录仍生效(FC-SCORE-INV-027)
 ```
 
 ---
@@ -337,6 +343,7 @@ valid_time 过期不触发物理删除
 | middle | L2 崩溃抽样 + L3 召回 + L4 集成 | 每次 MR |
 | heavy | 全量崩溃注入 + criterion + 长跑 | 每夜/每周 |
 | fuzz | cargo-fuzz | 每夜 |
+| mutation | `cargo-mutants`(配置见根目录 `mutants.toml`):存活变异体 = 约束遗漏测试,须补测试后重跑 | L2 起,每夜 |
 
 矩阵平台:Linux(x86_64/aarch64)+ Windows(x86_64,重点覆盖
 [04 §6](04-l2-persist.md)/[04 §9](04-l2-persist.md) 的平台专项)。
@@ -349,8 +356,9 @@ valid_time 过期不触发物理删除
 同一套校验器(同一份代码,避免"测试里一套、生产一套")。
 
 **契约追溯(FSVDD 强制)**:[spec/contracts.md](../spec/contracts.md) 是形式化约束的
-唯一真实数据源;每个测试注释必须引用其 `FC-*` 编号。CI 的 `xtask check-contracts`
-校验"契约条目 ↔ 测试套件"100% 映射,任何新增业务逻辑若未登记契约即阻断合并。
+唯一真实数据源;每个测试注释必须引用其 `FC-*` 编号。`tests/contract_traceability.rs`
+在 `cargo test` 中机械校验"契约条目 ↔ 测试"双向映射(无悬空引用、无孤立测试),
+任何新增业务逻辑若未登记契约即阻断合并。
 
 ## 本章小结
 
@@ -358,7 +366,7 @@ valid_time 过期不触发物理删除
 - 崩溃注入用 `FsyncHook` + **前缀不变量**,覆盖撕裂写与位翻转。
 - 召回/等价性用属性测试;性能有明确门槛;fuzz 保证不 panic/不 UB。
 - CI 四档 + 平台矩阵;`db.check()` 与生产复用同一套校验器。
-- 契约追溯由 `xtask check-contracts` 强制 100% 映射。
+- 契约追溯由 `tests/contract_traceability.rs` 在 `cargo test` 中强制双向映射。
 
 ## 下一章
 
