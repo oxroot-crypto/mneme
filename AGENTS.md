@@ -25,7 +25,7 @@ MSRV 1.93。**当前实现了 L0 原语层 `src/core/` 与 L1 内存引擎 `src/
 
 ## 依赖与算法
 
-- 依赖白名单:`Cargo.toml` 直接依赖仅 4 个(非 feature)。新增任何外部依赖都要在 PR 中论证必要性。
+- 依赖白名单:`Cargo.toml` 非 feature 直接依赖白名单上限 4 个(`serde`/`serde_json`/`thiserror`,以及 L2 的 `crc32fast`)。新增任何外部依赖都要在 PR 中论证必要性。
 - HNSW、BM25、量化、bloom、compaction 调度、分词等复杂算法一律自研。
 
 ## 命令

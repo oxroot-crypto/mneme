@@ -38,20 +38,20 @@ impl Namespace {
     /// assert!(ns.touch("a", Some(0.1)).unwrap());
     /// ```
     pub fn touch(&self, key: &str, boost: Option<f32>) -> Result<bool> {
-        let mut ws = self.table.write();
-        if ws.closed {
-            return Err(MnemeError::Closed);
-        }
-        let Some(ns_id) = ws.ns_id_of(&self.ns_path) else {
-            return Ok(false);
-        };
-        let Some(rowid) = ws.key_index.get(&(ns_id, Key::new(key))).copied() else {
-            return Ok(false);
-        };
-        let now = self.config.clock.now_unix_ms();
-        let hit = touch_rowid(&mut ws, rowid, boost, now)?;
-        self.table.publish(&ws);
-        Ok(hit)
+        let config = Arc::clone(&self.config);
+        let ns_path = Arc::clone(&self.ns_path);
+        self.table.write_tx(move |ws| {
+            if ws.closed {
+                return Err(MnemeError::Closed);
+            }
+            let Some(ns_id) = ws.ns_id_of(&ns_path) else {
+                return Ok(false);
+            };
+            let Some(rowid) = ws.key_index.get(&(ns_id, Key::new(key))).copied() else {
+                return Ok(false);
+            };
+            touch_rowid(ws, rowid, boost, config.clock.now_unix_ms())
+        })
     }
 
     /// 按 `RowId` 访问强化。
@@ -66,14 +66,13 @@ impl Namespace {
     /// # Errors
     /// 库已关闭 → [`MnemeError::Closed`];`boost` 含非有限值 → [`MnemeError::NonFinite`]。
     pub fn touch_by_rowid(&self, id: RowId, boost: Option<f32>) -> Result<bool> {
-        let mut ws = self.table.write();
-        if ws.closed {
-            return Err(MnemeError::Closed);
-        }
-        let now = self.config.clock.now_unix_ms();
-        let hit = touch_rowid(&mut ws, id, boost, now)?;
-        self.table.publish(&ws);
-        Ok(hit)
+        let config = Arc::clone(&self.config);
+        self.table.write_tx(move |ws| {
+            if ws.closed {
+                return Err(MnemeError::Closed);
+            }
+            touch_rowid(ws, id, boost, config.clock.now_unix_ms())
+        })
     }
 
     /// 检索反馈闭环(幂等键 `(rowid, query_id)`,不变量 I27)。
@@ -105,38 +104,42 @@ impl Namespace {
     /// assert!(!ns.feedback(rowid, Feedback::Used, QueryId(1)).unwrap());
     /// ```
     pub fn feedback(&self, id: RowId, feedback: Feedback, query_id: QueryId) -> Result<bool> {
-        let mut ws = self.table.write();
-        if ws.closed {
-            return Err(MnemeError::Closed);
-        }
-        // 不可见记录(不存在/已墓碑/已过期)无法被强化:先校验命中,再占用幂等键
-        // (FC-SCORE-INV-027);`latest_live` 只查墓碑,逻辑过期须经 `is_live(now)` 判断。
-        let now = self.config.clock.now_unix_ms();
-        if latest_live(&ws, id).is_none_or(|base| !base.is_live(now)) {
-            return Ok(false);
-        }
-        if !ws.feedback_seen.insert((id, query_id.0)) {
-            return Ok(false);
-        }
-        match feedback {
-            Feedback::Used => {
-                touch_rowid(&mut ws, id, Some(FEEDBACK_USED_IMPORTANCE_BOOST), now)?;
+        let config = Arc::clone(&self.config);
+        self.table.write_tx(move |ws| {
+            if ws.closed {
+                return Err(MnemeError::Closed);
             }
-            Feedback::Ignored => {}
-            Feedback::Corrected { by } => {
-                let edge = Edge {
-                    from: by,
-                    to: id,
-                    kind: RelationKind::CONTRADICTS,
-                    weight: 1.0,
-                    metadata: Meta::Null,
-                };
-                relation::upsert_edge(Arc::make_mut(&mut ws.out_edges), edge.clone());
-                relation::upsert_edge(Arc::make_mut(&mut ws.in_edges), edge);
-                lower_confidence(&mut ws, id, now)?;
+            // 不可见记录(不存在/已墓碑/已过期)无法被强化:先校验命中,再占用幂等键
+            // (FC-SCORE-INV-027);`latest_live` 只查墓碑,逻辑过期须经 `is_live(now)` 判断。
+            let now = config.clock.now_unix_ms();
+            if latest_live(ws, id).is_none_or(|base| !base.is_live(now)) {
+                return Ok(false);
             }
-        }
-        self.table.publish(&ws);
-        Ok(true)
+            if ws.feedback_seen.contains(&(id, query_id.0)) {
+                return Ok(false);
+            }
+            match feedback {
+                Feedback::Used => {
+                    touch_rowid(ws, id, Some(FEEDBACK_USED_IMPORTANCE_BOOST), now)?;
+                }
+                Feedback::Ignored => {}
+                Feedback::Corrected { by } => {
+                    // 先做可失败的可信度下调,再写边;失败由 `write_tx` 整体回滚。
+                    lower_confidence(ws, id, now)?;
+                    let edge = Edge {
+                        from: by,
+                        to: id,
+                        kind: RelationKind::CONTRADICTS,
+                        weight: 1.0,
+                        metadata: Meta::Null,
+                    };
+                    relation::upsert_edge(Arc::make_mut(&mut ws.out_edges), edge.clone());
+                    relation::upsert_edge(Arc::make_mut(&mut ws.in_edges), edge);
+                }
+            }
+            // 生效成功后再登记幂等键:中途失败不占用键,调用方可重试(FC-SCORE-INV-027)。
+            Arc::make_mut(&mut ws.feedback_seen).insert((id, query_id.0));
+            Ok(true)
+        })
     }
 }

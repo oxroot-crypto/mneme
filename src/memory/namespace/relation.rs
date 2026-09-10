@@ -64,25 +64,25 @@ impl Namespace {
         to: RowId,
         options: RelateOptions,
     ) -> Result<()> {
-        let mut ws = self.table.write();
-        if ws.closed {
-            return Err(MnemeError::Closed);
-        }
-        // 非有限值边权会经联想扩展污染检索打分,入口直接拒绝(FC-GLOBAL-PRE-004)。
-        if !options.weight.is_finite() {
-            return Err(MnemeError::NonFinite);
-        }
-        let edge = Edge {
-            from,
-            to,
-            kind: options.kind,
-            weight: options.weight.clamp(0.0, 1.0),
-            metadata: options.metadata,
-        };
-        relation::upsert_edge(Arc::make_mut(&mut ws.out_edges), edge.clone());
-        relation::upsert_edge(Arc::make_mut(&mut ws.in_edges), edge);
-        self.table.publish(&ws);
-        Ok(())
+        self.table.write_tx(move |ws| {
+            if ws.closed {
+                return Err(MnemeError::Closed);
+            }
+            // 非有限值边权会经联想扩展污染检索打分,入口直接拒绝(FC-GLOBAL-PRE-004)。
+            if !options.weight.is_finite() {
+                return Err(MnemeError::NonFinite);
+            }
+            let edge = Edge {
+                from,
+                to,
+                kind: options.kind,
+                weight: options.weight.clamp(0.0, 1.0),
+                metadata: options.metadata,
+            };
+            relation::upsert_edge(Arc::make_mut(&mut ws.out_edges), edge.clone());
+            relation::upsert_edge(Arc::make_mut(&mut ws.in_edges), edge);
+            Ok(())
+        })
     }
 
     /// 删除一条关系边,返回是否命中。
@@ -115,14 +115,14 @@ impl Namespace {
     /// assert!(ns.unrelate(from, to, RelationKind::RELATED).unwrap());
     /// ```
     pub fn unrelate(&self, from: RowId, to: RowId, kind: RelationKind) -> Result<bool> {
-        let mut ws = self.table.write();
-        if ws.closed {
-            return Err(MnemeError::Closed);
-        }
-        let removed = relation::remove_edge(Arc::make_mut(&mut ws.out_edges), from, to, kind);
-        relation::remove_edge(Arc::make_mut(&mut ws.in_edges), to, from, kind);
-        self.table.publish(&ws);
-        Ok(removed)
+        self.table.write_tx(move |ws| {
+            if ws.closed {
+                return Err(MnemeError::Closed);
+            }
+            let removed = relation::remove_edge(Arc::make_mut(&mut ws.out_edges), from, to, kind);
+            relation::remove_edge(Arc::make_mut(&mut ws.in_edges), to, from, kind);
+            Ok(removed)
+        })
     }
 
     /// 返回 `from` 的出边(两端存活,不变量 I25)。

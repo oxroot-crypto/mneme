@@ -37,39 +37,41 @@ impl Namespace {
     /// assert_eq!(ns.forget(Expr::field("key").eq("a")).unwrap(), 1);
     /// ```
     pub fn forget(&self, filter: Expr) -> Result<usize> {
-        let mut ws = self.table.write();
-        if ws.closed {
-            return Err(MnemeError::Closed);
-        }
-        let Some(ns_id) = ws.ns_id_of(&self.ns_path) else {
-            return Ok(0);
-        };
-        let now = self.config.clock.now_unix_ms();
-        let victims: Vec<RowId> = ws
-            .slots
-            .iter()
-            .enumerate()
-            .filter(|(idx, slot)| {
-                !ws.dead.get(*idx)
-                    && slot.ns_id == ns_id
-                    && slot.is_live(now)
-                    && pred::matches(
-                        &filter,
-                        &EvalCtx {
-                            slot,
-                            access: ws.access.get(&slot.rowid).copied(),
-                        },
-                    )
-            })
-            .map(|(_, slot)| slot.rowid)
-            .collect();
-        let count = victims.len();
-        for rowid in victims {
-            let seqno = ws.alloc_seqno();
-            ws.tombstone(rowid, now, seqno)?;
-        }
-        self.table.publish(&ws);
-        Ok(count)
+        let config = Arc::clone(&self.config);
+        let ns_path = Arc::clone(&self.ns_path);
+        self.table.write_tx(move |ws| {
+            if ws.closed {
+                return Err(MnemeError::Closed);
+            }
+            let Some(ns_id) = ws.ns_id_of(&ns_path) else {
+                return Ok(0);
+            };
+            let now = config.clock.now_unix_ms();
+            let victims: Vec<RowId> = ws
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(idx, slot)| {
+                    !ws.dead.get(*idx)
+                        && slot.ns_id == ns_id
+                        && slot.is_live(now)
+                        && pred::matches(
+                            &filter,
+                            &EvalCtx {
+                                slot,
+                                access: ws.access.get(&slot.rowid).copied(),
+                            },
+                        )
+                })
+                .map(|(_, slot)| slot.rowid)
+                .collect();
+            let count = victims.len();
+            for rowid in victims {
+                let seqno = ws.alloc_seqno();
+                ws.tombstone(rowid, now, seqno)?;
+            }
+            Ok(count)
+        })
     }
 
     /// 按遗忘策略回收低保留分记录。
@@ -94,33 +96,35 @@ impl Namespace {
     /// assert_eq!(report.scanned, 1);
     /// ```
     pub fn retain(&self, policy: Retention) -> Result<RetainReport> {
-        let mut ws = self.table.write();
-        if ws.closed {
-            return Err(MnemeError::Closed);
-        }
-        // 非有限值阈值会让「score < 阈值」恒为假、遗忘静默失效;`access_weight` 非有限值
-        // 同样会让保留分恒为 NaN,一并显式拒绝(FC-LIFE-POST-002 / FC-GLOBAL-PRE-004)。
-        if !policy.min_importance.is_finite() || !policy.access_weight.is_finite() {
-            return Err(MnemeError::Config {
-                reason: "min_importance 与 access_weight 必须是有限值",
-            });
-        }
-        let Some(ns_id) = ws.ns_id_of(&self.ns_path) else {
-            return Ok(RetainReport::default());
-        };
-        let now = self.config.clock.now_unix_ms();
-        let mut report = RetainReport::default();
-        let (scanned, victims) = collect_retain_victims(&ws, ns_id, now, &policy);
-        report.scanned = scanned;
-        for rowid in victims {
-            let seqno = ws.alloc_seqno();
-            if ws.tombstone(rowid, now, seqno)? {
-                report.forgotten += 1;
-                report.sampled_ids.push(rowid);
+        let config = Arc::clone(&self.config);
+        let ns_path = Arc::clone(&self.ns_path);
+        self.table.write_tx(move |ws| {
+            if ws.closed {
+                return Err(MnemeError::Closed);
             }
-        }
-        self.table.publish(&ws);
-        Ok(report)
+            // 非有限值阈值会让「score < 阈值」恒为假、遗忘静默失效;`access_weight` 非有限值
+            // 同样会让保留分恒为 NaN,一并显式拒绝(FC-LIFE-POST-002 / FC-GLOBAL-PRE-004)。
+            if !policy.min_importance.is_finite() || !policy.access_weight.is_finite() {
+                return Err(MnemeError::Config {
+                    reason: "min_importance 与 access_weight 必须是有限值",
+                });
+            }
+            let Some(ns_id) = ws.ns_id_of(&ns_path) else {
+                return Ok(RetainReport::default());
+            };
+            let now = config.clock.now_unix_ms();
+            let mut report = RetainReport::default();
+            let (scanned, victims) = collect_retain_victims(ws, ns_id, now, &policy);
+            report.scanned = scanned;
+            for rowid in victims {
+                let seqno = ws.alloc_seqno();
+                if ws.tombstone(rowid, now, seqno)? {
+                    report.forgotten += 1;
+                    report.sampled_ids.push(rowid);
+                }
+            }
+            Ok(report)
+        })
     }
 
     /// 记忆沉淀:把近似重复的记忆聚簇、合并/摘要,并链接来源(设计 09 §5)。
@@ -146,50 +150,51 @@ impl Namespace {
     /// assert_eq!(report.clusters, 1);
     /// ```
     pub fn consolidate(&self, policy: ConsolidationPolicy) -> Result<ConsolidateReport> {
-        let mut ws = self.table.write();
-        if ws.closed {
-            return Err(MnemeError::Closed);
-        }
-        // 策略参数非法时显式拒绝,绝不静默空转或索引越界 panic(FC-MODEL-POST-006):
-        // threshold=NaN 使 `相似度 ≥ 阈值` 恒为假,越界值超出相似度口径;
-        // max_cluster=0 会把候选簇截断为空簇。
-        // NaN 的 `contains` 恒为 false,一个区间判断即可同时覆盖非有限值与越界。
-        if !(0.0..=1.0).contains(&policy.threshold) || policy.max_cluster == 0 {
-            return Err(MnemeError::Config {
-                reason: "沉淀策略非法:threshold 必须为 [0,1] 内的有限值且 max_cluster ≥ 1",
-            });
-        }
-        let Some(ns_id) = ws.ns_id_of(&self.ns_path) else {
-            return Ok(ConsolidateReport::default());
-        };
-        let now = self.config.clock.now_unix_ms();
-        let candidates = collect_consolidation_candidates(&ws, ns_id, now, &policy);
-        let vectors: Vec<&[f32]> = candidates
-            .iter()
-            .map(|slot_data| slot_data.vector.as_ref())
-            .collect();
-        let clusters = score::cluster_by_similarity(&vectors, policy.threshold);
-        let target_path = consolidation_target(&self.ns_path, &policy);
-        let target_id = ws.register_ns(&target_path);
-
-        let mut report = ConsolidateReport::default();
-        {
-            let mut ctx = ConsolidationCtx {
-                ws: &mut ws,
-                policy: &policy,
-                candidates: &candidates,
-                target_id,
-                target_path: &target_path,
-                now,
+        let config = Arc::clone(&self.config);
+        let ns_path = Arc::clone(&self.ns_path);
+        self.table.write_tx(move |ws| {
+            if ws.closed {
+                return Err(MnemeError::Closed);
+            }
+            // 策略参数非法时显式拒绝,绝不静默空转或索引越界 panic(FC-MODEL-POST-006):
+            // threshold=NaN 使 `相似度 ≥ 阈值` 恒为假,越界值超出相似度口径;
+            // max_cluster=0 会把候选簇截断为空簇。
+            // NaN 的 `contains` 恒为 false,一个区间判断即可同时覆盖非有限值与越界。
+            if !(0.0..=1.0).contains(&policy.threshold) || policy.max_cluster == 0 {
+                return Err(MnemeError::Config {
+                    reason: "沉淀策略非法:threshold 必须为 [0,1] 内的有限值且 max_cluster ≥ 1",
+                });
+            }
+            let Some(ns_id) = ws.ns_id_of(&ns_path) else {
+                return Ok(ConsolidateReport::default());
             };
-            for cluster in clusters {
-                if cluster.len() >= 2 {
-                    ctx.merge_cluster(&cluster, &mut report)?;
+            let now = config.clock.now_unix_ms();
+            let candidates = collect_consolidation_candidates(ws, ns_id, now, &policy);
+            let vectors: Vec<&[f32]> = candidates
+                .iter()
+                .map(|slot_data| slot_data.vector.as_ref())
+                .collect();
+            let clusters = score::cluster_by_similarity(&vectors, policy.threshold);
+            let target_path = consolidation_target(&ns_path, &policy);
+            let target_id = ws.register_ns(&target_path);
+            let mut report = ConsolidateReport::default();
+            {
+                let mut ctx = ConsolidationCtx {
+                    ws,
+                    policy: &policy,
+                    candidates: &candidates,
+                    target_id,
+                    target_path: &target_path,
+                    now,
+                };
+                for cluster in clusters {
+                    if cluster.len() >= 2 {
+                        ctx.merge_cluster(&cluster, &mut report)?;
+                    }
                 }
             }
-        }
-        self.table.publish(&ws);
-        Ok(report)
+            Ok(report)
+        })
     }
 }
 

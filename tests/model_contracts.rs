@@ -143,6 +143,45 @@ fn supersede_closes_previous_valid_to() {
     assert_eq!(old.valid_to(), Some(200), "旧版本 valid_to 被闭合");
 }
 
+/// FC-MODEL-POST-003(supersede 沿用同 key;显式冲突 → `KeyMismatch`;索引不悬挂)
+#[test]
+fn supersede_preserves_key_and_rejects_conflict() {
+    let db = mem(2);
+    let ns = db.namespace("n");
+    ns.insert(Record::new(vec![1.0, 0.0]).key("os").text("windows"))
+        .expect("insert");
+    // 省略 key → 继承首参 key,`get`/`check` 均正常。
+    ns.supersede("os", Record::new(vec![0.0, 1.0]).text("macos"))
+        .expect("supersede");
+    let got = ns.get("os").expect("get").expect("present");
+    assert_eq!(got.key(), Some("os"), "supersede 须沿用同一 key");
+    assert_eq!(got.text(), Some("macos"));
+    assert!(
+        db.check().expect("check").ok,
+        "supersede 后 key 索引不应悬挂"
+    );
+    // 带 key 的历史视图同样能定位新版本(不因 key 丢失而失准)。
+    let snap = db.as_of(i64::MAX).expect("as_of");
+    assert_eq!(
+        snap.namespace("n")
+            .get("os")
+            .expect("get")
+            .expect("present")
+            .text(),
+        Some("macos")
+    );
+    // 显式给出冲突 key → KeyMismatch,且不产生任何写入。
+    assert!(matches!(
+        ns.supersede("os", Record::new(vec![1.0, 1.0]).key("other")),
+        Err(mneme::MnemeError::KeyMismatch { .. })
+    ));
+    assert_eq!(
+        ns.get("os").expect("get").expect("present").text(),
+        Some("macos")
+    );
+    assert!(db.check().expect("check").ok);
+}
+
 /// FC-MODEL-INV-026
 #[test]
 fn as_of_returns_historical_snapshot() {

@@ -142,13 +142,15 @@ ns.supersede(key, new_record)?;   // 语义糖:update 同 key + 将旧版本 val
 `supersede` 把"更新"与"有效时间闭区间"绑定:旧事实在有效时间上被新事实取代,但**历史版本被
 保留**(默认永久,受 `history_horizon` 约束,[07 §4.2a](07-l5-life.md))。这与普通 `update`
 (整体替换、旧版本仅被遮蔽)的区别是:`supersede` 保留"曾经为真"的语义,且历史经版本链可查。
+由于是 `update 同 key`,新记录**沿用目标 key**:`new_record` 省略 key 时继承首参 `key`;
+显式给出且冲突 → `KeyMismatch`,绝不静默改 key 或留下悬挂 `key_index`。
 
 ### 3.4 矛盾与一致
 
 - `RelationKind::CONTRADICTS` 只是标注,引擎**不自动裁决**谁对;排序时由 [10 §2](10-scoring.md)
   的 `confidence` 与 `recency` 决定倾向,最终由宿主/Agent 决策;
-- `db.check()` 报告"同 key 有效时间重叠的活版本"(可能是未 `supersede` 的更新遗漏),
-  作为一致性建议,不阻断;
+- `db.check()` 做全量一致性校验:段 CRC、RowId 版本链一致性、key 索引 ↔ entries 对账,
+  并报告「同 key 有效时间重叠的活版本」等一致性建议(可能是未 `supersede` 的更新遗漏);建议不阻断;
 - **版本状态(STA 契约用语,对应 [FC-MODEL-STA-001](../spec/contracts.md))**:同一 RowId 的物理版本
   从 `Active`(seqno 最大、当前查询可见)变为 `Shadowed`(被更新遮蔽、当前查询不可见,
   但仍可经 `as_of` 历史读),再在超出 `history_horizon` 后变为 `Reclaimed`(物理回收、彻底不可见)。

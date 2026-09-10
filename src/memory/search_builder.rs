@@ -18,6 +18,25 @@ use crate::memory::rerank::{Fusion, Reranker};
 use crate::memory::table::{ReaderView, Table};
 
 /// 检索构建器。
+///
+/// 由 [`Namespace::search`](crate::memory::Namespace::search) 或
+/// [`SnapshotNamespace::search`](crate::memory::SnapshotNamespace::search) 创建,
+/// 链式设置参数后以 [`SearchBuilder::execute`] 执行。
+///
+/// # Examples
+/// ```
+/// use mneme::{Mneme, Record};
+/// let db = Mneme::in_memory(2).unwrap();
+/// let ns = db.namespace("demo");
+/// ns.insert(Record::new(vec![1.0, 0.0]).key("a")).unwrap();
+/// let hits = ns
+///     .search()
+///     .vector(&[1.0, 0.0])
+///     .top_k(1)
+///     .execute()
+///     .unwrap();
+/// assert_eq!(hits.len(), 1);
+/// ```
 pub struct SearchBuilder<'a> {
     pub(crate) table: Arc<Table>,
     pub(crate) config: Arc<Config>,

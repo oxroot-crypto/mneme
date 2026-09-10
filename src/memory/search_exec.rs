@@ -173,9 +173,13 @@ impl SearchBuilder<'_> {
         now: i64,
     ) -> Vec<(Scored, ScoreBreakdown)> {
         match &self.scoring {
-            Some(scoring) => {
-                score::rerank_composite(view, &scored, scoring, self.config.metric, now)
-            }
+            Some(scoring) => score::rerank_composite(score::CompositeRerank {
+                view,
+                candidates: &scored,
+                scoring,
+                metric: self.config.metric,
+                now_ms: now,
+            }),
             None => scored
                 .iter()
                 .map(|candidate| {

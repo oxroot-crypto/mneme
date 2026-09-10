@@ -102,10 +102,11 @@ impl SlotData {
     }
 }
 
-/// 写路径的可变状态;字段均为 `Arc`,写入经 `Arc::make_mut` 触发 COW。
+/// 写路径的可变状态;容器字段均为 `Arc`,写入经 `Arc::make_mut` 触发 COW。
 ///
-/// 实现 `Clone` 以便批量写入在失败时快照回滚(集合字段为 `Arc`,`clone` 仅复制
-/// 句柄;回滚后首次写入经 COW 触发一次深拷贝,见 `Namespace::insert_batch`)。
+/// 实现 `Clone` 以便批量写入在失败时快照回滚:所有容器字段(`slots`/各索引/
+/// `access`/`feedback_seen` 等)均为 `Arc`,`clone` 仅复制句柄,不深拷贝内容
+/// (回滚后首次写入经 COW 触发一次拷贝,见 `Namespace::insert_batch`)。
 #[derive(Clone)]
 pub(crate) struct WriterState {
     pub(crate) slots: Arc<Vec<Arc<SlotData>>>,
@@ -122,8 +123,9 @@ pub(crate) struct WriterState {
     pub(crate) next_ns_id: u32,
     pub(crate) ns_registry: Arc<HashMap<NsId, Arc<str>>>,
     pub(crate) ns_by_path: Arc<HashMap<Arc<str>, NsId>>,
-    // 反馈幂等键(I27);L1 常驻内存,L5 随访问统计一并落盘。
-    pub(crate) feedback_seen: HashSet<(RowId, u64)>,
+    // 反馈幂等键(I27);L1 常驻内存,L5 随访问统计一并落盘。经 `Arc` COW,
+    // 使批量写入快照(`WriterState::clone`)与回滚不深拷贝该集合。
+    pub(crate) feedback_seen: Arc<HashSet<(RowId, u64)>>,
     pub(crate) closed: bool,
 }
 
@@ -144,7 +146,7 @@ impl WriterState {
             next_ns_id: 1,
             ns_registry: Arc::new(HashMap::new()),
             ns_by_path: Arc::new(HashMap::new()),
-            feedback_seen: HashSet::new(),
+            feedback_seen: Arc::new(HashSet::new()),
             closed: false,
         }
     }
@@ -180,16 +182,6 @@ impl WriterState {
         id
     }
 
-    /// 追加一个物理版本(默认可见),返回其 `SlotId`。
-    ///
-    /// 墓碑版本由 [`WriterState::tombstone`] 构造,其 `deleted` 标记负责不可见;
-    /// 遮蔽旧版本由 [`WriterState::hide_latest`] 负责。
-    pub(crate) fn append_slot(&mut self, slot_data: SlotData) -> Result<SlotId> {
-        let slot = slot_id_for(self.slots.len())?;
-        Arc::make_mut(&mut self.slots).push(Arc::new(slot_data));
-        Ok(slot)
-    }
-
     /// 把某 `RowId` 的当前最新版本标记为不可见(被遮蔽/删除)。
     pub(crate) fn hide_latest(&mut self, rowid: RowId) {
         if let Some(slot) = self.latest.get(&rowid).copied() {
@@ -198,7 +190,16 @@ impl WriterState {
     }
 
     /// 记录一个物理版本到版本链,并更新 `latest` / `key_index` / `text_index`。
+    ///
+    /// 若该 `RowId` 的上一版本带 key 且与新版本 key 不同(如 `supersede`/`merge`
+    /// 改变 key),先移除旧 `key_index` 项,避免悬挂映射使 `get`/`check` 失准。
     pub(crate) fn link_version(&mut self, rowid: RowId, slot: SlotId) {
+        if let Some((ns_id, old_key)) = self.previous_key(rowid) {
+            let new_key = self.slots[slot.get() as usize].key.as_ref();
+            if new_key != Some(&old_key) {
+                Arc::make_mut(&mut self.key_index).remove(&(ns_id, old_key));
+            }
+        }
         Arc::make_mut(&mut self.versions)
             .entry(rowid)
             .or_default()
@@ -213,10 +214,24 @@ impl WriterState {
         }
     }
 
+    /// 遮蔽前 `rowid` 当前最新版本的 `(ns_id, key)`(无 key 或不存在时 `None`)。
+    fn previous_key(&self, rowid: RowId) -> Option<(NsId, Key)> {
+        let previous = self.latest.get(&rowid).copied()?;
+        let slot_data = &self.slots[previous.get() as usize];
+        slot_data
+            .key
+            .as_ref()
+            .map(|key| (slot_data.ns_id, key.clone()))
+    }
+
     /// 提交一个新物理版本:遮蔽旧版本、追加、登记版本链。
+    ///
+    /// 容量校验在遮蔽旧版本**之前**完成:槽位溢出(`u32::MAX`)时返回结构化错误且
+    /// 不改动旧版本,消除「已遮蔽但无新版本」的半写(FC-MEM-PRE-002 零部分写入)。
     pub(crate) fn commit_version(&mut self, rowid: RowId, slot_data: SlotData) -> Result<SlotId> {
+        let slot = slot_id_for(self.slots.len())?;
         self.hide_latest(rowid);
-        let slot = self.append_slot(slot_data)?;
+        Arc::make_mut(&mut self.slots).push(Arc::new(slot_data));
         self.link_version(rowid, slot);
         Ok(slot)
     }
@@ -338,6 +353,27 @@ impl Table {
             .write()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *guard = view;
+    }
+
+    /// 在写事务中执行 `f`:进入前快照写状态,`f` 返回 `Err` 时回滚到快照、
+    /// 不发布;成功时发布读视图。
+    ///
+    /// 所有容器字段均为 `Arc`,`clone` 仅复制句柄,故快照/回滚廉价。此机制保证
+    /// 任何失败的写操作对读者零可见、不留半写(FC-MEM-POST-002 泛化),并让
+    /// 失败写入不残留命名空间登记等副作用。
+    pub(crate) fn write_tx<T>(&self, f: impl FnOnce(&mut WriterState) -> Result<T>) -> Result<T> {
+        let mut ws = self.write();
+        let snapshot = ws.clone();
+        match f(&mut ws) {
+            Ok(value) => {
+                self.publish(&ws);
+                Ok(value)
+            }
+            Err(error) => {
+                *ws = snapshot;
+                Err(error)
+            }
+        }
     }
 }
 

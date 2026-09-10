@@ -49,6 +49,7 @@ pub enum MnemeError {
     Corrupted { segment: Option<SegmentId>, reason: String }, // CRC 不过/魔数不符;None = 文件级损坏(如 MANIFEST 全坏)
     DimensionMismatch { expected: u32, got: usize },    // 建库时已锁维度
     MetricMismatch { existing: Metric, requested: Metric }, // 打开时参数与库不符
+    KeyMismatch { expected: Key, got: Key },            // supersede 新记录 key 与目标冲突
     KeyNotFound(Key),                                   // 保留变体,当前无 API 产生(见 16 §4)
     DuplicateKey(Key),                                  // InsertMode::RejectDuplicate 时
     FilterParse(String),                                // DSL 语法错误,带位置信息

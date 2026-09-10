@@ -5,12 +5,14 @@
 > **前置阅读**:[01 §6](01-overview.md)(API 速览)、[02](02-l0-core.md)。
 > **本章你将学到**:API 语义细则 → 内存表结构 → 暴力扫描 → 过滤 AST → 去重预检。
 
-模块:`memory/{engine.rs, builder.rs, namespace/, snapshot.rs, search_builder.rs, expand.rs,
-table.rs, search.rs, pred.rs, pred_eval.rs, record.rs, write_helpers.rs, mutate_helpers.rs,
-dedup.rs, relation.rs, temporal.rs, score.rs, lifecycle.rs, ops.rs, config.rs}`——`engine.rs`
-承载库句柄 `Mneme`,`namespace/` 承载 `Namespace` 的写/读/访问/生命周期/关系方法,
-`search_builder.rs` 与 `expand.rs` 承载 `SearchBuilder` 执行流程及联想扩展/结果去重;
-本章 §2 的语义即其行为规约,其余小节逐个展开数据结构与算法。
+模块:`memory/{engine.rs, engine_ops.rs, builder.rs, namespace/, snapshot.rs, snapshot_scan.rs,
+search_builder.rs, search_exec.rs, expand.rs, rerank.rs, table.rs, search.rs, pred.rs,
+pred_eval.rs, record.rs, write_helpers.rs, mutate_helpers.rs, dedup.rs, relation.rs,
+temporal.rs, score.rs, lifecycle.rs, ops.rs, config.rs}`——`engine.rs` 承载库句柄 `Mneme`
+(统计/fsck/落盘门面在 `engine_ops.rs`),`namespace/` 承载 `Namespace` 的写/读/访问/
+生命周期/关系方法(过滤遍历与计数在 `namespace/scan.rs`),`snapshot.rs`/`snapshot_scan.rs`
+承载快照只读视图;`search_builder.rs`、`search_exec.rs` 与 `expand.rs` 承载 `SearchBuilder`
+执行流程及联想扩展/结果去重;本章 §2 的语义即其行为规约,其余小节逐个展开数据结构与算法。
 
 ---
 
@@ -38,13 +40,14 @@ pub enum InsertOutcome { Inserted(RowId), Merged(RowId), Duplicate { existing: R
 |---|---|
 | 维度校验 | 向量长度 ≠ 建库维度 → `DimensionMismatch`(故 `Record::new` 不返回 `Result`) |
 | 数值校验 | 任一分量为 `NaN`/`±Inf` → `NonFinite`(否则污染 `Metric::better` 排序;见 [16 §8](16-api-reference.md)) |
-| 同 key | `InsertMode::Upsert`(默认):**保留既有 RowId**,写入新物理版本(seqno+1),旧版本被遮蔽;`RejectDuplicate`:报错。RowId 因此是跨更新稳定的逻辑身份(02 §1) |
+| 同 key | `InsertMode::Upsert`(默认):**保留既有 RowId**,写入新物理版本(seqno+1),旧版本被遮蔽;`RejectDuplicate`:同 key 存在**可见**记录(未墓碑且未逻辑过期)时报错,墓碑/逻辑过期记录视为不存在并复用既有 RowId。RowId 因此是跨更新稳定的逻辑身份(02 §1) |
 | seqno | 每次成功写入分配新 `SeqNo`,全库单调递增 |
 | TTL | 相对时长即刻换算为绝对 `expires_at`(Unix 毫秒,经 `Clock` 取值) |
 | importance | 未指定默认 0.5;范围 [0,1],超范围钳制(clamp);含非有限值(NaN)→ `NonFinite` 拒绝,绝不入库 |
 | valid time | `Record::valid_from/valid_to` 可选,构成双时态(valid time + transaction time),见 [09 §3](09-memory-model.md) |
 | confidence | `Record::confidence` 可选,默认 1.0;参与检索打分的可信度因子,见 [10](10-scoring.md) |
-| 批量 | `insert_batch` **整批原子**(I15,定义见 [16 §9](16-api-reference.md)):共用一次组提交 fsync;WAL 侧以 `BatchBegin`/`BatchCommit` 帧包裹([04 §2.3](04-l2-persist.md));任一条**校验失败**(维度/数值/限额)则整批拒绝、不产生部分写入;结果顺序与输入一一对应。**去重命中**(`Dedup::Reject`)或 `InsertMode::RejectDuplicate` 属于逐条业务结果,不使整批回滚——命中位置返回 `Duplicate`,其余记录照常写入 |
+| 事务性 | 任何写操作(单条/批量/update/delete/touch/feedback/forget/retain/consolidate/drop_namespace…)失败都回滚到操作前状态、对读者不可见,副作用(命名空间登记、访问计数、关系边)一并回滚,绝不半写(FC-MEM-POST-002) |
+| 批量 | `insert_batch` **整批原子**(I15,定义见 [16 §9](16-api-reference.md)):共用一次组提交 fsync;WAL 侧以 `BatchBegin`/`BatchCommit` 帧包裹([04 §2.3](04-l2-persist.md));任一条**校验失败**(维度/数值/限额)则整批拒绝;预校验后逐条求值仍失败(`Dedup::Merge` 回调产物超限、槽位容量溢出)时同样整批回滚、不产生部分写入;结果顺序与输入一一对应。**去重命中**(`Dedup::Reject`)或 `InsertMode::RejectDuplicate` 属于逐条业务结果,不使整批回滚——命中位置返回 `Duplicate`,其余记录照常写入 |
 
 **局部更新 `update`**(不改变 RowId;不提供向量则不写向量区):
 
@@ -153,7 +156,7 @@ WriterState
 ├── seqno:      SeqNo                    ← 下一个可分配序号
 ├── next_rowid / next_ns_id: u64 / u32   ← 标识水位
 ├── ns_registry / ns_by_path: Arc<HashMap<…>>     ← 命名空间路径 ↔ NsId 双向注册表
-├── feedback_seen: HashSet<(RowId, u64)> ← 反馈幂等键(I27)
+├── feedback_seen: Arc<HashSet<(RowId, u64)>> ← 反馈幂等键(I27)
 └── closed:     bool                     ← 关闭标记
 SlotData { rowid, ns_id, ns_path, seqno, key, vector: Arc<[f32]>, norm_sq,
            text, text_hash, meta, created_at, expires_at, importance, confidence,
@@ -340,7 +343,8 @@ pub enum Dedup { Off, Reject, Replace, KeepBoth, Merge(fn(&RecordRef<'_>, &Recor
 - `Replace`:旧行墓碑,新行入位(保留新时间戳);
 - `KeepBoth`:照常插入,返回 `Inserted(RowId)`(不返回重复信息;需感知重复请用 `Reject`);
 - `Merge`:以命中的旧记录为主体应用回调返回的 `Record`(如保留旧向量、取更高 `importance`、合并 `text`),
-  **保留旧 RowId 就地更新**(符合 I22),返回 `InsertOutcome::Merged(existing)`;回调返回 `None` 等价 `KeepBoth`。
+  **保留旧 RowId 就地更新**(符合 I22),返回 `InsertOutcome::Merged(existing)`;回调返回 `None` 等价 `KeepBoth`;
+  若回调产物改变了 key,`key_index` 随新版本迁移(旧 key 映射移除,不悬挂)。
   L4 之后可用元数据索引细化(如只在 `kind == "preference"` 内查重——把判重查询限定在同一语义类别,防误杀)。
 
 > **注意**:`Dedup` 是**写入期**去重。检索结果的去重是另一套语义与另一个类型

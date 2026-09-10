@@ -52,24 +52,56 @@ pub(crate) struct InsertCtx {
     pub(crate) in_batch: bool,
 }
 
-/// 写入前校验维度、有限性与各项限额。
-pub(crate) fn validate_insert(config: &Config, rec: &Record) -> Result<()> {
+/// 校验向量维度与分量有限性(写/更新同口径)。
+fn validate_vector(config: &Config, vector: &[f32]) -> Result<()> {
     let expected = config.dimension.get();
-    if rec.vector.len() != expected as usize {
+    if vector.len() != expected as usize {
         return Err(MnemeError::DimensionMismatch {
             expected,
-            got: rec.vector.len(),
+            got: vector.len(),
         });
     }
-    if rec.vector.iter().any(|value| !value.is_finite()) {
+    if vector.iter().any(|value| !value.is_finite()) {
         return Err(MnemeError::NonFinite);
     }
-    // 标量因子含非有限值会污染综合打分与遗忘公式,拒绝而非静默钳制(FC-GLOBAL-PRE-004)。
-    if rec.importance.is_some_and(|value| !value.is_finite())
-        || rec.confidence.is_some_and(|value| !value.is_finite())
+    Ok(())
+}
+
+/// 校验 `importance`/`confidence` 标量因子为有限值(非有限值会污染打分与遗忘公式)。
+fn validate_scalars(importance: Option<f32>, confidence: Option<f32>) -> Result<()> {
+    // 拒绝而非静默钳制(FC-GLOBAL-PRE-004)。
+    if importance.is_some_and(|value| !value.is_finite())
+        || confidence.is_some_and(|value| !value.is_finite())
     {
         return Err(MnemeError::NonFinite);
     }
+    Ok(())
+}
+
+/// 校验单个 metadata/provenance 字段的大小与嵌套深度(FC-GLOBAL-PRE-003)。
+fn validate_meta_field(config: &Config, field: &'static str, meta: &Meta) -> Result<()> {
+    let size = meta::size_bytes(meta);
+    if size > config.limits.meta_bytes {
+        return Err(MnemeError::TooLarge {
+            field,
+            limit: config.limits.meta_bytes,
+            got: size,
+        });
+    }
+    let depth = meta::depth(meta);
+    if depth > config.limits.meta_depth as usize {
+        return Err(MnemeError::MetaTooDeep {
+            limit: config.limits.meta_depth as usize,
+            got: depth,
+        });
+    }
+    Ok(())
+}
+
+/// 写入前校验维度、有限性与各项限额。
+pub(crate) fn validate_insert(config: &Config, rec: &Record) -> Result<()> {
+    validate_vector(config, &rec.vector)?;
+    validate_scalars(rec.importance, rec.confidence)?;
     if let Some(key) = &rec.key
         && key.len() > config.limits.key_bytes
     {
@@ -90,21 +122,7 @@ pub(crate) fn validate_insert(config: &Config, rec: &Record) -> Result<()> {
     }
     for (field, meta) in [("metadata", &rec.metadata), ("provenance", &rec.provenance)] {
         if let Some(meta) = meta {
-            let size = meta::size_bytes(meta);
-            if size > config.limits.meta_bytes {
-                return Err(MnemeError::TooLarge {
-                    field,
-                    limit: config.limits.meta_bytes,
-                    got: size,
-                });
-            }
-            let depth = meta::depth(meta);
-            if depth > config.limits.meta_depth as usize {
-                return Err(MnemeError::MetaTooDeep {
-                    limit: config.limits.meta_depth as usize,
-                    got: depth,
-                });
-            }
+            validate_meta_field(config, field, meta)?;
         }
     }
     Ok(())
@@ -114,22 +132,9 @@ pub(crate) fn validate_insert(config: &Config, rec: &Record) -> Result<()> {
 /// 与 [`validate_insert`] 同口径;`Some(None)` 清空语义不携带新载荷,无需校验)。
 pub(crate) fn validate_patch(config: &Config, patch: &UpdatePatch) -> Result<()> {
     if let Some(vector) = &patch.vector {
-        let expected = config.dimension.get();
-        if vector.len() != expected as usize {
-            return Err(MnemeError::DimensionMismatch {
-                expected,
-                got: vector.len(),
-            });
-        }
-        if vector.iter().any(|value| !value.is_finite()) {
-            return Err(MnemeError::NonFinite);
-        }
+        validate_vector(config, vector)?;
     }
-    if patch.importance.is_some_and(|value| !value.is_finite())
-        || patch.confidence.is_some_and(|value| !value.is_finite())
-    {
-        return Err(MnemeError::NonFinite);
-    }
+    validate_scalars(patch.importance, patch.confidence)?;
     if let Some(Some(text)) = &patch.text
         && text.len() > config.limits.text_bytes
     {
@@ -144,21 +149,7 @@ pub(crate) fn validate_patch(config: &Config, patch: &UpdatePatch) -> Result<()>
         ("provenance", &patch.provenance),
     ] {
         if let Some(Some(meta)) = meta {
-            let size = meta::size_bytes(meta);
-            if size > config.limits.meta_bytes {
-                return Err(MnemeError::TooLarge {
-                    field,
-                    limit: config.limits.meta_bytes,
-                    got: size,
-                });
-            }
-            let depth = meta::depth(meta);
-            if depth > config.limits.meta_depth as usize {
-                return Err(MnemeError::MetaTooDeep {
-                    limit: config.limits.meta_depth as usize,
-                    got: depth,
-                });
-            }
+            validate_meta_field(config, field, meta)?;
         }
     }
     Ok(())
@@ -211,18 +202,27 @@ pub(crate) fn latest_live(ws: &WriterState, rowid: RowId) -> Option<Arc<SlotData
     (!slot_data.deleted).then_some(slot_data)
 }
 
+/// 判重探针的只读上下文(聚合配置/命名空间/时刻,避免超长参数列表)。
+pub(crate) struct DedupProbe<'a> {
+    /// 建库配置(提供 `dedup_threshold`)。
+    pub(crate) config: &'a Config,
+    /// 目标命名空间。
+    pub(crate) ns_id: NsId,
+    /// 当前时刻(Unix 毫秒)。
+    pub(crate) now: i64,
+}
+
+/// 查找与 `rec` 命中的既有记录;返回 `(rowid, 相似度)`。
 pub(crate) fn find_duplicate(
     ws: &WriterState,
-    config: &Config,
-    ns_id: NsId,
+    probe: DedupProbe<'_>,
     rec: &Record,
-    now: i64,
 ) -> Option<(RowId, f32)> {
     if let Some(text) = &rec.text {
         let hash = dedup::fnv1a64(text.as_bytes());
-        if let Some(rowid) = ws.text_index.get(&(ns_id, hash)).copied()
+        if let Some(rowid) = ws.text_index.get(&(probe.ns_id, hash)).copied()
             && let Some(slot_data) = latest_live(ws, rowid)
-            && slot_data.is_live(now)
+            && slot_data.is_live(probe.now)
             && slot_data.text.as_deref() == Some(text.as_str())
         {
             return Some((rowid, 1.0));
@@ -231,11 +231,11 @@ pub(crate) fn find_duplicate(
     let mut best: Option<(RowId, f32)> = None;
     for (idx, slot) in ws.slots.iter().enumerate() {
         // 逻辑过期记录与墓碑一样不可见,不得参与判重(FC-LIFE-INV-009)。
-        if ws.dead.get(idx) || slot.ns_id != ns_id || !slot.is_live(now) {
+        if ws.dead.get(idx) || slot.ns_id != probe.ns_id || !slot.is_live(probe.now) {
             continue;
         }
         let sim = score::cosine_sim(&rec.vector, &slot.vector);
-        if sim >= config.dedup_threshold && best.is_none_or(|(_, previous)| sim > previous) {
+        if sim >= probe.config.dedup_threshold && best.is_none_or(|(_, previous)| sim > previous) {
             best = Some((slot.rowid, sim));
         }
     }
@@ -252,7 +252,15 @@ pub(crate) fn insert_one(
     let duplicate = if matches!(config.dedup, Dedup::Off | Dedup::KeepBoth) {
         None
     } else {
-        find_duplicate(ws, config, ctx.ns_id, &ctx.rec, ctx.now)
+        find_duplicate(
+            ws,
+            DedupProbe {
+                config,
+                ns_id: ctx.ns_id,
+                now: ctx.now,
+            },
+            &ctx.rec,
+        )
     };
     // `Replace` 语义要求生成新 RowId,即使新记录带同 key 也不能复用旧行。
     let force_new_rowid = duplicate.is_some() && matches!(config.dedup, Dedup::Replace);
@@ -374,7 +382,11 @@ fn resolve_rowid(
         .get(&(ctx.ns_id, Key::new(key.as_str())))
         .copied();
     match (existing, config.insert_mode) {
-        (Some(existing), InsertMode::RejectDuplicate) if latest_live(ws, existing).is_some() => {
+        // 仅当同 key 存在**可见**记录(未墓碑且未逻辑过期)时才拒绝重复;墓碑/逻辑过期
+        // 视为不存在并复用既有 `RowId`(与 `Dedup::Reject`/读路径同口径,FC-LIFE-INV-009)。
+        (Some(existing), InsertMode::RejectDuplicate)
+            if latest_live(ws, existing).is_some_and(|slot| slot.is_live(ctx.now)) =>
+        {
             if ctx.in_batch {
                 Ok(RowIdChoice::BatchDuplicate(existing))
             } else {

@@ -4,7 +4,6 @@
 //! (设计 03 §8),后续层只替换实现。写入与检索的公开 API 见
 //! [`Namespace`](crate::memory::Namespace)。
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -13,10 +12,7 @@ use crate::core::types::{NsId, RowId};
 use crate::memory::builder::Builder;
 use crate::memory::config::Config;
 use crate::memory::namespace::Namespace;
-use crate::memory::ops::{
-    BackupReport, CheckReport, CompactionControl, Histogram, HistoryStat, NsStat, QuantStat, Stats,
-    StorageStat,
-};
+use crate::memory::ops::{BackupReport, CompactionControl};
 use crate::memory::snapshot::SnapshotHandle;
 use crate::memory::table::Table;
 use crate::memory::temporal;
@@ -155,40 +151,40 @@ impl Mneme {
     /// assert_eq!(db.drop_namespace("demo").unwrap(), 1);
     /// ```
     pub fn drop_namespace(&self, path: &str) -> Result<usize> {
-        let mut ws = self.table.write();
-        if ws.closed {
-            return Err(MnemeError::Closed);
-        }
-        let prefix = format!("{path}/");
-        let victims: Vec<(NsId, Arc<str>)> = ws
-            .ns_registry
-            .iter()
-            .filter(|(_, registered)| {
-                let registered: &str = registered;
-                registered == path || registered.starts_with(&prefix)
-            })
-            .map(|(id, registered)| (*id, Arc::clone(registered)))
-            .collect();
-        let now = self.config.clock.now_unix_ms();
-        for (ns_id, _) in &victims {
-            let rowids: Vec<RowId> = ws
-                .slots
-                .iter()
-                .filter(|slot| slot.ns_id == *ns_id && !slot.deleted)
-                .map(|slot| slot.rowid)
-                .collect();
-            for rowid in rowids {
-                let seqno = ws.alloc_seqno();
-                ws.tombstone(rowid, now, seqno)?;
+        let config = Arc::clone(&self.config);
+        self.table.write_tx(move |ws| {
+            if ws.closed {
+                return Err(MnemeError::Closed);
             }
-            Arc::make_mut(&mut ws.ns_registry).remove(ns_id);
-        }
-        for (_, path) in &victims {
-            Arc::make_mut(&mut ws.ns_by_path).remove(path);
-        }
-        let count = victims.len();
-        self.table.publish(&ws);
-        Ok(count)
+            let prefix = format!("{path}/");
+            let victims: Vec<(NsId, Arc<str>)> = ws
+                .ns_registry
+                .iter()
+                .filter(|(_, registered)| {
+                    let registered: &str = registered;
+                    registered == path || registered.starts_with(&prefix)
+                })
+                .map(|(id, registered)| (*id, Arc::clone(registered)))
+                .collect();
+            let now = config.clock.now_unix_ms();
+            for (ns_id, _) in &victims {
+                let rowids: Vec<RowId> = ws
+                    .slots
+                    .iter()
+                    .filter(|slot| slot.ns_id == *ns_id && !slot.deleted)
+                    .map(|slot| slot.rowid)
+                    .collect();
+                for rowid in rowids {
+                    let seqno = ws.alloc_seqno();
+                    ws.tombstone(rowid, now, seqno)?;
+                }
+                Arc::make_mut(&mut ws.ns_registry).remove(ns_id);
+            }
+            for (_, path) in &victims {
+                Arc::make_mut(&mut ws.ns_by_path).remove(path);
+            }
+            Ok(victims.len())
+        })
     }
 
     /// 钉住当前读视图,返回一致快照句柄。
@@ -262,132 +258,6 @@ impl Mneme {
         })
     }
 
-    /// 返回运行统计。
-    ///
-    /// # Errors
-    /// 库已关闭时返回 [`MnemeError::Closed`]。
-    ///
-    /// # Examples
-    /// ```
-    /// use mneme::{Mneme, Record};
-    /// let db = Mneme::in_memory(2).unwrap();
-    /// db.namespace("demo")
-    ///     .insert(Record::new(vec![1.0, 0.0]))
-    ///     .unwrap();
-    /// let stats = db.stats().unwrap();
-    /// assert_eq!(stats.per_namespace["demo"].doc_count, 1);
-    /// ```
-    pub fn stats(&self) -> Result<Stats> {
-        let view = self.table.view();
-        if view.closed {
-            return Err(MnemeError::Closed);
-        }
-        let mut per_namespace: HashMap<String, NsStat> = HashMap::new();
-        let mut live_rows = 0_u64;
-        let now = self.config.clock.now_unix_ms();
-        for (idx, slot) in view.slots.iter().enumerate() {
-            // 逻辑过期记录与墓碑一样不计入统计(FC-LIFE-INV-009)。
-            if view.dead.get(idx) || !slot.is_live(now) {
-                continue;
-            }
-            live_rows += 1;
-            let stat = per_namespace.entry(slot.ns_path.to_string()).or_default();
-            stat.doc_count += 1;
-            stat.total_doc_len += slot.text.as_ref().map_or(0, |text| text.len() as u64);
-        }
-        let relations = view.out_edges.values().map(Vec::len).sum::<usize>() as u64;
-        Ok(Stats {
-            segments: Vec::new(),
-            wal_bytes: 0,
-            memory_est: live_rows
-                * u64::from(self.config.dimension.get())
-                * std::mem::size_of::<f32>() as u64,
-            trash_bytes: 0,
-            query_latency: Histogram::default(),
-            per_namespace,
-            quant: QuantStat {
-                configured: self.config.quantization,
-                active: self.config.quantization,
-                recall_est: None,
-            },
-            compaction: self.control.state(),
-            retain: None,
-            relations,
-            history: HistoryStat {
-                retained_versions: view.slots.len() as u64,
-                reclaimed_versions: 0,
-                horizon: self.config.compaction.history_horizon,
-            },
-            storage: StorageStat {
-                encryption: false,
-                compression: self.config.compression,
-                migrated_segments: 0,
-                total_segments: 0,
-            },
-        })
-    }
-
-    /// fsck:校验内部索引一致性。
-    ///
-    /// # Errors
-    /// 库已关闭时返回 [`MnemeError::Closed`]。
-    ///
-    /// # Examples
-    /// ```
-    /// use mneme::{Mneme, Record};
-    /// let db = Mneme::in_memory(2).unwrap();
-    /// db.namespace("demo")
-    ///     .insert(Record::new(vec![1.0, 0.0]).key("a"))
-    ///     .unwrap();
-    /// assert!(db.check().unwrap().ok);
-    /// ```
-    pub fn check(&self) -> Result<CheckReport> {
-        let view = self.table.view();
-        if view.closed {
-            return Err(MnemeError::Closed);
-        }
-        let mut suggestions = Vec::new();
-        for ((ns_id, key), rowid) in view.key_index.iter() {
-            match view.live_slot(*rowid) {
-                Some(slot) => {
-                    let slot_data = &view.slots[slot.get() as usize];
-                    if slot_data.ns_id != *ns_id || slot_data.key.as_ref() != Some(key) {
-                        suggestions.push(format!("key 索引不一致:{key}"));
-                    }
-                }
-                None => suggestions.push(format!("key 索引指向不可见行:{key}")),
-            }
-        }
-        Ok(CheckReport {
-            ok: suggestions.is_empty(),
-            corrupted: Vec::new(),
-            suggestions,
-        })
-    }
-
-    /// 返回后台合并控制句柄(与库共享同一状态)。
-    ///
-    /// # Returns
-    /// 与库共享同一合并状态的 [`CompactionControl`]。
-    pub fn compact_control(&self) -> CompactionControl {
-        self.control.clone()
-    }
-
-    /// 显式落盘(L1 无持久化,为空操作)。
-    ///
-    /// # Returns
-    /// 恒 `Ok`(L1 无持久化,无 I/O)。
-    ///
-    /// # Errors
-    /// 库已关闭时返回 [`MnemeError::Closed`]。
-    pub fn flush(&self) -> Result<()> {
-        let view = self.table.view();
-        if view.closed {
-            return Err(MnemeError::Closed);
-        }
-        Ok(())
-    }
-
     /// 关闭共享库:标记关闭并释放资源;幂等。
     ///
     /// # Errors
@@ -400,9 +270,10 @@ impl Mneme {
     /// db.close().unwrap();
     /// ```
     pub fn close(self) -> Result<()> {
-        let mut ws = self.table.write();
-        ws.closed = true;
-        self.table.publish(&ws);
-        Ok(())
+        let table = Arc::clone(&self.table);
+        table.write_tx(move |ws| {
+            ws.closed = true;
+            Ok(())
+        })
     }
 }

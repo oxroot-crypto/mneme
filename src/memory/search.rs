@@ -124,7 +124,7 @@ fn collect_candidates(params: &SearchParams<'_>) -> Vec<u32> {
                 continue;
             }
         }
-        // 槽位下标 ≤ u32::MAX:append_slot 经 `slot_id_for` 拒绝继续增长,
+        // 槽位下标 ≤ u32::MAX:commit_version 经 `slot_id_for` 拒绝继续增长,
         // 下标越界即违反 FC-MEM-INV-004,故此转换可证明不会失败。
         candidates.push(u32::try_from(idx).expect("槽位下标必可转入 u32(FC-MEM-INV-004)"));
     }

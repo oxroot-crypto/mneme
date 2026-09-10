@@ -21,7 +21,6 @@
 impl Mneme {
     /// 打开一个已初始化的本地目录记忆库。等价于 builder().path(dir).build()。
     /// 维度与度量从 MANIFEST 读回,无需重复指定;新建请用 builder().dimension(d).path(dir).build()。
-    /// L1 阶段(无持久化)恒返回 Unsupported{feature}(见 §4 错误表),L2 起生效。
     pub fn open(path: impl AsRef<Path>) -> Result<Mneme>;
 
     /// 纯内存库(易失),维度必填。等价于 builder().dimension(d).build()(不设 path)。
@@ -234,7 +233,7 @@ impl SearchBuilder<'_> {
     pub fn ef(self, ef: usize) -> Self;                     // 仅 L3+ 生效;上限 4096
     pub fn filter(self, e: Expr) -> Self;                   // 预过滤(语义见 03 §2.2)
     pub fn dedup(self, d: ResultDedup) -> Self;             // 结果级去重(见 06 §6)
-    pub fn fusion(self, f: Fusion) -> Self;                 // 双通道融合;L1 未落地,设置即 `Unsupported`(L4)
+    pub fn fusion(self, f: Fusion) -> Self;                 // 双通道融合(见 06 §4)
     pub fn score(self, s: Scoring) -> Self;                 // 时序/重要度/访问感知打分(见 10 §2)
     pub fn diversify(self, d: Diversity) -> Self;           // MMR 多样性(见 10 §5)
     pub fn expand(self, e: RelationExpand) -> Self;         // 关系联想扩展(见 10 §3)
@@ -258,6 +257,7 @@ impl Namespace {
     // ---- 双时态(见 09 §3)----
     /// 信念修订:更新同 key,并把旧版本 `valid_to` 闭合为新版本 `valid_from`。
     /// 要求该 key 已存在(不存在返回 `UpdateOutcome::NotFound`);首个版本请用 `insert`/upsert。
+    /// 新记录沿用目标 key:省略 `rec.key` 时继承 `key`;显式给出且冲突 → `KeyMismatch`。
     pub fn supersede(&self, key: &str, rec: Record) -> Result<UpdateOutcome>;
 
     // ---- 记忆关系(见 09 §2)----
@@ -293,7 +293,7 @@ impl Mneme {
 impl Mneme {
     pub fn snapshot(&self) -> SnapshotHandle;   // 钉住当前 ReaderView(含可变表快照)
     pub fn as_of(&self, ts_ms: i64) -> Result<SnapshotHandle>;  // 双时态历史读:版本链上取 tx_ms ≤ ts 的可见版本(默认永久保留,见 07 §4.2a)
-    pub fn backup_to(&self, dir: impl AsRef<Path>) -> Result<BackupReport>;  // 先 flush 再备份;L1 阶段恒返回 Unsupported(见 §4 错误表)
+    pub fn backup_to(&self, dir: impl AsRef<Path>) -> Result<BackupReport>;  // 先 flush 再备份(见 §7)
     pub fn stats(&self) -> Result<Stats>;
     pub fn check(&self) -> Result<CheckReport>;  // fsck:CRC + 索引一致性 + 对账
     pub fn compact_control(&self) -> CompactionControl;  // pause()/resume()/state()
@@ -683,6 +683,7 @@ pub struct Tuning {
 | `KeyNotFound` | ❌ | **当前无 API 产生**(保留变体);`get` 返回 `Option`、`delete`/`touch` 返回 `bool`,均不以缺失报错 |
 | `DimensionMismatch` | ❌ | 调用方 bug:向量长度 ≠ 建库维度 |
 | `MetricMismatch` | ❌ | 打开参数与库不一致;去掉显式 metric 或改对 |
+| `KeyMismatch` | ❌ | `supersede` 新记录自带的 key 与目标 key 冲突;省略 key 以继承目标 key |
 | `FilterParse` | ❌ | DSL 语法错误,错误携带位置;修正表达式 |
 | `TooLarge` / `LimitExceeded` / `MetaTooDeep` | ❌ | 数据/参数超限,见 §8 |
 | `NonFinite` | ❌ | 向量分量或 `importance`/`confidence`/边权/`boost` 含 `NaN`/`±Inf`,会污染排序与打分;修正输入 |
@@ -698,7 +699,7 @@ pub struct Tuning {
 `spawn_blocking` 任务被取消/panic 的 `expect`([08 §6](08-l6-quant.md));
 ② `filter!` 宏对写死的非法字面量在展开处 panic——运行时输入请用 `Expr::from_str`
 返回的 `Result`([06 §1.1](06-l4-query.md)、不变量 I7);
-③ 并行扫描候选收集处对槽位下标的 `u32::try_from(..).expect`——`append_slot` 经
+③ 并行扫描候选收集处对槽位下标的 `u32::try_from(..).expect`——`commit_version` 经
 `slot_id_for` 拒绝溢出(FC-MEM-INV-004),该转换可证明不会失败。
 
 ---

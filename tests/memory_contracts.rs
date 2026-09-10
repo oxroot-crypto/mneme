@@ -217,6 +217,50 @@ fn upsert_keeps_rowid_and_rejects_duplicate() {
     ));
 }
 
+/// FC-MEM-POST-001 / FC-LIFE-INV-009
+/// `InsertMode::RejectDuplicate` 只拒绝同 key 的**可见**重复;墓碑/逻辑过期记录
+/// 视为不存在,复用既有 `RowId`(与 `exists`/`Dedup::Reject` 同口径)。
+#[test]
+fn reject_duplicate_ignores_expired_and_deleted() {
+    let clock = Arc::new(FakeClock::default());
+    clock.set(1_000);
+    let db = Mneme::builder()
+        .dimension(2)
+        .insert_mode(InsertMode::RejectDuplicate)
+        .clock(clock.clone())
+        .build()
+        .expect("build");
+    let ns = db.namespace("n");
+    // 逻辑过期:不再拒绝同 key 写入,且复用原 RowId。
+    let first = inserted(
+        ns.insert(
+            Record::new(vec![1.0, 0.0])
+                .key("e")
+                .ttl(std::time::Duration::from_millis(500)),
+        )
+        .expect("insert"),
+    );
+    clock.set(2_000);
+    assert!(!ns.exists("e").expect("exists"), "TTL 后不可见");
+    let second = inserted(
+        ns.insert(Record::new(vec![0.0, 1.0]).key("e"))
+            .expect("逻辑过期记录不应拒绝重复"),
+    );
+    assert_eq!(first, second, "逻辑过期记录视为不存在,复用 RowId");
+    // 墓碑:同样不拒绝,复用 RowId。
+    ns.delete("e").expect("delete");
+    let third = inserted(
+        ns.insert(Record::new(vec![1.0, 1.0]).key("e"))
+            .expect("墓碑记录不应拒绝重复"),
+    );
+    assert_eq!(first, third, "墓碑记录视为不存在,复用 RowId");
+    // 可见记录仍正常拒绝。
+    assert!(matches!(
+        ns.insert(Record::new(vec![1.0, 0.0]).key("e")),
+        Err(mneme::MnemeError::DuplicateKey(_))
+    ));
+}
+
 /// FC-MEM-POST-002(批量原子 + 逐条重复)
 #[test]
 fn insert_batch_is_atomic_with_per_row_duplicates() {
@@ -283,6 +327,53 @@ fn insert_batch_is_atomic_with_per_row_duplicates() {
         ns.count(None).expect("count"),
         1,
         "回滚后不得复活批内残留版本"
+    );
+}
+
+/// FC-MEM-POST-002(失败的单条与批量写入均不登记命名空间)
+#[test]
+fn failed_writes_do_not_register_namespace() {
+    fn merge_oversized(
+        _existing: &mneme::RecordRef<'_>,
+        _incoming: &mneme::RecordRef<'_>,
+    ) -> Option<Record> {
+        Some(Record::new(vec![1.0, 0.0]).text("toolong"))
+    }
+    let db = Mneme::builder()
+        .dimension(2)
+        .limits(Limits {
+            text_bytes: 4,
+            ..Limits::default()
+        })
+        .dedup(Dedup::Merge(merge_oversized))
+        .build()
+        .expect("build");
+    // 单条 insert 预校验失败 → 不登记。
+    assert!(
+        db.namespace("single")
+            .insert(Record::new(vec![1.0]))
+            .is_err()
+    );
+    assert!(db.list_namespaces().expect("list").is_empty());
+    // 批量预校验失败 → 不登记。
+    assert!(
+        db.namespace("batch")
+            .insert_batch(vec![Record::new(vec![1.0])])
+            .is_err()
+    );
+    assert!(db.list_namespaces().expect("list").is_empty());
+    // 批量预校验后中途失败(Merge 产物超限)→ 回滚全部副作用,含命名空间登记。
+    assert!(
+        db.namespace("mid")
+            .insert_batch(vec![
+                Record::new(vec![1.0, 0.0]).text("aaaa"),
+                Record::new(vec![1.0, 0.0]).text("aaaa"),
+            ])
+            .is_err()
+    );
+    assert!(
+        db.list_namespaces().expect("list").is_empty(),
+        "失败批不得残留命名空间登记"
     );
 }
 
@@ -472,6 +563,33 @@ fn dedup_reject_replace_and_merge() {
         ns.get_by_rowid(base).expect("get").expect("present").text(),
         Some("b")
     );
+}
+
+/// FC-MEM-POST-007(merge 回调改变 key 时 key 索引随新版本迁移,不悬挂)
+#[test]
+fn dedup_merge_key_change_migrates_index() {
+    fn merge(_existing: &mneme::RecordRef<'_>, incoming: &mneme::RecordRef<'_>) -> Option<Record> {
+        Some(incoming.to_record())
+    }
+    let db = Mneme::builder()
+        .dimension(2)
+        .dedup(Dedup::Merge(merge))
+        .build()
+        .expect("build");
+    let ns = db.namespace("n");
+    ns.insert(Record::new(vec![1.0, 0.0]).key("old"))
+        .expect("insert");
+    // 同向量 → 命中 merge,回调把 key 改为 "new"。
+    let outcome = ns
+        .insert(Record::new(vec![1.0, 0.0]).key("new"))
+        .expect("insert");
+    assert!(matches!(outcome, InsertOutcome::Merged(_)));
+    assert!(ns.get("old").expect("get").is_none(), "旧 key 索引应迁移");
+    assert_eq!(
+        ns.get("new").expect("get").expect("present").key(),
+        Some("new")
+    );
+    assert!(db.check().expect("check").ok, "merge 改 key 后索引不应悬挂");
 }
 
 /// FC-MEM-POST-007(`Replace` 即使带同 key 也生成新 RowId)

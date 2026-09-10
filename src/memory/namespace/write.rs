@@ -31,26 +31,25 @@ impl Namespace {
     /// assert!(ns.exists("a").unwrap());
     /// ```
     pub fn insert(&self, rec: Record) -> Result<InsertOutcome> {
-        let mut ws = self.table.write();
-        if ws.closed {
-            return Err(MnemeError::Closed);
-        }
-        let ns_id = ws.register_ns(&self.ns_path);
+        let config = Arc::clone(&self.config);
         let ns_path = Arc::clone(&self.ns_path);
-        let now = self.config.clock.now_unix_ms();
-        let outcome = insert_one(
-            &mut ws,
-            &self.config,
-            InsertCtx {
-                ns_id,
-                ns_path,
-                rec,
-                now,
-                in_batch: false,
-            },
-        )?;
-        self.table.publish(&ws);
-        Ok(outcome)
+        self.table.write_tx(move |ws| {
+            if ws.closed {
+                return Err(MnemeError::Closed);
+            }
+            let ns_id = ws.register_ns(&ns_path);
+            insert_one(
+                ws,
+                &config,
+                InsertCtx {
+                    ns_id,
+                    ns_path,
+                    rec,
+                    now: config.clock.now_unix_ms(),
+                    in_batch: false,
+                },
+            )
+        })
     }
 
     /// 批量写入,整批原子(不变量 I15)。
@@ -82,42 +81,37 @@ impl Namespace {
     /// assert_eq!(outcomes.len(), 2);
     /// ```
     pub fn insert_batch(&self, recs: Vec<Record>) -> Result<Vec<InsertOutcome>> {
-        let mut ws = self.table.write();
-        if ws.closed {
-            return Err(MnemeError::Closed);
-        }
-        for rec in &recs {
-            validate_insert(&self.config, rec)?;
-        }
-        let ns_id = ws.register_ns(&self.ns_path);
+        let config = Arc::clone(&self.config);
         let ns_path = Arc::clone(&self.ns_path);
-        let now = self.config.clock.now_unix_ms();
-        // 事务快照:预校验之后,`insert_one` 仍可能失败(`Dedup::Merge` 回调产物
-        // 超限、槽位容量溢出)。失败即回滚到批前状态,保证整批零部分写入
-        // (FC-MEM-POST-002)。集合字段均为 `Arc`,`clone` 仅复制句柄。
-        let snapshot = ws.clone();
-        let mut outcomes = Vec::with_capacity(recs.len());
-        for rec in recs {
-            match insert_one(
-                &mut ws,
-                &self.config,
-                InsertCtx {
-                    ns_id,
-                    ns_path: Arc::clone(&ns_path),
-                    rec,
-                    now,
-                    in_batch: true,
-                },
-            ) {
-                Ok(outcome) => outcomes.push(outcome),
-                Err(error) => {
-                    *ws = snapshot.clone();
-                    return Err(error);
-                }
+        // 事务快照:预校验后 `insert_one` 仍可能失败(`Dedup::Merge` 回调产物超限、
+        // 槽位容量溢出)。`write_tx` 回滚到批前状态(含命名空间登记),保证整批
+        // 零部分写入(FC-MEM-POST-002)。
+        self.table.write_tx(move |ws| {
+            if ws.closed {
+                return Err(MnemeError::Closed);
             }
-        }
-        self.table.publish(&ws);
-        Ok(outcomes)
+            for rec in &recs {
+                validate_insert(&config, rec)?;
+            }
+            let ns_id = ws.register_ns(&ns_path);
+            let now = config.clock.now_unix_ms();
+            let mut outcomes = Vec::with_capacity(recs.len());
+            for rec in recs {
+                let outcome = insert_one(
+                    ws,
+                    &config,
+                    InsertCtx {
+                        ns_id,
+                        ns_path: Arc::clone(&ns_path),
+                        rec,
+                        now,
+                        in_batch: true,
+                    },
+                )?;
+                outcomes.push(outcome);
+            }
+            Ok(outcomes)
+        })
     }
 
     /// 按 key 删除,返回是否命中活记录。
@@ -141,21 +135,21 @@ impl Namespace {
     /// assert!(!ns.exists("a").unwrap());
     /// ```
     pub fn delete(&self, key: &str) -> Result<bool> {
-        let mut ws = self.table.write();
-        if ws.closed {
-            return Err(MnemeError::Closed);
-        }
-        let Some(ns_id) = ws.ns_id_of(&self.ns_path) else {
-            return Ok(false);
-        };
-        let Some(rowid) = ws.key_index.get(&(ns_id, Key::new(key))).copied() else {
-            return Ok(false);
-        };
-        let now = self.config.clock.now_unix_ms();
-        let seqno = ws.alloc_seqno();
-        let removed = ws.tombstone(rowid, now, seqno)?;
-        self.table.publish(&ws);
-        Ok(removed)
+        let config = Arc::clone(&self.config);
+        let ns_path = Arc::clone(&self.ns_path);
+        self.table.write_tx(move |ws| {
+            if ws.closed {
+                return Err(MnemeError::Closed);
+            }
+            let Some(ns_id) = ws.ns_id_of(&ns_path) else {
+                return Ok(false);
+            };
+            let Some(rowid) = ws.key_index.get(&(ns_id, Key::new(key))).copied() else {
+                return Ok(false);
+            };
+            let seqno = ws.alloc_seqno();
+            ws.tombstone(rowid, config.clock.now_unix_ms(), seqno)
+        })
     }
 
     /// 按 `RowId` 删除,返回是否命中活记录。
@@ -169,15 +163,14 @@ impl Namespace {
     /// # Errors
     /// 库已关闭时返回 [`MnemeError::Closed`]。
     pub fn delete_by_rowid(&self, id: RowId) -> Result<bool> {
-        let mut ws = self.table.write();
-        if ws.closed {
-            return Err(MnemeError::Closed);
-        }
-        let now = self.config.clock.now_unix_ms();
-        let seqno = ws.alloc_seqno();
-        let removed = ws.tombstone(id, now, seqno)?;
-        self.table.publish(&ws);
-        Ok(removed)
+        let config = Arc::clone(&self.config);
+        self.table.write_tx(move |ws| {
+            if ws.closed {
+                return Err(MnemeError::Closed);
+            }
+            let seqno = ws.alloc_seqno();
+            ws.tombstone(id, config.clock.now_unix_ms(), seqno)
+        })
     }
 
     /// 保留 `RowId` 的局部更新(按 key 定位)。
@@ -210,19 +203,20 @@ impl Namespace {
     /// .unwrap();
     /// ```
     pub fn update(&self, key: &str, patch: UpdatePatch) -> Result<UpdateOutcome> {
-        let mut ws = self.table.write();
-        if ws.closed {
-            return Err(MnemeError::Closed);
-        }
-        let Some(ns_id) = ws.ns_id_of(&self.ns_path) else {
-            return Ok(UpdateOutcome::NotFound);
-        };
-        let Some(rowid) = ws.key_index.get(&(ns_id, Key::new(key))).copied() else {
-            return Ok(UpdateOutcome::NotFound);
-        };
-        let outcome = update_rowid(&mut ws, &self.config, rowid, &patch)?;
-        self.table.publish(&ws);
-        Ok(outcome)
+        let config = Arc::clone(&self.config);
+        let ns_path = Arc::clone(&self.ns_path);
+        self.table.write_tx(move |ws| {
+            if ws.closed {
+                return Err(MnemeError::Closed);
+            }
+            let Some(ns_id) = ws.ns_id_of(&ns_path) else {
+                return Ok(UpdateOutcome::NotFound);
+            };
+            let Some(rowid) = ws.key_index.get(&(ns_id, Key::new(key))).copied() else {
+                return Ok(UpdateOutcome::NotFound);
+            };
+            update_rowid(ws, &config, rowid, &patch)
+        })
     }
 
     /// 保留 `RowId` 的局部更新(按 `RowId` 定位)。
@@ -238,13 +232,13 @@ impl Namespace {
     /// [`MnemeError::TooLarge`]/[`MnemeError::MetaTooDeep`]。
     /// `RowId` 不存在时返回 `Ok(UpdateOutcome::NotFound)`,不算错误。
     pub fn update_by_rowid(&self, id: RowId, patch: UpdatePatch) -> Result<UpdateOutcome> {
-        let mut ws = self.table.write();
-        if ws.closed {
-            return Err(MnemeError::Closed);
-        }
-        let outcome = update_rowid(&mut ws, &self.config, id, &patch)?;
-        self.table.publish(&ws);
-        Ok(outcome)
+        let config = Arc::clone(&self.config);
+        self.table.write_tx(move |ws| {
+            if ws.closed {
+                return Err(MnemeError::Closed);
+            }
+            update_rowid(ws, &config, id, &patch)
+        })
     }
 
     /// 信念修订:更新同 key,并把旧版本 `valid_to` 闭合为新版本 `valid_from`。
@@ -270,39 +264,60 @@ impl Namespace {
     ///     .unwrap();
     /// ```
     pub fn supersede(&self, key: &str, rec: Record) -> Result<UpdateOutcome> {
-        let mut ws = self.table.write();
-        if ws.closed {
-            return Err(MnemeError::Closed);
-        }
-        let Some(ns_id) = ws.ns_id_of(&self.ns_path) else {
-            return Ok(UpdateOutcome::NotFound);
-        };
-        let Some(rowid) = ws.key_index.get(&(ns_id, Key::new(key))).copied() else {
-            return Ok(UpdateOutcome::NotFound);
-        };
-        let Some(latest) = ws.latest.get(&rowid).copied() else {
-            return Ok(UpdateOutcome::NotFound);
-        };
-        validate_insert(&self.config, &rec)?;
-        let now = self.config.clock.now_unix_ms();
-        let new_valid_from = rec.valid_from.unwrap_or(now);
-        // 闭合旧版本 valid_to(写者独占,可安全就地改写)。
-        {
-            let slots = Arc::make_mut(&mut ws.slots);
-            let old = Arc::make_mut(&mut slots[latest.get() as usize]);
-            old.valid_to = Some(new_valid_from);
-        }
-        let seqno = ws.alloc_seqno();
-        let slot_data = build_slot(SlotSpec {
-            ns_id,
-            ns_path: Arc::clone(&self.ns_path),
-            rowid,
-            seqno,
-            tx_ms: now,
-            rec,
-        });
-        ws.commit_version(rowid, slot_data)?;
-        self.table.publish(&ws);
-        Ok(UpdateOutcome::Updated(rowid))
+        let config = Arc::clone(&self.config);
+        let ns_path = Arc::clone(&self.ns_path);
+        self.table.write_tx(move |ws| {
+            if ws.closed {
+                return Err(MnemeError::Closed);
+            }
+            let Some(ns_id) = ws.ns_id_of(&ns_path) else {
+                return Ok(UpdateOutcome::NotFound);
+            };
+            let Some(rowid) = ws.key_index.get(&(ns_id, Key::new(key))).copied() else {
+                return Ok(UpdateOutcome::NotFound);
+            };
+            let Some(latest) = ws.latest.get(&rowid).copied() else {
+                return Ok(UpdateOutcome::NotFound);
+            };
+            // 信念修订 = update 同 key:新版本沿用目标 key;显式冲突 → `KeyMismatch`。
+            let rec = reconcile_supersede_key(rec, key)?;
+            validate_insert(&config, &rec)?;
+            let now = config.clock.now_unix_ms();
+            let new_valid_from = rec.valid_from.unwrap_or(now);
+            let seqno = ws.alloc_seqno();
+            let slot_data = build_slot(SlotSpec {
+                ns_id,
+                ns_path,
+                rowid,
+                seqno,
+                tx_ms: now,
+                rec,
+            });
+            // 先提交新版本(容量不足时在遮蔽旧版本前失败),成功后再闭合旧版本 valid_to,
+            // 保证提交失败时旧版本保持原样(FC-MEM-PRE-002 零部分写入)。
+            ws.commit_version(rowid, slot_data)?;
+            {
+                let slots = Arc::make_mut(&mut ws.slots);
+                let old = Arc::make_mut(&mut slots[latest.get() as usize]);
+                old.valid_to = Some(new_valid_from);
+            }
+            Ok(UpdateOutcome::Updated(rowid))
+        })
     }
+}
+
+/// 信念修订须沿用目标 key:新记录省略 key 时继承首参 key;显式给出且冲突 →
+/// [`MnemeError::KeyMismatch`],绝不静默改 key(FC-MODEL-POST-003)。
+fn reconcile_supersede_key(mut rec: Record, key: &str) -> Result<Record> {
+    match rec.key.as_deref() {
+        None => rec.key = Some(key.to_string()),
+        Some(existing) if existing != key => {
+            return Err(MnemeError::KeyMismatch {
+                expected: Key::new(key),
+                got: Key::new(existing),
+            });
+        }
+        Some(_) => {}
+    }
+    Ok(rec)
 }

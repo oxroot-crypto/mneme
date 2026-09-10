@@ -3,7 +3,7 @@
 //! 覆盖 `docs/spec/contracts.md` 的以下条目:
 //!
 //! * FC-LIFE-INV-023、FC-LIFE-POST-001/002
-//! * FC-MEM-ERR-001/002、FC-MEM-STA-001
+//! * FC-MEM-ERR-001/002、FC-MEM-STA-001、FC-MEM-POST-008
 //! * FC-GLOBAL-ERR-001/002、FC-GLOBAL-PRE-004
 //!   (冒烟:任何公开 API 路径不 panic;错误分类变体语义互不混淆;策略参数非法 → Config)
 
@@ -11,7 +11,7 @@ use mneme::{Diversity, Expr, Mneme, Record, Retention};
 
 mod common;
 
-use common::{inserted, mem};
+use common::{FakeClock, inserted, mem};
 
 /// FC-LIFE-INV-023 / FC-LIFE-POST-001
 #[test]
@@ -73,6 +73,50 @@ fn closed_database_rejects_operations() {
         Err(mneme::MnemeError::Closed)
     ));
     assert!(matches!(ns.get("k"), Err(mneme::MnemeError::Closed)));
+}
+
+/// FC-MEM-POST-008(check 对含删除/过期记录的健康库仍返回 ok)
+#[test]
+fn check_reports_healthy_after_delete() {
+    let db = mem(2);
+    let ns = db.namespace("n");
+    ns.insert(Record::new(vec![1.0, 0.0]).key("a"))
+        .expect("insert");
+    assert!(db.check().expect("check").ok);
+    // 墓碑不应被当作索引不一致。
+    ns.delete("a").expect("delete");
+    assert!(db.check().expect("check").ok, "删除后不应误报不一致");
+    // 命名空间级联删除(墓碑 + 注销)同样不应误报。
+    ns.insert(Record::new(vec![0.0, 1.0]).key("b"))
+        .expect("insert");
+    db.drop_namespace("n").expect("drop");
+    assert!(
+        db.check().expect("check").ok,
+        "drop_namespace 后不应误报不一致"
+    );
+}
+
+/// FC-MEM-POST-008(check 对含逻辑过期记录的健康库仍返回 ok)
+#[test]
+fn check_reports_healthy_after_expiry() {
+    let clock = FakeClock::default();
+    clock.set(1_000);
+    let db = Mneme::builder()
+        .dimension(2)
+        .clock(std::sync::Arc::new(clock.clone()))
+        .build()
+        .expect("build");
+    let ns = db.namespace("n");
+    ns.insert(
+        Record::new(vec![1.0, 0.0])
+            .key("a")
+            .ttl(std::time::Duration::from_millis(100)),
+    )
+    .expect("insert");
+    assert!(db.check().expect("check").ok);
+    clock.set(2_000);
+    assert!(!ns.exists("a").expect("exists"), "到期不可见");
+    assert!(db.check().expect("check").ok, "逻辑过期不应误报不一致");
 }
 
 /// FC-GLOBAL-ERR-001
@@ -171,5 +215,14 @@ fn error_taxonomy_is_specific() {
     assert!(matches!(
         ns.retain(Retention::new().access_weight(f32::INFINITY)),
         Err(mneme::MnemeError::Config { .. })
+    ));
+    // supersede 显式冲突 key → KeyMismatch(§0.2 错误矩阵)
+    let keyed = mem(2).namespace("keyed");
+    keyed
+        .insert(Record::new(vec![1.0, 0.0]).key("k"))
+        .expect("insert");
+    assert!(matches!(
+        keyed.supersede("k", Record::new(vec![0.0, 1.0]).key("other")),
+        Err(mneme::MnemeError::KeyMismatch { .. })
     ));
 }

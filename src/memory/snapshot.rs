@@ -4,15 +4,14 @@ use std::marker::PhantomData;
 use std::sync::Arc;
 
 use crate::core::error::Result;
-use crate::core::options::{Diversity, RelationKind};
+use crate::core::options::Diversity;
 use crate::core::types::{Key, NsId, RowId};
 use crate::memory::dedup::ResultDedup;
 use crate::memory::namespace::{DEFAULT_TOP_K, point_get};
 use crate::memory::pred::{self, EvalCtx, Expr};
 use crate::memory::record::RecordRef;
-use crate::memory::relation::Edge;
 use crate::memory::search_builder::SearchBuilder;
-use crate::memory::table::{ReaderView, Table};
+use crate::memory::table::{ReaderView, SlotData, Table};
 
 /// 快照句柄:钉住某个读视图。
 #[derive(Clone)]
@@ -71,9 +70,9 @@ impl SnapshotHandle {
 /// 快照上的命名空间只读视图。
 #[derive(Clone)]
 pub struct SnapshotNamespace {
-    table: Arc<Table>,
-    view: Arc<ReaderView>,
-    ns_path: Arc<str>,
+    pub(crate) table: Arc<Table>,
+    pub(crate) view: Arc<ReaderView>,
+    pub(crate) ns_path: Arc<str>,
 }
 
 impl std::fmt::Debug for SnapshotNamespace {
@@ -85,7 +84,7 @@ impl std::fmt::Debug for SnapshotNamespace {
 }
 
 impl SnapshotNamespace {
-    fn ns_id(&self) -> Option<NsId> {
+    pub(crate) fn ns_id(&self) -> Option<NsId> {
         self.view.ns_registry.iter().find_map(|(id, path)| {
             if **path == *self.ns_path {
                 Some(*id)
@@ -171,6 +170,19 @@ impl SnapshotNamespace {
     ///
     /// # Errors
     /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
+    ///
+    /// # Examples
+    /// ```
+    /// use mneme::{InsertOutcome, Mneme, Record};
+    /// let db = Mneme::in_memory(2).unwrap();
+    /// let ns = db.namespace("demo");
+    /// let rowid = match ns.insert(Record::new(vec![1.0, 0.0])).unwrap() {
+    ///     InsertOutcome::Inserted(id) => id,
+    ///     other => panic!("unexpected: {other:?}"),
+    /// };
+    /// let snap = db.snapshot().namespace("demo");
+    /// assert!(snap.get_by_rowid(rowid).unwrap().is_some());
+    /// ```
     pub fn get_by_rowid(&self, id: RowId) -> Result<Option<RecordRef<'_>>> {
         let now = self.table.config.clock.now_unix_ms();
         Ok(self
@@ -191,6 +203,18 @@ impl SnapshotNamespace {
     ///
     /// # Errors
     /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
+    ///
+    /// # Examples
+    /// ```
+    /// use mneme::{Mneme, Record};
+    /// let db = Mneme::in_memory(2).unwrap();
+    /// let ns = db.namespace("demo");
+    /// ns.insert(Record::new(vec![1.0, 0.0]).key("a")).unwrap();
+    /// let snap = db.snapshot().namespace("demo");
+    /// let refs = snap.get_many(&["a", "missing"]).unwrap();
+    /// assert!(refs[0].is_some());
+    /// assert!(refs[1].is_none());
+    /// ```
     pub fn get_many(&self, keys: &[&str]) -> Result<Vec<Option<RecordRef<'_>>>> {
         let now = self.table.config.clock.now_unix_ms();
         let ns_id = self.ns_id();
@@ -210,6 +234,19 @@ impl SnapshotNamespace {
     ///
     /// # Errors
     /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
+    ///
+    /// # Examples
+    /// ```
+    /// use mneme::{InsertOutcome, Mneme, Record};
+    /// let db = Mneme::in_memory(2).unwrap();
+    /// let ns = db.namespace("demo");
+    /// let rowid = match ns.insert(Record::new(vec![1.0, 0.0])).unwrap() {
+    ///     InsertOutcome::Inserted(id) => id,
+    ///     other => panic!("unexpected: {other:?}"),
+    /// };
+    /// let snap = db.snapshot().namespace("demo");
+    /// assert_eq!(snap.get_vector(rowid).unwrap().unwrap(), vec![1.0, 0.0]);
+    /// ```
     pub fn get_vector(&self, id: RowId) -> Result<Option<Vec<f32>>> {
         let now = self.table.config.clock.now_unix_ms();
         Ok(self
@@ -230,6 +267,17 @@ impl SnapshotNamespace {
     ///
     /// # Errors
     /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
+    ///
+    /// # Examples
+    /// ```
+    /// use mneme::{Mneme, Record};
+    /// let db = Mneme::in_memory(2).unwrap();
+    /// db.namespace("demo")
+    ///     .insert(Record::new(vec![1.0, 0.0]).key("a"))
+    ///     .unwrap();
+    /// let snap = db.snapshot().namespace("demo");
+    /// assert!(snap.exists("a").unwrap());
+    /// ```
     pub fn exists(&self, key: &str) -> Result<bool> {
         Ok(self.get(key)?.is_some())
     }
@@ -244,6 +292,17 @@ impl SnapshotNamespace {
     ///
     /// # Errors
     /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
+    ///
+    /// # Examples
+    /// ```
+    /// use mneme::{Mneme, Record};
+    /// let db = Mneme::in_memory(2).unwrap();
+    /// db.namespace("demo")
+    ///     .insert(Record::new(vec![1.0, 0.0]))
+    ///     .unwrap();
+    /// let snap = db.snapshot().namespace("demo");
+    /// assert_eq!(snap.count(None).unwrap(), 1);
+    /// ```
     pub fn count(&self, filter: Option<Expr>) -> Result<u64> {
         let Some(ns_id) = self.ns_id() else {
             return Ok(0);
@@ -254,140 +313,30 @@ impl SnapshotNamespace {
             if self.view.dead.get(idx) || slot.ns_id != ns_id || !slot.is_live(now) {
                 continue;
             }
-            if let Some(expr) = &filter {
-                let ctx = EvalCtx {
-                    slot,
-                    access: self.view.access.get(&slot.rowid).copied(),
-                };
-                if !pred::matches(expr, &ctx) {
-                    continue;
-                }
+            if !passes_filter(&filter, slot, &self.view, &slot.rowid) {
+                continue;
             }
             count += 1;
         }
         Ok(count)
     }
+}
 
-    /// 出边(两端存活)。
-    ///
-    /// # Arguments
-    /// * `from` - 出边源 `RowId`。
-    /// * `kinds` - 关系类型过滤;空切片表示不过滤。
-    ///
-    /// # Returns
-    /// 过滤 `kinds` 且两端仍存活的出边列表;悬挂边不可见。
-    ///
-    /// # Errors
-    /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
-    pub fn neighbors(&self, from: RowId, kinds: &[RelationKind]) -> Result<Vec<Edge>> {
-        Ok(self
-            .view
-            .out_edges
-            .get(&from)
-            .map(|edges| {
-                edges
-                    .iter()
-                    .filter(|edge| {
-                        (kinds.is_empty() || kinds.contains(&edge.kind))
-                            && self.view.live_slot(edge.from).is_some()
-                            && self.view.live_slot(edge.to).is_some()
-                    })
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default())
-    }
-
-    /// 入边(两端存活)。
-    ///
-    /// # Arguments
-    /// * `to` - 入边目标 `RowId`。
-    /// * `kinds` - 关系类型过滤;空切片表示不过滤。
-    ///
-    /// # Returns
-    /// 过滤 `kinds` 且 `edge.to == to`、两端存活的边列表。
-    ///
-    /// # Errors
-    /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
-    pub fn predecessors(&self, to: RowId, kinds: &[RelationKind]) -> Result<Vec<Edge>> {
-        Ok(self
-            .view
-            .out_edges
-            .values()
-            .flatten()
-            .filter(|edge| {
-                edge.to == to
-                    && (kinds.is_empty() || kinds.contains(&edge.kind))
-                    && self.view.live_slot(edge.from).is_some()
-                    && self.view.live_slot(edge.to).is_some()
-            })
-            .cloned()
-            .collect())
-    }
-
-    /// 遍历(不含墓碑/过期记录),调用前物化命中行的 `Arc` 句柄、不复制记录体
-    /// (FC-MEM-CPLX-005,非流式)。
-    ///
-    /// # Arguments
-    /// * `filter` - 三值过滤表达式;`None` 表示不过滤。
-    ///
-    /// # Returns
-    /// 按 `RowId` 升序产出 `Ok(RecordRef)` 的迭代器(内层 `Err` 为 L2 预留)。
-    ///
-    /// # Errors
-    /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
-    pub fn iter(
-        &self,
-        filter: Option<Expr>,
-    ) -> Result<impl Iterator<Item = Result<RecordRef<'_>>> + '_> {
-        self.iter_with(filter, false)
-    }
-
-    /// 遍历(导出/审计/重建用);`include_deleted=true` 时包含墓碑/过期记录。
-    ///
-    /// # Arguments
-    /// * `filter` - 三值过滤表达式;`None` 表示不过滤。
-    /// * `include_deleted` - `true` 时包含墓碑/已逻辑过期记录。
-    ///
-    /// # Returns
-    /// 按 `RowId` 升序产出 `Ok(RecordRef)` 的迭代器(内层 `Err` 为 L2 预留)。
-    /// 调用前物化命中行的 `Arc` 句柄、不复制记录体(FC-MEM-CPLX-005,非流式)。
-    ///
-    /// # Errors
-    /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
-    pub fn iter_with(
-        &self,
-        filter: Option<Expr>,
-        include_deleted: bool,
-    ) -> Result<impl Iterator<Item = Result<RecordRef<'_>>> + '_> {
-        let now = self.table.config.clock.now_unix_ms();
-        let mut collected = Vec::new();
-        if let Some(ns_id) = self.ns_id() {
-            for (rowid, slot) in self.view.latest.iter() {
-                let slot_data = &self.view.slots[slot.get() as usize];
-                if slot_data.ns_id != ns_id {
-                    continue;
-                }
-                if !include_deleted
-                    && (self.view.dead.get(slot.get() as usize) || !slot_data.is_live(now))
-                {
-                    continue;
-                }
-                if let Some(expr) = &filter {
-                    let ctx = EvalCtx {
-                        slot: slot_data,
-                        access: self.view.access.get(rowid).copied(),
-                    };
-                    if !pred::matches(expr, &ctx) {
-                        continue;
-                    }
-                }
-                collected.push(Arc::clone(slot_data));
-            }
-        }
-        collected.sort_by_key(|slot_data| slot_data.rowid);
-        Ok(collected
-            .into_iter()
-            .map(|slot_data| Ok(RecordRef::new(slot_data))))
+/// 判断记录是否通过可选过滤表达式(三值语义,缺失字段不命中)。
+pub(crate) fn passes_filter(
+    filter: &Option<Expr>,
+    slot_data: &SlotData,
+    view: &ReaderView,
+    rowid: &RowId,
+) -> bool {
+    match filter {
+        Some(expr) => pred::matches(
+            expr,
+            &EvalCtx {
+                slot: slot_data,
+                access: view.access.get(rowid).copied(),
+            },
+        ),
+        None => true,
     }
 }

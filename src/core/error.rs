@@ -43,6 +43,14 @@ pub enum MnemeError {
         /// 调用方请求的度量。
         requested: Metric,
     },
+    /// `supersede` 新记录自带的 key 与目标 key 冲突(信念修订须沿用同一 key)。
+    #[error("键不匹配:期望 {expected},实际 {got}")]
+    KeyMismatch {
+        /// 目标 key(`supersede` 首参)。
+        expected: Key,
+        /// 新记录自带的 key。
+        got: Key,
+    },
     /// 键不存在(保留变体,当前无 API 产生,见设计 16 §4)。
     #[error("键不存在: {0}")]
     KeyNotFound(Key),

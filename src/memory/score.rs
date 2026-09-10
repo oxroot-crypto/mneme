@@ -209,13 +209,29 @@ impl CompositeRanker<'_> {
 }
 
 /// 对候选做综合重排,返回按综合分降序(同分 `RowId` 升序)的结果。
-pub(crate) fn rerank_composite(
-    view: &ReaderView,
-    candidates: &[Scored],
-    scoring: &Scoring,
-    metric: Metric,
-    now_ms: i64,
-) -> Vec<(Scored, ScoreBreakdown)> {
+/// 综合重排输入(聚合视图/候选/策略/度量,避免超长参数列表)。
+pub(crate) struct CompositeRerank<'a> {
+    /// 只读视图(取记录体与访问统计)。
+    pub(crate) view: &'a ReaderView,
+    /// 待重排候选。
+    pub(crate) candidates: &'a [Scored],
+    /// 综合打分权重。
+    pub(crate) scoring: &'a Scoring,
+    /// 距离度量。
+    pub(crate) metric: Metric,
+    /// 当前时刻(Unix 毫秒)。
+    pub(crate) now_ms: i64,
+}
+
+/// 对候选做综合重排,返回按综合分降序(同分 `RowId` 升序)的结果。
+pub(crate) fn rerank_composite(input: CompositeRerank<'_>) -> Vec<(Scored, ScoreBreakdown)> {
+    let CompositeRerank {
+        view,
+        candidates,
+        scoring,
+        metric,
+        now_ms,
+    } = input;
     let (min, max) = normalize_span(candidates, metric);
     let ranker = CompositeRanker {
         view,
@@ -286,20 +302,10 @@ pub(crate) fn mmr_select(
 pub(crate) fn cluster_by_similarity(vectors: &[&[f32]], threshold: f32) -> Vec<Vec<usize>> {
     let n = vectors.len();
     let mut parent: Vec<usize> = (0..n).collect();
-    fn find(parent: &mut [usize], mut x: usize) -> usize {
-        while parent[x] != x {
-            parent[x] = parent[parent[x]];
-            x = parent[x];
-        }
-        x
-    }
     for i in 0..n {
         for j in (i + 1)..n {
             if cosine_sim(vectors[i], vectors[j]) >= threshold {
-                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
-                if ri != rj {
-                    parent[ri] = rj;
-                }
+                union(&mut parent, i, j);
             }
         }
     }
@@ -309,6 +315,23 @@ pub(crate) fn cluster_by_similarity(vectors: &[&[f32]], threshold: f32) -> Vec<V
         groups.entry(root).or_default().push(i);
     }
     groups.into_values().collect()
+}
+
+/// 并查集查找(路径减半)。
+fn find(parent: &mut [usize], mut x: usize) -> usize {
+    while parent[x] != x {
+        parent[x] = parent[parent[x]];
+        x = parent[x];
+    }
+    x
+}
+
+/// 合并两个集合(根不同才连接)。
+fn union(parent: &mut [usize], i: usize, j: usize) {
+    let (ri, rj) = (find(parent, i), find(parent, j));
+    if ri != rj {
+        parent[ri] = rj;
+    }
 }
 
 #[cfg(test)]

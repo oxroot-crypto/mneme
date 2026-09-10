@@ -105,9 +105,6 @@ pub(crate) fn touch_rowid(
     let Some(base) = latest_live(ws, rowid) else {
         return Ok(false);
     };
-    let stat = Arc::make_mut(&mut ws.access).entry(rowid).or_default();
-    stat.access_count = stat.access_count.saturating_add(1);
-    stat.last_access_ms = now;
     if let Some(boost) = boost {
         let mut slot_data = (*base).clone();
         slot_data.importance = (slot_data.importance + boost).clamp(0.0, 1.0);
@@ -115,6 +112,10 @@ pub(crate) fn touch_rowid(
         slot_data.tx_ms = now;
         ws.commit_version(rowid, slot_data)?;
     }
+    // 提交成功后再记访问,避免提交失败时计数被提前累加。
+    let stat = Arc::make_mut(&mut ws.access).entry(rowid).or_default();
+    stat.access_count = stat.access_count.saturating_add(1);
+    stat.last_access_ms = now;
     Ok(true)
 }
 

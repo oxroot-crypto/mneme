@@ -134,7 +134,7 @@ pub enum ErrorKind { Io, Corrupted, Busy, TooLarge, LimitExceeded, UnsupportedVe
 ```
 
 > `ErrorKind` 是 `MnemeError` 的粗分类:同名变体直接对应;`DimensionMismatch`/`MetricMismatch`/
-> `DuplicateKey`/`FilterParse`/`KeyNotFound`/`NonFinite`/`MetaTooDeep`/`Inconsistent` 归入 `Other`
+> `KeyMismatch`/`DuplicateKey`/`FilterParse`/`KeyNotFound`/`NonFinite`/`MetaTooDeep`/`Inconsistent` 归入 `Other`
 > (需要精确定位时宿主仍以 `MnemeError` 为准,见 [02 §2](02-l0-core.md)、[16 §4](16-api-reference.md))。
 
 - 默认 `None`(不注册即零成本);宿主可把事件桥接到 `tracing`/OpenTelemetry/metrics;

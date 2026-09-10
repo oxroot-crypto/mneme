@@ -12,6 +12,7 @@ mod access;
 mod life;
 mod query;
 mod relation;
+mod scan;
 mod write;
 
 pub(crate) use query::point_get;

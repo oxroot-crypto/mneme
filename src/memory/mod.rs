@@ -7,10 +7,12 @@
 //! # 模块
 //!
 //! * `engine` —— 库句柄 `Mneme` 的门面方法。
+//! * `engine_ops` —— `Mneme` 的统计/fsck/合并控制/落盘方法。
 //! * `builder` —— 建库器 `Builder`(链式 setter 在子模块 `builder::options`)。
 //! * `namespace` —— `Namespace` 及其写(`write`)/读(`query`)/访问(`access`)/
 //!   生命周期(`life`)/关系(`relation`)方法。
 //! * `snapshot` —— `SnapshotHandle` 与快照只读视图。
+//! * `snapshot_scan` —— 快照视图的遍历/关系读取方法。
 //! * `search_builder` —— `SearchBuilder` 链式配置与公开入口 `execute()`。
 //! * `search_exec` —— `execute()` 内部执行流水线(视图/扫描/扩展/排序/去重)。
 //! * `rerank` —— 融合器 `Fusion` 与精排钩子 `Reranker`。
@@ -32,6 +34,7 @@ mod builder;
 mod config;
 mod dedup;
 mod engine;
+mod engine_ops;
 mod expand;
 mod lifecycle;
 mod mutate_helpers;
@@ -47,6 +50,7 @@ mod search;
 mod search_builder;
 mod search_exec;
 mod snapshot;
+mod snapshot_scan;
 mod table;
 mod temporal;
 mod write_helpers;
