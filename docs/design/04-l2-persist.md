@@ -6,7 +6,8 @@
 > **本章你将学到**:目录与文件布局 → 四种文件的字节图 → WAL 协议 → CRC 数学 →
 > zone map 与 Bloom filter 完整推导 → MANIFEST 原子性(Windows 专项) → 恢复流程。
 
-模块:`persist/{wal.rs, vsec.rs, msec.rs, delta.rs, edges.rs, manifest.rs, recover.rs, flush.rs, source.rs, storage.rs, trash.rs}`
+模块:`persist/{wal.rs, vsec.rs, msec.rs, delta.rs, edges.rs, manifest.rs, recover.rs, flush.rs, source.rs, storage.rs, trash.rs, store.rs}`
+(`store.rs` 是协调句柄 `Store`:实现内存引擎的 `PersistHook`、承接 `open`/`flush`/Checkpoint)
 
 ---
 
@@ -225,7 +226,7 @@ seqno 为该写操作分配的全局单调序号(§3.1);回放据此跳过已落
 type: 1=Insert 2=Delete 3=Touch 4=Checkpoint 5=BatchBegin 6=BatchCommit
       7=DeleteRow 8=TouchRow 9=NsRegister 10=Update 11=UpdateRow 12=Relate 13=Unrelate
       14=RelKindRegister
-Insert     = 记录体(同 msec entry 格式,含 NsId)
+Insert     = 记录体(同 msec entry 格式,含 NsId)[u32 dim][f32 × dim]  # 记录体不含向量,故附向量副本供崩溃恢复
 Delete     = [NsId u32][key len+bytes]
 DeleteRow  = [RowId u64]                          # 无 key 记录按 RowId 删除
 Touch      = [NsId u32][key len+bytes][i64 at_ms][u32 access_delta][f32 importance_delta]

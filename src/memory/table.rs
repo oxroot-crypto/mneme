@@ -17,6 +17,45 @@ use crate::memory::bitset::BitSet;
 use crate::memory::config::Config;
 use crate::memory::relation::Edge;
 
+/// 一个待持久化到 WAL 的写操作(L2 由 [`PersistHook`] 消费)。
+///
+/// 由 [`WriterState`] 在变更点收集、`write_tx` 在事务成功后统一交给持久层,
+/// 保证 WAL 先于可见性写入(设计 04 §3.1),且失败时随事务回滚一并丢弃。
+#[derive(Debug, Clone)]
+pub(crate) enum WriteOp {
+    /// 命名空间首次登记。
+    NsRegister {
+        /// 命名空间编号。
+        ns_id: u32,
+        /// 命名空间路径。
+        path: Arc<str>,
+    },
+    /// 提交一个新物理版本(记录体)。
+    Insert {
+        /// 新版本的槽位数据(`deleted == false`)。
+        slot: Arc<SlotData>,
+    },
+    /// 提交一个墓碑版本(无记录体)。
+    DeleteRow {
+        /// 目标 `RowId`。
+        rowid: RowId,
+        /// 版本序号。
+        seqno: SeqNo,
+    },
+}
+
+/// 持久层写日志钩子:由 L2 的持久引擎实现,内存引擎在无钩子时行为不变。
+///
+/// `log` 对同一写事务的多个操作按顺序原子落盘;返回 `Err` 时调用方回滚该事务,
+/// 保证"WAL 失败则写入不可见"(设计 04 §3.1)。
+pub(crate) trait PersistHook: Send + Sync {
+    /// 顺序记录一批写操作。
+    ///
+    /// # Errors
+    /// WAL 写入/fsync 失败时返回对应错误。
+    fn log(&self, ops: &[WriteOp]) -> Result<()>;
+}
+
 /// 把槽位下标映射为 `SlotId`;超出 `u32::MAX` 时返回结构化错误,绝不静默饱和
 /// (FC-MEM-INV-004)。
 pub(crate) fn slot_id_for(len: usize) -> Result<SlotId> {
@@ -93,11 +132,13 @@ pub(crate) struct WriterState {
     // 反馈幂等键(I27);L1 常驻内存,L5 随访问统计一并落盘。经 `Arc` COW,
     // 使批量写入快照(`WriterState::clone`)与回滚不深拷贝该集合。
     pub(crate) feedback_seen: Arc<HashSet<(RowId, u64)>>,
+    // 当前写事务待持久化的操作;由 `write_tx` 在成功后交给 [`PersistHook`]。
+    pub(crate) pending: Vec<WriteOp>,
     pub(crate) closed: bool,
 }
 
 impl WriterState {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             slots: Arc::new(Vec::new()),
             dead: Arc::new(BitSet::default()),
@@ -114,6 +155,7 @@ impl WriterState {
             ns_registry: Arc::new(HashMap::new()),
             ns_by_path: Arc::new(HashMap::new()),
             feedback_seen: Arc::new(HashSet::new()),
+            pending: Vec::new(),
             closed: false,
         }
     }
@@ -145,7 +187,11 @@ impl WriterState {
         self.next_ns_id += 1;
         let path: Arc<str> = Arc::from(path);
         Arc::make_mut(&mut self.ns_registry).insert(id, path.clone());
-        Arc::make_mut(&mut self.ns_by_path).insert(path, id);
+        Arc::make_mut(&mut self.ns_by_path).insert(path.clone(), id);
+        self.pending.push(WriteOp::NsRegister {
+            ns_id: id.get(),
+            path,
+        });
         id
     }
 
@@ -199,9 +245,18 @@ impl WriterState {
     pub(crate) fn commit_version(&mut self, rowid: RowId, slot_data: SlotData) -> Result<SlotId> {
         let slot = slot_id_for(self.slots.len())?;
         ensure_key_available(self, &slot_data)?;
+        let deleted = slot_data.deleted;
+        let seqno = slot_data.seqno;
         self.hide_latest(rowid);
-        Arc::make_mut(&mut self.slots).push(Arc::new(slot_data));
+        let arc = Arc::new(slot_data);
+        Arc::make_mut(&mut self.slots).push(Arc::clone(&arc));
         self.link_version(rowid, slot);
+        // 记录待持久化操作:墓碑落 `DeleteRow`,其余落完整新版本 `Insert`。
+        if deleted {
+            self.pending.push(WriteOp::DeleteRow { rowid, seqno });
+        } else {
+            self.pending.push(WriteOp::Insert { slot: arc });
+        }
         Ok(slot)
     }
 
@@ -299,22 +354,45 @@ impl ReaderView {
     }
 }
 
-/// 内存表:写状态 + 已发布读视图 + 配置。
+/// 内存表:写状态 + 已发布读视图 + 配置 + 可选持久钩子。
 pub(crate) struct Table {
     pub(crate) writer: Mutex<WriterState>,
     pub(crate) reader: RwLock<Arc<ReaderView>>,
     pub(crate) config: Arc<Config>,
+    /// 持久层写日志钩子;`None` = 纯内存(L1)。
+    pub(crate) persist: Option<Arc<dyn PersistHook>>,
 }
 
 impl Table {
-    /// 以给定配置新建空表。
+    /// 以给定配置新建空表(无持久钩子)。
     pub(crate) fn new(config: Arc<Config>) -> Self {
+        Self::new_with(config, None)
+    }
+
+    /// 以给定配置与持久钩子新建空表。
+    pub(crate) fn new_with(config: Arc<Config>, persist: Option<Arc<dyn PersistHook>>) -> Self {
         let writer = WriterState::new();
         let view = Arc::new(writer.snapshot());
         Self {
             writer: Mutex::new(writer),
             reader: RwLock::new(view),
             config,
+            persist,
+        }
+    }
+
+    /// 以恢复出的写状态构造表(持久化打开;状态已含段与 WAL 重放结果)。
+    pub(crate) fn from_state(
+        config: Arc<Config>,
+        state: WriterState,
+        persist: Option<Arc<dyn PersistHook>>,
+    ) -> Self {
+        let view = Arc::new(state.snapshot());
+        Self {
+            writer: Mutex::new(state),
+            reader: RwLock::new(view),
+            config,
+            persist,
         }
     }
 
@@ -358,6 +436,14 @@ impl Table {
         let snapshot = ws.clone();
         match f(&mut ws) {
             Ok(value) => {
+                // WAL 先于可见性写入:持久失败则整体回滚,绝不发布半持久状态。
+                let ops = std::mem::take(&mut ws.pending);
+                if let Some(persist) = &self.persist
+                    && let Err(error) = persist.log(&ops)
+                {
+                    *ws = snapshot;
+                    return Err(error);
+                }
                 self.publish(&ws);
                 Ok(value)
             }

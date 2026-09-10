@@ -3,8 +3,9 @@
 > **Mneme**(μνήμη,古希腊语"记忆";记忆女神 Mnemosyne 的同源词)是一个纯 Rust 编写的**嵌入型向量存储引擎**,
 > 专为 **AI Agent 的超长期记忆层**设计:进程内运行、无需服务端、数据经年累月增长而不失控。
 
-**状态**:开发中(尚未发布到 crates.io)。**L0 原语层(`src/core/`)与 L1 内存引擎(`src/memory/`)**已实现
-并通过形式化契约验收,后续按 L2→L6 逐层推进,每层完成时都是一个可独立交付的完整产品。
+**状态**:开发中(尚未发布到 crates.io)。**L0 原语层(`src/core/`)、L1 内存引擎(`src/memory/`)
+与 L2 持久层(`src/persist/`)**已实现并通过形式化契约验收,后续按 L3→L6 逐层推进,
+每层完成时都是一个可独立交付的完整产品。
 设计与验收标准见 [docs/DESIGN.md](docs/DESIGN.md)。
 
 ---
@@ -131,8 +132,8 @@ mdbook build               # 输出到 book/
 
 ## 开发与测试
 
-> 当前已实现 L0 原语层与 L1 内存引擎,下列命令即可运行;`cargo test --features async`(async 门面
-> 等价性)等 feature 相关命令待对应层(含 `[features]` 定义)落地后加入。
+> 当前已实现 L0 原语层、L1 内存引擎与 L2 持久层,下列命令即可运行;`cargo test --features async`
+> (async 门面等价性)等 feature 相关命令待对应层(含 `[features]` 定义)落地后加入。
 
 ```bash
 cargo fmt --all -- --check

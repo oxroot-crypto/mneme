@@ -33,8 +33,10 @@
 
 mod bitset;
 mod builder;
-mod config;
-mod dedup;
+// `config`/`dedup`/`relation`/`search`/`table` 供 L2 `persist` 读取内存表结构
+// (flush/recover 需要),故以 `pub(crate)` 暴露给同 crate 的兄弟模块。
+pub(crate) mod config;
+pub(crate) mod dedup;
 mod engine;
 mod engine_ops;
 mod expand;
@@ -45,15 +47,15 @@ mod ops;
 mod pred;
 mod pred_eval;
 mod record;
-mod relation;
+pub(crate) mod relation;
 mod rerank;
 mod score;
-mod search;
+pub(crate) mod search;
 mod search_builder;
 mod search_exec;
 mod snapshot;
 mod snapshot_scan;
-mod table;
+pub(crate) mod table;
 mod temporal;
 mod write_helpers;
 

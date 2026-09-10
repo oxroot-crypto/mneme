@@ -17,7 +17,8 @@ use crate::memory::dedup::Dedup;
 use crate::memory::engine::Mneme;
 use crate::memory::lifecycle::Retention;
 use crate::memory::ops::CompactionControl;
-use crate::memory::table::Table;
+use crate::memory::table::{PersistHook, Table};
+use crate::persist::store::Store;
 
 mod options;
 
@@ -32,6 +33,7 @@ pub struct Builder {
     path: Option<std::path::PathBuf>,
     dimension: Option<u32>,
     metric: Metric,
+    metric_explicit: bool,
     fsync: FsyncPolicy,
     insert_mode: InsertMode,
     dedup: Dedup,
@@ -59,6 +61,7 @@ impl Default for Builder {
             path: None,
             dimension: None,
             metric: Metric::Cosine,
+            metric_explicit: false,
             fsync: FsyncPolicy::default(),
             insert_mode: InsertMode::default(),
             dedup: Dedup::default(),
@@ -86,10 +89,11 @@ impl Builder {
     /// 构建库句柄。
     ///
     /// # Errors
-    /// * 未设置 `dimension` → [`MnemeError::Config`];
+    /// * 未设置 `dimension`(新建库)→ [`MnemeError::Config`];
     /// * `dedup_threshold` 非 `[0,1]` 内的有限值 → [`MnemeError::Config`]
     ///   (FC-GLOBAL-PRE-004:NaN 会让去重静默失效,越界值超出余弦相似度口径,绝不静默);
-    /// * 设置了 `path` → [`MnemeError::Unsupported`](持久化在 L2 实现)。
+    /// * `path` 已存在库且显式维度/度量与其不符 → [`MnemeError::DimensionMismatch`]/
+    ///   [`MnemeError::MetricMismatch`];目录被其他实例独占 → [`MnemeError::Busy`]。
     ///
     /// # Examples
     /// ```
@@ -98,24 +102,39 @@ impl Builder {
     /// assert!(db.list_namespaces().unwrap().is_empty());
     /// ```
     pub fn build(self) -> Result<Mneme> {
-        if self.path.is_some() {
-            return Err(MnemeError::Unsupported {
-                feature: "持久化(path, L2)",
-            });
-        }
         // NaN 的 `contains` 恒为 false,一个区间判断即可同时覆盖非有限值与越界。
         if !(0.0..=1.0).contains(&self.dedup_threshold) {
             return Err(MnemeError::Config {
                 reason: "dedup_threshold 必须是 [0,1] 内的有限值",
             });
         }
-        let dimension = self.dimension.ok_or(MnemeError::Config {
-            reason: "新建内存库必须指定维度",
-        })?;
+        // 有 `path` 走持久层;否则纯内存。持久路径先解析维度/度量(已存在库以
+        // MANIFEST 为准),再统一构造配置。
+        let requested_metric = self.metric_explicit.then_some(self.metric);
+        let (store, recovered, dimension, metric) = match &self.path {
+            Some(path) => {
+                let (store, state, dimension, metric) = Store::open(
+                    path,
+                    self.dimension,
+                    requested_metric,
+                    self.fsync,
+                    self.read_only,
+                    self.verify_on_open,
+                    self.fail_fast_on_corruption,
+                )?;
+                (Some(store), Some(state), dimension, metric)
+            }
+            None => {
+                let dimension = self.dimension.ok_or(MnemeError::Config {
+                    reason: "新建内存库必须指定维度",
+                })?;
+                (None, None, dimension, self.metric)
+            }
+        };
         let dimension = Dimension::new(dimension)?;
-        let config = Config {
+        let config = Arc::new(Config {
             dimension,
-            metric: self.metric,
+            metric,
             fsync: self.fsync,
             insert_mode: self.insert_mode,
             dedup: self.dedup,
@@ -135,12 +154,19 @@ impl Builder {
             read_only: self.read_only,
             verify_on_open: self.verify_on_open,
             fail_fast_on_corruption: self.fail_fast_on_corruption,
+        });
+        let table = match (&store, recovered) {
+            (Some(store), Some(state)) => {
+                let hook: Arc<dyn PersistHook> = Arc::clone(store) as Arc<dyn PersistHook>;
+                Arc::new(Table::from_state(Arc::clone(&config), state, Some(hook)))
+            }
+            _ => Arc::new(Table::new(Arc::clone(&config))),
         };
-        let config = Arc::new(config);
         Ok(Mneme {
-            table: Arc::new(Table::new(Arc::clone(&config))),
+            table,
             config,
             control: CompactionControl::new(),
+            store,
         })
     }
 }

@@ -10,18 +10,28 @@
 //! * `msec` —— 元数据段编解码(头部 + 记录体 + 版本链 + key 索引)。
 //! * `delta` —— 跨段覆盖区(墓碑/更新/访问)编解码。
 //! * `edges` —— 关系邻接索引编解码。
-//! * `wal` —— WAL 帧编解码与组提交写入器。
+//! * `wal` —— WAL 帧编解码、回放与写入器。
 //! * `manifest` —— MANIFEST 编解码(write-once + `current` 指针)。
 //! * `source` —— 段读取后端抽象(`SegmentSource` 与 `FileSource`)。
+//! * `storage` —— 目录布局、原子写入与独占文件锁。
+//! * `trash` —— 旧段文件的延迟删除。
+//! * `flush` —— 写状态 → 段文件(全量快照)。
+//! * `recover` —— 段文件 + WAL → 写状态。
+//! * `store` —— 协调句柄 `Store`(实现 `PersistHook`、`flush`、`open`)。
 //!
-//! > 本层只向下依赖 [`crate::core`];不向上依赖 `memory`(分层单向)。
+//! > 本层向下依赖 [`crate::core`] 与 [`crate::memory`](L1,L2 高于 L1);
 //! > `memmap2`/`MmapSource` 按依赖白名单自 L3 引入,本层仅提供 `FileSource`。
 
 pub(crate) mod delta;
 pub(crate) mod edges;
+pub(crate) mod flush;
 pub(crate) mod manifest;
 pub(crate) mod msec;
+pub(crate) mod recover;
 pub(crate) mod source;
+pub(crate) mod storage;
+pub(crate) mod store;
+pub(crate) mod trash;
 pub(crate) mod vsec;
 pub(crate) mod wal;
 

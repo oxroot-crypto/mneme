@@ -16,6 +16,7 @@ use crate::memory::ops::{BackupReport, CompactionControl};
 use crate::memory::snapshot::SnapshotHandle;
 use crate::memory::table::Table;
 use crate::memory::temporal;
+use crate::persist::store::Store;
 
 /// 库句柄;内部 `Arc` 共享,克隆廉价且可跨线程。
 #[derive(Clone)]
@@ -23,6 +24,8 @@ pub struct Mneme {
     pub(crate) table: Arc<Table>,
     pub(crate) config: Arc<Config>,
     pub(crate) control: CompactionControl,
+    /// 持久层协调句柄;纯内存库为 `None`。
+    pub(crate) store: Option<Arc<Store>>,
 }
 
 impl std::fmt::Debug for Mneme {
@@ -44,14 +47,14 @@ impl Mneme {
     /// 当前恒返回 [`MnemeError::Unsupported`]。
     ///
     /// # Examples
-    /// ```
+    /// ```no_run
     /// use mneme::Mneme;
-    /// assert!(Mneme::open("some/dir").is_err());
+    /// // 仅编译不执行:会打开/创建本地目录。
+    /// let db = Mneme::open("data/agent_memory").expect("open");
+    /// # let _ = db;
     /// ```
-    pub fn open(_path: impl AsRef<Path>) -> Result<Mneme> {
-        Err(MnemeError::Unsupported {
-            feature: "持久化(open, L2)",
-        })
+    pub fn open(path: impl AsRef<Path>) -> Result<Mneme> {
+        Builder::default().path(path).build()
     }
 
     /// 创建纯内存库(易失),维度必填。
@@ -270,6 +273,15 @@ impl Mneme {
     /// db.close().unwrap();
     /// ```
     pub fn close(self) -> Result<()> {
+        if let Some(store) = &self.store {
+            let ws = self.table.write();
+            // 只读库不写盘;可写库在关闭前把全部已确认写入落成段(I16)。
+            if !ws.closed && !self.config.read_only {
+                store.flush(&ws, &self.config)?;
+            }
+            drop(ws);
+            store.release_lock();
+        }
         let table = Arc::clone(&self.table);
         table.write_tx(move |ws| {
             ws.closed = true;

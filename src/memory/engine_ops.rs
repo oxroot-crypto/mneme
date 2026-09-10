@@ -130,17 +130,25 @@ impl Mneme {
         self.control.clone()
     }
 
-    /// 显式落盘(L1 无持久化,为空操作)。
+    /// 显式落盘:把可变表物化为新段并提交 MANIFEST。
     ///
-    /// # Returns
-    /// 恒 `Ok`(L1 无持久化,无 I/O)。
+    /// 纯内存库为空操作;持久库执行全量快照 flush 并重置 WAL(设计 04 §3.2)。
     ///
     /// # Errors
-    /// 库已关闭时返回 [`MnemeError::Closed`]。
+    /// 库已关闭时返回 [`MnemeError::Closed`];只读模式返回
+    /// [`MnemeError::Unsupported`];I/O 失败返回 [`MnemeError::Io`]。
     pub fn flush(&self) -> Result<()> {
         let view = self.table.view();
         if view.closed {
             return Err(MnemeError::Closed);
+        }
+        drop(view);
+        if let Some(store) = &self.store {
+            let ws = self.table.write();
+            if ws.closed {
+                return Err(MnemeError::Closed);
+            }
+            store.flush(&ws, &self.config)?;
         }
         Ok(())
     }

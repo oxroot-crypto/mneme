@@ -39,6 +39,7 @@
 
 | 日期 | 变更 |
 |---|---|
+| 2026-09 | 落地 L2 持久化接线(M2):新增 `persist/store.rs` 协调句柄(实现内存引擎 `PersistHook`,WAL-before-visible + 批 `BatchBegin/Commit` + Checkpoint 重置);`flush` 采用 **全量快照**(设计 04 §3.2 的 L2 兜底)写 vsec/msec + write-once MANIFEST,`open` 由「MANIFEST/段/WAL」重建状态并回放 `seqno > watermark`;`close` 先 flush 再释放锁。`FC-PERSIST-INV-001/019/020`、`FC-PERSIST-POST-001/003`、`FC-PERSIST-ERR-001/002/003/004` 置 `Passed`(测试见 `tests/persist_contracts.rs` 与 `src/persist/*.rs` 单测);`FC-MEM-ERR-002` 收紧:`open`/`path` 已落地,新建持久库缺维度改返回 `Config`。WAL `Insert` 负载补 `[u32 dim][f32×dim]` 向量副本(设计 04 §2.3 的记录体不含向量,否则未 flush 记录重启后丢失),已同步 04 §2.3。门面(`memory::Builder`/`Mneme`)作为单一 crate 组合根引用 `persist`(构成根例外,不改变 L0→L6 业务依赖方向) |
 | 2026-09 | 文档对齐(实现与设计一致性):① `VectorStore` 内部 trait 按 03 §8/04 §14 明确为 **L3 随 HNSW 引入**,L1/L2 直接实现同一组公开签名,同步修订 01 §2「接口先于实现」表述;② 04 §11 明确 L2 仅提供 `FileSource`,`MmapSource`/`mmap` 自 L3 引入(依 01 §5 依赖表);③ 04 §10.1 `FsyncHook`/`IoAction` 明确经 `Builder::fsync_hook` 公开注入(测试 seam),不再表述为"仅测试 builder 暴露" |
 | 2026-09 | 启动 L2 持久层实现:① 新增 `crc32fast` 直接依赖(白名单 L2)、`tempfile` dev-dep;② 按 01 §5 依赖表(§5 权威)`memmap2` 自 L3 引入,L2 仅提供 `SegmentSource`+`FileSource`(std),`MmapSource`/`mmap` feature 推迟至 L3,并据此澄清 04 §11;③ 按 03 §8/04 §14 引入内部 `VectorStore` 内部接口(`Target`/`SearchOpt`/`EntryRef`),持久层 `Database` 实现之;④ L2 契约测试文件 `tests/persist_contracts.rs` 登记进 `tests/contract_traceability.rs` 双向追溯门禁,条目自 M1 起由 `待补` 回填真实测试路径 |
 | 2026-09 | 终审扫尾整改:① `supersede` 此前不查墓碑,`delete` 后调用会把记录复活;现与 `update` 同口径——已墓碑记录返回 `NotFound`、绝不复活(FC-MODEL-POST-003 收紧)。② `WriterState::commit_version` 新增 key 占用预检:新版本携带的 key 若已被**另一可见记录**占用(合并/替换回调改变 key 时的冲突),返回 `DuplicateKey` 并整体回滚,绝不静默覆盖他人 `key_index`(FC-MEM-POST-007 收紧,§0.2 `DuplicateKey` 触发条件扩展)。③ `touch`/`touch_by_rowid` 此前不查逻辑过期,现仅对可见记录生效、否则返回 `false`,与 `feedback`/读路径同口径(新增 FC-MEM-POST-009)。④ `BitSet` 拆出 `src/memory/bitset.rs`,`table.rs` 收敛至 400 行内(rust 规范 §3) |
@@ -88,7 +89,7 @@
 | `LimitExceeded { field, limit, got }` | 参数越上限(维度、`top_k`、`ef`) | FC-CORE-PRE-001、FC-GLOBAL-PRE-004、FC-MEM-PRE-003 | 原 `Invalid("top_k 超过上限")` 等 |
 | `MetaTooDeep { limit, got }` | metadata 嵌套深度超限 | FC-GLOBAL-PRE-003、FC-MEM-PRE-002 | 原 `Invalid("metadata 嵌套过深")` |
 | `Config { reason }` | 建库/查询配置非法(缺维度、无查询通道、MMR `lambda` 非有限值)、策略参数含非有限值(`min_importance`/`access_weight`/`threshold`/`dedup_threshold`)或越界(`dedup_threshold`/`threshold` ∉ [0,1])或非法(`max_cluster = 0`) | FC-MEM-STA-001、FC-MEM-PRE-003、FC-MODEL-POST-006、FC-LIFE-POST-002、FC-GLOBAL-PRE-004 | 原 `Invalid("新建内存库必须指定维度")` 等 |
-| `Unsupported { feature }` | 能力延后到后续层,绝不静默降级(`Fusion` 单独设置即拒绝,无需 text 通道) | FC-MEM-ERR-002 | open/backup/path/BM25/Fusion |
+| `Unsupported { feature }` | 能力延后到后续层,绝不静默降级(`Fusion` 单独设置即拒绝,无需 text 通道;`open`/`path` 已在 L2 落地,只读模式写亦返回本变体) | FC-MEM-ERR-002、FC-PERSIST-ERR-003 | backup/BM25/Fusion/text、只读写 |
 | `Inconsistent { reason }` | 内部不变量被破坏 | FC-MEM-INV-004 | 原 `Invalid("去重命中但记录不可见")` |
 
 > **迁移说明(破坏性变更)**:`Invalid(&'static str)` 已移除。调用方若曾按字符串匹配
@@ -147,7 +148,7 @@
 | FC-MEM-INV-004 | INV | `SlotId` 随物理版本单调递增、永不复用;槽位容量溢出(`u32::MAX`)返回结构化错误,绝不静默饱和 | `src/memory/table.rs::slot_id_for_rejects_overflow` | Passed |
 | FC-MEM-STA-001 | STA | 库生命周期五元组 `M=(States={Open,Closed}, Events={Close}, δ(Open,Close)=Closed, δ(Closed,Close)=Closed, s0=Open, F={Closed})`;`Closed` 后经任意句柄读写 → `Closed`;重复 `close` 幂等返回 `Ok` | `tests/life_contracts.rs::database_lifecycle_open_closed` | Passed |
 | FC-MEM-ERR-001 | ERR | `close` 后(经任意克隆句柄)读写返回 `Closed`;重复 `close` 返回 `Ok`(幂等) | `tests/life_contracts.rs::closed_database_rejects_operations` | Passed |
-| FC-MEM-ERR-002 | ERR | L1 尚未落地的能力以结构化 `Unsupported{feature}` 返回、绝不静默:`text`/`Fusion`(L4,`Fusion` 单独设置即拒绝)、`open`/`backup_to`/`path`(L2) | `tests/life_contracts.rs::deferred_features_return_structured_errors` | Passed |
+| FC-MEM-ERR-002 | ERR | 尚未落地的能力以结构化 `Unsupported{feature}` 返回、绝不静默:`text`/`Fusion`(L4,`Fusion` 单独设置即拒绝)、`backup_to`(L2 备份);`open`/`path` 已在 L2 落地(新建持久库缺维度返回 `Config`,不再是 `Unsupported`) | `tests/life_contracts.rs::deferred_features_return_structured_errors` | Passed |
 
 ---
 
@@ -155,17 +156,19 @@
 
 | 编号 | 类型 | 形式化规范 | 对应测试 | 状态 |
 |---|---|---|---|---|
-| FC-PERSIST-INV-001 | INV | **I1**:已确认写入不半写;未确认写入重启后要么完整可见要么不存在 | 待补 | Planned |
-| FC-PERSIST-INV-002 | INV | **I2**:任意 bit 损坏可检出或拒绝启动,绝不静默返回错误数据 | 待补 | Planned |
+| FC-PERSIST-INV-001 | INV | **I1**:已确认写入不半写;未确认写入重启后要么完整可见要么不存在 | `tests/persist_contracts.rs::reopen_after_close_recovers_records`、`tests/persist_contracts.rs::reopen_after_drop_recovers_from_wal` | Passed |
+| FC-PERSIST-INV-002 | INV | **I2**:任意 bit 损坏可检出或拒绝启动,绝不静默返回错误数据 | `src/persist/vsec.rs::vsec_detects_header_corruption`、`src/persist/vsec.rs::vsec_detects_payload_corruption`、`src/persist/manifest.rs::manifest_detects_header_corruption`、`src/persist/manifest.rs::manifest_detects_payload_corruption`、`src/persist/wal.rs::wal_bad_crc_stops_replay` | Passed |
 | FC-PERSIST-INV-003 | INV | **I3**:活跃段集合 = 某 MANIFEST 版本所列集合 | 待补 | Planned |
 | FC-PERSIST-INV-004 | INV | **I4**:WAL 总量 ≤ `wal_bytes`;段文件只增不改 | 待补 | Planned |
-| FC-PERSIST-INV-019 | INV | **I19**:`delete`/`update`/`touch`/`relate` 返回 `Ok` 后,崩溃 + WAL 截断仍生效,删除永不复活 | 待补 | Planned |
-| FC-PERSIST-INV-020 | INV | **I20**:`path↔NsId`、`next_ns_id`、`next_rowid` 可由 MANIFEST+WAL 重建,ID 永不复用 | 待补 | Planned |
-| FC-PERSIST-POST-001 | POST | **I15**:`insert_batch` 整批原子:可见记录数 ∈ {0, n},无部分批 | 待补 | Planned |
+| FC-PERSIST-INV-019 | INV | **I19**:`delete`/`update`/`touch`/`relate` 返回 `Ok` 后,崩溃 + WAL 截断仍生效,删除永不复活 | `tests/persist_contracts.rs::delete_survives_flush_and_reopen`、`tests/persist_contracts.rs::crash_after_delete_does_not_resurrect`、`tests/persist_contracts.rs::update_survives_reopen` | Passed |
+| FC-PERSIST-INV-020 | INV | **I20**:`path↔NsId`、`next_ns_id`、`next_rowid` 可由 MANIFEST+WAL 重建,ID 永不复用 | `tests/persist_contracts.rs::namespace_and_rowid_survive_reopen` | Passed |
+| FC-PERSIST-POST-001 | POST | **I15**:`insert_batch` 整批原子:可见记录数 ∈ {0, n},无部分批 | `tests/persist_contracts.rs::batch_insert_is_atomic_across_reopen` | Passed |
 | FC-PERSIST-POST-002 | POST | Checkpoint 仅当 `seqno ≤ watermark` 的覆盖条目已物化时才截断 WAL | 待补 | Planned |
-| FC-PERSIST-POST-003 | POST | **I16**:`close()` 返回 `Ok` 后所有已确认写入持久;`Drop` 不保证 | 待补 | Planned |
-| FC-PERSIST-ERR-001 | ERR | 未知 WAL 帧类型 → 停止回放并报错,不静默跳过 | 待补 | Planned |
-| FC-PERSIST-ERR-002 | ERR | 更高主版本 → `UnsupportedVersion`(I18) | 待补 | Planned |
+| FC-PERSIST-POST-003 | POST | **I16**:`close()` 返回 `Ok` 后所有已确认写入持久;`Drop` 不保证 | `tests/persist_contracts.rs::reopen_after_close_recovers_records` | Passed |
+| FC-PERSIST-ERR-001 | ERR | 未知 WAL 帧类型 → 停止回放并报错,不静默跳过 | `src/persist/wal.rs::wal_unknown_frame_type_errors` | Passed |
+| FC-PERSIST-ERR-002 | ERR | 更高主版本 → `UnsupportedVersion`(I18) | `src/persist/vsec.rs::vsec_rejects_higher_major`、`src/persist/manifest.rs::manifest_rejects_higher_major` | Passed |
+| FC-PERSIST-ERR-003 | ERR | 只读模式写操作 → `Unsupported { feature: "只读模式写入" }`,绝不静默(设计 04 §13) | `tests/persist_contracts.rs::read_only_rejects_writes` | Passed |
+| FC-PERSIST-ERR-004 | ERR | 打开时显式维度与 MANIFEST 不符 → `DimensionMismatch`,拒绝打开(设计 16 §3) | `tests/persist_contracts.rs::dimension_mismatch_rejected_on_open` | Passed |
 | FC-PERSIST-STA-001 | STA | 段生命周期:`Building → Committed → Obsolete → (trash)`;`Committed` 段内容不可变 | 待补 | Planned |
 | FC-PERSIST-STA-002 | STA | 崩溃点状态:`Building` 段为孤儿,恢复时清理;不进入任何 MANIFEST 视图 | 待补 | Planned |
 

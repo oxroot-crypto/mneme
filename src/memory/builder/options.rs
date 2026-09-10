@@ -18,7 +18,7 @@ use crate::memory::lifecycle::Retention;
 use super::Builder;
 
 impl Builder {
-    /// 设置存储目录;L1 尚未实现持久化,设置后 `build()` 返回 `Unsupported`。
+    /// 设置存储目录;设置后 `build()` 打开/新建持久库(设计 04 §1)。
     ///
     /// # Arguments
     ///
@@ -57,6 +57,7 @@ impl Builder {
     /// 携带度量的构建器(链式)。
     pub fn metric(mut self, metric: Metric) -> Self {
         self.metric = metric;
+        self.metric_explicit = true;
         self
     }
 

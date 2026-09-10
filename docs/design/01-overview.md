@@ -177,7 +177,7 @@ mneme/
 │   ├── lib.rs          # 门面:Mneme / Namespace / Builder;pub use 公开类型
 │   ├── core/           # L0:types.rs error.rs metric.rs simd.rs varint.rs meta.rs heap.rs options/
 │   ├── memory/         # L1:engine.rs engine_ops.rs builder.rs namespace/ snapshot.rs snapshot_scan.rs search_builder.rs search_exec.rs expand.rs rerank.rs table.rs bitset.rs search.rs pred.rs pred_eval.rs record.rs write_helpers.rs mutate_helpers.rs dedup.rs relation.rs temporal.rs score.rs lifecycle.rs ops.rs config.rs
-│   ├── persist/        # L2:wal.rs vsec.rs msec.rs delta.rs edges.rs manifest.rs recover.rs flush.rs source.rs storage.rs trash.rs
+│   ├── persist/        # L2:wal.rs vsec.rs msec.rs delta.rs edges.rs manifest.rs recover.rs flush.rs source.rs storage.rs trash.rs store.rs
 │   ├── index/          # L3:hnsw.rs graph.rs filtered.rs merge.rs rebuild.rs
 │   ├── query/          # L4:parse.rs plan.rs zmap.rs bm25.rs fusion.rs result_dedup.rs exec.rs
 │   ├── life/           # L5:ttl.rs retain.rs access.rs namespace.rs compact.rs backup.rs stats.rs

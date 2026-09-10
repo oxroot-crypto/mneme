@@ -242,20 +242,43 @@ pub(crate) fn replay(bytes: &[u8]) -> Result<Replay> {
     })
 }
 
-/// 编码 `Insert` 负载(记录体,含 `NsId`)。
+/// 编码 `Insert` 负载:`[记录体(含长度前缀)][u32 dim][f32 × dim]`。
+///
+/// 记录体(设计 04 §2.3)只含元数据不含向量,故 WAL 追加向量副本以支持崩溃恢复;
+/// 该字段是对设计 §2.3 的必要补全(否则未 flush 的记录重启后向量丢失)。
 ///
 /// # Errors
-/// 记录体超限时返回 [`MnemeError::TooLarge`]。
-pub(crate) fn encode_insert(entry: &EntryData) -> Result<Vec<u8>> {
-    msec::encode_entry(entry)
+/// 记录体或向量长度超限时返回 [`MnemeError::TooLarge`]。
+pub(crate) fn encode_insert(entry: &EntryData, vector: &[f32]) -> Result<Vec<u8>> {
+    let mut out = msec::encode_entry(entry)?;
+    let dim = u32::try_from(vector.len()).map_err(|_| MnemeError::TooLarge {
+        field: "wal insert vector",
+        limit: u32::MAX as usize,
+        got: vector.len(),
+    })?;
+    put_u32(&mut out, dim);
+    for value in vector {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    Ok(out)
 }
 
-/// 解码 `Insert` 负载。
+/// 解码 `Insert` 负载,返回 `(记录体, 向量)`。
 ///
 /// # Errors
-/// 记录体损坏时返回 [`MnemeError::Corrupted`]。
-pub(crate) fn decode_insert(payload: &[u8]) -> Result<EntryData> {
-    msec::entry_from_prefix(payload)
+/// 记录体或向量损坏时返回 [`MnemeError::Corrupted`]。
+pub(crate) fn decode_insert(payload: &[u8]) -> Result<(EntryData, Vec<f32>)> {
+    let entry = msec::entry_from_prefix(payload)?;
+    let total_len = u32::from_le_bytes(payload[0..4].try_into().unwrap_or([0; 4])) as usize;
+    let mut cursor = Cursor::new(&payload[4 + total_len..], "wal insert 向量");
+    let dim = cursor.u32()? as usize;
+    let mut vector = Vec::with_capacity(dim);
+    for _ in 0..dim {
+        vector.push(f32::from_le_bytes(
+            cursor.take(4)?.try_into().unwrap_or([0; 4]),
+        ));
+    }
+    Ok((entry, vector))
 }
 
 /// 编码 `Delete` 负载 `[NsId u32][key len+bytes]`。
@@ -409,7 +432,7 @@ mod tests {
         bytes.extend_from_slice(&encode_frame(
             1,
             FrameKind::Insert,
-            &encode_insert(&entry()).expect("insert"),
+            &encode_insert(&entry(), &[1.0, 2.0]).expect("insert"),
         ));
         bytes.extend_from_slice(&encode_frame(2, FrameKind::Delete, &encode_delete(1, "k")));
         bytes.extend_from_slice(&encode_frame(
@@ -425,7 +448,7 @@ mod tests {
         assert_eq!(replay.frames[0].kind, FrameKind::Insert);
         assert_eq!(
             decode_insert(&replay.frames[0].payload).expect("insert"),
-            entry()
+            (entry(), vec![1.0, 2.0])
         );
         assert_eq!(
             decode_delete(&replay.frames[1].payload).expect("delete"),
