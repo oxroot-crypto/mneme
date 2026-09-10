@@ -46,13 +46,22 @@ impl Mneme {
             stat.total_doc_len += slot.text.as_ref().map_or(0, |text| text.len() as u64);
         }
         let relations = view.out_edges.values().map(Vec::len).sum::<usize>() as u64;
+        let (segments, wal_bytes, trash_bytes, total_segments) = match &self.store {
+            Some(store) => (
+                store.segment_stats(),
+                store.wal_bytes(),
+                store.trash_bytes(),
+                store.total_segments(),
+            ),
+            None => (Vec::new(), 0, 0, 0),
+        };
         Ok(Stats {
-            segments: Vec::new(),
-            wal_bytes: 0,
+            segments,
+            wal_bytes,
             memory_est: live_rows
                 * u64::from(self.config.dimension.get())
                 * std::mem::size_of::<f32>() as u64,
-            trash_bytes: 0,
+            trash_bytes,
             query_latency: Histogram::default(),
             per_namespace,
             quant: QuantStat {
@@ -72,7 +81,7 @@ impl Mneme {
                 encryption: false,
                 compression: self.config.compression,
                 migrated_segments: 0,
-                total_segments: 0,
+                total_segments,
             },
         })
     }

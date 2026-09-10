@@ -100,11 +100,11 @@ impl WalWriter {
         })
     }
 
-    /// 追加一帧,并按策略 fsync。返回写入后的文件长度。
+    /// 追加一帧(不 fsync;由 [`WalWriter::sync`] 在事务末统一落盘)。
     ///
     /// # Errors
     /// I/O 失败返回 [`MnemeError::Io`]。
-    fn append(&mut self, seqno: u64, kind: FrameKind, payload: &[u8]) -> Result<u64> {
+    fn append(&mut self, seqno: u64, kind: FrameKind, payload: &[u8]) -> Result<()> {
         use std::io::Write as _;
         let frame = wal::encode_frame(seqno, kind, payload);
         let offset = self.file.metadata()?.len();
@@ -116,14 +116,21 @@ impl WalWriter {
             })?;
         }
         self.file.write_all(&frame)?;
-        // `Always`/`Batched` 均在此同步:同步次数不弱于设计承诺(更强持久性无害)。
+        Ok(())
+    }
+
+    /// 按 `FsyncPolicy` 落盘:一个写事务只调用一次(组提交,FC-PERSIST-CPLX-001)。
+    ///
+    /// # Errors
+    /// 同步 I/O 失败返回 [`MnemeError::Io`]。
+    fn sync(&mut self) -> Result<()> {
         if matches!(self.policy, FsyncPolicy::Always | FsyncPolicy::Batched(_)) {
             if let Some(hook) = &self.hook {
                 hook.before(IoAction::Fsync { file: WAL_FILE })?;
             }
             self.file.sync_all()?;
         }
-        Ok(self.file.metadata()?.len())
+        Ok(())
     }
 
     /// 重置 WAL(Checkpoint):截断为空并重写文件头。
@@ -189,6 +196,10 @@ impl Store {
             Some(FileLock::acquire(root)?)
         };
         trash::purge(root)?;
+        // 清理崩溃残留的 `Building` 半成品(ATOMIC 写的 `.tmp`);只读实例亦只读取、不删除。
+        if !read_only {
+            cleanup_orphans(root)?;
+        }
 
         let loaded = load_manifest(root)?;
         let (manifest, version) = match loaded {
@@ -297,6 +308,58 @@ impl Store {
     /// 库根目录。
     pub(crate) fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// 当前 WAL 文件字节数。
+    pub(crate) fn wal_bytes(&self) -> u64 {
+        storage::resolve(&self.root, WAL_FILE)
+            .ok()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map_or(0, |metadata| metadata.len())
+    }
+
+    /// `trash/` 目录字节数。
+    pub(crate) fn trash_bytes(&self) -> u64 {
+        trash::bytes(&self.root).unwrap_or(0)
+    }
+
+    /// 活跃段统计(来自当前 MANIFEST)。
+    pub(crate) fn segment_stats(&self) -> Vec<crate::memory::ops::SegmentStat> {
+        let guard = self
+            .manifest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        guard
+            .manifest
+            .segments
+            .iter()
+            .map(|segment| {
+                let bytes = storage::resolve(
+                    &self.root,
+                    &format!("{SEGMENTS_DIR}/{}", vsec_name(segment.segment_id)),
+                )
+                .ok()
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map_or(0, |metadata| metadata.len());
+                crate::memory::ops::SegmentStat {
+                    id: crate::core::types::SegmentId::new(segment.segment_id),
+                    rows: segment.row_count,
+                    bytes,
+                    dead_ratio: 0.0,
+                    created: segment.created_ms,
+                }
+            })
+            .collect()
+    }
+
+    /// 活跃段数。
+    pub(crate) fn total_segments(&self) -> usize {
+        self.manifest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .manifest
+            .segments
+            .len()
     }
 
     /// 释放独占锁(`close` 调用;幂等)。
@@ -515,6 +578,44 @@ impl PersistHook for Store {
                         &wal::encode_delete_row(rowid.get()),
                     )?;
                 }
+                WriteOp::Access {
+                    rowid,
+                    seqno,
+                    at_ms,
+                    importance_delta,
+                } => {
+                    wal.append(
+                        seqno.get(),
+                        FrameKind::TouchRow,
+                        &wal::encode_touch_row(rowid.get(), *at_ms, 1, *importance_delta),
+                    )?;
+                }
+                WriteOp::Relate {
+                    from,
+                    to,
+                    kind,
+                    weight,
+                    meta,
+                    seqno,
+                } => {
+                    wal.append(
+                        seqno.get(),
+                        FrameKind::Relate,
+                        &wal::encode_relate(from.get(), to.get(), *kind, *weight, meta),
+                    )?;
+                }
+                WriteOp::Unrelate {
+                    from,
+                    to,
+                    kind,
+                    seqno,
+                } => {
+                    wal.append(
+                        seqno.get(),
+                        FrameKind::Unrelate,
+                        &wal::encode_unrelate(from.get(), to.get(), *kind),
+                    )?;
+                }
             }
         }
         if batch {
@@ -524,6 +625,20 @@ impl PersistHook for Store {
                 FrameKind::BatchCommit,
                 &wal::encode_batch_commit(ops.len() as u32, crc),
             )?;
+        }
+        // 整个写事务只 fsync 一次(组提交)。
+        wal.sync()?;
+        Ok(())
+    }
+
+    fn maybe_flush(&self, ws: &WriterState, config: &Config) -> Result<()> {
+        if self.read_only {
+            return Ok(());
+        }
+        let limit = config.compaction.wal_bytes;
+        // L2 兜底:WAL 达到上限即全量快照 flush,保证 WAL 有界(I4)。
+        if limit > 0 && self.wal_bytes() >= limit {
+            self.flush(ws, config)?;
         }
         Ok(())
     }
@@ -562,6 +677,24 @@ fn seqno_range(ws: &WriterState) -> (u64, u64) {
     } else {
         (min, max)
     }
+}
+
+/// 清理 `segments/`、`wal/` 与根目录下的 `.tmp` 半成品(崩溃点 `Building` 孤儿)。
+fn cleanup_orphans(root: &Path) -> Result<()> {
+    for dir in [SEGMENTS_DIR, WAL_DIR, ""] {
+        for name in storage::list_dir(root, dir)? {
+            if !name.ends_with(".tmp") {
+                continue;
+            }
+            let rel = if dir.is_empty() {
+                name.clone()
+            } else {
+                format!("{dir}/{name}")
+            };
+            storage::remove_if_exists(&storage::resolve(root, &rel)?)?;
+        }
+    }
+    Ok(())
 }
 
 /// 读取 `current` 或扫描目录得到最新合法 MANIFEST;不存在返回 `None`。

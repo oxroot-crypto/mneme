@@ -50,7 +50,7 @@ impl Builder {
     pub fn access_flush_interval(self, d: Duration) -> Self; // 默认 30s
     pub fn compression(self, c: Compression) -> Self;       // 文本/元数据压缩,默认 None(见 11)
     pub fn encryption(self, e: Option<Encryption>) -> Self; // 静态加密,feature `encrypt`(见 11)
-    pub fn storage(self, s: Arc<dyn Storage>) -> Self;      // 存储后端,默认 FsStorage;WASM/边缘自定义(见 12 §3)
+    pub fn storage(self, s: Arc<dyn Storage>) -> Self;      // 存储后端,默认 FsStorage;WASM/边缘自定义(见 12 §3;L12 落地,当前内部 std::fs)
     pub fn read_only(self, yes: bool) -> Self;              // 只读共享模式(见 12 §2)
     pub fn read_only_probe_interval(self, d: Duration) -> Self; // 只读实例探测新 MANIFEST 的周期,默认 1s
     pub fn verify_on_open(self, yes: bool) -> Self;         // 打开时全量校验各段 payload CRC,默认 false(见 04 §4.3)

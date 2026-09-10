@@ -69,8 +69,12 @@ let db = Mneme::builder().path("./agent_memory").read_only(true).build()?;
 
 [04 §11](04-l2-persist.md) 已把段读取抽象为 `SegmentSource`(mmap / `FileSource`)。
 WASM 没有 mmap,但有内存文件系统/IndexedDB;需要把**写路径**也抽象出来。
-为此,`Storage` trait 作为 **L2 基础设施抽象**定义在 `persist/storage.rs`
-(与 `SegmentSource` 同层,避免上层反向依赖),`deploy/` 只提供 WASM 适配实现。
+为此,`Storage` trait 计划定义在 `persist/storage.rs`(与 `SegmentSource` 同层,
+避免上层反向依赖),`deploy/` 只提供 WASM 适配实现。
+> **落地状态**:L2 目前以 `persist/storage.rs` 的 `std::fs` 自由函数实现文件操作
+> (原子写/锁/目录遍历),`Storage` trait 与 `Builder::storage` 待 **L12** 引入首个
+> 非 `FsStorage` 后端(WASM/OPFS)时抽取,以避免在仅有一个后端时过早抽象。
+> 故 16 §1.1 的 `Builder::storage` 亦标记为 L12 落地。
 
 ```rust
 /// 存储后端的文件元数据(不依赖 `std::fs`,WASM 后端同样可实现)。

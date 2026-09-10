@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuar
 
 use crate::core::error::{MnemeError, Result};
 use crate::core::meta::Meta;
+use crate::core::options::RelationKind;
 use crate::core::types::{Key, NsId, RowId, SeqNo, SlotId};
 use crate::memory::bitset::BitSet;
 use crate::memory::config::Config;
@@ -42,6 +43,43 @@ pub(crate) enum WriteOp {
         /// 版本序号。
         seqno: SeqNo,
     },
+    /// 访问统计更新(touch;`importance` 变更已随版本 `Insert` 记录)。
+    Access {
+        /// 目标 `RowId`。
+        rowid: RowId,
+        /// 版本序号。
+        seqno: SeqNo,
+        /// 访问时刻(Unix 毫秒)。
+        at_ms: i64,
+        /// 重要度增量。
+        importance_delta: f32,
+    },
+    /// 建立/更新关系边。
+    Relate {
+        /// 起点。
+        from: RowId,
+        /// 终点。
+        to: RowId,
+        /// 关系类型。
+        kind: u16,
+        /// 边权。
+        weight: f32,
+        /// 边元数据。
+        meta: Meta,
+        /// 版本序号。
+        seqno: SeqNo,
+    },
+    /// 删除关系边。
+    Unrelate {
+        /// 起点。
+        from: RowId,
+        /// 终点。
+        to: RowId,
+        /// 关系类型。
+        kind: u16,
+        /// 版本序号。
+        seqno: SeqNo,
+    },
 }
 
 /// 持久层写日志钩子:由 L2 的持久引擎实现,内存引擎在无钩子时行为不变。
@@ -54,6 +92,14 @@ pub(crate) trait PersistHook: Send + Sync {
     /// # Errors
     /// WAL 写入/fsync 失败时返回对应错误。
     fn log(&self, ops: &[WriteOp]) -> Result<()>;
+
+    /// 持久层内部阈值(如 WAL 容量)越界时触发一次落盘;默认无操作。
+    ///
+    /// # Errors
+    /// 落盘 I/O 失败时返回对应错误。
+    fn maybe_flush(&self, _ws: &WriterState, _config: &Config) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// 把槽位下标映射为 `SlotId`;超出 `u32::MAX` 时返回结构化错误,绝不静默饱和
@@ -193,6 +239,42 @@ impl WriterState {
             path,
         });
         id
+    }
+
+    /// 建立/更新关系边并记录 WAL 操作。
+    pub(crate) fn relate_edge(&mut self, edge: Edge) {
+        crate::memory::relation::upsert_edge(Arc::make_mut(&mut self.out_edges), edge.clone());
+        crate::memory::relation::upsert_edge(Arc::make_mut(&mut self.in_edges), edge.clone());
+        let seqno = self.alloc_seqno();
+        self.pending.push(WriteOp::Relate {
+            from: edge.from,
+            to: edge.to,
+            kind: edge.kind.0,
+            weight: edge.weight,
+            meta: edge.metadata,
+            seqno,
+        });
+    }
+
+    /// 删除关系边并记录 WAL 操作;未命中返回 `false` 且不消耗序号。
+    pub(crate) fn unrelate_edge(&mut self, from: RowId, to: RowId, kind: RelationKind) -> bool {
+        let removed = crate::memory::relation::remove_edge(
+            Arc::make_mut(&mut self.out_edges),
+            from,
+            to,
+            kind,
+        );
+        crate::memory::relation::remove_edge(Arc::make_mut(&mut self.in_edges), to, from, kind);
+        if removed {
+            let seqno = self.alloc_seqno();
+            self.pending.push(WriteOp::Unrelate {
+                from,
+                to,
+                kind: kind.0,
+                seqno,
+            });
+        }
+        removed
     }
 
     /// 把某 `RowId` 的当前最新版本标记为不可见(被遮蔽/删除)。
@@ -438,11 +520,16 @@ impl Table {
             Ok(value) => {
                 // WAL 先于可见性写入:持久失败则整体回滚,绝不发布半持久状态。
                 let ops = std::mem::take(&mut ws.pending);
-                if let Some(persist) = &self.persist
-                    && let Err(error) = persist.log(&ops)
-                {
-                    *ws = snapshot;
-                    return Err(error);
+                if let Some(persist) = &self.persist {
+                    if let Err(error) = persist.log(&ops) {
+                        *ws = snapshot;
+                        return Err(error);
+                    }
+                    // WAL 容量等阈值兜底:越界即全量快照 flush(设计 04 §3.2)。
+                    if let Err(error) = persist.maybe_flush(&ws, &self.config) {
+                        *ws = snapshot;
+                        return Err(error);
+                    }
                 }
                 self.publish(&ws);
                 Ok(value)

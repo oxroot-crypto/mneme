@@ -236,31 +236,37 @@ pub(crate) fn replay_wal(state: &mut WriterState, bytes: &[u8], watermark: u64) 
     if bytes.is_empty() {
         return Ok(());
     }
-    let replay = wal::replay(bytes)?;
     // 批原子回放(I15):批内帧先暂存,遇 `BatchCommit` 才整体应用;
     // 文件在提交帧前结束则整批丢弃(设计 04 §3.3)。
-    let mut batch: Option<Vec<wal::Frame>> = None;
-    for frame in replay.frames {
-        match frame.kind {
+    let mut batch: Option<Vec<(u64, FrameKind, Vec<u8>)>> = None;
+    wal::visit_frames(bytes, |seqno, kind, payload| {
+        match kind {
             FrameKind::BatchBegin => {
                 batch = Some(Vec::new());
-                continue;
+                return Ok(());
             }
             FrameKind::BatchCommit => {
                 if let Some(buffered) = batch.take() {
-                    for inner in buffered {
-                        apply_if_after_watermark(state, &inner, watermark)?;
+                    for (inner_seqno, inner_kind, inner_payload) in buffered {
+                        apply_if_after_watermark(
+                            state,
+                            inner_seqno,
+                            inner_kind,
+                            &inner_payload,
+                            watermark,
+                        )?;
                     }
                 }
-                continue;
+                return Ok(());
             }
             _ => {}
         }
         match batch.as_mut() {
-            Some(buffered) => buffered.push(frame),
-            None => apply_if_after_watermark(state, &frame, watermark)?,
+            Some(buffered) => buffered.push((seqno, kind, payload.to_vec())),
+            None => apply_if_after_watermark(state, seqno, kind, payload, watermark)?,
         }
-    }
+        Ok(())
+    })?;
     // 未闭合的批(缺 `BatchCommit`)整体丢弃。
     state.pending.clear();
     Ok(())
@@ -269,30 +275,29 @@ pub(crate) fn replay_wal(state: &mut WriterState, bytes: &[u8], watermark: u64) 
 /// 仅应用 `seqno > watermark` 的帧,并推进内存水位。
 fn apply_if_after_watermark(
     state: &mut WriterState,
-    frame: &wal::Frame,
+    seqno: u64,
+    kind: FrameKind,
+    payload: &[u8],
     watermark: u64,
 ) -> Result<()> {
     // 注册帧是幂等元数据,且可能在首次 flush 前落盘(watermark 仍为 0),
     // 故不受水位约束,始终重放(设计 04 §3.3「注册与水位恢复」)。
-    let metadata = matches!(
-        frame.kind,
-        FrameKind::NsRegister | FrameKind::RelKindRegister
-    );
-    if !metadata && frame.seqno <= watermark {
+    let metadata = matches!(kind, FrameKind::NsRegister | FrameKind::RelKindRegister);
+    if !metadata && seqno <= watermark {
         return Ok(());
     }
-    apply_frame(state, frame)?;
-    if frame.seqno > state.seqno.get() {
-        state.seqno = SeqNo::new(frame.seqno);
+    apply_frame(state, seqno, kind, payload)?;
+    if seqno > state.seqno.get() {
+        state.seqno = SeqNo::new(seqno);
     }
     Ok(())
 }
 
 /// 应用单帧到写状态。
-fn apply_frame(state: &mut WriterState, frame: &wal::Frame) -> Result<()> {
-    match frame.kind {
+fn apply_frame(state: &mut WriterState, seqno: u64, kind: FrameKind, payload: &[u8]) -> Result<()> {
+    match kind {
         FrameKind::NsRegister => {
-            let (ns_id, path) = wal::decode_ns_register(&frame.payload)?;
+            let (ns_id, path) = wal::decode_ns_register(payload)?;
             let id = NsId::new(ns_id);
             Arc::make_mut(&mut state.ns_registry).insert(id, Arc::clone(&path));
             Arc::make_mut(&mut state.ns_by_path).insert(path, id);
@@ -301,7 +306,7 @@ fn apply_frame(state: &mut WriterState, frame: &wal::Frame) -> Result<()> {
             }
         }
         FrameKind::Insert => {
-            let (entry, vector) = wal::decode_insert(&frame.payload)?;
+            let (entry, vector) = wal::decode_insert(payload)?;
             let tx_ms = entry.created_at_ms;
             let slot = slot_from_entry(state, &entry, vector, tx_ms, false);
             if entry.rowid.get() >= state.next_rowid {
@@ -310,13 +315,40 @@ fn apply_frame(state: &mut WriterState, frame: &wal::Frame) -> Result<()> {
             state.commit_version(entry.rowid, slot)?;
         }
         FrameKind::DeleteRow => {
-            let rowid = RowId::new(wal::decode_delete_row(&frame.payload)?);
+            let rowid = RowId::new(wal::decode_delete_row(payload)?);
             if rowid.get() >= state.next_rowid {
                 state.next_rowid = rowid.get() + 1;
             }
-            let _ = state.tombstone(rowid, 0, SeqNo::new(frame.seqno))?;
+            let _ = state.tombstone(rowid, 0, SeqNo::new(seqno))?;
         }
-        // 其余帧类型(Touch/Update/Relate/…)在 M3 接线;当前实现忽略但绝不误用。
+        FrameKind::TouchRow => {
+            let (rowid, at_ms, access_delta, _importance) = wal::decode_touch_row(payload)?;
+            let stat = Arc::make_mut(&mut state.access)
+                .entry(RowId::new(rowid))
+                .or_default();
+            stat.access_count = stat.access_count.saturating_add(access_delta);
+            stat.last_access_ms = at_ms;
+        }
+        FrameKind::Relate => {
+            let (from, to, kind, weight, meta) = wal::decode_relate(payload)?;
+            let edge = Edge {
+                from: RowId::new(from),
+                to: RowId::new(to),
+                kind: RelationKind(kind),
+                weight,
+                metadata: meta,
+            };
+            relation::upsert_edge(Arc::make_mut(&mut state.out_edges), edge.clone());
+            relation::upsert_edge(Arc::make_mut(&mut state.in_edges), edge);
+        }
+        FrameKind::Unrelate => {
+            let (from, to, kind) = wal::decode_unrelate(payload)?;
+            let (from, to) = (RowId::new(from), RowId::new(to));
+            let kind = RelationKind(kind);
+            relation::remove_edge(Arc::make_mut(&mut state.out_edges), from, to, kind);
+            relation::remove_edge(Arc::make_mut(&mut state.in_edges), to, from, kind);
+        }
+        // 其余帧类型(Update/UpdateRow/BatchBegin/Commit 等)在对应路径处理或忽略。
         _ => {}
     }
     Ok(())

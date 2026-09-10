@@ -10,11 +10,12 @@
 use std::sync::Arc;
 
 use crate::core::error::{MnemeError, Result};
+use crate::core::meta::{self, Meta};
 use crate::core::metric::Metric;
 use crate::persist::msec::{self, EntryData};
 use crate::persist::vsec::{metric_from_u8, metric_to_u8};
 use crate::persist::{
-    Cursor, FORMAT_VERSION, check_version, crc32, put_bytes_u32, put_u32, put_u64,
+    Cursor, FORMAT_VERSION, check_version, crc32, put_bytes_u32, put_i64, put_u32, put_u64,
 };
 
 /// WAL 魔数。
@@ -192,8 +193,29 @@ pub(crate) fn encode_frame(seqno: u64, kind: FrameKind, payload: &[u8]) -> Vec<u
 /// 文件头损坏,或遇到未知帧类型(FC-PERSIST-ERR-001,绝不静默跳过)时返回错误。
 /// 尾部撕裂帧(长度不足/CRC 不符)不计入 `frames` 并停止回放,由调用方截断。
 pub(crate) fn replay(bytes: &[u8]) -> Result<Replay> {
-    parse_file_header(bytes)?;
     let mut frames = Vec::new();
+    let valid_len = visit_frames(bytes, |seqno, kind, payload| {
+        frames.push(Frame {
+            seqno,
+            kind,
+            payload: payload.to_vec(),
+        });
+        Ok(())
+    })?;
+    Ok(Replay { frames, valid_len })
+}
+
+/// 流式遍历 WAL 帧,每帧以 `on_frame(seqno, kind, payload)` 回调,不整体物化
+/// (空间 `O(1)`,批缓冲由调用方自理;设计 04 §3.4)。返回有效字节长度。
+///
+/// # Errors
+/// 文件头损坏或未知帧类型(FC-PERSIST-ERR-001)时返回结构化错误;
+/// 尾部撕裂帧(长度不足/CRC 不符)停止遍历并返回其前长度。
+pub(crate) fn visit_frames(
+    bytes: &[u8],
+    mut on_frame: impl FnMut(u64, FrameKind, &[u8]) -> Result<()>,
+) -> Result<usize> {
+    parse_file_header(bytes)?;
     let mut offset = FILE_HEADER_LEN;
     while offset < bytes.len() {
         // 帧头不足 → 撕裂尾部,停止。
@@ -228,18 +250,11 @@ pub(crate) fn replay(bytes: &[u8]) -> Result<Replay> {
                 reason: format!("wal: 未知帧类型 {kind_byte}"),
             });
         };
-        let payload = bytes[offset + FRAME_HEADER_LEN..frame_end].to_vec();
-        frames.push(Frame {
-            seqno,
-            kind,
-            payload,
-        });
+        let payload = &bytes[offset + FRAME_HEADER_LEN..frame_end];
+        on_frame(seqno, kind, payload)?;
         offset = frame_end;
     }
-    Ok(Replay {
-        frames,
-        valid_len: offset,
-    })
+    Ok(offset)
 }
 
 /// 编码 `Insert` 负载:`[记录体(含长度前缀)][u32 dim][f32 × dim]`。
@@ -318,6 +333,78 @@ pub(crate) fn encode_delete_row(rowid: u64) -> Vec<u8> {
 pub(crate) fn decode_delete_row(payload: &[u8]) -> Result<u64> {
     let mut cursor = Cursor::new(payload, "wal delete_row");
     cursor.u64()
+}
+
+/// 编码 `TouchRow` 负载 `[RowId][i64 at_ms][u32 access_delta][f32 importance_delta]`。
+pub(crate) fn encode_touch_row(
+    rowid: u64,
+    at_ms: i64,
+    access_delta: u32,
+    importance_delta: f32,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u64(&mut out, rowid);
+    put_i64(&mut out, at_ms);
+    put_u32(&mut out, access_delta);
+    out.extend_from_slice(&importance_delta.to_le_bytes());
+    out
+}
+
+/// 解码 `TouchRow` 负载。
+///
+/// # Errors
+/// 长度不足时返回 [`MnemeError::Corrupted`]。
+pub(crate) fn decode_touch_row(payload: &[u8]) -> Result<(u64, i64, u32, f32)> {
+    let mut cursor = Cursor::new(payload, "wal touch_row");
+    let rowid = cursor.u64()?;
+    let at_ms = cursor.i64()?;
+    let access_delta = cursor.u32()?;
+    let importance_delta = f32::from_le_bytes(cursor.take(4)?.try_into().unwrap_or([0; 4]));
+    Ok((rowid, at_ms, access_delta, importance_delta))
+}
+
+/// 编码 `Relate` 负载 `[from][to][kind u16][f32 weight][meta len+bytes]`。
+pub(crate) fn encode_relate(from: u64, to: u64, kind: u16, weight: f32, meta: &Meta) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u64(&mut out, from);
+    put_u64(&mut out, to);
+    out.extend_from_slice(&kind.to_le_bytes());
+    out.extend_from_slice(&weight.to_le_bytes());
+    put_bytes_u32(&mut out, &meta::to_bytes(meta));
+    out
+}
+
+/// 解码 `Relate` 负载。
+///
+/// # Errors
+/// 长度越界或 meta 损坏时返回 [`MnemeError::Corrupted`]。
+pub(crate) fn decode_relate(payload: &[u8]) -> Result<(u64, u64, u16, f32, Meta)> {
+    let mut cursor = Cursor::new(payload, "wal relate");
+    let from = cursor.u64()?;
+    let to = cursor.u64()?;
+    let kind = cursor.u16()?;
+    let weight = f32::from_le_bytes(cursor.take(4)?.try_into().unwrap_or([0; 4]));
+    let meta_len = cursor.u32()? as usize;
+    let meta = meta::from_bytes(cursor.take(meta_len)?)?;
+    Ok((from, to, kind, weight, meta))
+}
+
+/// 编码 `Unrelate` 负载 `[from][to][kind u16]`。
+pub(crate) fn encode_unrelate(from: u64, to: u64, kind: u16) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u64(&mut out, from);
+    put_u64(&mut out, to);
+    out.extend_from_slice(&kind.to_le_bytes());
+    out
+}
+
+/// 解码 `Unrelate` 负载。
+///
+/// # Errors
+/// 长度不足时返回 [`MnemeError::Corrupted`]。
+pub(crate) fn decode_unrelate(payload: &[u8]) -> Result<(u64, u64, u16)> {
+    let mut cursor = Cursor::new(payload, "wal unrelate");
+    Ok((cursor.u64()?, cursor.u64()?, cursor.u16()?))
 }
 
 /// 编码 `Checkpoint` 负载。
@@ -514,6 +601,24 @@ mod tests {
         bytes.extend_from_slice(&crc32(&covered).to_le_bytes());
         bytes.extend_from_slice(&covered);
         assert!(matches!(replay(&bytes), Err(MnemeError::Corrupted { .. })));
+    }
+
+    /// TouchRow / Relate / Unrelate 负载往返一致。
+    #[test]
+    fn wal_touch_relate_roundtrip() {
+        assert_eq!(
+            decode_touch_row(&encode_touch_row(7, 123, 2, 0.5)).expect("touch"),
+            (7, 123, 2, 0.5)
+        );
+        let meta = json!({"why": "link"});
+        assert_eq!(
+            decode_relate(&encode_relate(1, 2, 3, 0.7, &meta)).expect("relate"),
+            (1, 2, 3, 0.7, meta)
+        );
+        assert_eq!(
+            decode_unrelate(&encode_unrelate(1, 2, 3)).expect("unrelate"),
+            (1, 2, 3)
+        );
     }
 
     /// 文件头损坏被检出。
