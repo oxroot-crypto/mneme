@@ -3,7 +3,7 @@
 > **本章目标**:掌握 Rust 的变量、基本类型,以及最重要的**所有权(ownership)**。
 > **前置**:读过 [01 章](01-toolchain.md),会 `cargo build`。
 > **对应源码**:[`src/core/types.rs`](../../src/core/types.rs)、[`src/core/varint.rs`](../../src/core/varint.rs)、
-> [`src/core/metric.rs`](../../src/core/metric.rs)、[`src/memory/table.rs`](../../src/memory/table.rs)。
+> [`src/core/metric.rs`](../../src/core/metric.rs)、[`src/memory/table/state.rs`](../../src/memory/table/state.rs)。
 
 这是全书**最关键**的一章。所有权是 Rust 区别于其他语言的核心,也是初学者最容易卡住的地方。
 读完本章你能理解 mneme 里为什么大量使用 `u32`/`u64`/`f32`、为什么 `newtype` 里直接包一个整数。
@@ -274,7 +274,7 @@ pub(crate) fn hide_latest(&mut self, rowid: RowId) {
 }
 ```
 
-见 [`src/memory/table.rs`](../../src/memory/table.rs)。因此"给写状态拍快照"(`WriterState::clone`)
+见 [`src/memory/table/state.rs`](../../src/memory/table/state.rs)。因此"给写状态拍快照"(`WriterState::clone`)
 只是复制一批 `Arc` 句柄,非常廉价——这是写事务失败回滚与读者无锁扫描的共同前提
 (用法见 [04 §5.1](04-borrowing-strings-slices.md) 与 [07 §4.3](07-iterators-closures.md))。
 

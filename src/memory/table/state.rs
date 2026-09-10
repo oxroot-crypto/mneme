@@ -1,21 +1,26 @@
-//! 内存表结构、写状态与不可变读视图。
-//!
-//! 写路径由 [`Table::writer`] 串行;每次写入完成后由 [`Table::publish`] 把
-//! [`WriterState`] 的 `Arc` 句柄快照成一份 [`ReaderView`] 并原子发布,
-//! 读者克隆该 `Arc` 后即可无锁扫描——这是设计 03 §3/§7 的 L1 落地。
-//!
-//! 物理版本以 [`SlotData`] 表示,下标即 `SlotId`、**只增不减**;被遮蔽/删除的
-//! 版本以 `dead` 位图标记,`as_of` 仍可经版本链读取历史。
+//! 物理槽位与写状态(`table/state.rs`)。
 
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::Arc;
 
 use crate::core::error::{MnemeError, Result};
 use crate::core::meta::Meta;
+use crate::core::options::RelationKind;
 use crate::core::types::{Key, NsId, RowId, SeqNo, SlotId};
 use crate::memory::bitset::BitSet;
-use crate::memory::config::Config;
 use crate::memory::relation::Edge;
+
+use super::view::ReaderView;
+use super::write_op::WriteOp;
+
+/// 单条记录的访问统计(内存累积;L5 起落盘)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AccessStat {
+    /// 最近一次访问时刻(Unix 毫秒)。
+    pub last_access_ms: i64,
+    /// 累计访问次数。
+    pub access_count: u32,
+}
 
 /// 把槽位下标映射为 `SlotId`;超出 `u32::MAX` 时返回结构化错误,绝不静默饱和
 /// (FC-MEM-INV-004)。
@@ -27,15 +32,6 @@ pub(crate) fn slot_id_for(len: usize) -> Result<SlotId> {
             limit: u32::MAX as usize,
             got: len,
         })
-}
-
-/// 单条记录的访问统计(内存累积;L5 起落盘)。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct AccessStat {
-    /// 最近一次访问时刻(Unix 毫秒)。
-    pub last_access_ms: i64,
-    /// 累计访问次数。
-    pub access_count: u32,
 }
 
 /// 一个物理版本(不可变,`Arc` 共享)。下标即 `SlotId`。
@@ -93,11 +89,14 @@ pub(crate) struct WriterState {
     // 反馈幂等键(I27);L1 常驻内存,L5 随访问统计一并落盘。经 `Arc` COW,
     // 使批量写入快照(`WriterState::clone`)与回滚不深拷贝该集合。
     pub(crate) feedback_seen: Arc<HashSet<(RowId, u64)>>,
+    // 当前写事务待持久化的操作;由 `write_tx` 在成功后交给 [`super::PersistHook`]。
+    pub(crate) pending: Vec<WriteOp>,
     pub(crate) closed: bool,
 }
 
 impl WriterState {
-    fn new() -> Self {
+    /// 构造空写状态(无段、无版本、`SeqNo`/`RowId`/`NsId` 水位从零开始)。
+    pub(crate) fn new() -> Self {
         Self {
             slots: Arc::new(Vec::new()),
             dead: Arc::new(BitSet::default()),
@@ -114,6 +113,7 @@ impl WriterState {
             ns_registry: Arc::new(HashMap::new()),
             ns_by_path: Arc::new(HashMap::new()),
             feedback_seen: Arc::new(HashSet::new()),
+            pending: Vec::new(),
             closed: false,
         }
     }
@@ -145,8 +145,48 @@ impl WriterState {
         self.next_ns_id += 1;
         let path: Arc<str> = Arc::from(path);
         Arc::make_mut(&mut self.ns_registry).insert(id, path.clone());
-        Arc::make_mut(&mut self.ns_by_path).insert(path, id);
+        Arc::make_mut(&mut self.ns_by_path).insert(path.clone(), id);
+        self.pending.push(WriteOp::NsRegister {
+            ns_id: id.get(),
+            path,
+        });
         id
+    }
+
+    /// 建立/更新关系边并记录 WAL 操作。
+    pub(crate) fn relate_edge(&mut self, edge: Edge) {
+        crate::memory::relation::upsert_edge(Arc::make_mut(&mut self.out_edges), edge.clone());
+        crate::memory::relation::upsert_edge(Arc::make_mut(&mut self.in_edges), edge.clone());
+        let seqno = self.alloc_seqno();
+        self.pending.push(WriteOp::Relate {
+            from: edge.from,
+            to: edge.to,
+            kind: edge.kind.0,
+            weight: edge.weight,
+            meta: edge.metadata,
+            seqno,
+        });
+    }
+
+    /// 删除关系边并记录 WAL 操作;未命中返回 `false` 且不消耗序号。
+    pub(crate) fn unrelate_edge(&mut self, from: RowId, to: RowId, kind: RelationKind) -> bool {
+        let removed = crate::memory::relation::remove_edge(
+            Arc::make_mut(&mut self.out_edges),
+            from,
+            to,
+            kind,
+        );
+        crate::memory::relation::remove_edge(Arc::make_mut(&mut self.in_edges), to, from, kind);
+        if removed {
+            let seqno = self.alloc_seqno();
+            self.pending.push(WriteOp::Unrelate {
+                from,
+                to,
+                kind: kind.0,
+                seqno,
+            });
+        }
+        removed
     }
 
     /// 把某 `RowId` 的当前最新版本标记为不可见(被遮蔽/删除)。
@@ -199,9 +239,23 @@ impl WriterState {
     pub(crate) fn commit_version(&mut self, rowid: RowId, slot_data: SlotData) -> Result<SlotId> {
         let slot = slot_id_for(self.slots.len())?;
         ensure_key_available(self, &slot_data)?;
+        let deleted = slot_data.deleted;
+        let seqno = slot_data.seqno;
+        let tx_ms = slot_data.tx_ms;
         self.hide_latest(rowid);
-        Arc::make_mut(&mut self.slots).push(Arc::new(slot_data));
+        let arc = Arc::new(slot_data);
+        Arc::make_mut(&mut self.slots).push(Arc::clone(&arc));
         self.link_version(rowid, slot);
+        // 记录待持久化操作:墓碑落 `DeleteRow`,其余落完整新版本 `Insert`。
+        if deleted {
+            self.pending.push(WriteOp::DeleteRow {
+                rowid,
+                seqno,
+                tx_ms,
+            });
+        } else {
+            self.pending.push(WriteOp::Insert { slot: arc });
+        }
         Ok(slot)
     }
 
@@ -261,112 +315,6 @@ fn ensure_key_available(ws: &WriterState, slot_data: &SlotData) -> Result<()> {
         return Err(MnemeError::DuplicateKey(key.clone()));
     }
     Ok(())
-}
-
-/// 不可变读视图:读者克隆后无锁扫描。
-pub(crate) struct ReaderView {
-    pub(crate) slots: Arc<Vec<Arc<SlotData>>>,
-    pub(crate) dead: Arc<BitSet>,
-    pub(crate) key_index: Arc<HashMap<(NsId, Key), RowId>>,
-    pub(crate) versions: Arc<HashMap<RowId, Vec<SlotId>>>,
-    pub(crate) latest: Arc<HashMap<RowId, SlotId>>,
-    pub(crate) out_edges: Arc<HashMap<RowId, Vec<Edge>>>,
-    pub(crate) in_edges: Arc<HashMap<RowId, Vec<Edge>>>,
-    pub(crate) access: Arc<HashMap<RowId, AccessStat>>,
-    pub(crate) ns_registry: Arc<HashMap<NsId, Arc<str>>>,
-    pub(crate) seqno: SeqNo,
-    /// 库是否已关闭(关闭后读写返回 `Closed`)。
-    pub(crate) closed: bool,
-}
-
-impl ReaderView {
-    /// 返回 `rowid` 当前可见的物理槽位(被遮蔽/墓碑则为 `None`)。
-    pub(crate) fn live_slot(&self, rowid: RowId) -> Option<SlotId> {
-        let slot = *self.latest.get(&rowid)?;
-        if self.dead.get(slot.get() as usize) {
-            return None;
-        }
-        let slot_data = self.slots.get(slot.get() as usize)?;
-        if slot_data.deleted {
-            return None;
-        }
-        Some(slot)
-    }
-
-    /// 按 `(ns_id, key)` 解析稳定 `RowId`。
-    pub(crate) fn rowid_of_key(&self, ns_id: NsId, key: &Key) -> Option<RowId> {
-        self.key_index.get(&(ns_id, key.clone())).copied()
-    }
-}
-
-/// 内存表:写状态 + 已发布读视图 + 配置。
-pub(crate) struct Table {
-    pub(crate) writer: Mutex<WriterState>,
-    pub(crate) reader: RwLock<Arc<ReaderView>>,
-    pub(crate) config: Arc<Config>,
-}
-
-impl Table {
-    /// 以给定配置新建空表。
-    pub(crate) fn new(config: Arc<Config>) -> Self {
-        let writer = WriterState::new();
-        let view = Arc::new(writer.snapshot());
-        Self {
-            writer: Mutex::new(writer),
-            reader: RwLock::new(view),
-            config,
-        }
-    }
-
-    /// 获取写锁;锁中毒时恢复内部数据继续工作(不 panic)。
-    pub(crate) fn write(&self) -> MutexGuard<'_, WriterState> {
-        self.writer
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// 获取读锁。
-    pub(crate) fn read(&self) -> RwLockReadGuard<'_, Arc<ReaderView>> {
-        self.reader
-            .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    /// 克隆当前读视图。
-    pub(crate) fn view(&self) -> Arc<ReaderView> {
-        Arc::clone(&self.read())
-    }
-
-    /// 把写状态发布为新的读视图(调用方须持有写锁)。
-    pub(crate) fn publish(&self, ws: &WriterState) {
-        let view = Arc::new(ws.snapshot());
-        let mut guard: RwLockWriteGuard<'_, Arc<ReaderView>> = self
-            .reader
-            .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        *guard = view;
-    }
-
-    /// 在写事务中执行 `f`:进入前快照写状态,`f` 返回 `Err` 时回滚到快照、
-    /// 不发布;成功时发布读视图。
-    ///
-    /// 所有容器字段均为 `Arc`,`clone` 仅复制句柄,故快照/回滚廉价。此机制保证
-    /// 任何失败的写操作对读者零可见、不留半写(FC-MEM-POST-002 泛化),并让
-    /// 失败写入不残留命名空间登记等副作用。
-    pub(crate) fn write_tx<T>(&self, f: impl FnOnce(&mut WriterState) -> Result<T>) -> Result<T> {
-        let mut ws = self.write();
-        let snapshot = ws.clone();
-        match f(&mut ws) {
-            Ok(value) => {
-                self.publish(&ws);
-                Ok(value)
-            }
-            Err(error) => {
-                *ws = snapshot;
-                Err(error)
-            }
-        }
-    }
 }
 
 #[cfg(test)]

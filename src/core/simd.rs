@@ -9,6 +9,10 @@
 //! * aarch64:使用 NEON 内核(NEON 为基线)。
 //! * 其它架构:标量参考实现。
 
+/// `_mm_shuffle_ps` 立即数:取每对 32 位元素中的高元素(即 `imm[1:0] = 0b01`)。
+#[cfg(target_arch = "x86_64")]
+const SHUFFLE_TAKE_HIGHEST: i32 = 0x1;
+
 /// 计算两个等长 f32 向量的点积。
 ///
 /// # Arguments
@@ -112,7 +116,7 @@ mod x86 {
             let sum128 = _mm_add_ps(lo, hi);
             let shuffled = _mm_movehl_ps(sum128, sum128);
             let pairs = _mm_add_ps(sum128, shuffled);
-            let high = _mm_shuffle_ps(pairs, pairs, 0x1);
+            let high = _mm_shuffle_ps(pairs, pairs, super::SHUFFLE_TAKE_HIGHEST);
             _mm_cvtss_f32(_mm_add_ss(pairs, high))
         };
         while i < n {
@@ -141,7 +145,7 @@ mod x86 {
             }
             let shuffled = _mm_movehl_ps(acc, acc);
             let pairs = _mm_add_ps(acc, shuffled);
-            let high = _mm_shuffle_ps(pairs, pairs, 0x1);
+            let high = _mm_shuffle_ps(pairs, pairs, super::SHUFFLE_TAKE_HIGHEST);
             _mm_cvtss_f32(_mm_add_ss(pairs, high))
         };
         while i < n {

@@ -39,6 +39,14 @@
 
 | 日期 | 变更 |
 |---|---|
+| 2026-09 | L2 合并前独立审查整改:① WAL 撕裂尾部在可写重开时**物理截断**(`FC-PERSIST-INV-005`),修复残尾永久屏蔽后续追加导致的数据丢失;② 首次 flush 崩溃(段已写、MANIFEST 未提交)在有 WAL 时以 WAL 重建并清理孤儿段,不再误判 `Corrupted`(`FC-PERSIST-STA-003`,`FC-PERSIST-ERR-005` 收紧为「无 MANIFEST 且无 WAL」);③ MANIFEST 引用的段文件缺失/为空 → `Corrupted`,绝不静默跳过(`FC-PERSIST-ERR-006`);④ 只读打开绝不建目录/清 trash,库目录不存在 → `Config`(`FC-PERSIST-ERR-003` 扩展);⑤ WAL `Insert`/`DeleteRow` 帧携带 `tx_ms`,崩溃恢复后 `as_of` 历史正确(`FC-PERSIST-POST-006`,`FC-PERSIST-POST-005` 补访问统计断言);⑥ WAL 落盘即提交点,后台 flush 失败不回滚已提交写(`FC-PERSIST-INV-006`);⑦ `BatchCommit` 回放校验计数与 `batch_crc`;⑧ 锁改用 `std::fs::File::try_lock` OS 咨询锁(进程终止由内核自动释放,消除 24h 陈旧锁阻塞与接管 TOCTOU,`LOCK` 文件保留不删);⑨ 删除未接线的 `src/persist/delta/**`(孤儿实现,区域保留给 L5);⑩ 未受信长度按剩余字节数设预分配上界;⑪ 移除 `#[allow(dead_code)]`,删除/测试化真正未用项;`FC-PERSIST-CPLX-007` 修正为 L2 整段读入口径(不再声称 mmap 惰性) |
+| 2026-09 | L2 复审补齐(契约漂移修复):① 目录状态不一致(`current` 存在但无合法 MANIFEST;存在段文件却无 MANIFEST)→ `Corrupted`,绝不覆盖(新增 `FC-PERSIST-ERR-005`);② 段主版本过新即使默认非 fail-fast 也拒绝打开(修 I18 此前被降级为跳过,`FC-PERSIST-ERR-002` 收紧);③ `check()` 扩展为逐段 CRC + 版本链校验(设计 16 §1.6);④ 只读打开不创建/改写 WAL、空事务不误报(`FC-PERSIST-ERR-003` 补测试);⑤ MANIFEST 未引用的段孤儿在可写打开时清理(`FC-PERSIST-STA-002` 补测试);⑥ 时钟回拨单调钳制 `MonotonicClock`(设计 04 §10.2,`FC-GLOBAL-PRE-005` 转 Passed);⑦ 16 §1.1 未落地 setter(encryption/compression/storage/read_only_probe_interval)标注所属层 |
+| 2026-09 | L2 范围界定(文档对齐,与实现一致):① 公开 `Storage` trait 与 `Builder::storage` 推迟到 **L12**(WASM/OPFS 首个非 `FsStorage` 后端出现时抽取),L2 用 `persist/storage.rs` 的 `std::fs` 自由函数,已同步 12 §3.1 与 16 §1.1;② feature `encrypt`/`compress`/`compress-zstd` 的**实现**归 [11 安全存储](../design/11-security-storage.md),L2 仅按 04 §2.5 预留 `header_len` 扩展区(`key_id`/`codec` 缺省 0),磁盘布局在 feature 关闭时逐字节成立;③ `memmap2`/`MmapSource`(L3)、`VectorStore`(L3) 沿用前条目裁定 |
+| 2026-09 | L2 完整性补齐:① `touch`/`relate`/`unrelate` 落 WAL(`WriteOp::Access/Relate/Unrelate`,回放重建访问统计与关系边,`FC-PERSIST-POST-005` 转 Passed);② WAL **组提交**(一个写事务仅 1 次 fsync,`FC-PERSIST-CPLX-001` Passed)与 **WAL 容量自动兜底**(达 `wal_bytes` 触发全量快照 flush,`FC-PERSIST-INV-004` Passed);③ `stats()` 回填真实段/WAL/trash 统计(`FC-PERSIST-INV-003` Passed);④ 恢复清理崩溃残留 `.tmp`(`FC-PERSIST-STA-002` Passed)、已提交段 write-once(`FC-PERSIST-STA-001` Passed)、Checkpoint 先物化后截断(`FC-PERSIST-POST-002` Passed)、`verify_on_open`+fail-fast 损坏拒绝(`FC-PERSIST-INV-002` 补测试);⑤ `wal::visit_frames` 流式回放(空间 $O(1)$)。L2 `FC-PERSIST-CPLX-001..003、006..010` 以「解析证明 + 哨兵/操作计数」置 Passed;`CPLX-004/005`(zone map/bloom 扫描评估)属 L4 查询层,保持 Planned 并注明 L2 仅占位空区 |
+| 2026-09 | 落地 L2 加固(M3):新增 `persist/hook.rs` 的公开 `FsyncHook`/`IoAction` 与 `Builder::fsync_hook`(测试崩溃注入,设计 04 §10.1),WAL 写/fsync 与段/MANIFEST 写前置触发;`Store::backup_to` 实现(flush → 复制段/MANIFEST/WAL → `current` 最后写,产物可独立 open,设计 16 §7);`Mneme::backup_to` 接线。新增测试 `injected_wal_failure_keeps_confirmed_prefix`(FC-PERSIST-INV-001)与 `backup_is_independently_openable`(新增 `FC-PERSIST-POST-004`);新增 `FC-PERSIST-POST-005`(Planned:`touch`/`relate` WAL 帧持久性待补,当前仅经 flush 快照持久),`FC-PERSIST-INV-019` 收敛为「记录级」 |
+| 2026-09 | 落地 L2 持久化接线(M2):新增 `persist/store.rs` 协调句柄(实现内存引擎 `PersistHook`,WAL-before-visible + 批 `BatchBegin/Commit` + Checkpoint 重置);`flush` 采用 **全量快照**(设计 04 §3.2 的 L2 兜底)写 vsec/msec + write-once MANIFEST,`open` 由「MANIFEST/段/WAL」重建状态并回放 `seqno > watermark`;`close` 先 flush 再释放锁。`FC-PERSIST-INV-001/019/020`、`FC-PERSIST-POST-001/003`、`FC-PERSIST-ERR-001/002/003/004` 置 `Passed`(测试见 `tests/persist_contracts.rs` 与 `src/persist/*.rs` 单测);`FC-MEM-ERR-002` 收紧:`open`/`path` 已落地,新建持久库缺维度改返回 `Config`。WAL `Insert` 负载补 `[u32 dim][f32×dim]` 向量副本(设计 04 §2.3 的记录体不含向量,否则未 flush 记录重启后丢失),已同步 04 §2.3。门面(`memory::Builder`/`Mneme`)作为单一 crate 组合根引用 `persist`(构成根例外,不改变 L0→L6 业务依赖方向) |
+| 2026-09 | 文档对齐(实现与设计一致性):① `VectorStore` 内部 trait 按 03 §8/04 §14 明确为 **L3 随 HNSW 引入**,L1/L2 直接实现同一组公开签名,同步修订 01 §2「接口先于实现」表述;② 04 §11 明确 L2 仅提供 `FileSource`,`MmapSource`/`mmap` 自 L3 引入(依 01 §5 依赖表);③ 04 §10.1 `FsyncHook`/`IoAction` 明确经 `Builder::fsync_hook` 公开注入(测试 seam),不再表述为"仅测试 builder 暴露" |
+| 2026-09 | 启动 L2 持久层实现:① 新增 `crc32fast` 直接依赖(白名单 L2)、`tempfile` dev-dep;② 按 01 §5 依赖表(§5 权威)`memmap2` 自 L3 引入,L2 仅提供 `SegmentSource`+`FileSource`(std),`MmapSource`/`mmap` feature 推迟至 L3,并据此澄清 04 §11;③ `VectorStore` 内部接口(`Target`/`SearchOpt`/`EntryRef`)按 03 §8/04 §14 随 **L3 HNSW** 引入,L2 **不**引入、持久层直接复用公开签名(后续「文档对齐」「范围界定」条目已确认);④ L2 契约测试文件 `tests/persist_contracts.rs` 登记进 `tests/contract_traceability.rs` 双向追溯门禁,条目自 M1 起由 `待补` 回填真实测试路径 |
 | 2026-09 | 终审扫尾整改:① `supersede` 此前不查墓碑,`delete` 后调用会把记录复活;现与 `update` 同口径——已墓碑记录返回 `NotFound`、绝不复活(FC-MODEL-POST-003 收紧)。② `WriterState::commit_version` 新增 key 占用预检:新版本携带的 key 若已被**另一可见记录**占用(合并/替换回调改变 key 时的冲突),返回 `DuplicateKey` 并整体回滚,绝不静默覆盖他人 `key_index`(FC-MEM-POST-007 收紧,§0.2 `DuplicateKey` 触发条件扩展)。③ `touch`/`touch_by_rowid` 此前不查逻辑过期,现仅对可见记录生效、否则返回 `false`,与 `feedback`/读路径同口径(新增 FC-MEM-POST-009)。④ `BitSet` 拆出 `src/memory/bitset.rs`,`table.rs` 收敛至 400 行内(rust 规范 §3) |
 | 2026-09 | 合并前阻断项修复(B1):① `supersede` 新版本此前直接采用 `rec.key`,省略 key 时丢失目标 key 并留下悬挂 `key_index`(违反新增的 FC-MEM-POST-008,使 `get`/`check`/带 key 的 `as_of` 失准)。现改为信念修订沿用目标 key(省略即继承,显式冲突 → 新增 `KeyMismatch`),并在 `WriterState::link_version` 中于 key 变化时移除旧映射(覆盖 `Dedup::Merge` 改 key 场景),同步 §0.2 错误矩阵与 FC-MODEL-POST-003/FC-MEM-POST-007。② 引入写事务 `Table::write_tx`:所有写操作失败回滚到操作前状态且不发布,修复单条 `insert`/`feedback` 等失败后残留半写(如命名空间登记、访问计数、关系边)并在下次 publish 泄漏的问题,落实 FC-MEM-POST-002 零部分写入(新增 `failed_writes_do_not_register_namespace`)。③ 补 FC-MEM-POST-008 的逻辑过期用例(`check_reports_healthy_after_expiry`)。④ Rust 规范整改:`validate_insert`/`validate_patch` 拆分共享校验、`find_duplicate`/`rerank_composite` 收敛为参数结构体、`cluster_by_similarity`/`iter_with` 降低嵌套、`engine`/`namespace::query` 拆分至 400 行内 |
 | 2026-09 | 合并前终审整改:① `check()` 误报修复——此前把「key 索引指向墓碑行」当作不一致,导致任意 `delete`/`drop_namespace` 后健康库 `ok=false`;现改为按最新版本 `ns_id`/`key` 对账,墓碑/逻辑过期不算不一致(新增 FC-MEM-POST-008);② `InsertMode::RejectDuplicate` 逻辑过期记录视为不存在(此前过期记录仍 `DuplicateKey`,与 `exists`/`Dedup::Reject` 口径不一致),`FC-MEM-POST-001` 措辞收紧;③ `WriterState::commit_version` 先校验槽位容量再遮蔽旧版本,消除容量溢出时「已遮蔽但无新版本」的半写,`supersede` 的旧版本 `valid_to` 闭合移至提交成功之后,落实 FC-MEM-PRE-002 零部分写入;④ `feedback` 幂等键改为生效后再登记,失败不占用;`feedback_seen` 经 `Arc` COW,批量快照/回滚不再深拷贝(修正 `WriterState` 注释) |
@@ -86,7 +94,7 @@
 | `LimitExceeded { field, limit, got }` | 参数越上限(维度、`top_k`、`ef`) | FC-CORE-PRE-001、FC-GLOBAL-PRE-004、FC-MEM-PRE-003 | 原 `Invalid("top_k 超过上限")` 等 |
 | `MetaTooDeep { limit, got }` | metadata 嵌套深度超限 | FC-GLOBAL-PRE-003、FC-MEM-PRE-002 | 原 `Invalid("metadata 嵌套过深")` |
 | `Config { reason }` | 建库/查询配置非法(缺维度、无查询通道、MMR `lambda` 非有限值)、策略参数含非有限值(`min_importance`/`access_weight`/`threshold`/`dedup_threshold`)或越界(`dedup_threshold`/`threshold` ∉ [0,1])或非法(`max_cluster = 0`) | FC-MEM-STA-001、FC-MEM-PRE-003、FC-MODEL-POST-006、FC-LIFE-POST-002、FC-GLOBAL-PRE-004 | 原 `Invalid("新建内存库必须指定维度")` 等 |
-| `Unsupported { feature }` | 能力延后到后续层,绝不静默降级(`Fusion` 单独设置即拒绝,无需 text 通道) | FC-MEM-ERR-002 | open/backup/path/BM25/Fusion |
+| `Unsupported { feature }` | 能力延后到后续层,绝不静默降级(`Fusion` 单独设置即拒绝,无需 text 通道;`open`/`path`/持久库 `backup_to` 已在 L2 落地;只读模式写亦返回本变体) | FC-MEM-ERR-002、FC-PERSIST-ERR-003 | BM25/Fusion/text、只读写、**纯内存库** backup |
 | `Inconsistent { reason }` | 内部不变量被破坏 | FC-MEM-INV-004 | 原 `Invalid("去重命中但记录不可见")` |
 
 > **迁移说明(破坏性变更)**:`Invalid(&'static str)` 已移除。调用方若曾按字符串匹配
@@ -142,10 +150,10 @@
 | FC-MEM-INV-001 | INV | `RowId` 跨 `update`/upsert 不变,访问统计与关系边始终指向同一逻辑记忆(I22) | `tests/memory_contracts.rs::upsert_keeps_rowid_and_rejects_duplicate`、`tests/memory_contracts.rs::seqno_and_rowid_stable_prop` | Passed |
 | FC-MEM-INV-002 | INV | `SeqNo` 全库单调递增、永不复用;快照以 seqno 水位界定可见版本 | `tests/memory_contracts.rs::upsert_keeps_rowid_and_rejects_duplicate`、`tests/memory_contracts.rs::seqno_and_rowid_stable_prop` | Passed |
 | FC-MEM-INV-003 | INV | **排序全等性**(FC-INDEX-POST-003):同一快照内任意两次同参数 `execute()` 结果逐位相同,同分按 `RowId` 升序 | `tests/query_contracts.rs::search_order_is_total_and_stable` | Passed |
-| FC-MEM-INV-004 | INV | `SlotId` 随物理版本单调递增、永不复用;槽位容量溢出(`u32::MAX`)返回结构化错误,绝不静默饱和 | `src/memory/table.rs::slot_id_for_rejects_overflow` | Passed |
+| FC-MEM-INV-004 | INV | `SlotId` 随物理版本单调递增、永不复用;槽位容量溢出(`u32::MAX`)返回结构化错误,绝不静默饱和 | `src/memory/table/state.rs::slot_id_for_rejects_overflow` | Passed |
 | FC-MEM-STA-001 | STA | 库生命周期五元组 `M=(States={Open,Closed}, Events={Close}, δ(Open,Close)=Closed, δ(Closed,Close)=Closed, s0=Open, F={Closed})`;`Closed` 后经任意句柄读写 → `Closed`;重复 `close` 幂等返回 `Ok` | `tests/life_contracts.rs::database_lifecycle_open_closed` | Passed |
 | FC-MEM-ERR-001 | ERR | `close` 后(经任意克隆句柄)读写返回 `Closed`;重复 `close` 返回 `Ok`(幂等) | `tests/life_contracts.rs::closed_database_rejects_operations` | Passed |
-| FC-MEM-ERR-002 | ERR | L1 尚未落地的能力以结构化 `Unsupported{feature}` 返回、绝不静默:`text`/`Fusion`(L4,`Fusion` 单独设置即拒绝)、`open`/`backup_to`/`path`(L2) | `tests/life_contracts.rs::deferred_features_return_structured_errors` | Passed |
+| FC-MEM-ERR-002 | ERR | 尚未落地的能力以结构化 `Unsupported{feature}` 返回、绝不静默:`text`/`Fusion`(L4,`Fusion` 单独设置即拒绝)、**纯内存库** `backup_to`(持久库已在 L2 实现,见 `FC-PERSIST-POST-004`);`open`/`path` 已在 L2 落地(新建持久库缺维度返回 `Config`,不再是 `Unsupported`) | `tests/life_contracts.rs::deferred_features_return_structured_errors` | Passed |
 
 ---
 
@@ -153,19 +161,31 @@
 
 | 编号 | 类型 | 形式化规范 | 对应测试 | 状态 |
 |---|---|---|---|---|
-| FC-PERSIST-INV-001 | INV | **I1**:已确认写入不半写;未确认写入重启后要么完整可见要么不存在 | 待补 | Planned |
-| FC-PERSIST-INV-002 | INV | **I2**:任意 bit 损坏可检出或拒绝启动,绝不静默返回错误数据 | 待补 | Planned |
-| FC-PERSIST-INV-003 | INV | **I3**:活跃段集合 = 某 MANIFEST 版本所列集合 | 待补 | Planned |
-| FC-PERSIST-INV-004 | INV | **I4**:WAL 总量 ≤ `wal_bytes`;段文件只增不改 | 待补 | Planned |
-| FC-PERSIST-INV-019 | INV | **I19**:`delete`/`update`/`touch`/`relate` 返回 `Ok` 后,崩溃 + WAL 截断仍生效,删除永不复活 | 待补 | Planned |
-| FC-PERSIST-INV-020 | INV | **I20**:`path↔NsId`、`next_ns_id`、`next_rowid` 可由 MANIFEST+WAL 重建,ID 永不复用 | 待补 | Planned |
-| FC-PERSIST-POST-001 | POST | **I15**:`insert_batch` 整批原子:可见记录数 ∈ {0, n},无部分批 | 待补 | Planned |
-| FC-PERSIST-POST-002 | POST | Checkpoint 仅当 `seqno ≤ watermark` 的覆盖条目已物化时才截断 WAL | 待补 | Planned |
-| FC-PERSIST-POST-003 | POST | **I16**:`close()` 返回 `Ok` 后所有已确认写入持久;`Drop` 不保证 | 待补 | Planned |
-| FC-PERSIST-ERR-001 | ERR | 未知 WAL 帧类型 → 停止回放并报错,不静默跳过 | 待补 | Planned |
-| FC-PERSIST-ERR-002 | ERR | 更高主版本 → `UnsupportedVersion`(I18) | 待补 | Planned |
-| FC-PERSIST-STA-001 | STA | 段生命周期:`Building → Committed → Obsolete → (trash)`;`Committed` 段内容不可变 | 待补 | Planned |
-| FC-PERSIST-STA-002 | STA | 崩溃点状态:`Building` 段为孤儿,恢复时清理;不进入任何 MANIFEST 视图 | 待补 | Planned |
+| FC-PERSIST-INV-001 | INV | **I1**:已确认写入不半写;未确认写入重启后要么完整可见要么不存在;写事务 append/sync 失败时截断半写帧(失败写绝不持久、不遮挡后续已确认写) | `tests/persist_contracts.rs::reopen_after_close_recovers_records`、`tests/persist_contracts.rs::reopen_after_drop_recovers_from_wal`、`tests/persist_contracts.rs::injected_wal_failure_keeps_confirmed_prefix`、`tests/persist_contracts.rs::injected_fsync_failure_rolls_back_frames` | Passed |
+| FC-PERSIST-INV-002 | INV | **I2**:任意 bit 损坏可检出或拒绝启动,绝不静默返回错误数据 | `src/persist/vsec.rs::vsec_detects_header_corruption`、`src/persist/vsec.rs::vsec_detects_payload_corruption`、`src/persist/manifest.rs::manifest_detects_header_corruption`、`src/persist/manifest.rs::manifest_detects_payload_corruption`、`src/persist/wal/mod.rs::wal_bad_crc_stops_replay`、`tests/persist_contracts.rs::verify_on_open_detects_payload_corruption`、`tests/persist_contracts.rs::check_detects_corrupt_segment` | Passed |
+| FC-PERSIST-INV-003 | INV | **I3**:活跃段集合 = 某 MANIFEST 版本所列集合 | `tests/persist_contracts.rs::flush_checkpoints_after_materialize` | Passed |
+| FC-PERSIST-INV-004 | INV | **I4**:WAL 总量 ≤ `wal_bytes`;段文件只增不改 | `tests/persist_contracts.rs::wal_capacity_triggers_snapshot_flush`、`tests/persist_contracts.rs::committed_segment_is_write_once` | Passed |
+| FC-PERSIST-INV-005 | INV | **I1(撕裂尾部)**:可写重开时物理截断 WAL 撕裂尾部(有效长度 = 头部 + 完整帧),使截断之后的追加写入不被残尾永久屏蔽;有效前缀不受影响;WAL 短于文件头(Checkpoint 重置中途崩溃)视为撕裂头并重建,不拒绝打开 | `tests/persist_contracts.rs::torn_wal_tail_truncated_on_reopen`、`tests/persist_contracts.rs::short_wal_header_is_recreated_on_open` | Passed |
+| FC-PERSIST-INV-006 | INV | **I1(提交点)**:WAL 帧成功 fsync 即为提交点;其后后台 flush 失败不回滚已提交写,绝不出现「返回 `Err` 但重启后可见」的矛盾(flush 失败由下次写重试,`stats().wal_bytes` 可观测) | `tests/persist_contracts.rs::flush_failure_does_not_lose_committed_write` | Passed |
+| FC-PERSIST-INV-019 | INV | **I19(记录级)**:`delete`/`update` 返回 `Ok` 后,崩溃 + WAL 截断仍生效,删除永不复活(`touch`/`relate` 的 WAL 帧见 FC-PERSIST-POST-005) | `tests/persist_contracts.rs::delete_survives_flush_and_reopen`、`tests/persist_contracts.rs::crash_after_delete_does_not_resurrect`、`tests/persist_contracts.rs::update_survives_reopen` | Passed |
+| FC-PERSIST-INV-020 | INV | **I20**:`path↔NsId`、`next_ns_id`、`next_rowid` 可由 MANIFEST+WAL 重建,ID 永不复用 | `tests/persist_contracts.rs::namespace_and_rowid_survive_reopen` | Passed |
+| FC-PERSIST-POST-001 | POST | **I15**:`insert_batch` 整批原子:可见记录数 ∈ {0, n},无部分批 | `tests/persist_contracts.rs::batch_insert_is_atomic_across_reopen` | Passed |
+| FC-PERSIST-POST-002 | POST | Checkpoint 仅当 `seqno ≤ watermark` 的覆盖条目已物化时才截断 WAL | `tests/persist_contracts.rs::flush_checkpoints_after_materialize` | Passed |
+| FC-PERSIST-POST-003 | POST | **I16**:`close()` 返回 `Ok` 后所有已确认写入持久;`Drop` 不保证 | `tests/persist_contracts.rs::reopen_after_close_recovers_records` | Passed |
+| FC-PERSIST-POST-004 | POST | `backup_to` 先 flush 再复制段/MANIFEST/WAL,`current` 最后写;产物可独立 `open`(设计 16 §7) | `tests/persist_contracts.rs::backup_is_independently_openable` | Passed |
+| FC-PERSIST-POST-005 | POST | `touch`/`relate`/`unrelate` 的 WAL 帧持久性:崩溃后回放 `TouchRow`/`Relate`/`Unrelate` 帧,`access_count`/访问时刻与关系边不丢失(importance 强化随版本 `Insert`)、unrelate 不复活 | `tests/persist_contracts.rs::relate_and_unrelate_survive_crash`、`tests/persist_contracts.rs::touch_boost_survives_crash`、`src/persist/wal/mod.rs::wal_touch_relate_roundtrip` | Passed |
+| FC-PERSIST-POST-006 | POST | WAL `Insert`/`DeleteRow` 帧携带版本事务时间 `tx_ms`;崩溃恢复后 `as_of(t)` 历史正确(删除前时点可见、删除后不可见),不以记录体 `created_at` 或 `0` 代替 | `tests/persist_contracts.rs::as_of_history_survives_reopen` | Passed |
+| FC-PERSIST-ERR-001 | ERR | 未知 WAL 帧类型 → 停止回放并报错,不静默跳过 | `src/persist/wal/mod.rs::wal_unknown_frame_type_errors` | Passed |
+| FC-PERSIST-ERR-002 | ERR | 更高主版本 → `UnsupportedVersion`(I18),段级过新版本即使默认非 fail-fast 也拒绝打开、绝不降级为跳过 | `src/persist/vsec.rs::vsec_rejects_higher_major`、`src/persist/manifest.rs::manifest_rejects_higher_major`、`tests/persist_contracts.rs::higher_major_segment_is_rejected` | Passed |
+| FC-PERSIST-ERR-003 | ERR | 只读模式写操作 → `Unsupported { feature: "只读模式写入" }`,绝不静默;只读打开不创建/改写 WAL(设计 04 §13);只读打开绝不改动文件系统(不建目录、不清 `trash/`),库目录不存在 → `Config` | `tests/persist_contracts.rs::read_only_rejects_writes`、`tests/persist_contracts.rs::read_only_open_does_not_create_wal`、`tests/persist_contracts.rs::read_only_open_does_not_mutate` | Passed |
+| FC-PERSIST-ERR-004 | ERR | 打开时显式维度与 MANIFEST 不符 → `DimensionMismatch`,拒绝打开(设计 16 §3) | `tests/persist_contracts.rs::dimension_mismatch_rejected_on_open` | Passed |
+| FC-PERSIST-ERR-005 | ERR | 目录状态不一致(`current` 存在但无合法 MANIFEST,或存在段文件却既无 MANIFEST 也无 WAL)→ `Corrupted`,绝不当作新库覆盖既有数据(设计 16 §3)。注:段文件存在但**有 WAL** 属首次 flush 崩溃,见 `FC-PERSIST-STA-003`,不返回 `Corrupted` | `tests/persist_contracts.rs::corrupt_current_without_valid_manifest_is_rejected`、`tests/persist_contracts.rs::segments_without_manifest_are_rejected` | Passed |
+| FC-PERSIST-ERR-006 | ERR | MANIFEST 引用的段文件缺失或为空 → `Corrupted`,绝不静默跳过而少返回数据(I2/I3) | `tests/persist_contracts.rs::referenced_segment_missing_is_rejected`、`tests/persist_contracts.rs::referenced_segment_empty_is_rejected` | Passed |
+| FC-PERSIST-ERR-007 | ERR | WAL `BatchCommit` 的批内帧计数与 `batch_crc` 在回放时校验;不符 → `Corrupted`,拒绝应用半批,绝不静默(I15);未闭合批(缺 `BatchCommit`)不计入已提交长度,重开时截断,绝不吞掉其后单操作事务 | `src/persist/recover/replay.rs::replay_rejects_mismatched_batch_crc`、`src/persist/recover/replay.rs::replay_rejects_mismatched_batch_count`、`src/persist/recover/replay.rs::replay_applies_well_formed_batch`、`src/persist/recover/replay.rs::unclosed_batch_is_not_committed`、`tests/persist_contracts.rs::unclosed_batch_tail_does_not_swallow_later_writes` | Passed |
+| FC-PERSIST-ERR-008 | ERR | 独占锁基于 OS 咨询锁(`std::fs::File::try_lock`):活实例持有 → `Busy`;进程崩溃/退出时内核自动释放,后续实例无需租约/接管即可获取;`Drop` 释放锁但不删除锁文件,避免不同 inode 各自加锁破坏互斥(设计 16 §3) | `src/persist/storage.rs::file_lock_blocks_second_holder`、`src/persist/storage.rs::file_lock_acquires_when_lock_file_exists`、`src/persist/storage.rs::file_lock_file_persists_after_drop` | Passed |
+| FC-PERSIST-STA-001 | STA | 段生命周期:`Building → Committed → Obsolete → (trash)`;`Committed` 段内容不可变(write-once,重写产生新段) | `tests/persist_contracts.rs::committed_segment_is_write_once` | Passed |
+| FC-PERSIST-STA-002 | STA | 崩溃点状态:`Building` 段(`.tmp` 半成品)与 MANIFEST 未引用的段为孤儿,可写打开时清理;不进入任何 MANIFEST 视图 | `tests/persist_contracts.rs::orphan_tmp_cleaned_on_open`、`tests/persist_contracts.rs::unreferenced_segment_cleaned_on_open` | Passed |
+| FC-PERSIST-STA-003 | STA | 首次 flush 中途崩溃(段已写、MANIFEST 未提交):存在 WAL 时以 WAL 为准重建,孤儿段被清理,绝不误判为 `Corrupted` 而丢数据 | `tests/persist_contracts.rs::first_flush_crash_recovers_from_wal` | Passed |
 
 ---
 
@@ -256,7 +276,7 @@
 | FC-GLOBAL-PRE-004 | PRE | `importance`/`confidence` 越界钳制到 [0,1],含非有限值(NaN)→ `NonFinite` 拒绝(含 `UpdatePatch` 与 `touch` boost、关系边权);`top_k`/`ef` > 4096 → `LimitExceeded`;`dedup_threshold`/`threshold`/`min_importance`/`access_weight` 等策略参数与 MMR `lambda` 含非有限值 → `Config`;`dedup_threshold`/`threshold` 越界 [0,1] → `Config` | `tests/memory_contracts.rs::importance_and_confidence_clamped`、`tests/memory_contracts.rs::importance_confidence_boundary_three_point`、`tests/query_contracts.rs::search_limits_reject_top_k_and_ef`、`tests/life_contracts.rs::error_taxonomy_is_specific`、`tests/model_contracts.rs::relate_weight_rejects_non_finite_and_clamps` | Passed |
 | FC-GLOBAL-ERR-001 | ERR | 库绝不 panic;文档化例外共三处:① `filter!` 字面量、② async `spawn_blocking`、③ 并行扫描候选收集处槽位下标的 `u32::try_from(..).expect`(`commit_version` 经 `slot_id_for` 拒绝溢出,`FC-MEM-INV-004` 保证不可达) | `tests/life_contracts.rs::l1_api_smoke_never_panics` | Passed |
 | FC-GLOBAL-ERR-002 | ERR | 错误分类矩阵(§0.2)各变体语义互不混淆:`Closed`/`NonFinite`/`LimitExceeded`/`MetaTooDeep`/`Config`/`Unsupported`/`Inconsistent` 各由专属条件触发 | `tests/life_contracts.rs::error_taxonomy_is_specific` | Passed |
-| FC-GLOBAL-PRE-005 | PRE | 时钟回拨经单调水位钳制;记录不会因回拨早消失 | 待补 | Planned |
+| FC-GLOBAL-PRE-005 | PRE | 时钟回拨经单调水位钳制(取历史最大值);记录不会因回拨早消失/复活 | `tests/memory_contracts.rs::clock_rollback_does_not_resurrect_expired_record` | Passed |
 
 ---
 
@@ -319,16 +339,16 @@
 
 | 编号 | 类型 | 形式化规范(时间 / 空间) | 对应测试 / 基准 | 状态 |
 |---|---|---|---|---|
-| FC-PERSIST-CPLX-001 | CPLX | WAL 提交:单条 $O(1)$ 内存追加;组提交 $N$ 条 $O(N)$ 追加 + **1 次** fsync/批;空间顺序写 | 待补 | Planned |
-| FC-PERSIST-CPLX-002 | CPLX | WAL 回放:时间 $O(\text{unflushed frames})$;空间 $O(1)$ 流式 | 待补 | Planned |
-| FC-PERSIST-CPLX-003 | CPLX | CRC-32:时间 $O(n)$、空间 $O(1)$(8 KiB 常量表);$n$ = 字节数 | 待补 | Planned |
-| FC-PERSIST-CPLX-004 | CPLX | zone map 剪枝:时间 $O(\lceil n/1024\rceil \times \text{predicates})$;空间 16 B/块/字段 | 待补 | Planned |
-| FC-PERSIST-CPLX-005 | CPLX | bloom 判定:时间 $O(k)=O(7)$;空间 $1.44\log_2(1/p)$ bit/元素 | 待补 | Planned |
-| FC-PERSIST-CPLX-006 | CPLX | MANIFEST 提交:时间 $O(S_{\text{seg}})$ 写新文件;空间保留 2 版 | 待补 | Planned |
-| FC-PERSIST-CPLX-007 | CPLX | `open` 恢复:时间 $O(\text{WAL replay})$ + 段头校验;mmap 惰性,空间 $O(1)$/段 | 待补 | Planned |
-| FC-PERSIST-CPLX-008 | CPLX | 单点写 `insert`:时间 $O(1)$ 内存 + WAL 追加(fsync 按 `FsyncPolicy`);空间 $O(d)$ | 待补 | Planned |
-| FC-PERSIST-CPLX-009 | CPLX | 单点读 `get(key)`:时间 $O(\log n)$ + 一次记录读;`get_by_rowid`: $O(\log n)$ 版本链定位 | 待补 | Planned |
-| FC-PERSIST-CPLX-010 | CPLX | `as_of(t)`:时间 $O(S_{\text{seg}}\cdot\log n)$ 定位版本链 + 查询;空间随历史窗口增长 | 待补 | Planned |
+| FC-PERSIST-CPLX-001 | CPLX | WAL 提交:单条 $O(1)$ 内存追加;组提交 $N$ 条 $O(N)$ 追加 + **1 次** fsync/批;空间顺序写 | 操作计数单测 `tests/persist_contracts.rs::batch_insert_uses_single_fsync`(整批 Fsync 动作数 = 1) | Passed |
+| FC-PERSIST-CPLX-002 | CPLX | WAL 回放(`wal::visit_frames`):时间 $O(\text{有效帧})$;空间 $O(1)$ 流式(批内帧缓冲 ≤ 单批帧数)。注:`Store::open` 当前将 WAL 整文件读入内存后再流式回放,该路径空间 $O(\text{WAL 字节})$(mmap 惰性属 L3) | 解析证明(设计 04 §3.4;`wal::visit_frames` 逐帧回调不物化)+ 哨兵 `src/persist/wal/mod.rs::wal_replay_roundtrip` | Passed |
+| FC-PERSIST-CPLX-003 | CPLX | CRC-32:时间 $O(n)$、空间 $O(1)$;$n$ = 字节数(实现为 `crc32fast` 查表/切片,常量因子依平台) | 解析证明(设计 04 §4.4;`crc32fast`)+ 哨兵 `src/persist/vsec.rs::vsec_detects_payload_corruption` | Passed |
+| FC-PERSIST-CPLX-004 | CPLX | zone map 剪枝:时间 $O(\lceil n/1024\rceil \times \text{predicates})$;空间 16 B/块/字段(评估路径在 L4 查询层;L2 仅占位该空区,`zmap_len=0`) | 待补(L4) | Planned |
+| FC-PERSIST-CPLX-005 | CPLX | bloom 判定:时间 $O(k)=O(7)$;空间 $1.44\log_2(1/p)$ bit/元素(评估路径在 L4 查询层;L2 仅占位该空区,`bloom_len=0`) | 待补(L4) | Planned |
+| FC-PERSIST-CPLX-006 | CPLX | MANIFEST 提交:时间 $O(S_{\text{seg}})$ 写新文件;空间保留 2 版 | 解析证明(设计 04 §6;`manifest::encode` 逐段线性)+ 哨兵 `src/persist/manifest.rs::manifest_roundtrip` | Passed |
+| FC-PERSIST-CPLX-007 | CPLX | `open` 恢复:时间 $O(\text{段总字节} + \text{WAL 字节})$(逐段读入并校验 + 回放);空间 $O(\text{段总字节} + \text{WAL 字节})$——L2 将段/WAL 整读入内存,mmap 惰性访问属 L3(设计 04 §11) | 哨兵 `tests/persist_contracts.rs::reopen_after_drop_recovers_from_wal`;解析证明(设计 04 §7;`read_segment_bytes` 逐段读入) | Passed |
+| FC-PERSIST-CPLX-008 | CPLX | 单点写 `insert`:时间 $O(1)$ 内存 + WAL 追加(fsync 按 `FsyncPolicy`);空间 $O(d)$ | 哨兵 `tests/persist_contracts.rs::reopen_after_close_recovers_records`;解析证明(HashMap 追加 + 定长帧) | Passed |
+| FC-PERSIST-CPLX-009 | CPLX | 单点读 `get(key)`:时间 $O(\log n)$ + 一次记录读(实现为 HashMap 期望 $O(1)$ $\subseteq O(\log n)$);`get_by_rowid`: $O(\log n)$ 版本链定位 | 哨兵 `tests/persist_contracts.rs::namespace_and_rowid_survive_reopen`;解析证明(设计 04 §5.5) | Passed |
+| FC-PERSIST-CPLX-010 | CPLX | `as_of(t)`:时间 $O(V + N_c\cdot d)$($V$ = 全部物理版本数,`temporal::snapshot_at` 单遍择版本;当前实现不随段数$S_{\text{seg}}$分层加速);空间 $O(V + N_c)$(随历史窗口与候选规模增长) | 哨兵 `tests/persist_contracts.rs::version_chain_survives_reopen`;解析证明(设计 04 §5.5) | Passed |
 
 #### 9.2.4 L3 索引层(index)
 

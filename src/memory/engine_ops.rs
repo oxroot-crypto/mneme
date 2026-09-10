@@ -10,6 +10,32 @@ use crate::memory::engine::Mneme;
 use crate::memory::ops::{
     CheckReport, CompactionControl, Histogram, HistoryStat, NsStat, QuantStat, Stats, StorageStat,
 };
+use crate::memory::table::ReaderView;
+
+/// 持久后端的段/WAL/trash 统计。
+#[derive(Default)]
+struct StoreStats {
+    segments: Vec<crate::memory::ops::SegmentStat>,
+    wal_bytes: u64,
+    trash_bytes: u64,
+    total_segments: usize,
+}
+
+/// 聚合各命名空间活行数与文本总长(逻辑过期与墓碑不计入,FC-LIFE-INV-009)。
+fn aggregate_namespaces(view: &ReaderView, now: i64) -> (HashMap<String, NsStat>, u64) {
+    let mut per_namespace: HashMap<String, NsStat> = HashMap::new();
+    let mut live_rows = 0_u64;
+    for (idx, slot) in view.slots.iter().enumerate() {
+        if view.dead.get(idx) || !slot.is_live(now) {
+            continue;
+        }
+        live_rows += 1;
+        let stat = per_namespace.entry(slot.ns_path.to_string()).or_default();
+        stat.doc_count += 1;
+        stat.total_doc_len += slot.text.as_ref().map_or(0, |text| text.len() as u64);
+    }
+    (per_namespace, live_rows)
+}
 
 impl Mneme {
     /// 返回运行统计。
@@ -32,27 +58,17 @@ impl Mneme {
         if view.closed {
             return Err(MnemeError::Closed);
         }
-        let mut per_namespace: HashMap<String, NsStat> = HashMap::new();
-        let mut live_rows = 0_u64;
         let now = self.config.clock.now_unix_ms();
-        for (idx, slot) in view.slots.iter().enumerate() {
-            // 逻辑过期记录与墓碑一样不计入统计(FC-LIFE-INV-009)。
-            if view.dead.get(idx) || !slot.is_live(now) {
-                continue;
-            }
-            live_rows += 1;
-            let stat = per_namespace.entry(slot.ns_path.to_string()).or_default();
-            stat.doc_count += 1;
-            stat.total_doc_len += slot.text.as_ref().map_or(0, |text| text.len() as u64);
-        }
+        let (per_namespace, live_rows) = aggregate_namespaces(&view, now);
         let relations = view.out_edges.values().map(Vec::len).sum::<usize>() as u64;
+        let store = self.collect_store_stats();
         Ok(Stats {
-            segments: Vec::new(),
-            wal_bytes: 0,
+            segments: store.segments,
+            wal_bytes: store.wal_bytes,
             memory_est: live_rows
                 * u64::from(self.config.dimension.get())
                 * std::mem::size_of::<f32>() as u64,
-            trash_bytes: 0,
+            trash_bytes: store.trash_bytes,
             query_latency: Histogram::default(),
             per_namespace,
             quant: QuantStat {
@@ -72,15 +88,29 @@ impl Mneme {
                 encryption: false,
                 compression: self.config.compression,
                 migrated_segments: 0,
-                total_segments: 0,
+                total_segments: store.total_segments,
             },
         })
     }
 
-    /// fsck:校验内部索引一致性。
+    /// 收集持久后端的段/WAL/trash 统计;纯内存库返回零值。
+    fn collect_store_stats(&self) -> StoreStats {
+        match &self.store {
+            Some(store) => StoreStats {
+                segments: store.segment_stats(),
+                wal_bytes: store.wal_bytes(),
+                trash_bytes: store.trash_bytes(),
+                total_segments: store.total_segments(),
+            },
+            None => StoreStats::default(),
+        }
+    }
+
+    /// fsck:校验内部索引一致性与持久段完整性。
     ///
-    /// 仅当 key 索引指向不存在的物理版本,或最新版本 `ns_id`/`key` 与索引不符时
-    /// 报告不一致;已删除(墓碑)与已逻辑过期的记录不算不一致(FC-MEM-POST-008)。
+    /// 内存侧:仅当 key 索引指向不存在的物理版本,或最新版本 `ns_id`/`key` 与索引
+    /// 不符时报告不一致;已删除(墓碑)与已逻辑过期的记录不算不一致(FC-MEM-POST-008)。
+    /// 持久侧(L2):逐段校验头部/payload CRC 与版本链记录体(设计 16 §1.6)。
     ///
     /// # Errors
     /// 库已关闭时返回 [`MnemeError::Closed`]。
@@ -102,6 +132,14 @@ impl Mneme {
             return Err(MnemeError::Closed);
         }
         let mut suggestions = Vec::new();
+        let mut corrupted = Vec::new();
+        // L2:逐段校验头部/payload CRC 与版本链(设计 16 §1.6)。
+        if let Some(store) = &self.store {
+            for id in store.verify_segments() {
+                suggestions.push(format!("段 {id} 校验失败"));
+                corrupted.push(id);
+            }
+        }
         for ((ns_id, key), rowid) in view.key_index.iter() {
             // 按最新物理版本对账(墓碑/逻辑过期不算不一致):key 索引指向不存在的
             // 版本,或最新版本 ns/key 与索引不符,才是真正的不一致(FC-MEM-POST-008)。
@@ -117,7 +155,7 @@ impl Mneme {
         }
         Ok(CheckReport {
             ok: suggestions.is_empty(),
-            corrupted: Vec::new(),
+            corrupted,
             suggestions,
         })
     }
@@ -130,17 +168,25 @@ impl Mneme {
         self.control.clone()
     }
 
-    /// 显式落盘(L1 无持久化,为空操作)。
+    /// 显式落盘:把可变表物化为新段并提交 MANIFEST。
     ///
-    /// # Returns
-    /// 恒 `Ok`(L1 无持久化,无 I/O)。
+    /// 纯内存库为空操作;持久库执行全量快照 flush 并重置 WAL(设计 04 §3.2)。
     ///
     /// # Errors
-    /// 库已关闭时返回 [`MnemeError::Closed`]。
+    /// 库已关闭时返回 [`MnemeError::Closed`];只读模式返回
+    /// [`MnemeError::Unsupported`];I/O 失败返回 [`MnemeError::Io`]。
     pub fn flush(&self) -> Result<()> {
         let view = self.table.view();
         if view.closed {
             return Err(MnemeError::Closed);
+        }
+        drop(view);
+        if let Some(store) = &self.store {
+            let ws = self.table.write();
+            if ws.closed {
+                return Err(MnemeError::Closed);
+            }
+            store.flush(&ws, &self.config)?;
         }
         Ok(())
     }

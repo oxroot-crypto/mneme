@@ -28,7 +28,7 @@ flowchart TD
     L["L5 生命周期层 life/<br/>TTL · 遗忘曲线 · compaction<br/>命名空间 · 快照备份"]
     QL["L4 检索层 query/<br/>过滤 DSL · BM25 · RRF 融合 · 去重"]
     H["L3 索引层 index/<br/>自研 HNSW · 过滤感知搜索 · mmap"]
-    P["L2 持久层 persist/<br/>WAL · 段文件 · delta 覆盖 · MANIFEST · 崩溃恢复"]
+    P["L2 持久层 persist/<br/>WAL · 段文件 · 墓碑/新版本覆盖 · MANIFEST · 崩溃恢复"]
     M["L1 内存引擎 memory/<br/>完整公开 API · 暴力扫描检索<br/>(API 在此冻结)"]
     C["L0 原语层 core/<br/>类型 · 错误 · SIMD 距离 · TopK 堆 · varint"]
 

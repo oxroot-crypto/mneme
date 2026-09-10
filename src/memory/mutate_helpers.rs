@@ -13,7 +13,7 @@ use crate::memory::dedup;
 use crate::memory::record::{Record, RecordRef, UpdateOutcome};
 use crate::memory::score::ConsolidationPolicy;
 use crate::memory::search;
-use crate::memory::table::{SlotData, WriterState};
+use crate::memory::table::{SlotData, WriteOp, WriterState};
 use crate::memory::write_helpers::{latest_live, validate_patch};
 
 /// `Feedback::Corrected` 降低可信度的步长。
@@ -120,6 +120,14 @@ pub(crate) fn touch_rowid(
     let stat = Arc::make_mut(&mut ws.access).entry(rowid).or_default();
     stat.access_count = stat.access_count.saturating_add(1);
     stat.last_access_ms = now;
+    // 访问统计单独落 WAL(重要性变更已随上面的版本 `Insert` 记录)。
+    let seqno = ws.alloc_seqno();
+    ws.pending.push(WriteOp::Access {
+        rowid,
+        seqno,
+        at_ms: now,
+        importance_delta: 0.0,
+    });
     Ok(true)
 }
 
