@@ -1,0 +1,142 @@
+//! msec 记录体解码(`msec/entry.rs`)。
+
+use std::sync::Arc;
+
+use crate::core::error::{MnemeError, Result};
+use crate::core::meta::{self, Meta};
+use crate::core::types::{Key, NsId, RowId, SeqNo};
+use crate::persist::Cursor;
+
+use super::{
+    EntryData, FLAG_ACCESS, FLAG_CONFIDENCE, FLAG_IMPORTANCE, FLAG_KEY, FLAG_PROVENANCE, FLAG_TEXT,
+    FLAG_TTL, FLAG_VALID_TIME,
+};
+
+/// 解码单个记录体(不含长度前缀的 `body` 字节)。
+///
+/// # Errors
+/// 字段越界、JSON 损坏或标志位矛盾时返回 [`MnemeError::Corrupted`]。
+pub(super) fn decode_entry(body: &[u8]) -> Result<EntryData> {
+    let mut cursor = Cursor::new(body, "msec entry");
+    let rowid = RowId::new(cursor.u64()?);
+    let seqno = SeqNo::new(cursor.u64()?);
+    let ns_id = NsId::new(cursor.u32()?);
+    let flags = cursor.u8()?;
+    let key = decode_key(&mut cursor, flags)?;
+    let text = decode_text(&mut cursor, flags)?;
+    let meta_len = cursor.u32()? as usize;
+    let meta = meta::from_bytes(cursor.take(meta_len)?)?;
+    let created_at_ms = cursor.i64()?;
+    let expires_at_ms = if flags & FLAG_TTL != 0 {
+        Some(cursor.i64()?)
+    } else {
+        None
+    };
+    let importance = decode_flag_f32(&mut cursor, flags, FLAG_IMPORTANCE)?;
+    let access = decode_access(&mut cursor, flags)?;
+    let valid_time = decode_valid_time(&mut cursor, flags)?;
+    let confidence = decode_flag_f32(&mut cursor, flags, FLAG_CONFIDENCE)?;
+    let provenance = decode_provenance(&mut cursor, flags)?;
+    if !cursor.is_empty() {
+        return Err(MnemeError::Corrupted {
+            segment: None,
+            reason: "msec: 记录体尾部有残留字节".to_string(),
+        });
+    }
+    Ok(EntryData {
+        rowid,
+        seqno,
+        ns_id,
+        key,
+        text,
+        meta,
+        created_at_ms,
+        expires_at_ms,
+        importance,
+        access,
+        valid_time,
+        confidence,
+        provenance,
+    })
+}
+
+/// 从带 `u32 total_len` 前缀的记录体字节解析记录(WAL `Insert` 帧用)。
+///
+/// # Errors
+/// 长度前缀越界或记录体损坏时返回 [`MnemeError::Corrupted`]。
+pub(crate) fn entry_from_prefix(bytes: &[u8]) -> Result<EntryData> {
+    let mut cursor = Cursor::new(bytes, "msec entry 前缀");
+    let total_len = cursor.u32()? as usize;
+    decode_entry(cursor.take(total_len)?)
+}
+
+/// 读取小端 `f32`。
+fn read_f32(cursor: &mut Cursor<'_>) -> Result<f32> {
+    let bytes = cursor.take(4)?;
+    Ok(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+/// 按 `flag` 存在位读取可选 `f32`。
+fn decode_flag_f32(cursor: &mut Cursor<'_>, flags: u8, flag: u8) -> Result<Option<f32>> {
+    if flags & flag == 0 {
+        return Ok(None);
+    }
+    Ok(Some(read_f32(cursor)?))
+}
+
+/// 读取带 `u32` 长度前缀的 UTF-8 字符串。
+fn read_utf8(cursor: &mut Cursor<'_>, field: &str) -> Result<Arc<str>> {
+    let len = cursor.u32()? as usize;
+    let value = std::str::from_utf8(cursor.take(len)?).map_err(|error| MnemeError::Corrupted {
+        segment: None,
+        reason: format!("msec: {field} 非 UTF-8:{error}"),
+    })?;
+    Ok(Arc::from(value))
+}
+
+/// 按标志位解码可选 key。
+fn decode_key(cursor: &mut Cursor<'_>, flags: u8) -> Result<Option<Key>> {
+    if flags & FLAG_KEY == 0 {
+        return Ok(None);
+    }
+    let text = read_utf8(cursor, "key")?;
+    Ok(Some(Key::new(&*text)))
+}
+
+/// 按标志位解码可选 text。
+fn decode_text(cursor: &mut Cursor<'_>, flags: u8) -> Result<Option<Arc<str>>> {
+    if flags & FLAG_TEXT == 0 {
+        return Ok(None);
+    }
+    Ok(Some(read_utf8(cursor, "text")?))
+}
+
+/// 按标志位解码访问统计 `(last_access_ms, access_count)`。
+fn decode_access(cursor: &mut Cursor<'_>, flags: u8) -> Result<Option<(i64, u32)>> {
+    if flags & FLAG_ACCESS == 0 {
+        return Ok(None);
+    }
+    let last_access = cursor.i64()?;
+    let count = cursor.u32()?;
+    Ok(Some((last_access, count)))
+}
+
+/// 按标志位解码有效时间 `(valid_from, valid_to)`。
+fn decode_valid_time(cursor: &mut Cursor<'_>, flags: u8) -> Result<Option<(i64, Option<i64>)>> {
+    if flags & FLAG_VALID_TIME == 0 {
+        return Ok(None);
+    }
+    let valid_from = cursor.i64()?;
+    let has_to = cursor.u8()? != 0;
+    let valid_to = if has_to { Some(cursor.i64()?) } else { None };
+    Ok(Some((valid_from, valid_to)))
+}
+
+/// 按标志位解码 provenance。
+fn decode_provenance(cursor: &mut Cursor<'_>, flags: u8) -> Result<Option<Meta>> {
+    if flags & FLAG_PROVENANCE == 0 {
+        return Ok(None);
+    }
+    let len = cursor.u32()? as usize;
+    Ok(Some(meta::from_bytes(cursor.take(len)?)?))
+}

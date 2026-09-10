@@ -177,6 +177,58 @@ fn count_u32(value: usize, field: &'static str) -> Result<u32> {
 /// # Errors
 /// 魔数/版本/头部 CRC/payload CRC/长度不符时返回 [`MnemeError::Corrupted`]。
 pub(crate) fn parse(bytes: &[u8]) -> Result<Manifest> {
+    let header = parse_header(bytes)?;
+    let body = &bytes[HEADER_LEN as usize..bytes.len() - 4];
+    let stored_payload_crc =
+        u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap_or([0; 4]));
+    if crc32(body) != stored_payload_crc {
+        return Err(MnemeError::Corrupted {
+            segment: None,
+            reason: "manifest: payload_crc32 不符".to_string(),
+        });
+    }
+    let mut cursor = Cursor::new(body, "manifest 变长区");
+    let namespaces = parse_namespaces(&mut cursor, header.ns_count)?;
+    let rel_kinds = parse_rel_kinds(&mut cursor, header.rel_kind_count)?;
+    let segments = parse_segments(&mut cursor, header.active_count)?;
+    if !cursor.is_empty() {
+        return Err(MnemeError::Corrupted {
+            segment: None,
+            reason: "manifest: 变长区尾部有残留字节".to_string(),
+        });
+    }
+    Ok(Manifest {
+        dimension: header.dimension,
+        metric: header.metric,
+        next_rel_kind: header.next_rel_kind,
+        manifest_version: header.manifest_version,
+        watermark_seqno: header.watermark_seqno,
+        next_rowid: header.next_rowid,
+        next_segment_id: header.next_segment_id,
+        next_ns_id: header.next_ns_id,
+        namespaces,
+        rel_kinds,
+        segments,
+    })
+}
+
+/// MANIFEST 定长头部字段与变长区行数。
+struct ManifestHeader {
+    dimension: u32,
+    metric: Metric,
+    next_rel_kind: u16,
+    manifest_version: u64,
+    watermark_seqno: u64,
+    next_rowid: u64,
+    next_segment_id: u32,
+    next_ns_id: u32,
+    active_count: usize,
+    ns_count: usize,
+    rel_kind_count: usize,
+}
+
+/// 校验并解析 MANIFEST 定长头部。
+fn parse_header(bytes: &[u8]) -> Result<ManifestHeader> {
     if bytes.len() < HEADER_LEN as usize + 4 {
         return Err(MnemeError::Corrupted {
             segment: None,
@@ -189,8 +241,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Manifest> {
             reason: "manifest: 魔数不符".to_string(),
         });
     }
-    let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-    check_version("manifest", version)?;
+    check_version("manifest", u16::from_le_bytes([bytes[4], bytes[5]]))?;
     let header_len = u16::from_le_bytes([bytes[6], bytes[7]]);
     if header_len != HEADER_LEN {
         return Err(MnemeError::Corrupted {
@@ -205,45 +256,49 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Manifest> {
             reason: "manifest: header_crc32 不符".to_string(),
         });
     }
+    Ok(ManifestHeader {
+        dimension: u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+        metric: metric_from_u8(bytes[16])?,
+        next_rel_kind: u16::from_le_bytes([bytes[22], bytes[23]]),
+        manifest_version: read_u64(bytes, 24),
+        watermark_seqno: read_u64(bytes, 32),
+        next_rowid: read_u64(bytes, 40),
+        next_segment_id: read_u32(bytes, 48),
+        next_ns_id: read_u32(bytes, 52),
+        active_count: read_u32(bytes, 56) as usize,
+        ns_count: read_u32(bytes, 60) as usize,
+        rel_kind_count: read_u32(bytes, 64) as usize,
+    })
+}
 
-    let dimension = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
-    let metric = metric_from_u8(bytes[16])?;
-    let next_rel_kind = u16::from_le_bytes([bytes[22], bytes[23]]);
-    let manifest_version = read_u64(bytes, 24);
-    let watermark_seqno = read_u64(bytes, 32);
-    let next_rowid = read_u64(bytes, 40);
-    let next_segment_id = read_u32(bytes, 48);
-    let next_ns_id = read_u32(bytes, 52);
-    let active_count = read_u32(bytes, 56) as usize;
-    let ns_count = read_u32(bytes, 60) as usize;
-    let rel_kind_count = read_u32(bytes, 64) as usize;
-
-    let body = &bytes[HEADER_LEN as usize..bytes.len() - 4];
-    let stored_payload_crc =
-        u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().unwrap_or([0; 4]));
-    if crc32(body) != stored_payload_crc {
-        return Err(MnemeError::Corrupted {
-            segment: None,
-            reason: "manifest: payload_crc32 不符".to_string(),
-        });
-    }
-    let mut cursor = Cursor::new(body, "manifest 变长区");
-    let mut namespaces = Vec::with_capacity(ns_count);
-    for _ in 0..ns_count {
+/// 解析命名空间条目列表。
+fn parse_namespaces(cursor: &mut Cursor<'_>, count: usize) -> Result<Vec<NsEntry>> {
+    let mut namespaces = Vec::with_capacity(count);
+    for _ in 0..count {
         let ns_id = cursor.u32()?;
         let len = cursor.u32()? as usize;
-        let path = read_utf8(&mut cursor, len, "path")?;
+        let path = read_utf8(cursor, len, "path")?;
         namespaces.push(NsEntry { ns_id, path });
     }
-    let mut rel_kinds = Vec::with_capacity(rel_kind_count);
-    for _ in 0..rel_kind_count {
+    Ok(namespaces)
+}
+
+/// 解析关系类型条目列表。
+fn parse_rel_kinds(cursor: &mut Cursor<'_>, count: usize) -> Result<Vec<RelKindEntry>> {
+    let mut rel_kinds = Vec::with_capacity(count);
+    for _ in 0..count {
         let kind = cursor.u16()?;
         let len = cursor.u32()? as usize;
-        let name = read_utf8(&mut cursor, len, "name")?;
+        let name = read_utf8(cursor, len, "name")?;
         rel_kinds.push(RelKindEntry { kind, name });
     }
-    let mut segments = Vec::with_capacity(active_count);
-    for _ in 0..active_count {
+    Ok(rel_kinds)
+}
+
+/// 解析段条目列表。
+fn parse_segments(cursor: &mut Cursor<'_>, count: usize) -> Result<Vec<SegmentEntry>> {
+    let mut segments = Vec::with_capacity(count);
+    for _ in 0..count {
         segments.push(SegmentEntry {
             segment_id: cursor.u32()?,
             format_version: cursor.u16()?,
@@ -258,26 +313,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Manifest> {
             entry_level: cursor.u8()?,
         });
     }
-    if !cursor.is_empty() {
-        return Err(MnemeError::Corrupted {
-            segment: None,
-            reason: "manifest: 变长区尾部有残留字节".to_string(),
-        });
-    }
-
-    Ok(Manifest {
-        dimension,
-        metric,
-        next_rel_kind,
-        manifest_version,
-        watermark_seqno,
-        next_rowid,
-        next_segment_id,
-        next_ns_id,
-        namespaces,
-        rel_kinds,
-        segments,
-    })
+    Ok(segments)
 }
 
 /// 读取 UTF-8 字符串。

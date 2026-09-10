@@ -225,9 +225,9 @@ fn sync_parent(path: &Path) -> Result<()> {
     if let Some(parent) = path.parent()
         && let Ok(file) = File::open(parent)
     {
-        // 目录 fsync 在部分平台不受支持;失败仅意味着目录项可能晚于数据落盘,
-        // 由 MANIFEST write-once + 扫描兜底(设计 04 §6)。
-        let _ = file.sync_all();
+        // reason: 目录 fsync 在部分平台不受支持;失败仅意味着目录项可能晚于数据落盘,
+        // 由 MANIFEST write-once + 扫描兜底(设计 04 §6),故显式忽略该错误。
+        file.sync_all().ok();
     }
     Ok(())
 }
@@ -298,7 +298,8 @@ impl FileLock {
 
 impl Drop for FileLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        // reason: `Drop` 无法传播错误;锁文件残留由下次 `acquire` 的陈旧检测兜底。
+        fs::remove_file(&self.path).ok();
     }
 }
 

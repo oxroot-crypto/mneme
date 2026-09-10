@@ -8,10 +8,18 @@ use std::collections::HashMap;
 
 use crate::core::error::Result;
 use crate::memory::config::Config;
-use crate::memory::table::WriterState;
+use crate::memory::table::{SlotData, WriterState};
 use crate::persist::edges::EdgeData;
 use crate::persist::msec::{self, EntryData, MsecInput, NsStatRow, SlotMeta};
 use crate::persist::vsec::{self, VsecInput};
+
+/// 段内槽位及其对应的向量/范数/删除位(向量借用自写状态)。
+struct SegmentSlots<'a> {
+    slots: Vec<SlotMeta>,
+    vectors: Vec<&'a [f32]>,
+    norms: Vec<f32>,
+    dead: Vec<bool>,
+}
 
 /// 把一个写状态编码为 `(vsec 字节, msec 字节)`。
 ///
@@ -22,63 +30,75 @@ pub(crate) fn build_segment(
     config: &Config,
     created_unix_ms: i64,
 ) -> Result<(Vec<u8>, Vec<u8>)> {
-    let count = ws.slots.len();
-    let mut slots = Vec::with_capacity(count);
-    let mut vectors: Vec<&[f32]> = Vec::with_capacity(count);
-    let mut norms = Vec::with_capacity(count);
-    let mut dead = Vec::with_capacity(count);
-
-    for (index, slot) in ws.slots.iter().enumerate() {
-        let is_dead = ws.dead.get(index) || slot.deleted;
-        let access = ws
-            .access
-            .get(&slot.rowid)
-            .map(|stat| (stat.last_access_ms, stat.access_count));
-        let body = (!slot.deleted).then(|| EntryData {
-            rowid: slot.rowid,
-            seqno: slot.seqno,
-            ns_id: slot.ns_id,
-            key: slot.key.clone(),
-            text: slot.text.clone(),
-            meta: slot.meta.clone(),
-            created_at_ms: slot.created_at,
-            expires_at_ms: slot.expires_at,
-            importance: Some(slot.importance),
-            access,
-            valid_time: Some((slot.valid_from, slot.valid_to)),
-            confidence: Some(slot.confidence),
-            provenance: slot.provenance.clone(),
-        });
-        slots.push(SlotMeta {
-            rowid: slot.rowid,
-            seqno: slot.seqno,
-            tx_ms: slot.tx_ms,
-            body,
-        });
-        vectors.push(slot.vector.as_ref());
-        norms.push(slot.norm_sq);
-        dead.push(is_dead);
-    }
-
+    let built = build_slots(ws);
     let vsec_bytes = vsec::encode(&VsecInput {
         dimension: config.dimension.get(),
         metric: config.metric,
         created_unix_ms,
-        vectors: &vectors,
-        norms: &norms,
-        dead: &dead,
+        vectors: &built.vectors,
+        norms: &built.norms,
+        dead: &built.dead,
     })?;
 
     let ns_stats = build_ns_stats(ws, config);
     let relations = build_relations(ws);
     let relations_bytes = crate::persist::edges::encode(&relations, false);
     let msec_bytes = msec::encode(&MsecInput {
-        slots: &slots,
+        slots: &built.slots,
         ns_stats: &ns_stats,
         delta: &[],
         relations: &relations_bytes,
     })?;
     Ok((vsec_bytes, msec_bytes))
+}
+
+/// 由写状态构造段内槽位与 vsec 输入列。
+fn build_slots(ws: &WriterState) -> SegmentSlots<'_> {
+    let count = ws.slots.len();
+    let mut built = SegmentSlots {
+        slots: Vec::with_capacity(count),
+        vectors: Vec::with_capacity(count),
+        norms: Vec::with_capacity(count),
+        dead: Vec::with_capacity(count),
+    };
+    for (index, slot) in ws.slots.iter().enumerate() {
+        built.dead.push(ws.dead.get(index) || slot.deleted);
+        built.slots.push(SlotMeta {
+            rowid: slot.rowid,
+            seqno: slot.seqno,
+            tx_ms: slot.tx_ms,
+            body: entry_body(slot, ws),
+        });
+        built.vectors.push(slot.vector.as_ref());
+        built.norms.push(slot.norm_sq);
+    }
+    built
+}
+
+/// 由槽位构造 msec 记录体;墓碑返回 `None`。
+fn entry_body(slot: &SlotData, ws: &WriterState) -> Option<EntryData> {
+    if slot.deleted {
+        return None;
+    }
+    let access = ws
+        .access
+        .get(&slot.rowid)
+        .map(|stat| (stat.last_access_ms, stat.access_count));
+    Some(EntryData {
+        rowid: slot.rowid,
+        seqno: slot.seqno,
+        ns_id: slot.ns_id,
+        key: slot.key.clone(),
+        text: slot.text.clone(),
+        meta: slot.meta.clone(),
+        created_at_ms: slot.created_at,
+        expires_at_ms: slot.expires_at,
+        importance: Some(slot.importance),
+        access,
+        valid_time: Some((slot.valid_from, slot.valid_to)),
+        confidence: Some(slot.confidence),
+        provenance: slot.provenance.clone(),
+    })
 }
 
 /// 统计各命名空间的活行数与文本总长(段内剪枝/BM25 用)。

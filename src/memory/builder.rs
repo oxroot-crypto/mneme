@@ -17,11 +17,14 @@ use crate::memory::dedup::Dedup;
 use crate::memory::engine::Mneme;
 use crate::memory::lifecycle::Retention;
 use crate::memory::ops::CompactionControl;
-use crate::memory::table::{PersistHook, Table};
+use crate::memory::table::{PersistHook, Table, WriterState};
 use crate::persist::hook::FsyncHook;
-use crate::persist::store::Store;
+use crate::persist::store::{OpenOptions, Store};
 
 mod options;
+
+/// [`Builder::open_backend`] 的返回:持久后端 + 初始写状态 + 维度 + 度量。
+type OpenedBackend = (Option<Arc<Store>>, Option<WriterState>, Dimension, Metric);
 
 /// 近似去重阈值的缺省值(统一按余弦口径)。
 const DEFAULT_DEDUP_THRESHOLD: f32 = 0.95;
@@ -105,38 +108,64 @@ impl Builder {
     /// assert!(db.list_namespaces().unwrap().is_empty());
     /// ```
     pub fn build(self) -> Result<Mneme> {
+        self.validate()?;
+        let (store, recovered, dimension, metric) = self.open_backend()?;
+        let config = Arc::new(self.into_config(dimension, metric));
+        let hook = store.as_ref();
+        let table = build_table(hook, recovered, &config);
+        Ok(Mneme {
+            table,
+            config,
+            control: CompactionControl::new(),
+            store,
+        })
+    }
+
+    /// 校验跨字段配置约束(FC-GLOBAL-PRE-004)。
+    fn validate(&self) -> Result<()> {
         // NaN 的 `contains` 恒为 false,一个区间判断即可同时覆盖非有限值与越界。
         if !(0.0..=1.0).contains(&self.dedup_threshold) {
             return Err(MnemeError::Config {
                 reason: "dedup_threshold 必须是 [0,1] 内的有限值",
             });
         }
-        // 有 `path` 走持久层;否则纯内存。持久路径先解析维度/度量(已存在库以
-        // MANIFEST 为准),再统一构造配置。
+        Ok(())
+    }
+
+    /// 打开持久后端;纯内存库返回 `None` 后端与初始写状态。
+    ///
+    /// 有 `path` 走持久层;否则纯内存。持久路径先解析维度/度量(已存在库以
+    /// MANIFEST 为准),再统一构造配置。
+    fn open_backend(&self) -> Result<OpenedBackend> {
         let requested_metric = self.metric_explicit.then_some(self.metric);
-        let (store, recovered, dimension, metric) = match &self.path {
+        match &self.path {
             Some(path) => {
                 let (store, state, dimension, metric) = Store::open(
                     path,
-                    self.dimension,
-                    requested_metric,
-                    self.fsync,
-                    self.read_only,
-                    self.verify_on_open,
-                    self.fail_fast_on_corruption,
-                    self.fsync_hook.clone(),
+                    OpenOptions {
+                        dimension: self.dimension,
+                        metric: requested_metric,
+                        fsync: self.fsync,
+                        read_only: self.read_only,
+                        verify_on_open: self.verify_on_open,
+                        fail_fast_on_corruption: self.fail_fast_on_corruption,
+                        hook: self.fsync_hook.clone(),
+                    },
                 )?;
-                (Some(store), Some(state), dimension, metric)
+                Ok((Some(store), Some(state), Dimension::new(dimension)?, metric))
             }
             None => {
                 let dimension = self.dimension.ok_or(MnemeError::Config {
                     reason: "新建内存库必须指定维度",
                 })?;
-                (None, None, dimension, self.metric)
+                Ok((None, None, Dimension::new(dimension)?, self.metric))
             }
-        };
-        let dimension = Dimension::new(dimension)?;
-        let config = Arc::new(Config {
+        }
+    }
+
+    /// 消耗 `Builder` 构造不可变运行配置。
+    fn into_config(self, dimension: Dimension, metric: Metric) -> Config {
+        Config {
             dimension,
             metric,
             fsync: self.fsync,
@@ -159,19 +188,21 @@ impl Builder {
             read_only: self.read_only,
             verify_on_open: self.verify_on_open,
             fail_fast_on_corruption: self.fail_fast_on_corruption,
-        });
-        let table = match (&store, recovered) {
-            (Some(store), Some(state)) => {
-                let hook: Arc<dyn PersistHook> = Arc::clone(store) as Arc<dyn PersistHook>;
-                Arc::new(Table::from_state(Arc::clone(&config), state, Some(hook)))
-            }
-            _ => Arc::new(Table::new(Arc::clone(&config))),
-        };
-        Ok(Mneme {
-            table,
-            config,
-            control: CompactionControl::new(),
-            store,
-        })
+        }
+    }
+}
+
+/// 由持久后端与写状态构造物理表。
+fn build_table(
+    store: Option<&Arc<Store>>,
+    recovered: Option<WriterState>,
+    config: &Arc<Config>,
+) -> Arc<Table> {
+    match (store, recovered) {
+        (Some(store), Some(state)) => {
+            let hook: Arc<dyn PersistHook> = Arc::clone(store) as Arc<dyn PersistHook>;
+            Arc::new(Table::from_state(Arc::clone(config), state, Some(hook)))
+        }
+        _ => Arc::new(Table::new(Arc::clone(config))),
     }
 }

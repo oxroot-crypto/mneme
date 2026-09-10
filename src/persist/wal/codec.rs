@@ -1,0 +1,135 @@
+//! WAL 文件头 / 帧的编解码与回放遍历(`wal/codec.rs`)。
+
+use crate::core::error::{MnemeError, Result};
+use crate::core::metric::Metric;
+use crate::persist::vsec::{metric_from_u8, metric_to_u8};
+use crate::persist::{FORMAT_VERSION, check_version, crc32};
+
+use super::{FILE_HEADER_LEN, FRAME_HEADER_LEN, Frame, FrameKind, MAGIC, Replay, WalHeader};
+
+/// 编码 WAL 文件头(32 字节,CRC 覆盖 `[0,12)`)。
+pub(crate) fn encode_file_header(dimension: u32, metric: Metric) -> [u8; FILE_HEADER_LEN] {
+    let mut out = [0_u8; FILE_HEADER_LEN];
+    out[0..4].copy_from_slice(&MAGIC);
+    out[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+    out[6..10].copy_from_slice(&dimension.to_le_bytes());
+    out[10] = metric_to_u8(metric);
+    let crc = crc32(&out[0..12]);
+    out[12..16].copy_from_slice(&crc.to_le_bytes());
+    out
+}
+
+/// 校验并解析 WAL 文件头。
+///
+/// # Errors
+/// 魔数/版本/CRC 不符或文件短于头部时返回 [`MnemeError::Corrupted`]。
+pub(crate) fn parse_file_header(bytes: &[u8]) -> Result<WalHeader> {
+    if bytes.len() < FILE_HEADER_LEN {
+        return Err(MnemeError::Corrupted {
+            segment: None,
+            reason: "wal: 文件短于头部".to_string(),
+        });
+    }
+    if bytes[0..4] != MAGIC {
+        return Err(MnemeError::Corrupted {
+            segment: None,
+            reason: "wal: 魔数不符".to_string(),
+        });
+    }
+    let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+    check_version("wal", version)?;
+    let stored_crc = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
+    if crc32(&bytes[0..12]) != stored_crc {
+        return Err(MnemeError::Corrupted {
+            segment: None,
+            reason: "wal: header_crc32 不符".to_string(),
+        });
+    }
+    let dimension = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]);
+    let metric = metric_from_u8(bytes[10])?;
+    Ok(WalHeader { dimension, metric })
+}
+
+/// 编码一帧。
+pub(crate) fn encode_frame(seqno: u64, kind: FrameKind, payload: &[u8]) -> Vec<u8> {
+    let payload_len = payload.len() as u32;
+    let mut covered = Vec::with_capacity(4 + 8 + 1 + payload.len());
+    covered.extend_from_slice(&payload_len.to_le_bytes());
+    covered.extend_from_slice(&seqno.to_le_bytes());
+    covered.push(kind.as_u8());
+    covered.extend_from_slice(payload);
+    let mut out = Vec::with_capacity(4 + covered.len());
+    out.extend_from_slice(&crc32(&covered).to_le_bytes());
+    out.extend_from_slice(&covered);
+    out
+}
+
+/// 回放 WAL:校验文件头后逐帧解析。
+///
+/// # Errors
+/// 文件头损坏,或遇到未知帧类型(FC-PERSIST-ERR-001,绝不静默跳过)时返回错误。
+/// 尾部撕裂帧(长度不足/CRC 不符)不计入 `frames` 并停止回放,由调用方截断。
+pub(crate) fn replay(bytes: &[u8]) -> Result<Replay> {
+    let mut frames = Vec::new();
+    let valid_len = visit_frames(bytes, |seqno, kind, payload| {
+        frames.push(Frame {
+            seqno,
+            kind,
+            payload: payload.to_vec(),
+        });
+        Ok(())
+    })?;
+    Ok(Replay { frames, valid_len })
+}
+
+/// 流式遍历 WAL 帧,每帧以 `on_frame(seqno, kind, payload)` 回调,不整体物化
+/// (空间 `O(1)`,批缓冲由调用方自理;设计 04 §3.4)。返回有效字节长度。
+///
+/// # Errors
+/// 文件头损坏或未知帧类型(FC-PERSIST-ERR-001)时返回结构化错误;
+/// 尾部撕裂帧(长度不足/CRC 不符)停止遍历并返回其前长度。
+pub(crate) fn visit_frames(
+    bytes: &[u8],
+    mut on_frame: impl FnMut(u64, FrameKind, &[u8]) -> Result<()>,
+) -> Result<usize> {
+    parse_file_header(bytes)?;
+    let mut offset = FILE_HEADER_LEN;
+    while offset < bytes.len() {
+        // 帧头不足 → 撕裂尾部,停止。
+        if offset + FRAME_HEADER_LEN > bytes.len() {
+            break;
+        }
+        let payload_len = u32::from_le_bytes([
+            bytes[offset + 4],
+            bytes[offset + 5],
+            bytes[offset + 6],
+            bytes[offset + 7],
+        ]) as usize;
+        let frame_end = offset + FRAME_HEADER_LEN + payload_len;
+        if frame_end > bytes.len() {
+            break;
+        }
+        let stored_crc = u32::from_le_bytes([
+            bytes[offset],
+            bytes[offset + 1],
+            bytes[offset + 2],
+            bytes[offset + 3],
+        ]);
+        let covered = &bytes[offset + 4..frame_end];
+        if crc32(covered) != stored_crc {
+            break;
+        }
+        let seqno = u64::from_le_bytes(bytes[offset + 8..offset + 16].try_into().unwrap_or([0; 8]));
+        let kind_byte = bytes[offset + 16];
+        let Some(kind) = FrameKind::from_u8(kind_byte) else {
+            return Err(MnemeError::Corrupted {
+                segment: None,
+                reason: format!("wal: 未知帧类型 {kind_byte}"),
+            });
+        };
+        let payload = &bytes[offset + FRAME_HEADER_LEN..frame_end];
+        on_frame(seqno, kind, payload)?;
+        offset = frame_end;
+    }
+    Ok(offset)
+}

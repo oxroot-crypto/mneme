@@ -202,16 +202,55 @@ fn set_bit(bitmap: &mut [u8], row: usize) {
 /// # Errors
 /// 魔数/版本/`header_len`/头部 CRC 不符、布局不一致或 `quant != 0` 时返回结构化错误。
 pub(crate) fn parse(bytes: &[u8]) -> Result<VsecView<'_>> {
+    let header = parse_header(bytes)?;
+    let stride = row_stride(header.dimension);
+    let vec_len = (header.row_count as usize)
+        .checked_mul(stride)
+        .ok_or_else(|| MnemeError::Corrupted {
+            segment: None,
+            reason: "vsec: 向量区长度溢出".to_string(),
+        })?;
+    let norm_len = if header.norm_col {
+        (header.row_count as usize) * 4
+    } else {
+        0
+    };
+    let bitmap_len = bitmap_bytes(header.row_count);
+    let expected = HEADER_LEN as usize + vec_len + norm_len + bitmap_len + 4;
+    if bytes.len() != expected {
+        return Err(MnemeError::Corrupted {
+            segment: None,
+            reason: format!("vsec: 文件长度 {} 应为 {expected}", bytes.len()),
+        });
+    }
+    let data = &bytes[HEADER_LEN as usize..bytes.len() - 4];
+    let payload_crc = u32::from_le_bytes([
+        bytes[bytes.len() - 4],
+        bytes[bytes.len() - 3],
+        bytes[bytes.len() - 2],
+        bytes[bytes.len() - 1],
+    ]);
+    Ok(VsecView {
+        header,
+        data,
+        stride,
+        vec_len,
+        norm_len,
+        payload_crc,
+        payload_crc_ok: None,
+    })
+}
+
+/// 校验并解析 vsec 定长头部。
+fn parse_header(bytes: &[u8]) -> Result<VsecHeader> {
     let mut cursor = Cursor::new(bytes, "vsec 头部");
-    let magic = cursor.take(4)?;
-    if magic != MAGIC {
+    if cursor.take(4)? != MAGIC {
         return Err(MnemeError::Corrupted {
             segment: None,
             reason: "vsec: 魔数不符".to_string(),
         });
     }
-    let version = cursor.u16()?;
-    check_version("vsec", version)?;
+    check_version("vsec", cursor.u16()?)?;
     let header_len = cursor.u16()?;
     if header_len != HEADER_LEN {
         return Err(MnemeError::Corrupted {
@@ -244,51 +283,13 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<VsecView<'_>> {
             feature: "量化副本(vsec quant != 0, L6)",
         });
     }
-
-    let header = VsecHeader {
+    Ok(VsecHeader {
         dimension,
         metric,
         quant,
         norm_col,
         row_count,
         created_unix_ms,
-    };
-    let stride = row_stride(dimension);
-    let vec_len =
-        (row_count as usize)
-            .checked_mul(stride)
-            .ok_or_else(|| MnemeError::Corrupted {
-                segment: None,
-                reason: "vsec: 向量区长度溢出".to_string(),
-            })?;
-    let norm_len = if norm_col {
-        (row_count as usize) * 4
-    } else {
-        0
-    };
-    let bitmap_len = bitmap_bytes(row_count);
-    let expected = HEADER_LEN as usize + vec_len + norm_len + bitmap_len + 4;
-    if bytes.len() != expected {
-        return Err(MnemeError::Corrupted {
-            segment: None,
-            reason: format!("vsec: 文件长度 {} 应为 {expected}", bytes.len()),
-        });
-    }
-    let data = &bytes[HEADER_LEN as usize..bytes.len() - 4];
-    let payload_crc = u32::from_le_bytes([
-        bytes[bytes.len() - 4],
-        bytes[bytes.len() - 3],
-        bytes[bytes.len() - 2],
-        bytes[bytes.len() - 1],
-    ]);
-    Ok(VsecView {
-        header,
-        data,
-        stride,
-        vec_len,
-        norm_len,
-        payload_crc,
-        payload_crc_ok: None,
     })
 }
 
