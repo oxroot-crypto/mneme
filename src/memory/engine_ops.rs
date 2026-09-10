@@ -86,10 +86,11 @@ impl Mneme {
         })
     }
 
-    /// fsck:校验内部索引一致性。
+    /// fsck:校验内部索引一致性与持久段完整性。
     ///
-    /// 仅当 key 索引指向不存在的物理版本,或最新版本 `ns_id`/`key` 与索引不符时
-    /// 报告不一致;已删除(墓碑)与已逻辑过期的记录不算不一致(FC-MEM-POST-008)。
+    /// 内存侧:仅当 key 索引指向不存在的物理版本,或最新版本 `ns_id`/`key` 与索引
+    /// 不符时报告不一致;已删除(墓碑)与已逻辑过期的记录不算不一致(FC-MEM-POST-008)。
+    /// 持久侧(L2):逐段校验头部/payload CRC 与版本链记录体(设计 16 §1.6)。
     ///
     /// # Errors
     /// 库已关闭时返回 [`MnemeError::Closed`]。
@@ -111,6 +112,14 @@ impl Mneme {
             return Err(MnemeError::Closed);
         }
         let mut suggestions = Vec::new();
+        let mut corrupted = Vec::new();
+        // L2:逐段校验头部/payload CRC 与版本链(设计 16 §1.6)。
+        if let Some(store) = &self.store {
+            for id in store.verify_segments() {
+                suggestions.push(format!("段 {id} 校验失败"));
+                corrupted.push(id);
+            }
+        }
         for ((ns_id, key), rowid) in view.key_index.iter() {
             // 按最新物理版本对账(墓碑/逻辑过期不算不一致):key 索引指向不存在的
             // 版本,或最新版本 ns/key 与索引不符,才是真正的不一致(FC-MEM-POST-008)。
@@ -126,7 +135,7 @@ impl Mneme {
         }
         Ok(CheckReport {
             ok: suggestions.is_empty(),
-            corrupted: Vec::new(),
+            corrupted,
             suggestions,
         })
     }

@@ -10,7 +10,7 @@ use crate::core::error::{MnemeError, Result};
 use crate::core::metric::Metric;
 use crate::core::options::{
     Clock, CompactionPolicy, Compression, Dimension, FsyncPolicy, HnswParams, InsertMode, Limits,
-    RelationIndex, SystemClock, Tuning, VectorFormat,
+    MonotonicClock, RelationIndex, SystemClock, Tuning, VectorFormat,
 };
 use crate::memory::config::Config;
 use crate::memory::dedup::Dedup;
@@ -154,7 +154,8 @@ impl Builder {
             parallelism: self.parallelism,
             tuning: self.tuning,
             limits: self.limits,
-            clock: self.clock,
+            // 时钟回拨单调钳制:TTL 只可能晚消失(FC-GLOBAL-PRE-005)。
+            clock: Arc::new(MonotonicClock::new(self.clock)),
             read_only: self.read_only,
             verify_on_open: self.verify_on_open,
             fail_fast_on_corruption: self.fail_fast_on_corruption,

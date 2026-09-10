@@ -22,13 +22,14 @@ use crate::memory::table::{PersistHook, SlotData, WriteOp, WriterState};
 use crate::persist::flush;
 use crate::persist::hook::{FsyncHook, IoAction};
 use crate::persist::manifest::{self, Manifest, NsEntry, SegmentEntry};
-use crate::persist::msec::EntryData;
+use crate::persist::msec::{self, EntryData};
 use crate::persist::recover::{self, SegmentBytes};
 use crate::persist::storage::{
     self, CURRENT_FILE, FileLock, MANIFEST_KEEP, SEGMENTS_DIR, WAL_DIR, manifest_name, msec_name,
     parse_manifest_name, vsec_name,
 };
 use crate::persist::trash;
+use crate::persist::vsec;
 use crate::persist::wal::{self, FrameKind};
 use crate::persist::{FORMAT_VERSION, crc32};
 
@@ -36,8 +37,11 @@ use crate::persist::{FORMAT_VERSION, crc32};
 const WAL_FILE: &str = "wal/wal_000001.log";
 
 /// WAL 写入器:持有当前 WAL 文件句柄,按 [`FsyncPolicy`] 决定落盘时机。
+///
+/// 只读实例不持有可写句柄(`file = None`);任何写方法返回 `Unsupported`,
+/// 且打开时绝不创建/改写 WAL 文件(设计 12 §2 只读共享)。
 struct WalWriter {
-    file: std::fs::File,
+    file: Option<std::fs::File>,
     policy: FsyncPolicy,
     dimension: u32,
     metric: Metric,
@@ -45,10 +49,10 @@ struct WalWriter {
 }
 
 impl WalWriter {
-    /// 打开既有 WAL(追加)或新建(写文件头)。
+    /// 打开既有 WAL(追加)或新建(写文件头);只读实例仅只读打开既有 WAL、不创建。
     ///
-    /// 既有 WAL 的头部维度/度量与当前库不符(或头部损坏)时重建;否则保留既有帧,
-    /// 由 `Store::open` 回放后再继续追加——绝不在此截断已 fsync 的帧。
+    /// 既有 WAL 的头部维度/度量与当前库不符(或头部损坏)时重建(仅可写实例);
+    /// 否则保留既有帧,由 `Store::open` 回放后再继续追加——绝不在此截断已 fsync 的帧。
     ///
     /// # Errors
     /// I/O 失败返回 [`MnemeError::Io`]。
@@ -58,9 +62,25 @@ impl WalWriter {
         metric: Metric,
         policy: FsyncPolicy,
         hook: Option<Arc<dyn FsyncHook>>,
+        read_only: bool,
     ) -> Result<Self> {
         storage::ensure_dir(&root.join(WAL_DIR))?;
         let path = storage::resolve(root, WAL_FILE)?;
+        if read_only {
+            // 只读:若 WAL 存在则只读打开(不用于写入),否则不持有句柄。
+            let file = if storage::exists(&path)? {
+                Some(std::fs::OpenOptions::new().read(true).open(&path)?)
+            } else {
+                None
+            };
+            return Ok(Self {
+                file,
+                policy,
+                dimension,
+                metric,
+                hook,
+            });
+        }
         let reuse = storage::read_file_opt(root, WAL_FILE)?
             .filter(|bytes| bytes.len() >= wal::FILE_HEADER_LEN)
             .and_then(|bytes| wal::parse_file_header(&bytes).ok())
@@ -72,7 +92,7 @@ impl WalWriter {
             use std::io::{Seek, SeekFrom};
             file.seek(SeekFrom::End(0))?;
             return Ok(Self {
-                file,
+                file: Some(file),
                 policy,
                 dimension,
                 metric,
@@ -92,7 +112,7 @@ impl WalWriter {
         file.write_all(&header)?;
         file.sync_all()?;
         Ok(Self {
-            file,
+            file: Some(file),
             policy,
             dimension,
             metric,
@@ -100,50 +120,63 @@ impl WalWriter {
         })
     }
 
+    /// 打开可写句柄;只读实例返回 `Unsupported`。
+    fn writable(&mut self) -> Result<&mut std::fs::File> {
+        self.file.as_mut().ok_or(MnemeError::Unsupported {
+            feature: "只读模式写入",
+        })
+    }
+
     /// 追加一帧(不 fsync;由 [`WalWriter::sync`] 在事务末统一落盘)。
     ///
     /// # Errors
-    /// I/O 失败返回 [`MnemeError::Io`]。
+    /// 只读实例返回 [`MnemeError::Unsupported`];I/O 失败返回 [`MnemeError::Io`]。
     fn append(&mut self, seqno: u64, kind: FrameKind, payload: &[u8]) -> Result<()> {
         use std::io::Write as _;
         let frame = wal::encode_frame(seqno, kind, payload);
-        let offset = self.file.metadata()?.len();
-        if let Some(hook) = &self.hook {
+        let hook = self.hook.clone();
+        let file = self.writable()?;
+        let offset = file.metadata()?.len();
+        if let Some(hook) = &hook {
             hook.before(IoAction::Write {
                 file: WAL_FILE,
                 offset,
                 len: frame.len(),
             })?;
         }
-        self.file.write_all(&frame)?;
+        file.write_all(&frame)?;
         Ok(())
     }
 
     /// 按 `FsyncPolicy` 落盘:一个写事务只调用一次(组提交,FC-PERSIST-CPLX-001)。
     ///
     /// # Errors
-    /// 同步 I/O 失败返回 [`MnemeError::Io`]。
+    /// 只读实例返回 [`MnemeError::Unsupported`];同步 I/O 失败返回 [`MnemeError::Io`]。
     fn sync(&mut self) -> Result<()> {
-        if matches!(self.policy, FsyncPolicy::Always | FsyncPolicy::Batched(_)) {
-            if let Some(hook) = &self.hook {
-                hook.before(IoAction::Fsync { file: WAL_FILE })?;
-            }
-            self.file.sync_all()?;
+        if !matches!(self.policy, FsyncPolicy::Always | FsyncPolicy::Batched(_)) {
+            return Ok(());
         }
+        let hook = self.hook.clone();
+        let file = self.writable()?;
+        if let Some(hook) = &hook {
+            hook.before(IoAction::Fsync { file: WAL_FILE })?;
+        }
+        file.sync_all()?;
         Ok(())
     }
 
     /// 重置 WAL(Checkpoint):截断为空并重写文件头。
     ///
     /// # Errors
-    /// I/O 失败返回 [`MnemeError::Io`]。
+    /// 只读实例返回 [`MnemeError::Unsupported`];I/O 失败返回 [`MnemeError::Io`]。
     fn reset(&mut self) -> Result<()> {
-        self.file.set_len(0)?;
+        let (dimension, metric) = (self.dimension, self.metric);
+        let file = self.writable()?;
+        file.set_len(0)?;
         use std::io::{Seek, SeekFrom, Write as _};
-        self.file.seek(SeekFrom::Start(0))?;
-        let header = wal::encode_file_header(self.dimension, self.metric);
-        self.file.write_all(&header)?;
-        self.file.sync_all()?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&wal::encode_file_header(dimension, metric))?;
+        file.sync_all()?;
         Ok(())
     }
 }
@@ -202,6 +235,13 @@ impl Store {
         }
 
         let loaded = load_manifest(root)?;
+        // 段文件存在却无 MANIFEST:不一致状态,拒绝当作新库覆盖既有数据(设计 16 §3)。
+        if loaded.is_none() && !segment_files(root)?.is_empty() {
+            return Err(MnemeError::Corrupted {
+                segment: None,
+                reason: "段文件存在但无 MANIFEST,拒绝覆盖".to_string(),
+            });
+        }
         let (manifest, version) = match loaded {
             Some((manifest, version)) => {
                 if let Some(dimension) = requested_dimension
@@ -267,15 +307,27 @@ impl Store {
             }
         };
 
-        // 载入段并重建写状态。
+        // 可写实例清理 MANIFEST 未引用的段孤儿(garbage),只读实例不写盘。
+        if !read_only {
+            remove_unreferenced_segments(root, &manifest)?;
+        }
+
+        // 载入段并重建写状态;损坏段(头部不可解析)返回其 id 以便隔离。
         let mut state = recover::empty_state(&manifest);
         let segments = read_segment_bytes(root, &manifest)?;
-        recover::load_segments(
+        let skipped = recover::load_segments(
             &mut state,
             &segments,
             verify_on_open,
             fail_fast_on_corruption,
         )?;
+        if !read_only && !skipped.is_empty() {
+            let names: Vec<String> = skipped
+                .iter()
+                .flat_map(|id| [vsec_name(*id), msec_name(*id)])
+                .collect();
+            trash::move_to_trash(root, &names)?;
+        }
 
         // 回放 WAL(仅 seqno > watermark)。
         if let Some(bytes) = storage::read_file_opt(root, WAL_FILE)? {
@@ -288,6 +340,7 @@ impl Store {
             manifest.metric,
             fsync,
             hook.clone(),
+            read_only,
         )?;
         let store = Arc::new(Store {
             root: root.to_path_buf(),
@@ -360,6 +413,44 @@ impl Store {
             .manifest
             .segments
             .len()
+    }
+
+    /// 校验全部活跃段:头部 + payload CRC + 版本链记录体可解析。
+    ///
+    /// 返回损坏段的 id 列表(供 `check()` 报告);不修改任何状态。
+    pub(crate) fn verify_segments(&self) -> Vec<crate::core::types::SegmentId> {
+        let guard = self
+            .manifest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut corrupt = Vec::new();
+        for segment in &guard.manifest.segments {
+            let result = (|| -> Result<()> {
+                let vsec_bytes = storage::read_file(
+                    &self.root,
+                    &format!("{SEGMENTS_DIR}/{}", vsec_name(segment.segment_id)),
+                )?;
+                let msec_bytes = storage::read_file(
+                    &self.root,
+                    &format!("{SEGMENTS_DIR}/{}", msec_name(segment.segment_id)),
+                )?;
+                let mut vsec_view = vsec::parse(&vsec_bytes)?;
+                vsec_view.verify_payload()?;
+                let mut msec_view = msec::parse(&msec_bytes)?;
+                msec_view.verify_payload()?;
+                // 版本链记录体可解析(含 doc_offset 有效性)。
+                for row in msec_view.version_rows()? {
+                    if row.doc_offset != msec::TOMBSTONE_DOC_OFFSET {
+                        let _ = msec_view.read_entry(row.doc_offset)?;
+                    }
+                }
+                Ok(())
+            })();
+            if result.is_err() {
+                corrupt.push(crate::core::types::SegmentId::new(segment.segment_id));
+            }
+        }
+        corrupt
     }
 
     /// 释放独占锁(`close` 调用;幂等)。
@@ -537,13 +628,15 @@ impl Store {
 
 impl PersistHook for Store {
     fn log(&self, ops: &[WriteOp]) -> Result<()> {
+        // 空事务(如 `close` 只置 closed 标志)在只读下亦无写入,直接成功;
+        // 真正的写操作在只读模式返回 `Unsupported`。
+        if ops.is_empty() {
+            return Ok(());
+        }
         if self.read_only {
             return Err(MnemeError::Unsupported {
                 feature: "只读模式写入",
             });
-        }
-        if ops.is_empty() {
-            return Ok(());
         }
         let mut wal = self
             .wal
@@ -697,8 +790,13 @@ fn cleanup_orphans(root: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 读取 `current` 或扫描目录得到最新合法 MANIFEST;不存在返回 `None`。
+/// 读取 `current` 或扫描目录得到最新合法 MANIFEST。
+///
+/// 返回 `Ok(None)` 仅表示"全新库"(`current`/`MANIFEST.*` 均不存在)。
+/// 若 `current` 存在但 `current` 指向的 MANIFEST 与目录内其余 `MANIFEST.*`
+/// 全部非法,返回 [`MnemeError::Corrupted`]——**绝不**当作新库覆盖(设计 16 §3)。
 fn load_manifest(root: &Path) -> Result<Option<(Manifest, u64)>> {
+    let has_current = storage::exists(&root.join(CURRENT_FILE))?;
     if let Some(bytes) = storage::read_file_opt(root, CURRENT_FILE)? {
         let text = String::from_utf8_lossy(&bytes);
         if let Ok(version) = text.trim().parse::<u64>()
@@ -723,7 +821,36 @@ fn load_manifest(root: &Path) -> Result<Option<(Manifest, u64)>> {
             best = Some((manifest, version));
         }
     }
+    if best.is_none() && has_current {
+        return Err(MnemeError::Corrupted {
+            segment: None,
+            reason: "current 存在但无任何 CRC 合法的 MANIFEST".to_string(),
+        });
+    }
     Ok(best)
+}
+
+/// 列出 `segments/` 下的段文件(`.vsec`/`.msec`)。
+fn segment_files(root: &Path) -> Result<Vec<String>> {
+    Ok(storage::list_dir(root, SEGMENTS_DIR)?
+        .into_iter()
+        .filter(|name| name.ends_with(".vsec") || name.ends_with(".msec"))
+        .collect())
+}
+
+/// 删除 MANIFEST 未引用的段文件(崩溃残留的 `Building`/`Obsolete` 孤儿)。
+fn remove_unreferenced_segments(root: &Path, manifest: &Manifest) -> Result<()> {
+    let referenced: std::collections::HashSet<String> = manifest
+        .segments
+        .iter()
+        .flat_map(|segment| [vsec_name(segment.segment_id), msec_name(segment.segment_id)])
+        .collect();
+    for name in segment_files(root)? {
+        if !referenced.contains(&name) {
+            storage::remove_if_exists(&storage::resolve(root, &format!("{SEGMENTS_DIR}/{name}"))?)?;
+        }
+    }
+    Ok(())
 }
 
 /// 提交 MANIFEST:写 `MANIFEST.<v>` → 写 `current` → 保留最近 `MANIFEST_KEEP` 版。

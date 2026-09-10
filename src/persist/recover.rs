@@ -44,39 +44,55 @@ pub(crate) fn empty_state(manifest: &Manifest) -> WriterState {
 
 /// 把各段记录重建成写状态(调用前请先用 [`empty_state`] 载入注册表/水位)。
 ///
+/// 返回被隔离(跳过)的段 id 列表,供调用方移入 `trash/`(设计 04 §7)。
+///
 /// # Errors
-/// 段头/记录体损坏且 `fail_fast` 时返回错误;否则损坏段被跳过(返回已载入部分)。
+/// 段头/记录体损坏且 `fail_fast` 时返回错误;否则损坏段被跳过并计入返回值。
 pub(crate) fn load_segments(
     state: &mut WriterState,
     segments: &[SegmentBytes],
     verify_payload: bool,
     fail_fast: bool,
-) -> Result<()> {
+) -> Result<Vec<u32>> {
     // 收集全部版本并按 (rowid, seqno) 全局排序,保证同一 RowId 的版本链有序。
     let mut versions: Vec<(VersionRow, usize)> = Vec::new();
     let mut parsed: Vec<(vsec::VsecView<'_>, msec::MsecView<'_>)> = Vec::new();
+    let mut skipped: Vec<u32> = Vec::new();
     for segment in segments {
         let mut vsec_view = match vsec::parse(&segment.vsec) {
             Ok(view) => view,
-            Err(error) if fail_fast => return Err(error),
-            Err(_) => continue,
+            // 主版本过新一律拒绝打开(I18),绝不因 fail-fast 关闭而降级为跳过。
+            Err(error) if fail_fast || matches!(error, MnemeError::UnsupportedVersion { .. }) => {
+                return Err(error);
+            }
+            Err(_) => {
+                skipped.push(segment.segment_id);
+                continue;
+            }
         };
         let mut msec_view = match msec::parse(&segment.msec) {
             Ok(view) => view,
-            Err(error) if fail_fast => return Err(error),
-            Err(_) => continue,
+            Err(error) if fail_fast || matches!(error, MnemeError::UnsupportedVersion { .. }) => {
+                return Err(error);
+            }
+            Err(_) => {
+                skipped.push(segment.segment_id);
+                continue;
+            }
         };
         if verify_payload {
             if let Err(error) = vsec_view.verify_payload() {
                 if fail_fast {
                     return Err(error);
                 }
+                skipped.push(segment.segment_id);
                 continue;
             }
             if let Err(error) = msec_view.verify_payload() {
                 if fail_fast {
                     return Err(error);
                 }
+                skipped.push(segment.segment_id);
                 continue;
             }
         }
@@ -153,7 +169,7 @@ pub(crate) fn load_segments(
         }
     }
     state.pending.clear();
-    Ok(())
+    Ok(skipped)
 }
 
 /// 由记录体 + 向量构造一个活槽位。

@@ -8,9 +8,9 @@
 //! `FC-PERSIST-INV-004`、`FC-PERSIST-INV-019`、`FC-PERSIST-INV-020`、
 //! `FC-PERSIST-POST-001`、`FC-PERSIST-POST-002`、`FC-PERSIST-POST-003`、
 //! `FC-PERSIST-POST-004`、`FC-PERSIST-POST-005`、`FC-PERSIST-STA-001`、
-//! `FC-PERSIST-STA-002`、`FC-PERSIST-ERR-003`、`FC-PERSIST-ERR-004`、
-//! `FC-PERSIST-CPLX-001`、`FC-PERSIST-CPLX-007`、`FC-PERSIST-CPLX-008`、
-//! `FC-PERSIST-CPLX-009`、`FC-PERSIST-CPLX-010`。
+//! `FC-PERSIST-STA-002`、`FC-PERSIST-ERR-002`、`FC-PERSIST-ERR-003`、
+//! `FC-PERSIST-ERR-004`、`FC-PERSIST-ERR-005`、`FC-PERSIST-CPLX-001`、`FC-PERSIST-CPLX-007`、
+//! `FC-PERSIST-CPLX-008`、`FC-PERSIST-CPLX-009`、`FC-PERSIST-CPLX-010`。
 //!
 //! 片级编解码的损坏检出与版本拒绝见各 `src/persist/*.rs` 单元测试。
 
@@ -319,6 +319,139 @@ fn touch_boost_survives_crash() {
     let rec = ns.get("a").expect("get").expect("visible");
     assert!((rec.importance() - 0.8).abs() < 1e-6);
     db.close().expect("close");
+}
+
+/// **FC-PERSIST-ERR-002(I18)**:段主版本过新 → `UnsupportedVersion`,即使默认
+/// 非 fail-fast 也拒绝打开(绝不降级为跳过)。
+#[test]
+fn higher_major_segment_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let db = build(dir.path(), 2);
+        db.namespace("demo")
+            .insert(Record::new(vec![1.0, 0.0]).key("a"))
+            .expect("a");
+        db.close().expect("close");
+    }
+    let vsec = dir.path().join("segments").join("seg_000000.vsec");
+    let mut bytes = std::fs::read(&vsec).expect("read");
+    // 版本在 head 校验之前判定,故无需重算头部 CRC。
+    bytes[4..6].copy_from_slice(&0x0100_u16.to_le_bytes());
+    std::fs::write(&vsec, &bytes).expect("write");
+
+    assert!(matches!(
+        Mneme::open(dir.path()),
+        Err(mneme::MnemeError::UnsupportedVersion { .. })
+    ));
+}
+
+/// **FC-PERSIST-ERR-003**:只读打开不创建/改写 WAL 文件,且可读既有数据。
+#[test]
+fn read_only_open_does_not_create_wal() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let db = build(dir.path(), 2);
+        db.namespace("demo")
+            .insert(Record::new(vec![1.0, 0.0]).key("a"))
+            .expect("a");
+        db.close().expect("close");
+    }
+    let wal = dir.path().join("wal").join("wal_000001.log");
+    std::fs::remove_file(&wal).expect("remove wal");
+
+    let db = Builder::default()
+        .read_only(true)
+        .path(dir.path())
+        .build()
+        .expect("read only open");
+    assert!(
+        db.namespace("demo").get("a").expect("get").is_some(),
+        "段数据可读"
+    );
+    assert!(!wal.exists(), "只读打开不得创建 WAL");
+    db.close().expect("close");
+}
+
+/// **FC-PERSIST-INV-002(I2)**:`check()` 逐段校验,损坏段被报告为 `Corrupted`。
+#[test]
+fn check_detects_corrupt_segment() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let db = build(dir.path(), 4);
+        db.namespace("demo")
+            .insert(Record::new(vec![1.0, 2.0, 3.0, 4.0]).key("a"))
+            .expect("a");
+        db.close().expect("close");
+    }
+    let vsec = dir.path().join("segments").join("seg_000000.vsec");
+    let mut bytes = std::fs::read(&vsec).expect("read");
+    bytes[70] ^= 0xFF;
+    std::fs::write(&vsec, &bytes).expect("write");
+
+    let db = Mneme::open(dir.path()).expect("open");
+    let report = db.check().expect("check");
+    assert!(!report.ok, "损坏段必须使 check 失败");
+    assert_eq!(report.corrupted.len(), 1);
+    assert_eq!(report.corrupted[0].get(), 0);
+    db.close().expect("close");
+}
+
+/// **FC-PERSIST-ERR-005**:`current` 存在但无合法 MANIFEST → `Corrupted`,拒绝覆盖。
+#[test]
+fn corrupt_current_without_valid_manifest_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let db = build(dir.path(), 2);
+        db.namespace("demo")
+            .insert(Record::new(vec![1.0, 0.0]).key("a"))
+            .expect("a");
+        db.close().expect("close");
+    }
+    std::fs::write(dir.path().join("current"), b"not-a-number").expect("corrupt current");
+    // 破坏唯一的 MANIFEST,使扫描也找不到合法版本。
+    let manifest_file = dir.path().join("MANIFEST.000001");
+    let mut bytes = std::fs::read(&manifest_file).expect("read manifest");
+    bytes[12] ^= 0xFF;
+    std::fs::write(&manifest_file, &bytes).expect("corrupt manifest");
+
+    assert!(matches!(
+        Mneme::open(dir.path()),
+        Err(mneme::MnemeError::Corrupted { .. })
+    ));
+}
+
+/// **FC-PERSIST-ERR-005**:存在段文件却无 MANIFEST → `Corrupted`,拒绝当作新库覆盖。
+#[test]
+fn segments_without_manifest_are_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    std::fs::create_dir_all(dir.path().join("segments")).expect("mkdir");
+    std::fs::write(
+        dir.path().join("segments").join("seg_000000.vsec"),
+        b"VSC1 garbage",
+    )
+    .expect("write orphan segment");
+
+    assert!(matches!(
+        Builder::default().dimension(2).path(dir.path()).build(),
+        Err(mneme::MnemeError::Corrupted { .. })
+    ));
+}
+
+/// **FC-PERSIST-STA-002**:MANIFEST 未引用的段孤儿在可写打开时清理。
+#[test]
+fn unreferenced_segment_cleaned_on_open() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let db = build(dir.path(), 2);
+        db.namespace("demo")
+            .insert(Record::new(vec![1.0, 0.0]).key("a"))
+            .expect("a");
+        db.close().expect("close");
+    }
+    let stray = dir.path().join("segments").join("seg_000042.vsec");
+    std::fs::write(&stray, b"VSC1 orphan").expect("write stray");
+    let _db = Mneme::open(dir.path()).expect("reopen");
+    assert!(!stray.exists(), "未引用段必须被清理");
 }
 
 /// **FC-PERSIST-POST-004**:`backup_to` 产出一致快照,可独立 `open`。
