@@ -6,7 +6,7 @@
 > **本章你将学到**:API 语义细则 → 内存表结构 → 暴力扫描 → 过滤 AST → 去重预检。
 
 模块:`memory/{engine.rs, engine_ops.rs, builder.rs, namespace/, snapshot.rs, snapshot_scan.rs,
-search_builder.rs, search_exec.rs, expand.rs, rerank.rs, table.rs, bitset.rs, search.rs, pred.rs,
+search_builder.rs, search_exec.rs, expand.rs, rerank.rs, table/(mod,handle,state,view,write_op).rs, bitset.rs, search.rs, pred.rs,
 pred_eval.rs, record.rs, write_helpers.rs, mutate_helpers.rs, dedup.rs, relation.rs,
 temporal.rs, score.rs, lifecycle.rs, ops.rs, config.rs}`——`engine.rs` 承载库句柄 `Mneme`
 (统计/fsck/落盘门面在 `engine_ops.rs`),`namespace/` 承载 `Namespace` 的写/读/访问/
@@ -139,7 +139,7 @@ impl Mneme {
 
 ---
 
-## 3. 内存表结构:`table.rs`
+## 3. 内存表结构:`table/`
 
 ```text
 Table
@@ -395,7 +395,8 @@ snapshot / as_of / backup_to / stats / check / compact_control` 的签名。
 
 **向下(L0)**:只使用 [02 §9](02-l0-core.md) 契约内的类型与函数。
 
-**向 L2 交接的内部接口**(L2 必须实现,以便内存层无痛升级为持久层):
+**向 L3 交接的内部接口**(L3 引入 HNSW 时落地,以便内存层无痛升级为索引层;
+L1/L2 阶段直接在引擎内实现本节签名,不引入该内部 trait,公开 API 始终不变):
 
 ```rust
 // SearchOpt: 检索参数打包(top_k / ef / filter / dedup / fusion / score / diversify / expand / as_of / query_id / rerank);
@@ -414,10 +415,12 @@ pub trait VectorStore: Send + Sync {
 }
 ```
 
-L2 的 `Database` 即 `VectorStore` 的持久实现;L3 的 HNSW 再替换其 `search` 实现——
-公开 API 始终不变。**注**:含 `impl Iterator` 返回位置( RPITIT)的 trait 不是
-object-safe,内部按泛型/单态使用(不构造 `dyn VectorStore`);若未来需要动态替换,
-把 `scan_alive` 改为返回 `Box<dyn Iterator<...> + '_>`。
+L3 以该 trait 承载 "暴力扫描 → HNSW" 的检索实现替换——公开 API 始终不变。
+L1 全内存引擎与 L2 持久引擎都是同一组公开签名的直接实现(见本仓 `src/memory/`、
+`src/persist/`),因此该 trait 在 L3 落地前不存在实现分歧。**注**:含 `impl Iterator`
+返回位置(RPITIT)的 trait 不是 object-safe,内部按泛型/单态使用(不构造
+`dyn VectorStore`);若需要动态替换,把 `scan_alive` 改为返回
+`Box<dyn Iterator<...> + '_>`。
 
 ## 本章小结
 

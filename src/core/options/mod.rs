@@ -21,6 +21,7 @@ mod limits;
 mod scoring;
 mod write;
 
+pub(crate) use clock::MonotonicClock;
 pub use clock::{Clock, SystemClock};
 pub use dimension::Dimension;
 pub use index::{HnswParams, Tuning, VectorFormat};

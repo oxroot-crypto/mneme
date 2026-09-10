@@ -3,7 +3,7 @@
 //! 覆盖 `docs/spec/contracts.md` 的以下条目:
 //!
 //! * FC-MEM-PRE-001/002/003、FC-MEM-POST-001..007/009、FC-MEM-INV-001/002
-//! * FC-GLOBAL-PRE-001..004、FC-MEM-CPLX-004(delete 复杂度哨兵)
+//! * FC-GLOBAL-PRE-001..005、FC-MEM-CPLX-004(delete 复杂度哨兵)
 //! * 跨族条目:FC-INDEX-POST-004、FC-MODEL-INV-022/024、FC-LIFE-INV-009
 //!
 //! 检索/过滤/打分、记忆模型、遗忘与库生命周期的专项测试分见
@@ -948,6 +948,42 @@ fn logically_expired_hidden_from_internal_paths() {
         })
         .expect("consolidate");
     assert_eq!(report.clusters, 0, "过期记录不得进入沉淀候选");
+}
+
+/// FC-GLOBAL-PRE-005(时钟回拨经单调水位钳制:过期记录不因回拨复活)
+#[test]
+fn clock_rollback_does_not_resurrect_expired_record() {
+    let clock = FakeClock::default();
+    clock.set(1_000);
+    let db = Mneme::builder()
+        .dimension(2)
+        .clock(Arc::new(clock.clone()))
+        .build()
+        .expect("build");
+    let ns = db.namespace("n");
+    ns.insert(
+        Record::new(vec![1.0, 0.0])
+            .key("a")
+            .ttl(std::time::Duration::from_millis(500)),
+    )
+    .expect("insert");
+    clock.set(2_000);
+    assert!(ns.get("a").expect("get").is_none(), "超过 TTL 后不可见");
+    // 回拨到 TTL 之前;单调钳制后时间不倒退,过期记录不得复活。
+    clock.set(100);
+    assert!(
+        ns.get("a").expect("get").is_none(),
+        "时钟回拨不得让过期记录复活"
+    );
+    let stats = db.stats().expect("stats");
+    assert!(
+        stats
+            .per_namespace
+            .get("n")
+            .is_none_or(|stat| stat.doc_count == 0),
+        "过期记录不得计入 stats"
+    );
+    db.close().expect("close");
 }
 
 proptest! {

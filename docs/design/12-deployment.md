@@ -8,7 +8,8 @@
 > 只读共享与 WASM 是**采用门槛级**能力:许多 Agent 框架会
 > 以多进程运行,边缘/浏览器则是嵌入式库的天然战场。单写者语义保持不变。
 
-模块:`deploy/{readonly.rs}`、`obs/observer.rs`;`Storage` 抽象位于 `persist/storage.rs`(L2)
+模块:`deploy/{readonly.rs}`、`obs/observer.rs`;`Storage` trait 计划落在 `persist/storage.rs`
+(L12 抽取,见 §3.1);L2 目前只有该文件的 `std::fs` 自由函数
 
 ---
 
@@ -32,13 +33,14 @@ let db = Mneme::builder().path("./agent_memory").read_only(true).build()?;
 // db 只能读;任何写操作返回 Unsupported { feature: "只读模式写入" }
 ```
 
-- 只读实例**不创建/不争抢写锁文件**([16 §3](16-api-reference.md));它只校验写者是否存活;
-- 只读实例**不写盘**:打开时在内存中重放未落段的 WAL(遇撕裂帧只忽略、不截断,
-  [04 §7](04-l2-persist.md));损坏段只从视图剔除,不移动文件;
-- 只读实例的可见性:打开时读一次 `current` → MANIFEST,之后**周期性探测** `current`
-  的版本号(mtime/内容),发现新版本则原子切换到新的 ReaderView;
+- 只读实例**不创建/不争抢写锁文件**,也不探测写者存活([16 §3](16-api-reference.md));
+- 只读实例**不改动文件系统**:打开时**不建目录、不清 `trash/`、不移动损坏段、不截断 WAL**,
+  只读取既有数据;在内存中重放未落段的 WAL(遇撕裂帧只忽略、不截断,
+  [04 §7](04-l2-persist.md));损坏段只从视图剔除,不移动文件(库目录不存在 → `Config`);
+- 只读实例的可见性:打开时读一次 `current` → MANIFEST。**周期性探测 `current` 版本号并原子
+  切换视图是 L12 目标**;L2 的只读实例打开后不随写者推进刷新(§2.1 描述的是目标语义);
 - **不变量 I29**:任意时刻只读实例看到的都是某个**已提交 MANIFEST 版本的完整视图**
-  (段集一致,不会看到半提交状态);新版本的可见延迟 ≤ 探测周期(默认 1s)。
+  (段集一致,不会看到半提交状态);新版本的可见延迟 ≤ 探测周期(默认 1s,L12)。
 
 ### 2.2 为什么不需要协议
 
@@ -69,8 +71,12 @@ let db = Mneme::builder().path("./agent_memory").read_only(true).build()?;
 
 [04 §11](04-l2-persist.md) 已把段读取抽象为 `SegmentSource`(mmap / `FileSource`)。
 WASM 没有 mmap,但有内存文件系统/IndexedDB;需要把**写路径**也抽象出来。
-为此,`Storage` trait 作为 **L2 基础设施抽象**定义在 `persist/storage.rs`
-(与 `SegmentSource` 同层,避免上层反向依赖),`deploy/` 只提供 WASM 适配实现。
+为此,`Storage` trait 计划定义在 `persist/storage.rs`(与 `SegmentSource` 同层,
+避免上层反向依赖),`deploy/` 只提供 WASM 适配实现。
+> **落地状态**:L2 目前以 `persist/storage.rs` 的 `std::fs` 自由函数实现文件操作
+> (原子写/锁/目录遍历),`Storage` trait 与 `Builder::storage` 待 **L12** 引入首个
+> 非 `FsStorage` 后端(WASM/OPFS)时抽取,以避免在仅有一个后端时过早抽象。
+> 故 16 §1.1 的 `Builder::storage` 亦标记为 L12 落地。
 
 ```rust
 /// 存储后端的文件元数据(不依赖 `std::fs`,WASM 后端同样可实现)。
@@ -85,7 +91,7 @@ pub trait Storage: Send + Sync {
     fn remove(&self, path: &str) -> Result<()>;
     fn list(&self, dir: &str) -> Result<Vec<String>>;
     fn stat(&self, path: &str) -> Result<FileMeta>;
-    fn create_new(&self, path: &str) -> Result<()>;  // 原子创建,已存在则失败(写锁文件用,见 16 §3)
+    fn create_new(&self, path: &str) -> Result<()>;  // 原子创建,已存在则失败(元数据原子写用)
     fn exists(&self, path: &str) -> Result<bool>;
 }
 ```
@@ -93,7 +99,7 @@ pub trait Storage: Send + Sync {
 - 桌面/服务器用 `FsStorage`(std);WASM 用 `MemStorage`(纯内存)或宿主提供的
   `OpfsStorage`(Origin Private File System,经宿主实现);后端经 `Builder::storage(Arc<dyn Storage>)`
   注入([16 §1.1](16-api-reference.md)),默认 `FsStorage`;
-- 写锁文件的原子创建(`create_new`)与存在性判定(`exists`)也走 `Storage`,保证后端可替换;
+- 文件锁经 `Storage` 提供 `try_lock` 等价能力(桌面 `FsStorage` 用 OS 咨询锁,见 [16 §3](16-api-reference.md)),存在性判定(`exists`)亦走 `Storage`,保证后端可替换;
 - `read_only` + `MemStorage` 可用于浏览器内只读记忆;写入需宿主提供持久化策略。
 
 ### 3.2 `no_std + alloc` 核心
@@ -117,6 +123,9 @@ WASM 通过 `Storage` 抽象接入;本章固化 `Storage`/`SegmentSource` 抽象
 
 [16 §10](16-api-reference.md) 目前只有 `stats()` 轮询。产品化需要**事件级**可观测,
 但又要守住"默认不引 `log`/`tracing` 依赖"。
+
+> **落地状态**:`Observer`/`Event`/`Builder::observer` 尚未在 `src/` 实现,计划随
+> **L12** 落地;当前版本没有该 API。
 
 ```rust
 pub trait Observer: Send + Sync {

@@ -16,6 +16,7 @@ use crate::memory::ops::{BackupReport, CompactionControl};
 use crate::memory::snapshot::SnapshotHandle;
 use crate::memory::table::Table;
 use crate::memory::temporal;
+use crate::persist::store::Store;
 
 /// 库句柄;内部 `Arc` 共享,克隆廉价且可跨线程。
 #[derive(Clone)]
@@ -23,6 +24,8 @@ pub struct Mneme {
     pub(crate) table: Arc<Table>,
     pub(crate) config: Arc<Config>,
     pub(crate) control: CompactionControl,
+    /// 持久层协调句柄;纯内存库为 `None`。
+    pub(crate) store: Option<Arc<Store>>,
 }
 
 impl std::fmt::Debug for Mneme {
@@ -34,24 +37,23 @@ impl std::fmt::Debug for Mneme {
 }
 
 impl Mneme {
-    /// 打开一个已初始化的本地目录记忆库(持久化在 L2 实现)。
+    /// 打开(或按需创建)一个本地目录记忆库(L2 持久化实现)。
     ///
     /// # Arguments
-    /// * `_path` - 已初始化库的目录路径;L1 阶段忽略,恒返回 `Unsupported`,
-    ///   L2 持久层落地后生效。
+    /// * `path` - 库目录路径;不存在时按默认配置新建(维度需经 [`Mneme::builder`] 指定)。
     ///
     /// # Errors
-    /// 当前恒返回 [`MnemeError::Unsupported`]。
+    /// 目录不可用、锁被占、MANIFEST/段损坏或维度冲突时返回结构化错误。
     ///
     /// # Examples
-    /// ```
+    /// ```no_run
     /// use mneme::Mneme;
-    /// assert!(Mneme::open("some/dir").is_err());
+    /// // 仅编译不执行:会打开/创建本地目录。
+    /// let db = Mneme::open("data/agent_memory").expect("open");
+    /// # let _ = db;
     /// ```
-    pub fn open(_path: impl AsRef<Path>) -> Result<Mneme> {
-        Err(MnemeError::Unsupported {
-            feature: "持久化(open, L2)",
-        })
+    pub fn open(path: impl AsRef<Path>) -> Result<Mneme> {
+        Builder::default().path(path).build()
     }
 
     /// 创建纯内存库(易失),维度必填。
@@ -238,13 +240,16 @@ impl Mneme {
         })
     }
 
-    /// 备份到目录(持久化在 L2 实现)。
+    /// 备份到目录:先 `flush`(非只读时)再复制段/MANIFEST/WAL,`current` 最后写。
+    ///
+    /// 纯内存库无持久内容,返回 [`MnemeError::Unsupported`]。
     ///
     /// # Arguments
-    /// * `_dir` - 备份目标目录;L1 阶段忽略,恒返回 `Unsupported`。
+    /// * `dir` - 备份目标目录;必须不存在或为空。
     ///
     /// # Errors
-    /// 当前恒返回 [`MnemeError::Unsupported`]。
+    /// 纯内存库返回 [`MnemeError::Unsupported`];目标非空返回 [`MnemeError::Busy`];
+    /// I/O 失败返回 [`MnemeError::Io`]。
     ///
     /// # Examples
     /// ```
@@ -252,10 +257,22 @@ impl Mneme {
     /// let db = Mneme::in_memory(2).unwrap();
     /// assert!(db.backup_to("backup").is_err());
     /// ```
-    pub fn backup_to(&self, _dir: impl AsRef<Path>) -> Result<BackupReport> {
-        Err(MnemeError::Unsupported {
-            feature: "备份(backup_to, L2)",
-        })
+    pub fn backup_to(&self, dir: impl AsRef<Path>) -> Result<BackupReport> {
+        let Some(store) = &self.store else {
+            return Err(MnemeError::Unsupported {
+                feature: "备份(backup_to, 纯内存库)",
+            });
+        };
+        // 持写锁跨 flush 与复制:阻止并发写触发阈值 flush 把正在复制的段移入 trash,
+        // 保证备份的段集合与 MANIFEST 一致(FC-PERSIST-POST-004)。
+        let ws = self.table.write();
+        if ws.closed {
+            return Err(MnemeError::Closed);
+        }
+        if !self.config.read_only {
+            store.flush(&ws, &self.config)?;
+        }
+        store.backup_to(dir.as_ref())
     }
 
     /// 关闭共享库:标记关闭并释放资源;幂等。
@@ -270,6 +287,15 @@ impl Mneme {
     /// db.close().unwrap();
     /// ```
     pub fn close(self) -> Result<()> {
+        if let Some(store) = &self.store {
+            let ws = self.table.write();
+            // 只读库不写盘;可写库在关闭前把全部已确认写入落成段(I16)。
+            if !ws.closed && !self.config.read_only {
+                store.flush(&ws, &self.config)?;
+            }
+            drop(ws);
+            store.release_lock();
+        }
         let table = Arc::clone(&self.table);
         table.write_tx(move |ws| {
             ws.closed = true;

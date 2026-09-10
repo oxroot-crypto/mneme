@@ -9,7 +9,7 @@ use crate::core::types::{NsId, RowId};
 use crate::memory::lifecycle::{RetainReport, Retention, retention_score};
 use crate::memory::mutate_helpers::{build_summary, is_consolidated};
 use crate::memory::pred::{self, EvalCtx, Expr};
-use crate::memory::relation::{self, Edge};
+use crate::memory::relation::Edge;
 use crate::memory::score::{self, ConsolidateReport, ConsolidationPolicy};
 use crate::memory::table::{SlotData, WriterState};
 use crate::memory::write_helpers::{SlotSpec, build_slot};
@@ -336,8 +336,7 @@ impl ConsolidationCtx<'_> {
                 weight: 1.0,
                 metadata: Meta::Null,
             };
-            relation::upsert_edge(Arc::make_mut(&mut self.ws.out_edges), edge.clone());
-            relation::upsert_edge(Arc::make_mut(&mut self.ws.in_edges), edge);
+            self.ws.relate_edge(edge);
         }
     }
 }
