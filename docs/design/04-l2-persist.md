@@ -758,7 +758,7 @@ Windows 不允许删除被 mmap/句柄打开的文件。方案:
 ### 10.1 崩溃注入:`FsyncHook`
 
 ```rust
-/// 待注入的 I/O 动作(仅测试 builder 暴露)。
+/// 待注入的 I/O 动作。
 pub enum IoAction {
     Write { file: &'static str, offset: u64, len: usize },
     Fsync { file: &'static str },
@@ -771,8 +771,8 @@ pub trait FsyncHook: Send + Sync {
 }
 ```
 
-仅测试 builder 暴露。用法见 [14 §2](14-testing.md):在随机点"杀死"进程,
-断言恢复后状态 = 已确认操作前缀。
+经 `Builder::fsync_hook` 公开注入(测试用 seam;生产不设置即无开销)。
+用法见 [14 §2](14-testing.md):在随机点"杀死"进程,断言恢复后状态 = 已确认操作前缀。
 
 ### 10.2 时间源:`Clock`
 
@@ -799,9 +799,9 @@ pub trait SegmentSource: Send + Sync {
 }
 ```
 
-`MmapSource`(feature `mmap`,memmap2)与 `FileSource`(std,`seek+read`)。
-索引层与恢复层只依赖此 trait——mmap 是**优化**而非功能依赖,任何平台不支持时可整体退化为
-`FileSource`(读吞吐降,正确性不变)。
+L2 提供 `FileSource`(std,`seek+read`);`MmapSource`(feature `mmap`,memmap2)按依赖
+白名单([01 §5](01-overview.md))自 **L3** 引入。索引层与恢复层只依赖此 trait——
+mmap 是**优化**而非功能依赖,任何平台不支持时可整体退化为 `FileSource`(读吞吐降,正确性不变)。
 
 ---
 
@@ -849,7 +849,9 @@ pub trait SegmentSource: Send + Sync {
 
 **向上提供**:
 
-1. `Database: VectorStore`([03 §8](03-l1-memory.md) trait 的持久实现);
+1. 持久化的 `Mneme` 引擎——与 L1 完全相同的公开签名(见 [03 §8](03-l1-memory.md)),
+   不再是易失内存实现;`VectorStore` 内部 trait 按 [03 §8](03-l1-memory.md) 推迟到 L3
+   随 HNSW 引入,故本层不新增该 trait 的实现分歧;
 2. 段格式编解码(`vsec/msec/wal/manifest` 的 read/write/replay,含 version_table 版本链,字节布局本章 §2);
 3. `SegmentSource` 抽象、`FsyncHook` / `Clock` 注入点、`trash` 管理;
 4. 事务语义:单次 `insert_batch` 原子(要么整批进 WAL,要么整批不出现);
