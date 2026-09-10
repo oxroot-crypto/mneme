@@ -9,6 +9,8 @@
 
 pub use serde_json::json;
 
+use crate::core::error::{MnemeError, Result};
+
 /// 元数据:任意 JSON 值。
 pub type Meta = serde_json::Value;
 
@@ -165,6 +167,37 @@ pub(crate) fn depth(value: &Meta) -> usize {
 /// 序列化字节数;序列化不可能失败,失败时保守返回 `usize::MAX`。
 pub(crate) fn size_bytes(value: &Meta) -> usize {
     serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+/// 把 JSON 值序列化为紧凑字节(L2 持久层 `msec`/`delta` 编码用)。
+///
+/// 序列化唯一的失败分支是 `usize`/`f64` 极端值,此时返回空串由调用方按损坏处理。
+///
+/// # Arguments
+///
+/// * `value` - 待序列化的 JSON 值。
+///
+/// # Returns
+///
+/// `serde_json` 紧凑表示的字节;失败时返回空 `Vec`。
+pub(crate) fn to_bytes(value: &Meta) -> Vec<u8> {
+    serde_json::to_vec(value).unwrap_or_default()
+}
+
+/// 从紧凑字节反序列化 JSON 值(L2 持久层 `msec`/`delta` 解码用)。
+///
+/// # Arguments
+///
+/// * `bytes` - `serde_json` 紧凑表示的字节。
+///
+/// # Errors
+///
+/// 字节不是合法 JSON 时返回 [`MnemeError::Corrupted`]。
+pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Meta> {
+    serde_json::from_slice(bytes).map_err(|error| MnemeError::Corrupted {
+        segment: None,
+        reason: format!("元数据 JSON 解码失败:{error}"),
+    })
 }
 
 /// 若 `value` 是 JSON 整数,按 Unix 毫秒时间戳返回。

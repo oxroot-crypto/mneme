@@ -16,9 +16,13 @@ categories = ["database"]
 serde = "1"
 serde_json = "1"
 thiserror = "2"
+# L2 持久层的 CRC-32 校验(帧/文件头/payload);传递依赖极少,白名单内(docs/design/01-overview.md §5)。
+crc32fast = "1"
 
 [dev-dependencies]
 proptest = "1"
+# 持久层测试用临时目录(白名单内,见 docs/design/01-overview.md §5.1)。
+tempfile = "3"
 
 [profile.release]
 # L0 为纯函数库,lto 收益有限;thin LTO 在跨 crate 内联与编译时间间折中,
