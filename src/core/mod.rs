@@ -12,8 +12,10 @@
 //! * [`heap`] —— `TopK` 有界堆(支持并行归并)。
 //! * [`varint`] —— 变长整数编解码。
 //! * [`meta`] —— 元数据(JSON)隔离区。
+//! * `bitset` —— 可增长位图(不可见版本标记 / 索引层候选位图)。
 //! * [`options`] —— 全局配置与选项类型。
 
+pub(crate) mod bitset;
 pub mod error;
 pub mod heap;
 pub mod meta;

@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::core::bitset::BitSet;
 use crate::core::types::SeqNo;
-use crate::memory::bitset::BitSet;
 use crate::memory::table::ReaderView;
 
 /// 按事务时间上界 `tx_ms` 重建一份读视图。
@@ -59,6 +59,7 @@ pub(crate) fn snapshot_at(view: &ReaderView, tx_ms: i64) -> ReaderView {
         in_edges: Arc::clone(&view.in_edges),
         access: Arc::clone(&view.access),
         ns_registry: Arc::clone(&view.ns_registry),
+        index: view.index.clone(),
         seqno,
         closed: view.closed,
     }

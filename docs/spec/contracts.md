@@ -39,6 +39,8 @@
 
 | 日期 | 变更 |
 |---|---|
+| 2026-09 | L3 合并前独立审查整改:① 过滤档③补齐「候选数 `< max(ef,1024)` → 暴力」触发,档②由「约束遍历」改为「全图遍历 + 结果限候选」(避免候选稀疏时图被过滤切断导致近空),同步 05 §8/16 §2;② HNSW 参数与过滤阈值建库期校验(`m≥2`/`m0≥m`/`≤4096`/阈值有限且 `brute≤post`,`FC-INDEX-PRE-001`),hidx 头部与逐节点度数同口径;③ `hidx` 缺失/整文件 CRC 不符:fail-fast 拒开、非 fail-fast 降级暴力且 `db.check()` 报告(`FC-INDEX-ERR-002`);④ `stats().segments[*].index_nodes/index_levels` 改取真实载入索引;⑤ 新增 `FC-INDEX-INV-008`(前缀 ANN + 未落盘尾归并 ≡ 全量暴力)、`FC-PERSIST-POST-007`(mmap/文件源读取等价);⑥ 文档同步(`VectorStore` → `memory::index::{VectorIndex,IndexFactory}`、模块清单、冷启动与 mmap 惰性口径、组合根例外) |
+| 2026-09 | 落地 L3 索引层:① 新增 `src/index/`(HNSW 构建/查询、过滤三档、hidx HID1 编解码);② 索引经 L1 抽象 `memory::index::{VectorIndex,IndexFactory}` 在门面注入,`WriterState`/`ReaderView` 随快照携带索引,查询前缀走 ANN、未落盘尾部恒暴力,`TopK` 归并(设计 05 §9;原计划 `merge.rs` 在全量快照单图下退化为 `TopK::merge`,已同步 05 §10);③ `flush` 写 `.hidx` 并登记 `hidx_crc`/`entry_slot`/`entry_level`,`open` 经"段内槽位→全局槽位"重排映射从 hidx 载入索引(损坏时降级暴力,`check()` 报告);④ 新增 feature `mmap`(默认开,`memmap2`)与 `MmapSource`,`criterion` dev-dep 与 `benches/hnsw.rs`;⑤ 新增契约 `FC-INDEX-POST-001/002/005/007/008/009`、`FC-INDEX-INV-007`、`FC-INDEX-ERR-001`、`FC-INDEX-CPLX-001..004`(均 Passed),`BitSet` 上移至 `core`(L0) |
 | 2026-09 | L2 合并前独立审查整改:① WAL 撕裂尾部在可写重开时**物理截断**(`FC-PERSIST-INV-005`),修复残尾永久屏蔽后续追加导致的数据丢失;② 首次 flush 崩溃(段已写、MANIFEST 未提交)在有 WAL 时以 WAL 重建并清理孤儿段,不再误判 `Corrupted`(`FC-PERSIST-STA-003`,`FC-PERSIST-ERR-005` 收紧为「无 MANIFEST 且无 WAL」);③ MANIFEST 引用的段文件缺失/为空 → `Corrupted`,绝不静默跳过(`FC-PERSIST-ERR-006`);④ 只读打开绝不建目录/清 trash,库目录不存在 → `Config`(`FC-PERSIST-ERR-003` 扩展);⑤ WAL `Insert`/`DeleteRow` 帧携带 `tx_ms`,崩溃恢复后 `as_of` 历史正确(`FC-PERSIST-POST-006`,`FC-PERSIST-POST-005` 补访问统计断言);⑥ WAL 落盘即提交点,后台 flush 失败不回滚已提交写(`FC-PERSIST-INV-006`);⑦ `BatchCommit` 回放校验计数与 `batch_crc`;⑧ 锁改用 `std::fs::File::try_lock` OS 咨询锁(进程终止由内核自动释放,消除 24h 陈旧锁阻塞与接管 TOCTOU,`LOCK` 文件保留不删);⑨ 删除未接线的 `src/persist/delta/**`(孤儿实现,区域保留给 L5);⑩ 未受信长度按剩余字节数设预分配上界;⑪ 移除 `#[allow(dead_code)]`,删除/测试化真正未用项;`FC-PERSIST-CPLX-007` 修正为 L2 整段读入口径(不再声称 mmap 惰性) |
 | 2026-09 | L2 复审补齐(契约漂移修复):① 目录状态不一致(`current` 存在但无合法 MANIFEST;存在段文件却无 MANIFEST)→ `Corrupted`,绝不覆盖(新增 `FC-PERSIST-ERR-005`);② 段主版本过新即使默认非 fail-fast 也拒绝打开(修 I18 此前被降级为跳过,`FC-PERSIST-ERR-002` 收紧);③ `check()` 扩展为逐段 CRC + 版本链校验(设计 16 §1.6);④ 只读打开不创建/改写 WAL、空事务不误报(`FC-PERSIST-ERR-003` 补测试);⑤ MANIFEST 未引用的段孤儿在可写打开时清理(`FC-PERSIST-STA-002` 补测试);⑥ 时钟回拨单调钳制 `MonotonicClock`(设计 04 §10.2,`FC-GLOBAL-PRE-005` 转 Passed);⑦ 16 §1.1 未落地 setter(encryption/compression/storage/read_only_probe_interval)标注所属层 |
 | 2026-09 | L2 范围界定(文档对齐,与实现一致):① 公开 `Storage` trait 与 `Builder::storage` 推迟到 **L12**(WASM/OPFS 首个非 `FsStorage` 后端出现时抽取),L2 用 `persist/storage.rs` 的 `std::fs` 自由函数,已同步 12 §3.1 与 16 §1.1;② feature `encrypt`/`compress`/`compress-zstd` 的**实现**归 [11 安全存储](../design/11-security-storage.md),L2 仅按 04 §2.5 预留 `header_len` 扩展区(`key_id`/`codec` 缺省 0),磁盘布局在 feature 关闭时逐字节成立;③ `memmap2`/`MmapSource`(L3)、`VectorStore`(L3) 沿用前条目裁定 |
@@ -186,6 +188,7 @@
 | FC-PERSIST-STA-001 | STA | 段生命周期:`Building → Committed → Obsolete → (trash)`;`Committed` 段内容不可变(write-once,重写产生新段) | `tests/persist_contracts.rs::committed_segment_is_write_once` | Passed |
 | FC-PERSIST-STA-002 | STA | 崩溃点状态:`Building` 段(`.tmp` 半成品)与 MANIFEST 未引用的段为孤儿,可写打开时清理;不进入任何 MANIFEST 视图 | `tests/persist_contracts.rs::orphan_tmp_cleaned_on_open`、`tests/persist_contracts.rs::unreferenced_segment_cleaned_on_open` | Passed |
 | FC-PERSIST-STA-003 | STA | 首次 flush 中途崩溃(段已写、MANIFEST 未提交):存在 WAL 时以 WAL 为准重建,孤儿段被清理,绝不误判为 `Corrupted` 而丢数据 | `tests/persist_contracts.rs::first_flush_crash_recovers_from_wal` | Passed |
+| FC-PERSIST-POST-007 | POST | 段读取后端等价:feature `mmap` 开/关时 `source::read_whole` 与 `std::fs::read` 逐字节一致;`MmapSource::slice` 返回整段、`read_at` 越界 → `UnexpectedEof`(mmap 为优化,不改变功能语义) | `src/persist/source.rs::read_whole_matches_bytes` | Passed |
 
 ---
 
@@ -196,9 +199,18 @@
 | FC-INDEX-INV-005 | INV | **I5**:同一快照内 `execute()` = 候选集内暴力 + 标准融合(统计等价) | 待补 | Planned |
 | FC-INDEX-INV-006 | INV | **I6**:过滤先行;结果与融合顺序无关 | 待补 | Planned |
 | FC-INDEX-INV-021 | INV | **I21**:BM25 统计按查询命名空间跨全部活跃段全局聚合(df/N/avgdl),只计活行,与段数无关,跨 NS 互不影响 | 待补 | Planned |
-| FC-INDEX-POST-001 | POST | 过滤三档结果 ≡ 候选位图内暴力(集合相等) | 待补 | Planned |
-| FC-INDEX-POST-002 | POST | `ef → ∞` 时 HNSW 结果收敛于精确暴力 | 待补 | Planned |
+| FC-INDEX-PRE-001 | PRE | 建库时校验 HNSW 参数:`m ≥ 2`、`m0 ≥ m`、`ef_construction ≥ 1`、`m`/`m0 ≤ 4096`(硬上限,越限使自产 hidx 无法读回);过滤三档阈值 `filter_post_threshold`/`filter_brute_threshold` 为 `[0,1]` 内有限值且 `brute ≤ post`。违反 → `Config`/`LimitExceeded`,绝不静默 | `tests/hnsw_contracts.rs::invalid_hnsw_params_and_thresholds_are_rejected` | Passed |
+| FC-INDEX-POST-001 | POST | 过滤三档:①后过滤(`s > post`,全图遍历 + `ef` 放大 ≤8×);②全图遍历 + `ef×4` 后过滤(结果限候选;不用约束遍历以免图被过滤切断);③候选暴力(选择性 ≤ `brute_threshold` 或候选数 < `max(ef,1024)`);档③恒等于「候选位图内暴力」,档①②与之统计等价且 `ef→∞` 精确(设计 05 §8) | `tests/hnsw_contracts.rs::filter_tier_three_matches_candidate_bruteforce`、`tests/hnsw_contracts.rs::filter_post_tier_matches_candidate_bruteforce` | Passed |
+| FC-INDEX-POST-002 | POST | **I5 收敛**:`ef → ∞` 时 HNSW 结果收敛于精确暴力 | `tests/hnsw_contracts.rs::ann_converges_to_bruteforce_with_large_ef` | Passed |
 | FC-INDEX-POST-003 | POST | **排序全等性**:同一快照内任意两次 `execute()`(同参数)结果完全一致(同分按 RowId 升序) | `tests/query_contracts.rs::search_order_is_total_and_stable` | Passed |
+| FC-INDEX-POST-005 | POST | ANN 结果 ⊆ alive ∩ 过滤位图;死节点与未被 alive 选中的历史版本只可穿越、不可入选(设计 05 §7/§12) | `tests/hnsw_contracts.rs::ann_excludes_deleted_records` | Passed |
+| FC-INDEX-POST-007 | POST | hidx(HID1)编解码往返恢复同一图(节点数/层级/邻接/入口/参数);`decode(encode(g))` 与 `g` 一致 | `src/index/hidx.rs::hidx_roundtrip_restores_graph` | Passed |
+| FC-INDEX-POST-008 | POST | 持久库 `flush` 写 `hidx` 并在 MANIFEST 登记 `hidx_crc`/`entry_slot`/`entry_level`;重开经重排映射从 hidx 载入索引(`stats().segments[*].index_nodes > 0`)且检索正确 | `tests/hnsw_contracts.rs::reopen_loads_hnsw_from_hidx` | Passed |
+| FC-INDEX-POST-009 | POST | ANN Recall@10 ≥ 0.95(随机均匀数据,`ef=128`,`brute_force_max_rows` 以上走图) | `tests/hnsw_contracts.rs::ann_recall_at_ten_meets_threshold` | Passed |
+| FC-INDEX-INV-007 | INV | 图节点 id ∈ [0,count);每层度数 ≤ M0(第 0 层)/ M(上层);无自环、邻居 id 有效 | `src/index/hnsw.rs::graph_degree_and_self_loop_invariants` | Passed |
+| FC-INDEX-INV-008 | INV | 查询 = 索引前缀 ANN + 未落盘尾部暴力,`TopK` 归并;`ef→∞` 时前缀精确,合并结果 ≡ 全量候选暴力(设计 05 §9 单段退化形态) | `tests/hnsw_contracts.rs::ann_merges_prefix_with_unflushed_tail` | Passed |
+| FC-INDEX-ERR-001 | ERR | hidx 魔数不符/负载 CRC 翻转 → `Corrupted`;主版本过新 → `UnsupportedVersion`(I18);任意输入不 panic、不静默 | `src/index/hidx.rs::hidx_rejects_bad_magic`、`src/index/hidx.rs::hidx_detects_payload_corruption`、`src/index/hidx.rs::hidx_rejects_higher_major` | Passed |
+| FC-INDEX-ERR-002 | ERR | MANIFEST 引用的 `hidx` 缺失/整文件 CRC 不符:fail-fast 打开 → `Corrupted`;可写非 fail-fast 打开 → 降级暴力(`stats().segments[*].index_nodes == 0`)、库仍可读,`db.check()` 报告该段损坏 | `tests/persist_contracts.rs::missing_hidx_degrades_or_rejects`、`tests/persist_contracts.rs::corrupt_hidx_degrades_or_rejects` | Passed |
 | FC-SCORE-INV-027 | INV | **I27**:同一 `(rowid, query_id)` 的反馈至多计一次;对不可见记录(不存在/已墓碑/已过期)的反馈返回 `false` 且**不占用幂等键**(后续该 `RowId` 重新可见时首次反馈仍生效);`execute()` 缺省生成的 `QueryId` 由进程级全局分配器分配(跨库实例共享同一编号空间,保证不冲突),调用方显式指定时须自行保证唯一性 | `tests/query_contracts.rs::feedback_is_idempotent_per_query` | Passed |
 | FC-SCORE-POST-001 | POST | `Scoring::default()` 与未开启 `score()` 的排序全等 | `tests/query_contracts.rs::default_scoring_matches_similarity_order` | Passed |
 | FC-SCORE-POST-002 | POST | `Scoring::floor` 下的候选满足 `ŝ ≥ floor` 或 `S = 0` | 待补 | Planned |
@@ -340,12 +352,12 @@
 | 编号 | 类型 | 形式化规范(时间 / 空间) | 对应测试 / 基准 | 状态 |
 |---|---|---|---|---|
 | FC-PERSIST-CPLX-001 | CPLX | WAL 提交:单条 $O(1)$ 内存追加;组提交 $N$ 条 $O(N)$ 追加 + **1 次** fsync/批;空间顺序写 | 操作计数单测 `tests/persist_contracts.rs::batch_insert_uses_single_fsync`(整批 Fsync 动作数 = 1) | Passed |
-| FC-PERSIST-CPLX-002 | CPLX | WAL 回放(`wal::visit_frames`):时间 $O(\text{有效帧})$;空间 $O(1)$ 流式(批内帧缓冲 ≤ 单批帧数)。注:`Store::open` 当前将 WAL 整文件读入内存后再流式回放,该路径空间 $O(\text{WAL 字节})$(mmap 惰性属 L3) | 解析证明(设计 04 §3.4;`wal::visit_frames` 逐帧回调不物化)+ 哨兵 `src/persist/wal/mod.rs::wal_replay_roundtrip` | Passed |
+| FC-PERSIST-CPLX-002 | CPLX | WAL 回放(`wal::visit_frames`):时间 $O(\text{有效帧})$;空间 $O(1)$ 流式(批内帧缓冲 ≤ 单批帧数)。注:`Store::open` 当前将 WAL 整文件读入内存后再流式回放,该路径空间 $O(\text{WAL 字节})$(mmap 读路径优化已随 L3 落地;真正惰性驻留待 L5/L6 段句柄重构) | 解析证明(设计 04 §3.4;`wal::visit_frames` 逐帧回调不物化)+ 哨兵 `src/persist/wal/mod.rs::wal_replay_roundtrip` | Passed |
 | FC-PERSIST-CPLX-003 | CPLX | CRC-32:时间 $O(n)$、空间 $O(1)$;$n$ = 字节数(实现为 `crc32fast` 查表/切片,常量因子依平台) | 解析证明(设计 04 §4.4;`crc32fast`)+ 哨兵 `src/persist/vsec.rs::vsec_detects_payload_corruption` | Passed |
 | FC-PERSIST-CPLX-004 | CPLX | zone map 剪枝:时间 $O(\lceil n/1024\rceil \times \text{predicates})$;空间 16 B/块/字段(评估路径在 L4 查询层;L2 仅占位该空区,`zmap_len=0`) | 待补(L4) | Planned |
 | FC-PERSIST-CPLX-005 | CPLX | bloom 判定:时间 $O(k)=O(7)$;空间 $1.44\log_2(1/p)$ bit/元素(评估路径在 L4 查询层;L2 仅占位该空区,`bloom_len=0`) | 待补(L4) | Planned |
 | FC-PERSIST-CPLX-006 | CPLX | MANIFEST 提交:时间 $O(S_{\text{seg}})$ 写新文件;空间保留 2 版 | 解析证明(设计 04 §6;`manifest::encode` 逐段线性)+ 哨兵 `src/persist/manifest.rs::manifest_roundtrip` | Passed |
-| FC-PERSIST-CPLX-007 | CPLX | `open` 恢复:时间 $O(\text{段总字节} + \text{WAL 字节})$(逐段读入并校验 + 回放);空间 $O(\text{段总字节} + \text{WAL 字节})$——L2 将段/WAL 整读入内存,mmap 惰性访问属 L3(设计 04 §11) | 哨兵 `tests/persist_contracts.rs::reopen_after_drop_recovers_from_wal`;解析证明(设计 04 §7;`read_segment_bytes` 逐段读入) | Passed |
+| FC-PERSIST-CPLX-007 | CPLX | `open` 恢复:时间 $O(\text{段总字节} + \text{WAL 字节})$(逐段读入并校验 + 回放);空间 $O(\text{段总字节} + \text{WAL 字节})$——L2 将段/WAL 整读入内存,mmap 读路径优化已随 L3 落地,真正惰性访问待 L5/L6 段句柄重构(设计 04 §11) | 哨兵 `tests/persist_contracts.rs::reopen_after_drop_recovers_from_wal`;解析证明(设计 04 §7;`read_segment_bytes` 逐段读入) | Passed |
 | FC-PERSIST-CPLX-008 | CPLX | 单点写 `insert`:时间 $O(1)$ 内存 + WAL 追加(fsync 按 `FsyncPolicy`);空间 $O(d)$ | 哨兵 `tests/persist_contracts.rs::reopen_after_close_recovers_records`;解析证明(HashMap 追加 + 定长帧) | Passed |
 | FC-PERSIST-CPLX-009 | CPLX | 单点读 `get(key)`:时间 $O(\log n)$ + 一次记录读(实现为 HashMap 期望 $O(1)$ $\subseteq O(\log n)$);`get_by_rowid`: $O(\log n)$ 版本链定位 | 哨兵 `tests/persist_contracts.rs::namespace_and_rowid_survive_reopen`;解析证明(设计 04 §5.5) | Passed |
 | FC-PERSIST-CPLX-010 | CPLX | `as_of(t)`:时间 $O(V + N_c\cdot d)$($V$ = 全部物理版本数,`temporal::snapshot_at` 单遍择版本;当前实现不随段数$S_{\text{seg}}$分层加速);空间 $O(V + N_c)$(随历史窗口与候选规模增长) | 哨兵 `tests/persist_contracts.rs::version_chain_survives_reopen`;解析证明(设计 04 §5.5) | Passed |
@@ -354,9 +366,10 @@
 
 | 编号 | 类型 | 形式化规范(时间 / 空间) | 对应测试 / 基准 | 状态 |
 |---|---|---|---|---|
-| FC-INDEX-CPLX-001 | CPLX | HNSW 单点插入:时间 $O(d\cdot(ef_c\cdot M_0 + M\log_M N))$;构建 $O(N\cdot d\cdot ef_c\cdot M_0)$;空间 $\approx(8M+20)$ B/节点 + 边表 | 待补 | Planned |
-| FC-INDEX-CPLX-002 | CPLX | HNSW 查询:期望上界 $O(d\cdot ef\cdot M_0)$(实测 $\approx(2\text{–}5)\cdot ef$ 次点积);空间 $O(ef)$ | 待补 | Planned |
-| FC-INDEX-CPLX-003 | CPLX | 上层下降:时间 $O(d\cdot M\cdot\log_M N)$;层高期望 $O(\log_M N)$ | 待补 | Planned |
+| FC-INDEX-CPLX-001 | CPLX | HNSW 单点插入:时间 $O(d\cdot(ef_c\cdot M_0 + M\log_M N))$;构建 $O(N\cdot d\cdot ef_c\cdot M_0)$;空间 $\approx(8M+20)$ B/节点 + 边表 | 操作计数单测 `src/index/hnsw.rs::build_distance_calls_scale_linearly` | Passed |
+| FC-INDEX-CPLX-002 | CPLX | HNSW 查询:期望上界 $O(d\cdot ef\cdot M_0)$(实测 $\approx(2\text{–}5)\cdot ef$ 次点积);空间 $O(ef)$ | 操作计数单测 `src/index/hnsw.rs::search_distance_calls_bounded_by_ef` | Passed |
+| FC-INDEX-CPLX-003 | CPLX | 上层下降:时间 $O(d\cdot M\cdot\log_M N)$;层高期望 $O(\log_M N)$ | 操作计数单测 `src/index/hnsw.rs::level_height_grows_logarithmically` | Passed |
+| FC-INDEX-CPLX-004 | CPLX | hidx 编解码:时间 $O(\text{nodes}+\text{edges})$、空间 $O(\text{bytes})$ | 操作计数单测 `src/index/hidx.rs::hidx_encode_decode_scale_linearly` | Passed |
 
 #### 9.2.5 L4 检索与排序层(query/score)
 

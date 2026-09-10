@@ -155,8 +155,11 @@ flowchart LR
 
 **渐进式的两个关键手段**:
 
+> **落地状态**:L0–L3 已实现(L3 = `src/index/` 自研 HNSW + `hidx` 持久化 + 过滤三档,
+> 验收 `tests/hnsw_contracts.rs`);L4–L6 尚无代码。
+
 1. **接口先于实现**:公开 API 在 L1 冻结(暴力与 HNSW 同签名),L3 **引入内部 trait
-   `VectorStore`** 作为暴力→HNSW 的替换缝;L2 的段文件头从第一天就带 `format_version` 字段。
+   `memory::index::{VectorIndex, IndexFactory}`** 作为暴力→HNSW 的替换缝;L2 的段文件头从第一天就带 `format_version` 字段。
    (L1/L2 直接在引擎内实现公开语义,不下沉该内部 trait;见 [03 §8](03-l1-memory.md)。)
 2. **每层有兜底**:L2 阶段(还没有 compaction)用"WAL 总量超 256MB 自动全量快照兜底"([04 §3.2](04-l2-persist.md));
    L3 永远保留暴力扫描作为过滤极端选择性时的第三档策略。
@@ -175,10 +178,10 @@ flowchart LR
 mneme/
 ├── src/
 │   ├── lib.rs          # 门面:Mneme / Namespace / Builder;pub use 公开类型
-│   ├── core/           # L0:types.rs error.rs metric.rs simd.rs varint.rs meta.rs heap.rs options/
-│   ├── memory/         # L1:engine.rs engine_ops.rs builder/ namespace/ snapshot.rs snapshot_scan.rs search_builder.rs search_exec.rs expand.rs rerank.rs table/ bitset.rs search.rs pred.rs pred_eval.rs record.rs write_helpers.rs mutate_helpers.rs dedup.rs relation.rs temporal.rs score.rs lifecycle.rs ops.rs config.rs
+│   ├── core/           # L0:types.rs error.rs metric.rs simd.rs varint.rs meta.rs heap.rs bitset.rs options/
+│   ├── memory/         # L1:engine.rs engine_ops.rs builder/ namespace/ snapshot.rs snapshot_scan.rs search_builder.rs search_exec.rs expand.rs rerank.rs table/ index.rs search.rs pred.rs pred_eval.rs record.rs write_helpers.rs mutate_helpers.rs dedup.rs relation.rs temporal.rs score.rs lifecycle.rs ops.rs config.rs
 │   ├── persist/        # L2:mod.rs codec.rs hook.rs wal/ msec/ recover/ store/ vsec.rs manifest.rs edges.rs flush.rs source.rs storage.rs trash.rs
-│   ├── index/          # L3:hnsw.rs graph.rs filtered.rs merge.rs rebuild.rs
+│   ├── index/          # L3:hnsw.rs graph.rs filtered.rs rebuild.rs hidx.rs
 │   ├── query/          # L4:parse.rs plan.rs zmap.rs bm25.rs fusion.rs result_dedup.rs exec.rs
 │   ├── life/           # L5:ttl.rs retain.rs access.rs namespace.rs compact.rs backup.rs stats.rs
 │   ├── quant/          # L6:scalar_i8.rs f16.rs rescore.rs

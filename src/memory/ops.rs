@@ -36,6 +36,10 @@ pub struct SegmentStat {
     pub dead_ratio: f32,
     /// 创建时刻(Unix 毫秒)。
     pub created: i64,
+    /// HNSW 图节点数(无索引段为 0;取自真实载入的索引)。
+    pub index_nodes: u64,
+    /// HNSW 图最高层级(无索引段为 0)。
+    pub index_levels: u8,
 }
 
 /// 单命名空间统计。

@@ -9,10 +9,12 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::error::{MnemeError, Result};
 use crate::core::metric::Metric;
+use crate::memory::index::IndexFactory;
+use crate::memory::index::VectorIndex;
 use crate::persist::hook::FsyncHook;
 use crate::persist::manifest::Manifest;
 use crate::persist::msec::{self, TOMBSTONE_DOC_OFFSET};
-use crate::persist::storage::{self, FileLock, SEGMENTS_DIR, msec_name, vsec_name};
+use crate::persist::storage::{self, FileLock, SEGMENTS_DIR, hidx_name, msec_name, vsec_name};
 use crate::persist::trash;
 use crate::persist::vsec;
 
@@ -34,6 +36,8 @@ pub(crate) struct Store {
     pub(super) metric: Metric,
     pub(super) read_only: bool,
     pub(super) hook: Option<Arc<dyn FsyncHook>>,
+    /// 索引工厂(校验 hidx 用;`None` = 不校验)。
+    pub(super) index_factory: Option<Arc<dyn IndexFactory>>,
 }
 
 impl Store {
@@ -53,23 +57,20 @@ impl Store {
         trash::bytes(&self.root).unwrap_or(0)
     }
 
-    /// 活跃段统计(来自当前 MANIFEST)。
-    pub(crate) fn segment_stats(&self) -> Vec<crate::memory::ops::SegmentStat> {
-        let guard = self
-            .manifest
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard
-            .manifest
-            .segments
+    /// 活跃段统计(来自当前 MANIFEST);`index` 为真实载入的索引(用于 HNSW 统计)。
+    pub(crate) fn segment_stats(
+        &self,
+        index: Option<&dyn VectorIndex>,
+    ) -> Vec<crate::memory::ops::SegmentStat> {
+        // 锁内只克隆段元数据,文件 I/O 放到锁外(避免阻塞并发 flush 的 MANIFEST 提交)。
+        let segments = self.manifest_snapshot().segments;
+        segments
             .iter()
-            .map(|segment| {
-                segment_stat(
-                    &self.root,
-                    segment.segment_id,
-                    segment.row_count,
-                    segment.created_ms,
-                )
+            .enumerate()
+            .map(|(position, segment)| {
+                // 单段架构:索引只对应第一个(唯一)活跃段。
+                let loaded = if position == 0 { index } else { None };
+                segment_stat(&self.root, segment, loaded)
             })
             .collect()
     }
@@ -88,13 +89,18 @@ impl Store {
     ///
     /// 返回损坏段的 id 列表(供 `check()` 报告);不修改任何状态。
     pub(crate) fn verify_segments(&self) -> Vec<crate::core::types::SegmentId> {
-        let guard = self
-            .manifest
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // 锁内只克隆段元数据,校验(读盘 + CRC)放到锁外。
+        let segments = self.manifest_snapshot().segments;
         let mut corrupt = Vec::new();
-        for segment in &guard.manifest.segments {
-            if verify_one_segment(&self.root, segment.segment_id).is_err() {
+        for segment in &segments {
+            if verify_one_segment(
+                &self.root,
+                segment.segment_id,
+                segment.hidx_crc,
+                self.index_factory.as_deref(),
+            )
+            .is_err()
+            {
                 corrupt.push(crate::core::types::SegmentId::new(segment.segment_id));
             }
         }
@@ -141,29 +147,41 @@ impl Store {
     }
 }
 
-/// 组装单个活跃段的统计。
+/// 组装单个活跃段的统计(HNSW 字段取自真实载入的索引,未载入则为 0)。
 fn segment_stat(
     root: &Path,
-    segment_id: u32,
-    rows: u64,
-    created_ms: i64,
+    segment: &crate::persist::manifest::SegmentEntry,
+    index: Option<&dyn VectorIndex>,
 ) -> crate::memory::ops::SegmentStat {
     // reason: stats 为尽力而为;路径解析/元数据读取失败仅少计字节,不影响正确性。
-    let bytes = storage::resolve(root, &format!("{SEGMENTS_DIR}/{}", vsec_name(segment_id)))
-        .ok()
-        .and_then(|path| std::fs::metadata(path).ok())
-        .map_or(0, |metadata| metadata.len());
+    let file_bytes = |name: &str| {
+        storage::resolve(root, &format!("{SEGMENTS_DIR}/{name}"))
+            .ok()
+            .and_then(|path| std::fs::metadata(path).ok())
+            .map_or(0, |metadata| metadata.len())
+    };
+    let mut bytes = file_bytes(&vsec_name(segment.segment_id));
+    if segment.hidx_crc != 0 {
+        bytes += file_bytes(&hidx_name(segment.segment_id));
+    }
     crate::memory::ops::SegmentStat {
-        id: crate::core::types::SegmentId::new(segment_id),
-        rows,
+        id: crate::core::types::SegmentId::new(segment.segment_id),
+        rows: segment.row_count,
         bytes,
         dead_ratio: 0.0,
-        created: created_ms,
+        created: segment.created_ms,
+        index_nodes: index.map_or(0, |idx| idx.node_count() as u64),
+        index_levels: index.map_or(0, |idx| idx.max_level()),
     }
 }
 
-/// 校验单个段:头部 + payload CRC + 版本链记录体可解析。
-fn verify_one_segment(root: &Path, segment_id: u32) -> Result<()> {
+/// 校验单个段:头部 + payload CRC + 版本链记录体可解析 + hidx(若有)。
+fn verify_one_segment(
+    root: &Path,
+    segment_id: u32,
+    hidx_crc: u32,
+    factory: Option<&dyn IndexFactory>,
+) -> Result<()> {
     let vsec_bytes =
         storage::read_file(root, &format!("{SEGMENTS_DIR}/{}", vsec_name(segment_id)))?;
     let msec_bytes =
@@ -187,6 +205,20 @@ fn verify_one_segment(root: &Path, segment_id: u32) -> Result<()> {
         if row.doc_offset != TOMBSTONE_DOC_OFFSET {
             let _ = msec_view.read_entry(row.doc_offset)?;
         }
+    }
+    // hidx 若存在则校验内部 CRC/布局(经 L1 工厂,避免 L2 依赖 L3)。
+    if hidx_crc != 0
+        && let Some(factory) = factory
+    {
+        let hidx_bytes =
+            storage::read_file(root, &format!("{SEGMENTS_DIR}/{}", hidx_name(segment_id)))?;
+        if crate::persist::crc32(&hidx_bytes) != hidx_crc {
+            return Err(MnemeError::Corrupted {
+                segment: Some(crate::core::types::SegmentId::new(segment_id)),
+                reason: "hidx 文件 CRC 与 MANIFEST 不符".to_string(),
+            });
+        }
+        factory.verify(&hidx_bytes)?;
     }
     Ok(())
 }

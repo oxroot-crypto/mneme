@@ -7,8 +7,16 @@
 > **本章你将学到**:NSW 与小世界 → 层级概率分布推导 → 构建/搜索算法逐步 →
 > 复杂度(构建 O(N·d·ef_c·M_0) 等)→ 8 点手算算例 → 墓碑删除 → 过滤三档策略。
 
-模块:`index/{hnsw.rs, graph.rs, filtered.rs, merge.rs, rebuild.rs}`
+模块:`index/{hnsw.rs, graph.rs, filtered.rs, rebuild.rs, hidx.rs}`
+(原计划的 `merge.rs` 在 L2 全量快照单图架构下退化为 L0 `TopK::merge`,不单设;
+L5 引入多图 compaction 重建时恢复为独立模块。)
 参考:HNSW 原论文(Malkov & Yashunin, 2016)的思想,实现为纯 Rust 自研、适配墓碑删除与过滤。
+
+> **落地状态(L3 已实现)**:`src/index/` 完整实现本章算法;HNSW 经 L1 内部 trait
+> `memory::index::{VectorIndex, IndexFactory}` 注入(见 §12),`flush` 随段写 `.hidx`、
+> `open` 从 hidx 载入并经"段内槽位→全局槽位"重排映射对齐恢复后的 `SlotId`;
+> 验收测试见 `tests/hnsw_contracts.rs`(Recall@10 ≥ 0.95、`ef→∞` 收敛、过滤三档、
+> hidx 往返/损坏、重开载入)。
 
 ---
 
@@ -313,8 +321,13 @@ $s = |\text{cand}| / N_{\text{alive}}$ 自适应三档:
 | 档 | 条件 | 策略 | ef 调整 |
 |---|---|---|---|
 | ① 后过滤 | $s > 0.10$ | 正常 HNSW,结果集过滤 | $ef' = ef \cdot \min(8,\ 1/s)$ |
-| ② 约束遍历 | $0.001 < s \le 0.10$ | 扩展邻居时检查候选位图,只走"过滤内"节点 | $ef' = ef \cdot 4$ |
-| ③ 候选暴力 | $s \le 0.001$(或候选数 < max(ef, 1024)) | 直接对候选位图暴力扫描 | — |
+| ② 放大后过滤 | $0.001 < s \le 0.10$(且候选数 ≥ `max(ef,1024)`) | **全图遍历**(保连通)+ 结果限候选 | $ef' = ef \cdot 4$ |
+| ③ 候选暴力 | $s \le 0.001$ 或候选数 < `max(ef, 1024)` | 直接对候选位图暴力扫描 | — |
+
+> **实现注**:原设计档②为"约束遍历(只展开过滤内节点)",但过滤稀疏时图会被候选位图
+> 切断,`ef` 再放大也探不到足够候选,召回近乎归零(已由候选数阈值兜底)。落地改为
+> **全图遍历、结果限候选**——遍历不受限(保持图连通),最终 `TopK` 只收候选位图内节点,
+> 仍严格满足"结果 ⊆ alive ∩ 过滤位图"且统计等价于候选暴力。档①②的区别仅剩 `ef'` 放大倍数。
 
 - 候选位图来自 L4 的 zone map/bloom 下推([06 §2](06-l4-query.md)),位图本身
   $O(N/8)$ 字节、popcount 求 $s$ 为 $O(N/64)$ 字操作——亚微秒;
@@ -333,6 +346,11 @@ $s = |\text{cand}| / N_{\text{alive}}$ 自适应三档:
 ---
 
 ## 9. 跨段归并:`merge.rs`
+
+> **落地状态**:L2 全量快照每次 flush 只保留一个活跃段,故 L3 的"多段图"退化为
+> **单个索引前缀 + 未建树尾扫描**:查询 = 前缀 ANN(`filtered.rs`)+ 尾部暴力,
+> 二者以 L0 `TopK::merge` 归并(见 `src/memory/search.rs`)。真正的多段 k 路归并
+> 随 L5 compaction(多段并存)恢复为独立模块;下述并行模型是 L5 的目标形态。
 
 库由多个段组成(追加式存储),每段有自己的图。查询 = 各段并行搜索 + 全局归并:
 
@@ -368,6 +386,11 @@ adj_blob:   逐点逐层 u32 邻居槽位数组(层0 ≤ M0 个,上层按 level 
 
 mmap 惰性加载:打开段只读头部与 node_table,邻接 blob 由缺页按需载入
 ——"1M 条冷启动 < 1s"的主要支撑点([01 §1.1](01-overview.md))。
+
+> **L3 现状**:`MmapSource`(feature `mmap`,默认开)已落地并统一用于段字节读取,
+> 但当前仍**整段载入内存**后解码;真正"只读头部 + 邻接缺页惰性驻留"需让
+> `ReaderView` 持有段句柄(`SegmentSource`),属 L5/L6 的段句柄重构。故冷启动目标
+> 由后续层兑现,本层只提供 mmap 读路径优化。
 
 ---
 
@@ -411,13 +434,15 @@ mmap 惰性加载:打开段只读头部与 node_table,邻接 blob 由缺页按�
 
 **向上提供**:
 
-1. `HnswIndex::build(parallel_iter, metric) -> Self`(构建,compaction 复用);
-2. `search(q, ef, k, filter_bitmap: Option<&BitSet>, alive: &BitSet) -> TopK`
-   (过滤位图由调用方传入,三档策略内聚于此);
-3. `insert/serialize/loader`(hidx 编解码,布局 §10);
-4. 段内入口点与统计(节点数/层数/死比率)暴露给 MANIFEST 与 `db.stats()`。
+1. `HnswIndex::build(nodes, params, metric) -> Self`(构建;compaction 复用,见 `rebuild.rs`);
+2. `VectorIndex::search(&IndexSearch) -> TopK<(RowId, SlotId)>`
+   (`alive` / 过滤位图 / `ef` 由调用方传入,三档策略内聚于 `filtered.rs`);
+3. `serialize` / `load`(hidx 编解码,布局 §10;无增量 `insert`,compaction 整体重建);
+4. 段内入口点与统计(节点数/层数)经 `stats()` 暴露(`SegmentStat.index_nodes/index_levels`)。
 
-**依赖**:仅 L0(`simd` 距离、`TopK`、类型)与 L2(`SegmentSource` 读 hidx)。
+**依赖**:仅 L0(`simd` 距离、`TopK`、`bitset`、标识类型)与 L1 的索引抽象
+`memory::index::{VectorIndex, IndexFactory}`(L1 只依赖 L0;L3 依赖 L1 不构成反向穿透);
+hidx 字节经 `SegmentSource` 读入,`MmapSource`(feature `mmap`,默认开)为读路径优化。
 **不变量**:同一段内,搜索结果 ⊆ alive 位图 ∩ 过滤位图(alive 由可见性规则生成,含 `as_of`);
 死节点与未被 alive 选中的历史版本只可穿越、不可入选;
 `ef → ∞` 时结果收敛于段内暴力扫描(属性测试断言,见 [14 §3](14-testing.md))。

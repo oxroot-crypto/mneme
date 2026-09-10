@@ -1,13 +1,17 @@
-//! 暴力扫描检索(`search.rs`)。
+//! 暴力扫描 / ANN 检索(`search.rs`)。
 //!
 //! **过滤先行**:先用元数据求值得到候选位图(不读向量),再分块并行打分、
-//! `TopK` 归并。这是设计 03 §4 的 L1 落地,也是 L3/L4 计划器的雏形。
+//! `TopK` 归并。这是设计 03 §4 的 L1 落地。L3 起:若读视图带有覆盖槽位前缀的
+//! 向量索引且前缀规模超过 `brute_force_max_rows`,前缀走 HNSW(过滤三档),
+//! 未建树的尾部仍暴力扫描,二者 `TopK` 归并——语义与纯暴力统计等价(设计 05 §9)。
 
+use crate::core::bitset::BitSet;
 use crate::core::error::{MnemeError, Result};
 use crate::core::heap::TopK;
 use crate::core::metric::{Metric, Score};
 use crate::core::simd;
 use crate::core::types::{NsId, RowId, SlotId};
+use crate::memory::index::{IndexSearch, VectorIndex};
 use crate::memory::pred::{self, EvalCtx, Expr};
 use crate::memory::table::ReaderView;
 
@@ -38,7 +42,7 @@ pub(crate) fn norm_sq(vector: &[f32]) -> f32 {
     simd::dot(vector, vector)
 }
 
-/// 一次暴力扫描的全部输入。
+/// 一次检索的全部输入。
 pub(crate) struct SearchParams<'a> {
     /// 不可变读视图。
     pub(crate) view: &'a ReaderView,
@@ -50,6 +54,8 @@ pub(crate) struct SearchParams<'a> {
     pub(crate) metric: Metric,
     /// 返回条数。
     pub(crate) top_k: usize,
+    /// ANN 探查宽度(仅前缀走索引时生效)。
+    pub(crate) ef: usize,
     /// 预过滤表达式。
     pub(crate) filter: Option<&'a Expr>,
     /// 当前时刻(Unix 毫秒)。
@@ -58,6 +64,12 @@ pub(crate) struct SearchParams<'a> {
     pub(crate) block: usize,
     /// 线程数;`0` = 自动。
     pub(crate) parallelism: usize,
+    /// 段行数低于此值恒暴力扫描(设计 05 §11)。
+    pub(crate) brute_force_max_rows: usize,
+    /// 过滤三档:后过滤 / 约束遍历分界。
+    pub(crate) filter_post_threshold: f32,
+    /// 过滤三档:约束遍历 / 候选暴力分界。
+    pub(crate) filter_brute_threshold: f32,
 }
 
 /// 分块扫描的输入(顺序与并行共用)。
@@ -72,7 +84,7 @@ struct ScanParams<'a> {
     threads: usize,
 }
 
-/// 在给定快照上做过滤 + 暴力打分,返回按 `Metric::better` 排序的 top-k。
+/// 在给定快照上做过滤 + 检索,返回按 `Metric::better` 排序的 top-k。
 pub(crate) fn search(params: &SearchParams<'_>) -> Result<Vec<Scored>> {
     let query_norm = if params.metric.needs_norm() {
         norm_sq(params.query)
@@ -86,25 +98,14 @@ pub(crate) fn search(params: &SearchParams<'_>) -> Result<Vec<Scored>> {
         return Ok(Vec::new());
     }
 
-    let (chunk, threads) = plan_scan(params);
-    let scan = ScanParams {
-        view: params.view,
-        candidates: &candidates,
-        query: params.query,
-        query_norm,
-        metric: params.metric,
-        k,
-        chunk,
-        threads,
-    };
-    let top = if candidates.len() <= chunk || threads <= 1 {
-        scan_sequential(&scan)
-    } else {
-        // 工作线程异常终止 = 打分阶段内部不变量被破坏;按 FC-GLOBAL-ERR-001 不向外
-        // 传播 panic,也不静默返回偏少的结果,而是转为结构化错误(FC-MEM-INV-004 口径)。
-        scan_parallel(&scan)?
-    };
+    // L3:前缀走 HNSW(ANN),尾部暴力扫描(内存段),归并后统一重取分。
+    if let Some(index) = params.view.index.as_ref()
+        && index.node_count() > params.brute_force_max_rows
+    {
+        return ann_search(params, index.as_ref(), &candidates, query_norm, k);
+    }
 
+    let top = run_scan(params, &candidates, query_norm, k)?;
     Ok(rescore(params, top, query_norm))
 }
 
@@ -129,6 +130,95 @@ fn collect_candidates(params: &SearchParams<'_>) -> Vec<u32> {
         candidates.push(u32::try_from(idx).expect("槽位下标必可转入 u32(FC-MEM-INV-004)"));
     }
     candidates
+}
+
+/// ANN 路径:前缀 HNSW + 尾部暴力,归并后再取分。
+fn ann_search(
+    params: &SearchParams<'_>,
+    index: &dyn VectorIndex,
+    candidates: &[u32],
+    query_norm: f32,
+    k: usize,
+) -> Result<Vec<Scored>> {
+    let indexed = index.node_count().min(params.view.slots.len());
+    let (alive, filter) = prefix_bitmaps(params, indexed, candidates);
+    let index_top = index.search(&IndexSearch {
+        query: params.query,
+        query_norm,
+        ef: params.ef,
+        k,
+        metric: params.metric,
+        alive: &alive,
+        filter: filter.as_ref(),
+        post_threshold: params.filter_post_threshold,
+        brute_threshold: params.filter_brute_threshold,
+    });
+
+    let tail: Vec<u32> = candidates
+        .iter()
+        .copied()
+        .filter(|&idx| idx as usize >= indexed)
+        .collect();
+    let top = if tail.is_empty() {
+        index_top
+    } else {
+        let mut merged = run_scan(params, &tail, query_norm, k)?;
+        merged.merge(index_top);
+        merged
+    };
+    Ok(rescore(params, top, query_norm))
+}
+
+/// 构造索引前缀的 `alive` 位图与候选过滤位图(均按全局槽位)。
+fn prefix_bitmaps(
+    params: &SearchParams<'_>,
+    indexed: usize,
+    candidates: &[u32],
+) -> (BitSet, Option<BitSet>) {
+    let mut alive = BitSet::default();
+    for idx in 0..indexed {
+        let slot = &params.view.slots[idx];
+        if !params.view.dead.get(idx) && slot.ns_id == params.ns_id && slot.is_live(params.now_ms) {
+            alive.set(idx);
+        }
+    }
+    let filter = params.filter.map(|_| {
+        let mut bits = BitSet::default();
+        for &idx in candidates {
+            if (idx as usize) < indexed {
+                bits.set(idx as usize);
+            }
+        }
+        bits
+    });
+    (alive, filter)
+}
+
+/// 决定分块大小与线程数并执行一次暴力扫描。
+fn run_scan(
+    params: &SearchParams<'_>,
+    candidates: &[u32],
+    query_norm: f32,
+    k: usize,
+) -> Result<TopK<(RowId, SlotId)>> {
+    let (chunk, threads) = plan_scan(params);
+    let scan = ScanParams {
+        view: params.view,
+        candidates,
+        query: params.query,
+        query_norm,
+        metric: params.metric,
+        k,
+        chunk,
+        threads,
+    };
+    if candidates.len() <= chunk || threads <= 1 {
+        Ok(scan_sequential(&scan))
+    } else {
+        // 工作线程异常终止 = 打分阶段内部不变量被破坏;按 FC-GLOBAL-ERR-001 不向外
+        // 传播 panic,也不静默返回偏少的结果,而是转为结构化错误(FC-MEM-INV-004 口径)。
+        scan_parallel(&scan)
+    }
 }
 
 /// 根据候选规模决定分块大小与线程数。

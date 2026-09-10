@@ -383,7 +383,7 @@ pub struct Stats {
     pub history: HistoryStat,                     // 版本链/历史保留统计(见 07 §4.2a)
     pub storage: StorageStat,                     // 加密/压缩生效状态(见 11)
 }
-pub struct SegmentStat { pub id: SegmentId, pub rows: u64, pub bytes: u64, pub dead_ratio: f32, pub created: i64 }
+pub struct SegmentStat { pub id: SegmentId, pub rows: u64, pub bytes: u64, pub dead_ratio: f32, pub created: i64, pub index_nodes: u64, pub index_levels: u8 }  // index_* 为 L3 HNSW 图统计(无索引段为 0)
 pub struct NsStat      { pub doc_count: u64, pub total_doc_len: u64 }
 pub struct Histogram   { /* 固定 32 桶边界与计数,详见 07 §7 */ }
 pub struct StorageStat { pub encryption: bool, pub compression: Compression, pub migrated_segments: usize, pub total_segments: usize }
@@ -618,8 +618,8 @@ pub struct Tuning {
     pub field_dict_max: u16,            // 默认 16    每段可索引字段上限(04 §5.1)
     pub bloom_fpp: f32,                 // 默认 0.01  布隆过滤器目标误判率(04 §5.3)
     pub brute_force_max_rows: u32,      // 默认 2048  段行数低于此值恒用暴力(05 §9)
-    pub filter_post_threshold: f32,     // 默认 0.10  过滤三档:后过滤/约束遍历分界(05 §8)
-    pub filter_brute_threshold: f32,    // 默认 0.001 过滤三档:约束遍历/候选暴力分界(05 §8)
+    pub filter_post_threshold: f32,     // 默认 0.10  过滤三档:后过滤/放大后过滤分界(05 §8)
+    pub filter_brute_threshold: f32,    // 默认 0.001 过滤三档:放大后过滤/候选暴力分界(05 §8)
     pub stopwords: bool,                // 默认 true  启用内置停用词表(06 §3.5)
 }
 ```
