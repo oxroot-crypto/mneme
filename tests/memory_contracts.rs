@@ -81,6 +81,106 @@ fn importance_and_confidence_clamped() {
     let rec = ns.get("k").expect("get").expect("present");
     assert_eq!(rec.importance(), 1.0);
     assert_eq!(rec.confidence(), 0.0);
+
+    // 非有限值(NaN)拒绝而非静默钳制:NaN 会污染综合打分与遗忘公式。
+    assert!(matches!(
+        ns.insert(Record::new(vec![1.0, 0.0]).key("nan").importance(f32::NAN)),
+        Err(mneme::MnemeError::NonFinite)
+    ));
+    assert!(matches!(
+        ns.insert(Record::new(vec![1.0, 0.0]).key("nan2").confidence(f32::NAN)),
+        Err(mneme::MnemeError::NonFinite)
+    ));
+    assert!(!ns.exists("nan").expect("exists"), "NaN 不得入库");
+    // touch boost 同口径:拒绝且访问统计不被污染。
+    assert!(matches!(
+        ns.touch("k", Some(f32::NAN)),
+        Err(mneme::MnemeError::NonFinite)
+    ));
+}
+
+/// FC-MEM-PRE-002 / FC-GLOBAL-PRE-003(更新补丁与 insert 同限额口径)
+#[test]
+fn update_enforces_write_limits() {
+    // 字节限额:text / metadata 超限 → TooLarge
+    let limits = Limits {
+        text_bytes: 4,
+        meta_bytes: 8,
+        ..Limits::default()
+    };
+    let db = Mneme::builder()
+        .dimension(2)
+        .limits(limits)
+        .build()
+        .expect("build");
+    let ns = db.namespace("n");
+    ns.insert(Record::new(vec![1.0, 0.0]).key("k").text("old"))
+        .expect("insert");
+
+    assert!(matches!(
+        ns.update("k", UpdatePatch::new().text(Some("toolong".to_string()))),
+        Err(mneme::MnemeError::TooLarge { field: "text", .. })
+    ));
+    assert!(matches!(
+        ns.update(
+            "k",
+            UpdatePatch::new().metadata(Some(mneme::json!({"k": "a-long-string"})))
+        ),
+        Err(mneme::MnemeError::TooLarge {
+            field: "metadata",
+            ..
+        })
+    ));
+    // importance 含非有限值 → NonFinite
+    assert!(matches!(
+        ns.update("k", UpdatePatch::new().importance(f32::NAN)),
+        Err(mneme::MnemeError::NonFinite)
+    ));
+    // 更新失败不得产生任何部分写入:记录保持上一版本原样。
+    let rec = ns.get("k").expect("get").expect("present");
+    assert_eq!(rec.text(), Some("old"));
+    assert_eq!(rec.importance(), 0.5, "缺省重要度未被污染");
+
+    // 深度限额:metadata 嵌套超限 → MetaTooDeep
+    let limits = Limits {
+        meta_depth: 1,
+        ..Limits::default()
+    };
+    let db = Mneme::builder()
+        .dimension(2)
+        .limits(limits)
+        .build()
+        .expect("build");
+    let ns = db.namespace("n");
+    ns.insert(Record::new(vec![1.0, 0.0]).key("k"))
+        .expect("insert");
+    assert!(matches!(
+        ns.update(
+            "k",
+            UpdatePatch::new().metadata(Some(mneme::json!({"a": {"b": 1}})))
+        ),
+        Err(mneme::MnemeError::MetaTooDeep { .. })
+    ));
+
+    // 边界值恰好等于上限时接受(Bound):text_bytes = 4 下 "abcd" 合法。
+    let limits = Limits {
+        text_bytes: 4,
+        ..Limits::default()
+    };
+    let db = Mneme::builder()
+        .dimension(2)
+        .limits(limits)
+        .build()
+        .expect("build");
+    let ns = db.namespace("n");
+    ns.insert(Record::new(vec![1.0, 0.0]).key("k"))
+        .expect("insert");
+    ns.update("k", UpdatePatch::new().text(Some("abcd".to_string())))
+        .expect("update");
+    assert_eq!(
+        ns.get("k").expect("get").expect("present").text(),
+        Some("abcd")
+    );
 }
 
 /// FC-MEM-POST-001 / FC-MEM-INV-001 / FC-MEM-INV-002 / FC-MODEL-INV-022

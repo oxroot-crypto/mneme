@@ -165,6 +165,34 @@ fn consolidate_merges_cluster_and_keeps_sources() {
     assert!(ns.exists("k0").expect("exists"), "keep_sources 保留来源");
 }
 
+/// FC-MODEL-POST-006(策略参数非法 → Config,绝不静默空转或索引越界 panic)
+#[test]
+fn consolidate_rejects_invalid_policy() {
+    let ns = mem(2).namespace("n");
+    ns.insert(Record::new(vec![1.0, 0.0])).expect("insert");
+    assert!(matches!(
+        ns.consolidate(mneme::ConsolidationPolicy {
+            max_cluster: 0,
+            ..Default::default()
+        }),
+        Err(mneme::MnemeError::Config { .. })
+    ));
+    assert!(matches!(
+        ns.consolidate(mneme::ConsolidationPolicy {
+            threshold: f32::NAN,
+            ..Default::default()
+        }),
+        Err(mneme::MnemeError::Config { .. })
+    ));
+    assert!(matches!(
+        ns.consolidate(mneme::ConsolidationPolicy {
+            threshold: 1.5,
+            ..Default::default()
+        }),
+        Err(mneme::MnemeError::Config { .. })
+    ));
+}
+
 /// FC-MODEL-STA-001 / FC-MODEL-INV-024 / FC-MODEL-INV-026(版本状态机)
 #[test]
 fn model_version_lifecycle_states() {

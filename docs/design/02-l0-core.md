@@ -58,8 +58,8 @@ pub enum MnemeError {
     MetaTooDeep { limit: usize, got: usize },           // metadata 嵌套过深
     UnsupportedVersion { file: &'static str, found: u16, max: u16 }, // 文件格式过新
     Closed,                                             // 库已关闭后经任意句柄读写
-    NonFinite,                                          // 向量分量 NaN/±Inf
-    Config { reason: &'static str },                    // 建库/查询配置非法
+    NonFinite,                                          // 向量分量或标量因子 NaN/±Inf
+    Config { reason: &'static str },                    // 建库/查询配置或策略参数非法
     Unsupported { feature: &'static str },              // 能力延后到后续层,绝不静默降级
     Inconsistent { reason: &'static str },              // 内部不变量被破坏
 }
@@ -124,6 +124,7 @@ $\|\mathbf{q}\|^2$ 是常数,于是**三种度量全部归结为一次点积**(n
 - 分母下限保护:`‖a‖·‖b‖ < ε`(如 1e-12,零向量)时余弦返回 0,不返回 NaN;
 - **非有限值在入口拒绝**:`insert` 时校验每个分量为有限值,`NaN`/`±Inf` 返回
   `NonFinite`(见 [03 §2.1](03-l1-memory.md)、[16 §8](16-api-reference.md));
+  `importance`/`confidence`/边权/`boost` 等标量因子同口径;
   距离函数本身不做该检查,以保持内层循环零分支;
 - 点积用 f32 累加即可(嵌入分量量级 ~0.1,1536 维累加误差远小于嵌入模型自身噪声);
   不用 Kahan/双精度——索引场景要的是**排序稳定性**而非绝对精度,

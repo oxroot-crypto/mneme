@@ -2,16 +2,18 @@
 //!
 //! 覆盖 `docs/spec/contracts.md` 的以下条目:
 //!
-//! * FC-MEM-CPLX-001..003/005(暴力扫描、过滤求值、并行归并、流式 iter)
+//! * FC-MEM-CPLX-001..003/005(暴力扫描、过滤求值、并行归并、iter 过滤/排序)
 //! * FC-INDEX-POST-003/004、FC-QUERY-ERR-002、FC-QUERY-POST-001
 //! * FC-SCORE-INV-027、FC-SCORE-POST-001
+
+use std::sync::Arc;
 
 use mneme::{Expr, Feedback, Metric, Mneme, Record, Scoring};
 use proptest::prelude::*;
 
 mod common;
 
-use common::{inserted, mem, reference_dot};
+use common::{FakeClock, inserted, mem, reference_dot};
 
 /// FC-MEM-CPLX-001 / FC-MEM-INV-003(暴力检索 ≡ 参考实现)
 #[test]
@@ -104,20 +106,31 @@ fn search_order_is_total_and_stable() {
     assert_eq!(first, sorted, "同分按 RowId 升序");
 }
 
-/// FC-MEM-CPLX-005
+/// FC-MEM-CPLX-005(过滤 + RowId 升序 + 墓碑常规路径不可见)
 #[test]
-fn iter_streams_filtered_records() {
+fn iter_filters_and_sorts_by_rowid() {
     let ns = mem(2).namespace("n");
+    // 先写 "z" 再写 "a":RowId 升序与字典序相反,可观测"按 RowId 而非 key 排序"。
+    ns.insert(Record::new(vec![1.0, 0.0]).key("z").importance(0.9))
+        .expect("insert");
     ns.insert(Record::new(vec![1.0, 0.0]).key("a").importance(0.9))
         .expect("insert");
-    ns.insert(Record::new(vec![0.0, 1.0]).key("b").importance(0.1))
+    ns.insert(Record::new(vec![0.0, 1.0]).key("m").importance(0.1))
         .expect("insert");
     let collected: Vec<String> = ns
         .iter(Some(Expr::field("importance").gt(0.5_f32)))
         .expect("iter")
         .map(|rec| rec.expect("row").key().expect("key").to_string())
         .collect();
-    assert_eq!(collected, vec!["a".to_string()]);
+    assert_eq!(
+        collected,
+        vec!["z".to_string(), "a".to_string()],
+        "预过滤命中且按 RowId 升序"
+    );
+    // 墓碑在常规 iter 不可见,iter_with(_, true) 审计入口可见(I9)。
+    ns.delete("z").expect("delete");
+    assert_eq!(ns.iter(None).expect("iter").count(), 2);
+    assert_eq!(ns.iter_with(None, true).expect("iter_with").count(), 3);
 }
 
 /// FC-MEM-PRE-003 / FC-GLOBAL-PRE-004(`top_k`/`ef` 超上限)
@@ -193,10 +206,18 @@ fn predicate_type_rules() {
     );
 }
 
-/// FC-SCORE-INV-027
+/// FC-SCORE-INV-027(同键幂等;不可见记录——不存在/已墓碑/已过期——返回 false
+/// 且不占用幂等键,该键随后仍可用于可见记录)
 #[test]
 fn feedback_is_idempotent_per_query() {
-    let ns = mem(2).namespace("n");
+    let clock = FakeClock::default();
+    clock.set(1_000);
+    let db = Mneme::builder()
+        .dimension(2)
+        .clock(Arc::new(clock.clone()))
+        .build()
+        .expect("build");
+    let ns = db.namespace("n");
     let id = inserted(
         ns.insert(Record::new(vec![1.0, 0.0]).key("k"))
             .expect("insert"),
@@ -210,6 +231,46 @@ fn feedback_is_idempotent_per_query() {
     assert!(
         ns.feedback(id, Feedback::Used, mneme::QueryId(8))
             .expect("feedback")
+    );
+    // 不存在:返回 false 且不占用幂等键(该键随后对可见记录仍生效)。
+    assert!(
+        !ns.feedback(mneme::RowId::new(999), Feedback::Used, mneme::QueryId(9))
+            .expect("feedback")
+    );
+    assert!(
+        ns.feedback(id, Feedback::Used, mneme::QueryId(9))
+            .expect("feedback"),
+        "不可见记录的 feedback 不得占用幂等键"
+    );
+    // 已墓碑:delete 后不可见;该键仍可用于后续写入的新记录。
+    ns.delete("k").expect("delete");
+    assert!(
+        !ns.feedback(id, Feedback::Used, mneme::QueryId(10))
+            .expect("feedback")
+    );
+    let new_id = inserted(
+        ns.insert(Record::new(vec![1.0, 0.0]).key("k2"))
+            .expect("insert"),
+    );
+    assert!(
+        ns.feedback(new_id, Feedback::Used, mneme::QueryId(10))
+            .expect("feedback"),
+        "墓碑处未占用的幂等键可用于新记录"
+    );
+    // 已过期(TTL 到期):不可见,绝不强化。
+    let ttl_id = inserted(
+        ns.insert(
+            Record::new(vec![1.0, 0.0])
+                .key("k3")
+                .ttl(std::time::Duration::from_millis(500)),
+        )
+        .expect("insert"),
+    );
+    clock.set(1_501);
+    assert!(
+        !ns.feedback(ttl_id, Feedback::Used, mneme::QueryId(11))
+            .expect("feedback"),
+        "已过期记录对 feedback 不可见"
     );
 }
 

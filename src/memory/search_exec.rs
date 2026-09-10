@@ -26,7 +26,7 @@ use crate::memory::temporal;
 static NEXT_QUERY_ID: AtomicU64 = AtomicU64::new(1);
 
 impl SearchBuilder<'_> {
-    /// 取检索视图:优先钉住的快照,否则取当前读视图;并校验关闭/文本通道。
+    /// 取检索视图:优先钉住的快照,否则取当前读视图;并校验关闭/文本/融合通道。
     pub(super) fn prepare_view(&self) -> Result<Arc<ReaderView>> {
         let view = match &self.pinned {
             Some(view) => Arc::clone(view),
@@ -38,6 +38,12 @@ impl SearchBuilder<'_> {
         if self.text.is_some() {
             return Err(MnemeError::Unsupported {
                 feature: "BM25 文本检索(L4)",
+            });
+        }
+        // Fusion 属于 L4 双通道融合能力:单独设置即拒绝,绝不静默忽略(FC-MEM-ERR-002)。
+        if self.fusion.is_some() {
+            return Err(MnemeError::Unsupported {
+                feature: "双通道融合(Fusion, L4)",
             });
         }
         Ok(view)
@@ -97,7 +103,7 @@ impl SearchBuilder<'_> {
         ns_id: NsId,
         query: &[f32],
         now: i64,
-    ) -> Vec<Scored> {
+    ) -> Result<Vec<Scored>> {
         search::search(&search::SearchParams {
             view,
             ns_id,

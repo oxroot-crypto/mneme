@@ -118,6 +118,7 @@ pub(crate) struct WriterState {
     pub(crate) next_ns_id: u32,
     pub(crate) ns_registry: Arc<HashMap<NsId, Arc<str>>>,
     pub(crate) ns_by_path: Arc<HashMap<Arc<str>, NsId>>,
+    // 反馈幂等键(I27);L1 常驻内存,L5 随访问统计一并落盘。
     pub(crate) feedback_seen: HashSet<(RowId, u64)>,
     pub(crate) closed: bool,
 }

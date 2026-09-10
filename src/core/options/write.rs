@@ -121,7 +121,7 @@ impl UpdatePatch {
     ///
     /// # Arguments
     ///
-    /// * `importance` - 新重要度,`[0,1]`。
+    /// * `importance` - 新重要度,`[0,1]`,越界钳制;非有限值(NaN)在 `update` 入口拒绝。
     ///
     /// # Returns
     ///
@@ -164,7 +164,7 @@ impl UpdatePatch {
     ///
     /// # Arguments
     ///
-    /// * `confidence` - 新可信度,`[0,1]`。
+    /// * `confidence` - 新可信度,`[0,1]`,越界钳制;非有限值(NaN)在 `update` 入口拒绝。
     ///
     /// # Returns
     ///

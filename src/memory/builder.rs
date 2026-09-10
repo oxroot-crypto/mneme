@@ -168,7 +168,7 @@ impl Builder {
     ///
     /// # Arguments
     ///
-    /// * `threshold` - 余弦相似度阈值,`[0,1]`。
+    /// * `threshold` - 余弦相似度阈值,`[0,1]`;越界或非有限值在 `build` 入口拒绝。
     ///
     /// # Returns
     ///
@@ -392,6 +392,8 @@ impl Builder {
     ///
     /// # Errors
     /// * 未设置 `dimension` → [`MnemeError::Config`];
+    /// * `dedup_threshold` 非 `[0,1]` 内的有限值 → [`MnemeError::Config`]
+    ///   (FC-GLOBAL-PRE-004:NaN 会让去重静默失效,越界值超出余弦相似度口径,绝不静默);
     /// * 设置了 `path` → [`MnemeError::Unsupported`](持久化在 L2 实现)。
     ///
     /// # Examples
@@ -404,6 +406,12 @@ impl Builder {
         if self.path.is_some() {
             return Err(MnemeError::Unsupported {
                 feature: "持久化(path, L2)",
+            });
+        }
+        // NaN 的 `contains` 恒为 false,一个区间判断即可同时覆盖非有限值与越界。
+        if !(0.0..=1.0).contains(&self.dedup_threshold) {
+            return Err(MnemeError::Config {
+                reason: "dedup_threshold 必须是 [0,1] 内的有限值",
             });
         }
         let dimension = self.dimension.ok_or(MnemeError::Config {

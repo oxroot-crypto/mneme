@@ -29,7 +29,8 @@ pub struct SearchBuilder<'a> {
     pub(crate) ef: Option<usize>,
     pub(crate) filter: Option<Expr>,
     pub(crate) dedup: ResultDedup,
-    pub(crate) fusion: Fusion,
+    /// 双通道融合器;`None` = 未设置(L1 未落地,设置即 `Unsupported`)。
+    pub(crate) fusion: Option<Fusion>,
     pub(crate) scoring: Option<Scoring>,
     pub(crate) diversify: Diversity,
     pub(crate) expand: Option<RelationExpand>,
@@ -128,13 +129,13 @@ impl SearchBuilder<'_> {
     ///
     /// # Arguments
     ///
-    /// * `fusion` - RRF 或加权融合。
+    /// * `fusion` - RRF 或加权融合;单独设置(无需 text 通道)即拒绝,绝不静默忽略。
     ///
     /// # Returns
     ///
     /// 携带融合器的构建器(链式)。
     pub fn fusion(mut self, fusion: Fusion) -> Self {
-        self.fusion = fusion;
+        self.fusion = Some(fusion);
         self
     }
 
@@ -253,7 +254,7 @@ impl SearchBuilder<'_> {
         };
         let now = self.config.clock.now_unix_ms();
         let view = self.apply_as_of(view);
-        let scored = self.run_search(&view, ns_id, query, now);
+        let scored = self.run_search(&view, ns_id, query, now)?;
         let (scored, via_map) = self.apply_expansion(&view, scored, now);
         let ranked = self.rank(&view, scored, now);
         let hits = self.build_hits(&view, ranked, self.resolve_query_id(), &via_map);

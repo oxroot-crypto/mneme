@@ -17,8 +17,9 @@ impl Namespace {
     /// * `rec` - 待写入记录;向量维度须与建库维度一致,分量必须是有限值。
     ///
     /// # Errors
-    /// 维度不符 → [`MnemeError::DimensionMismatch`];分量非有限值 → [`MnemeError::NonFinite`];
-    /// 超限 → [`MnemeError::TooLarge`]/[`MnemeError::MetaTooDeep`];`RejectDuplicate` 命中 →
+    /// 维度不符 → [`MnemeError::DimensionMismatch`];向量分量或 `importance`/`confidence`
+    /// 非有限值 → [`MnemeError::NonFinite`];超限 → [`MnemeError::TooLarge`]/
+    /// [`MnemeError::MetaTooDeep`];`RejectDuplicate` 命中 →
     /// [`MnemeError::DuplicateKey`];库已关闭 → [`MnemeError::Closed`]。
     ///
     /// # Examples
@@ -176,7 +177,10 @@ impl Namespace {
     ///
     /// # Errors
     /// 库已关闭 → [`MnemeError::Closed`];补丁向量维度不符 →
-    /// [`MnemeError::DimensionMismatch`];分量非有限值 → [`MnemeError::NonFinite`]。
+    /// [`MnemeError::DimensionMismatch`];向量分量或 `importance`/`confidence` 非有限值 →
+    /// [`MnemeError::NonFinite`];text/metadata/provenance 超限 →
+    /// [`MnemeError::TooLarge`]/[`MnemeError::MetaTooDeep`](FC-MEM-PRE-002:与 insert
+    /// 同口径,校验失败时记录保持上一版本原样)。
     /// key 不存在时返回 `Ok(UpdateOutcome::NotFound)`,不算错误。
     ///
     /// # Examples
@@ -218,7 +222,9 @@ impl Namespace {
     ///
     /// # Errors
     /// 库已关闭 → [`MnemeError::Closed`];补丁向量维度不符 →
-    /// [`MnemeError::DimensionMismatch`];分量非有限值 → [`MnemeError::NonFinite`]。
+    /// [`MnemeError::DimensionMismatch`];向量分量或 `importance`/`confidence` 非有限值 →
+    /// [`MnemeError::NonFinite`];text/metadata/provenance 超限 →
+    /// [`MnemeError::TooLarge`]/[`MnemeError::MetaTooDeep`]。
     /// `RowId` 不存在时返回 `Ok(UpdateOutcome::NotFound)`,不算错误。
     pub fn update_by_rowid(&self, id: RowId, patch: UpdatePatch) -> Result<UpdateOutcome> {
         let mut ws = self.table.write();
@@ -237,9 +243,10 @@ impl Namespace {
     /// * `rec` - 新版本记录;其 `valid_from`(缺省为当前时刻)同时作为旧版本的 `valid_to`。
     ///
     /// # Errors
-    /// 新记录维度不符 → [`MnemeError::DimensionMismatch`];分量非有限值 →
-    /// [`MnemeError::NonFinite`];超限 → [`MnemeError::TooLarge`]/[`MnemeError::MetaTooDeep`];
-    /// 库已关闭 → [`MnemeError::Closed`]。key 不存在时返回
+    /// 新记录维度不符 → [`MnemeError::DimensionMismatch`];向量分量或
+    /// `importance`/`confidence` 非有限值 → [`MnemeError::NonFinite`];超限 →
+    /// [`MnemeError::TooLarge`]/[`MnemeError::MetaTooDeep`];库已关闭 →
+    /// [`MnemeError::Closed`]。key 不存在时返回
     /// `Ok(UpdateOutcome::NotFound)`,不算错误。
     ///
     /// # Examples

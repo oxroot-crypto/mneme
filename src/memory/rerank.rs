@@ -8,7 +8,7 @@ use crate::memory::record::Hit;
 /// Reciprocal Rank Fusion 的缺省平滑常数。
 const RRF_K: u32 = 60;
 
-/// 融合器(双通道检索;L1 仅记录,`.text()` 在 L4 前返回 `Invalid`)。
+/// 融合器(双通道检索;L1 未落地,单独设置即返回 `Unsupported`)。
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Fusion {
     /// Reciprocal Rank Fusion,默认 `k=60`。

@@ -3,6 +3,7 @@
 //! **过滤先行**:先用元数据求值得到候选位图(不读向量),再分块并行打分、
 //! `TopK` 归并。这是设计 03 §4 的 L1 落地,也是 L3/L4 计划器的雏形。
 
+use crate::core::error::{MnemeError, Result};
 use crate::core::heap::TopK;
 use crate::core::metric::{Metric, Score};
 use crate::core::simd;
@@ -72,7 +73,7 @@ struct ScanParams<'a> {
 }
 
 /// 在给定快照上做过滤 + 暴力打分,返回按 `Metric::better` 排序的 top-k。
-pub(crate) fn search(params: &SearchParams<'_>) -> Vec<Scored> {
+pub(crate) fn search(params: &SearchParams<'_>) -> Result<Vec<Scored>> {
     let query_norm = if params.metric.needs_norm() {
         norm_sq(params.query)
     } else {
@@ -82,7 +83,7 @@ pub(crate) fn search(params: &SearchParams<'_>) -> Vec<Scored> {
     let candidates = collect_candidates(params);
     let k = params.top_k.min(candidates.len());
     if k == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
 
     let (chunk, threads) = plan_scan(params);
@@ -99,10 +100,12 @@ pub(crate) fn search(params: &SearchParams<'_>) -> Vec<Scored> {
     let top = if candidates.len() <= chunk || threads <= 1 {
         scan_sequential(&scan)
     } else {
-        scan_parallel(&scan)
+        // 工作线程异常终止 = 打分阶段内部不变量被破坏;按 FC-GLOBAL-ERR-001 不向外
+        // 传播 panic,也不静默返回偏少的结果,而是转为结构化错误(FC-MEM-INV-004 口径)。
+        scan_parallel(&scan)?
     };
 
-    rescore(params, top, query_norm)
+    Ok(rescore(params, top, query_norm))
 }
 
 /// 过滤先行:只求值元数据,得到候选槽位(不读向量)。
@@ -121,7 +124,9 @@ fn collect_candidates(params: &SearchParams<'_>) -> Vec<u32> {
                 continue;
             }
         }
-        candidates.push(u32::try_from(idx).unwrap_or(u32::MAX));
+        // 槽位下标 ≤ u32::MAX:append_slot 经 `slot_id_for` 拒绝继续增长,
+        // 下标越界即违反 FC-MEM-INV-004,故此转换可证明不会失败。
+        candidates.push(u32::try_from(idx).expect("槽位下标必可转入 u32(FC-MEM-INV-004)"));
     }
     candidates
 }
@@ -178,7 +183,7 @@ fn score_slot(params: &ScanParams<'_>, idx: u32) -> (RowId, SlotId, Score) {
     (slot_data.rowid, slot, score)
 }
 
-fn scan_parallel(params: &ScanParams<'_>) -> TopK<(RowId, SlotId)> {
+fn scan_parallel(params: &ScanParams<'_>) -> Result<TopK<(RowId, SlotId)>> {
     let chunk = params
         .chunk
         .max(params.candidates.len().div_ceil(params.threads));
@@ -197,17 +202,21 @@ fn scan_parallel(params: &ScanParams<'_>) -> TopK<(RowId, SlotId)> {
         handles
             .into_iter()
             .map(|handle| match handle.join() {
-                Ok(local) => local,
-                Err(_) => TopK::new(0, params.metric),
+                Ok(local) => Ok(local),
+                // 工作线程 panic:打分阶段的内部不变量被破坏,绝不静默吞掉
+                // (静默吞掉会返回偏少的结果,违反「拒绝静默失败」)。
+                Err(_) => Err(MnemeError::Inconsistent {
+                    reason: "并行扫描工作线程异常终止",
+                }),
             })
-            .collect::<Vec<_>>()
-    });
+            .collect::<Result<Vec<_>>>()
+    })?;
 
     let mut top = TopK::new(params.k, params.metric);
     for partial in partials {
         top.merge(partial);
     }
-    top
+    Ok(top)
 }
 
 #[cfg(test)]

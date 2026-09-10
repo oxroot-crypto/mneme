@@ -14,7 +14,7 @@ use crate::memory::record::{Record, RecordRef, UpdateOutcome};
 use crate::memory::score::ConsolidationPolicy;
 use crate::memory::search;
 use crate::memory::table::{SlotData, WriterState};
-use crate::memory::write_helpers::latest_live;
+use crate::memory::write_helpers::{latest_live, validate_patch};
 
 /// `Feedback::Corrected` 降低可信度的步长。
 const CONFIDENCE_DECAY_STEP: f32 = 0.1;
@@ -28,10 +28,12 @@ pub(crate) fn update_rowid(
     let Some(base) = latest_live(ws, rowid) else {
         return Ok(UpdateOutcome::NotFound);
     };
+    // 全量校验先行:任一字段超限/非有限值 → 整个补丁拒绝,记录保持原版本(零部分写入)。
+    validate_patch(config, patch)?;
     let now = config.clock.now_unix_ms();
     // 版本数据经 `Arc` 与读者共享,更新必须克隆出新版本(COW)。
     let mut slot_data = (*base).clone();
-    apply_patch(&mut slot_data, patch, config, now)?;
+    apply_patch(&mut slot_data, patch, now);
     slot_data.seqno = ws.alloc_seqno();
     slot_data.tx_ms = now;
     slot_data.deleted = false;
@@ -39,34 +41,18 @@ pub(crate) fn update_rowid(
     Ok(UpdateOutcome::Updated(rowid))
 }
 
-/// 把补丁字段应用到版本数据上。
-fn apply_patch(
-    slot_data: &mut SlotData,
-    patch: &UpdatePatch,
-    config: &Config,
-    now: i64,
-) -> Result<()> {
+/// 把补丁字段应用到版本数据上(全部字段已由 `validate_patch` 校验,不可失败)。
+fn apply_patch(slot_data: &mut SlotData, patch: &UpdatePatch, now: i64) {
     if let Some(vector) = &patch.vector {
-        apply_vector_patch(slot_data, vector, config)?;
+        apply_vector_patch(slot_data, vector);
     }
     apply_scalar_patch(slot_data, patch, now);
-    Ok(())
 }
 
-/// 应用补丁的向量字段:校验维度与非有限值后整体替换,并重算范数平方。
-fn apply_vector_patch(slot_data: &mut SlotData, vector: &[f32], config: &Config) -> Result<()> {
-    if vector.len() != config.dimension.get() as usize {
-        return Err(MnemeError::DimensionMismatch {
-            expected: config.dimension.get(),
-            got: vector.len(),
-        });
-    }
-    if vector.iter().any(|value| !value.is_finite()) {
-        return Err(MnemeError::NonFinite);
-    }
+/// 应用补丁的向量字段:整体替换并重算范数平方(维度/有限值已由校验保证)。
+fn apply_vector_patch(slot_data: &mut SlotData, vector: &[f32]) {
     slot_data.vector = Arc::from(vector.to_vec().into_boxed_slice());
     slot_data.norm_sq = search::norm_sq(&slot_data.vector);
-    Ok(())
 }
 
 /// 应用补丁的文本/元数据/标量字段(时间语义经 `now` 注入,不可失败)。
@@ -110,6 +96,12 @@ pub(crate) fn touch_rowid(
     boost: Option<f32>,
     now: i64,
 ) -> Result<bool> {
+    // 非有限值 boost 会污染 importance 与综合打分,入口直接拒绝(FC-GLOBAL-PRE-004)。
+    if let Some(boost) = boost
+        && !boost.is_finite()
+    {
+        return Err(MnemeError::NonFinite);
+    }
     let Some(base) = latest_live(ws, rowid) else {
         return Ok(false);
     };

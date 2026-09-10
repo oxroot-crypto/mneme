@@ -37,7 +37,7 @@ impl Builder {
     pub fn fsync(self, p: FsyncPolicy) -> Self;             // 默认 Batched(20ms)
     pub fn insert_mode(self, m: InsertMode) -> Self;        // 默认 Upsert
     pub fn dedup(self, d: Dedup) -> Self;                   // 默认 Off
-    pub fn dedup_threshold(self, t: f32) -> Self;           // 默认 0.95;近似去重余弦阈值
+    pub fn dedup_threshold(self, t: f32) -> Self;           // 默认 0.95;近似去重余弦阈值,`[0,1]` 内的有限值(越界建库即拒绝)
     pub fn quantization(self, f: VectorFormat) -> Self;     // 默认 F32;见 08
     pub fn hnsw(self, p: HnswParams) -> Self;               // 默认 M=16/M0=32/efc=200/ef=64
     pub fn compaction(self, p: CompactionPolicy) -> Self;   // 默认见 §2
@@ -210,7 +210,8 @@ impl Namespace {
     /// 统计命中行数(不物化记录,复用过滤器/索引)。
     pub fn count(&self, filter: Option<Expr>) -> Result<u64>;
 
-    /// 按过滤条件流式遍历(导出/审计/重建用),快照一致;不参与 ANN。
+    /// 按过滤条件遍历(导出/审计/重建用),快照一致;不参与 ANN。
+    /// 物化命中行的 `Arc` 句柄(不复制记录体,$O(N_c)$ 空间,FC-MEM-CPLX-005)。
     /// `include_deleted=true` 时包含墓碑/已逻辑过期记录(仅供审计,见 07 §3.4)。
     /// 外层 `Result` 是"建立遍历"的错误;内层 `Result` 是逐行读取(段损坏/被删)的错误——
     /// 迭代中途的 I/O 失败必须能被调用方看见,绝不静默截断(I2)。
@@ -232,7 +233,7 @@ impl SearchBuilder<'_> {
     pub fn ef(self, ef: usize) -> Self;                     // 仅 L3+ 生效;上限 4096
     pub fn filter(self, e: Expr) -> Self;                   // 预过滤(语义见 03 §2.2)
     pub fn dedup(self, d: ResultDedup) -> Self;             // 结果级去重(见 06 §6)
-    pub fn fusion(self, f: Fusion) -> Self;                 // 默认 Rrf{k:60}
+    pub fn fusion(self, f: Fusion) -> Self;                 // 双通道融合;L1 未落地,设置即 `Unsupported`(L4)
     pub fn score(self, s: Scoring) -> Self;                 // 时序/重要度/访问感知打分(见 10 §2)
     pub fn diversify(self, d: Diversity) -> Self;           // MMR 多样性(见 10 §5)
     pub fn expand(self, e: RelationExpand) -> Self;         // 关系联想扩展(见 10 §3)
@@ -249,7 +250,7 @@ impl SearchBuilder<'_> {
 impl Namespace {
     pub fn touch(&self, key: &str, boost: Option<f32>) -> Result<bool>;  // 访问计数 +1;boost=Some(d) 时 importance += d
     pub fn touch_by_rowid(&self, id: RowId, boost: Option<f32>) -> Result<bool>;
-    pub fn feedback(&self, id: RowId, fb: Feedback, query_id: QueryId) -> Result<bool>;  // 检索反馈闭环,幂等键 (id, query_id)(见 10 §4)
+    pub fn feedback(&self, id: RowId, fb: Feedback, query_id: QueryId) -> Result<bool>;  // 检索反馈闭环,幂等键 (id, query_id);记录不可见(不存在/墓碑/过期)→ false 且不占幂等键(见 10 §4)
     pub fn forget(&self, filter: Expr) -> Result<usize>;    // 主动遗忘,返回删除数
     pub fn retain(&self, policy: Retention) -> Result<RetainReport>;
 
@@ -531,7 +532,7 @@ pub struct QueryId(pub u64);
 /// 记忆沉淀策略与报告(见 [09 §5](09-memory-model.md))。
 pub struct ConsolidationPolicy {
     pub filter: Option<Expr>,     // 候选范围,默认 None = 全库活记录
-    pub threshold: f32,           // 近似重复阈值,默认 0.95
+    pub threshold: f32,           // 近似重复阈值,默认 0.95;[0,1] 内的有限值(越界入口拒绝)
     pub max_cluster: usize,       // 单簇上限,默认 32
     pub target: Option<String>,   // 摘要写入的命名空间路径,默认 None = 调用方所在命名空间
     pub summarizer: Option<Arc<dyn Summarizer>>,  // None = 引擎拼接
@@ -562,7 +563,7 @@ pub struct ConsolidateReport {
 | fsync 策略 | `.fsync` | `Batched(20ms)` | `Always/Batched/OnFlush/Never`,[04 §3](04-l2-persist.md) |
 | 同 key 行为 | `.insert_mode` | `Upsert` | `Upsert/RejectDuplicate` |
 | 去重策略 | `.dedup` | `Off` | `Off/Reject/Replace/KeepBoth/Merge`,[03 §6](03-l1-memory.md) |
-| 去重阈值 | `.dedup_threshold` | `0.95` | 近似去重阈值,**统一按余弦相似度口径**(非余弦度量下引擎内部先归一化);与 `ResultDedup::Near` 独立 |
+| 去重阈值 | `.dedup_threshold` | `0.95` | 近似去重阈值,**统一按余弦相似度口径**(非余弦度量下引擎内部先归一化);`[0,1]` 内的有限值,越界建库即拒绝;与 `ResultDedup::Near` 独立 |
 | 量化格式 | `.quantization` | `F32` | `F32/F16/I8Rescored`,[08](08-l6-quant.md) |
 | HNSW 参数 | `.hnsw` | 见下 | `HnswParams` |
 | compaction | `.compaction` | 见下 | `CompactionPolicy` |
@@ -681,19 +682,21 @@ pub struct Tuning {
 | `MetricMismatch` | ❌ | 打开参数与库不一致;去掉显式 metric 或改对 |
 | `FilterParse` | ❌ | DSL 语法错误,错误携带位置;修正表达式 |
 | `TooLarge` / `LimitExceeded` / `MetaTooDeep` | ❌ | 数据/参数超限,见 §8 |
-| `NonFinite` | ❌ | 向量分量含 `NaN`/`±Inf`,会污染排序;修正输入 |
+| `NonFinite` | ❌ | 向量分量或 `importance`/`confidence`/边权/`boost` 含 `NaN`/`±Inf`,会污染排序与打分;修正输入 |
 | `Closed` | ❌ | 库已关闭;不要再使用该库的任何克隆句柄 |
-| `Config` | ❌ | 建库/查询配置非法(缺维度、无查询通道) |
-| `Unsupported` | ❌ | 该能力延后到后续层(open/backup/text/Fusion);按版本升级 |
+| `Config` | ❌ | 建库/查询配置非法(缺维度、无查询通道),策略参数含非有限值或非法(如 `max_cluster = 0`) |
+| `Unsupported` | ❌ | 该能力延后到后续层(open/backup/text/Fusion;`Fusion` 单独设置即拒绝);按版本升级 |
 | `Inconsistent` | ❌ | 内部不变量被破坏(应为 bug);上报并附上下文 |
 | `UnsupportedVersion` | ❌ | 库由更新版本的 Mneme 写入;升级库,勿降级读 |
 | `Corrupted` | ❌ | 数据损坏:立即停止写入,跑 `db.check()`,按 §7 恢复 |
 
 **原则**:错误信息面向排查——`Corrupted` 带段号与原因,`FilterParse` 带出错位置
-([02 §2](02-l0-core.md))。库本身**绝不 panic**;唯二的例外是:① `async` 门面中
+([02 §2](02-l0-core.md))。库本身**绝不 panic**;唯三的例外是:① `async` 门面中
 `spawn_blocking` 任务被取消/panic 的 `expect`([08 §6](08-l6-quant.md));
 ② `filter!` 宏对写死的非法字面量在展开处 panic——运行时输入请用 `Expr::from_str`
-返回的 `Result`([06 §1.1](06-l4-query.md)、不变量 I7)。
+返回的 `Result`([06 §1.1](06-l4-query.md)、不变量 I7);
+③ 并行扫描候选收集处对槽位下标的 `u32::try_from(..).expect`——`append_slot` 经
+`slot_id_for` 拒绝溢出(FC-MEM-INV-004),该转换可证明不会失败。
 
 ---
 
@@ -824,7 +827,9 @@ backup/current           ← 内容 "42";改成 "41" 即回滚一个提交点
 限额通过 `.limits(Limits { .. })` 调整;调大以内存/恢复时间为代价,请评估后再改。
 
 > **向量取值校验**:插入时逐个分量检查是否为有限值,`NaN`/`±Inf` 一律返回 `NonFinite`
-> (否则会污染 `Metric::better` 的排序与 TopK)。零向量合法:余弦按 [02 §3.3](02-l0-core.md)
+> (否则会污染 `Metric::better` 的排序与 TopK)。**标量因子同口径**:`importance`/`confidence`
+> (含 `UpdatePatch` 与 `touch` boost)、关系边权含非有限值时同样返回 `NonFinite`,绝不入库。
+> 零向量合法:余弦按 [02 §3.3](02-l0-core.md)
 > 返回 0,但语义上是"无方向",调用方自行判断是否需要拒绝。
 
 ### 8.1 过滤保留字段

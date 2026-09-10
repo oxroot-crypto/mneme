@@ -8,6 +8,7 @@ use crate::core::options::{Feedback, QueryId, RelationKind};
 use crate::core::types::{Key, RowId};
 use crate::memory::mutate_helpers::{lower_confidence, touch_rowid};
 use crate::memory::relation::{self, Edge};
+use crate::memory::write_helpers::latest_live;
 
 use super::Namespace;
 
@@ -19,13 +20,14 @@ impl Namespace {
     ///
     /// # Arguments
     /// * `key` - 记录键;按当前命名空间隔离查找。
-    /// * `boost` - 重要度增量;`Some(d)` 时 `importance += d` 后钳制到 `[0.0, 1.0]`。
+    /// * `boost` - 重要度增量;`Some(d)` 时 `importance += d` 后钳制到 `[0.0, 1.0]`;
+    ///   `d` 含非有限值(NaN)→ `NonFinite`。
     ///
     /// # Returns
     /// 命中活记录返回 `true`(计数已更新);命名空间未注册或 key 不存在返回 `false`。
     ///
     /// # Errors
-    /// 库已关闭时返回 [`MnemeError::Closed`]。
+    /// 库已关闭 → [`MnemeError::Closed`];`boost` 含非有限值 → [`MnemeError::NonFinite`]。
     ///
     /// # Examples
     /// ```
@@ -62,7 +64,7 @@ impl Namespace {
     /// 命中活记录返回 `true`;`RowId` 不存在或已墓碑返回 `false`。
     ///
     /// # Errors
-    /// 库已关闭时返回 [`MnemeError::Closed`]。
+    /// 库已关闭 → [`MnemeError::Closed`];`boost` 含非有限值 → [`MnemeError::NonFinite`]。
     pub fn touch_by_rowid(&self, id: RowId, boost: Option<f32>) -> Result<bool> {
         let mut ws = self.table.write();
         if ws.closed {
@@ -83,7 +85,9 @@ impl Namespace {
     /// * `query_id` - 查询幂等标识;与 `id` 组成幂等键。
     ///
     /// # Returns
-    /// 首次收到该 `(rowid, query_id)` 返回 `true` 并生效;重复反馈返回 `false`(幂等)。
+    /// 首次收到该 `(rowid, query_id)` 且记录可见时返回 `true` 并生效;
+    /// 重复反馈或记录不可见(不存在/已墓碑/已过期)返回 `false`——
+    /// 不可见时不占用幂等键,该 `RowId` 重新可见后首次反馈仍生效。
     ///
     /// # Errors
     /// 库已关闭时返回 [`MnemeError::Closed`]。
@@ -105,10 +109,15 @@ impl Namespace {
         if ws.closed {
             return Err(MnemeError::Closed);
         }
+        // 不可见记录(不存在/已墓碑/已过期)无法被强化:先校验命中,再占用幂等键
+        // (FC-SCORE-INV-027);`latest_live` 只查墓碑,逻辑过期须经 `is_live(now)` 判断。
+        let now = self.config.clock.now_unix_ms();
+        if latest_live(&ws, id).is_none_or(|base| !base.is_live(now)) {
+            return Ok(false);
+        }
         if !ws.feedback_seen.insert((id, query_id.0)) {
             return Ok(false);
         }
-        let now = self.config.clock.now_unix_ms();
         match feedback {
             Feedback::Used => {
                 touch_rowid(&mut ws, id, Some(FEEDBACK_USED_IMPORTANCE_BOOST), now)?;

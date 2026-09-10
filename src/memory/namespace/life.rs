@@ -81,7 +81,8 @@ impl Namespace {
     /// 执行报告:扫描数、遗忘数与抽样 `RowId`(可审计,I23)。
     ///
     /// # Errors
-    /// 库已关闭时返回 [`MnemeError::Closed`]。
+    /// 库已关闭 → [`MnemeError::Closed`];`min_importance` 含非有限值(NaN)→
+    /// [`MnemeError::Config`]。
     ///
     /// # Examples
     /// ```
@@ -96,6 +97,12 @@ impl Namespace {
         let mut ws = self.table.write();
         if ws.closed {
             return Err(MnemeError::Closed);
+        }
+        // 非有限值阈值会让「score < 阈值」恒为假、遗忘静默失效,显式拒绝(FC-LIFE-POST-002)。
+        if !policy.min_importance.is_finite() {
+            return Err(MnemeError::Config {
+                reason: "min_importance 必须是有限值",
+            });
         }
         let Some(ns_id) = ws.ns_id_of(&self.ns_path) else {
             return Ok(RetainReport::default());
@@ -124,7 +131,8 @@ impl Namespace {
     /// 沉淀报告:簇数、被合并来源数与新摘要的 `RowId` 列表。
     ///
     /// # Errors
-    /// 库已关闭时返回 [`MnemeError::Closed`]。
+    /// 库已关闭 → [`MnemeError::Closed`];策略参数非法(`threshold` 非 `[0,1]`
+    /// 内的有限值或 `max_cluster = 0`)→ [`MnemeError::Config`]。
     ///
     /// # Examples
     /// ```
@@ -140,6 +148,15 @@ impl Namespace {
         let mut ws = self.table.write();
         if ws.closed {
             return Err(MnemeError::Closed);
+        }
+        // 策略参数非法时显式拒绝,绝不静默空转或索引越界 panic(FC-MODEL-POST-006):
+        // threshold=NaN 使 `相似度 ≥ 阈值` 恒为假,越界值超出相似度口径;
+        // max_cluster=0 会把候选簇截断为空簇。
+        // NaN 的 `contains` 恒为 false,一个区间判断即可同时覆盖非有限值与越界。
+        if !(0.0..=1.0).contains(&policy.threshold) || policy.max_cluster == 0 {
+            return Err(MnemeError::Config {
+                reason: "沉淀策略非法:threshold 必须为 [0,1] 内的有限值且 max_cluster ≥ 1",
+            });
         }
         let Some(ns_id) = ws.ns_id_of(&self.ns_path) else {
             return Ok(ConsolidateReport::default());

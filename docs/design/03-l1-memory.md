@@ -41,7 +41,7 @@ pub enum InsertOutcome { Inserted(RowId), Merged(RowId), Duplicate { existing: R
 | 同 key | `InsertMode::Upsert`(默认):**保留既有 RowId**,写入新物理版本(seqno+1),旧版本被遮蔽;`RejectDuplicate`:报错。RowId 因此是跨更新稳定的逻辑身份(02 §1) |
 | seqno | 每次成功写入分配新 `SeqNo`,全库单调递增 |
 | TTL | 相对时长即刻换算为绝对 `expires_at`(Unix 毫秒,经 `Clock` 取值) |
-| importance | 未指定默认 0.5;范围 [0,1],超范围钳制(clamp) |
+| importance | 未指定默认 0.5;范围 [0,1],超范围钳制(clamp);含非有限值(NaN)→ `NonFinite` 拒绝,绝不入库 |
 | valid time | `Record::valid_from/valid_to` 可选,构成双时态(valid time + transaction time),见 [09 §3](09-memory-model.md) |
 | confidence | `Record::confidence` 可选,默认 1.0;参与检索打分的可信度因子,见 [10](10-scoring.md) |
 | 批量 | `insert_batch` **整批原子**(I15,定义见 [16 §9](16-api-reference.md)):共用一次组提交 fsync;WAL 侧以 `BatchBegin`/`BatchCommit` 帧包裹([04 §2.3](04-l2-persist.md));任一条**校验失败**(维度/数值/限额)则整批拒绝、不产生部分写入;结果顺序与输入一一对应。**去重命中**(`Dedup::Reject`)或 `InsertMode::RejectDuplicate` 属于逐条业务结果,不使整批回滚——命中位置返回 `Duplicate`,其余记录照常写入 |
@@ -57,8 +57,8 @@ pub enum UpdateOutcome { Updated(RowId), NotFound }
 | 字段 | 语义 |
 |---|---|
 | `vector` | 提供时替换向量并重建该版本索引;不提供则保留 |
-| `text` / `metadata` / `provenance` | 提供时整体替换(非合并);`Some(None)` 清空 |
-| `importance` / `ttl` / `valid_time` / `confidence` | 提供时覆盖;`ttl(Some(None))` 取消过期 |
+| `text` / `metadata` / `provenance` | 提供时整体替换(非合并);`Some(None)` 清空;**受 [16 §8](16-api-reference.md) 限额约束**(与 insert 同口径),超限返回 `TooLarge`/`MetaTooDeep` 且记录保持上一版本原样 |
+| `importance` / `ttl` / `valid_time` / `confidence` | 提供时覆盖;`ttl(Some(None))` 取消过期;`importance`/`confidence` 含非有限值(NaN)→ `NonFinite` |
 | 可见性 | **不变量 I24(更新原子可见)**:更新写入新物理版本(新 seqno),对读者**原子可见**——任一并发查询要么看到旧版本、要么看到新版本,绝不看到字段混合的半更新;旧版本遮蔽,超期版本由 compaction 按 `history_horizon` 物理回收(I26) |
 | 与 upsert 的区别 | upsert 按 key 整体替换、可无既有 key;update 要求已存在,返回 `NotFound` 而非新建 |
 
@@ -100,13 +100,14 @@ impl SearchBuilder<'_> { pub fn execute(&self) -> Result<Vec<Hit>>; }
 
 - `touch(key, boost)` / `touch_by_rowid(rowid, boost)`:访问计数 +1、`last_access = now`
   (为 [07 遗忘曲线](07-l5-life.md) 供数);`boost` 为 `Some(d)` 时同时提升 importance
-  (`importance += d`,clamp 到 [0,1]);按 rowid 的版本用于无 key 记录;
+  (`importance += d`,clamp 到 [0,1];`d` 为非有限值(NaN)→ `NonFinite`);按 rowid 的版本用于无 key 记录;
 - `delete(key)` / `delete_by_rowid(rowid)`:墓碑;`forget(filter)`:对过滤器命中的每行打墓碑,返回删除数;
-- `iter(filter)`:按过滤条件流式遍历(导出/审计/重建用),快照一致、不参与 ANN;
+- `iter(filter)`:按过滤条件遍历(导出/审计/重建用),快照一致、不参与 ANN;
   逐行返回 `Result<RecordRef<'_>>`——迭代中途的 I/O 错误必须能被调用方看到([16 §1.3](16-api-reference.md));
 - `feedback(rowid, Feedback, query_id)`:检索反馈闭环([10 §4](10-scoring.md)),把"这条记忆是否被
   采用/纠正"回写为访问增益或重要度修正;幂等键 `(rowid, query_id)` 防重复计分
   (`query_id` 由 `execute()` 生成并随 `Hit` 返回,见 [10 §4.2](10-scoring.md));
+  对不可见记录(不存在/已墓碑/已过期)返回 `false` 且不占用幂等键;
 - `relate(from, to, kind, weight)` / `relate_with_options(from, to, RelateOptions)` /
   `unrelate(...)`:建立/删除记忆关系边
   ([09 §2](09-memory-model.md));关系边随记录墓碑级联失效;
@@ -330,7 +331,7 @@ pub enum Dedup { Off, Reject, Replace, KeepBoth, Merge(fn(&RecordRef<'_>, &Recor
 ```
 
 近似判重的阈值由 `Builder::dedup_threshold(f32)` 配置(默认 0.95,
-见 [16 §2](16-api-reference.md)),与检索结果的 `ResultDedup::Near { threshold }` 各自独立。
+`[0,1]` 内的有限值,越界建库即拒绝;见 [16 §2](16-api-reference.md)),与检索结果的 `ResultDedup::Near { threshold }` 各自独立。
 **该阈值统一按余弦相似度口径**:非余弦度量(`Dot`/`Euclidean`)下引擎先把两侧向量归一化
 再比较,调用方无需换算。
 `RecordRef` 定义见 [16 §1.2](16-api-reference.md)。

@@ -50,7 +50,7 @@ pub trait Summarizer: Send + Sync {
 pub struct ConsolidationPolicy {
     /// 候选范围,`None` = 当前命名空间全部活记录。
     pub filter: Option<Expr>,
-    /// 近似重复阈值,默认 0.95。
+    /// 近似重复阈值,默认 0.95;`[0,1]` 内的有限值,越界在 `consolidate` 入口拒绝。
     pub threshold: f32,
     /// 单簇上限,默认 32。
     pub max_cluster: usize,

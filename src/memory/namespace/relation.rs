@@ -21,7 +21,8 @@ impl Namespace {
     /// 恒 `Ok`;幂等键为 `(from, to, kind)`,重复 relate 覆盖 weight(metadata 不变)。
     ///
     /// # Errors
-    /// 库已关闭时返回 [`MnemeError::Closed`]。
+    /// 库已关闭时返回 [`MnemeError::Closed`];边权含非有限值(NaN)时返回
+    /// [`MnemeError::NonFinite`]。
     ///
     /// # Examples
     /// ```
@@ -55,7 +56,8 @@ impl Namespace {
     /// 恒 `Ok`。
     ///
     /// # Errors
-    /// 库已关闭时返回 [`MnemeError::Closed`]。
+    /// 库已关闭时返回 [`MnemeError::Closed`];边权含非有限值(NaN)时返回
+    /// [`MnemeError::NonFinite`]。
     pub fn relate_with_options(
         &self,
         from: RowId,
@@ -65,6 +67,10 @@ impl Namespace {
         let mut ws = self.table.write();
         if ws.closed {
             return Err(MnemeError::Closed);
+        }
+        // 非有限值边权会经联想扩展污染检索打分,入口直接拒绝(FC-GLOBAL-PRE-004)。
+        if !options.weight.is_finite() {
+            return Err(MnemeError::NonFinite);
         }
         let edge = Edge {
             from,

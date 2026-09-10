@@ -9,7 +9,6 @@ use crate::core::types::{Key, NsId, RowId};
 use crate::memory::dedup::ResultDedup;
 use crate::memory::pred::{self, EvalCtx, Expr};
 use crate::memory::record::RecordRef;
-use crate::memory::rerank::Fusion;
 use crate::memory::search_builder::SearchBuilder;
 use crate::memory::table::ReaderView;
 
@@ -41,7 +40,7 @@ impl Namespace {
             ef: None,
             filter: None,
             dedup: ResultDedup::Off,
-            fusion: Fusion::default(),
+            fusion: None,
             scoring: None,
             diversify: Diversity::Off,
             expand: None,
@@ -335,7 +334,7 @@ impl Namespace {
         self.iter_with(filter, false)
     }
 
-    /// 按过滤条件流式遍历;`include_deleted=true` 时包含墓碑/过期记录(仅审计)。
+    /// 按过滤条件遍历(导出/审计/重建用);`include_deleted=true` 时包含墓碑/过期记录(仅审计)。
     ///
     /// # Arguments
     /// * `filter` - 三值过滤表达式;`None` 表示不过滤。
@@ -343,6 +342,7 @@ impl Namespace {
     ///
     /// # Returns
     /// 按 `RowId` 升序产出 `Ok(RecordRef)` 的迭代器(内层 `Err` 为 L2 预留)。
+    /// 调用前物化命中行的 `Arc` 句柄、不复制记录体(FC-MEM-CPLX-005,非流式)。
     ///
     /// # Errors
     /// 库已关闭时返回 [`MnemeError::Closed`]。

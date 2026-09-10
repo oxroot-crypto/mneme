@@ -11,7 +11,6 @@ use crate::memory::namespace::{DEFAULT_TOP_K, point_get};
 use crate::memory::pred::{self, EvalCtx, Expr};
 use crate::memory::record::RecordRef;
 use crate::memory::relation::Edge;
-use crate::memory::rerank::Fusion;
 use crate::memory::search_builder::SearchBuilder;
 use crate::memory::table::{ReaderView, Table};
 
@@ -124,7 +123,7 @@ impl SnapshotNamespace {
             ef: None,
             filter: None,
             dedup: ResultDedup::Off,
-            fusion: Fusion::default(),
+            fusion: None,
             scoring: None,
             diversify: Diversity::Off,
             expand: None,
@@ -343,7 +342,7 @@ impl SnapshotNamespace {
         self.iter_with(filter, false)
     }
 
-    /// 流式遍历;`include_deleted=true` 时包含墓碑/过期记录。
+    /// 遍历(导出/审计/重建用);`include_deleted=true` 时包含墓碑/过期记录。
     ///
     /// # Arguments
     /// * `filter` - 三值过滤表达式;`None` 表示不过滤。
@@ -351,6 +350,7 @@ impl SnapshotNamespace {
     ///
     /// # Returns
     /// 按 `RowId` 升序产出 `Ok(RecordRef)` 的迭代器(内层 `Err` 为 L2 预留)。
+    /// 调用前物化命中行的 `Arc` 句柄、不复制记录体(FC-MEM-CPLX-005,非流式)。
     ///
     /// # Errors
     /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。

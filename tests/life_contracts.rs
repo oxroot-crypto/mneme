@@ -29,13 +29,20 @@ fn retain_forgets_below_threshold() {
     assert!(!ns.exists("drop").expect("exists"));
 }
 
-/// FC-MEM-ERR-002(延后能力返回结构化错误)
+/// FC-MEM-ERR-002(延后能力返回结构化错误;`Fusion` 单独设置即拒绝)
 #[test]
 fn deferred_features_return_structured_errors() {
     let db = mem(2);
     let ns = db.namespace("n");
     assert!(matches!(
         ns.search().text("x").execute(),
+        Err(mneme::MnemeError::Unsupported { .. })
+    ));
+    assert!(matches!(
+        ns.search()
+            .vector(&[1.0, 0.0])
+            .fusion(mneme::Fusion::default())
+            .execute(),
         Err(mneme::MnemeError::Unsupported { .. })
     ));
     assert!(matches!(
@@ -135,5 +142,22 @@ fn error_taxonomy_is_specific() {
     assert!(matches!(
         mneme::Dimension::new(0),
         Err(mneme::MnemeError::LimitExceeded { .. })
+    ));
+    // 策略参数含非有限值 → Config(FC-GLOBAL-PRE-004 / FC-LIFE-POST-002)
+    assert!(matches!(
+        Mneme::builder()
+            .dimension(2)
+            .dedup_threshold(f32::NAN)
+            .build(),
+        Err(mneme::MnemeError::Config { .. })
+    ));
+    // 越界 [0,1] → Config(FC-GLOBAL-PRE-004)
+    assert!(matches!(
+        Mneme::builder().dimension(2).dedup_threshold(1.5).build(),
+        Err(mneme::MnemeError::Config { .. })
+    ));
+    assert!(matches!(
+        ns.retain(Retention::new().min_importance(f32::NAN)),
+        Err(mneme::MnemeError::Config { .. })
     ));
 }

@@ -111,7 +111,10 @@ key 索引:   随机 key 集写入 → 重启 → 每个存活 key 的 get(key) 
             delete(key) 后所有旧版本不可见;compaction 后仍一致(04 §5.5)
 命名空间:   建多个嵌套 NS 并写入 → 重启 → list_namespaces() 与写入前完全一致;
             drop_namespace 后其路径从注册表移除, NsId 不再被新空间复用
-非法输入:   含 NaN/Inf 的向量 insert 返回 NonFinite;库内数据不被污染(03 §2.1)
+非法输入:   含 NaN/Inf 的向量或 NaN importance/confidence insert → NonFinite;
+            策略参数 NaN(dedup_threshold/min_importance/threshold、max_cluster=0)→ Config;
+            dedup_threshold/threshold 越界 [0,1] → Config;
+            update 超限 patch → TooLarge/MetaTooDeep 且保持原版本;库内数据不被污染(03 §2.1)
 陈旧锁:     模拟持锁进程死亡 → 再次 open 能自动接管而非永久 Busy(16 §3)
 稳定RowId:  同 key 连续 update/upsert 多轮 → RowId 始终不变(或按语义稳定),
             访问统计与关系边仍指向同一逻辑记忆(I22)
@@ -206,7 +209,9 @@ as_of(删除前) 在 compaction 回收该版本前仍能看到 A→B(双时态�
 
 ```text
 同一 (rowid, query_id) 重复 feedback(Used) n 次 → access_count 只 +1;
-不同 query_id 则各自计数;崩溃后重放不重复计分
+不同 query_id 则各自计数;崩溃后重放不重复计分;
+不可见记录(不存在/已墓碑/已过期)feedback → false 且不占用幂等键——
+该键随后对可见记录仍生效(FC-SCORE-INV-027)
 ```
 
 ---

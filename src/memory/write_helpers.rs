@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::core::error::{MnemeError, Result};
 use crate::core::meta::{self, Meta};
-use crate::core::options::InsertMode;
+use crate::core::options::{InsertMode, UpdatePatch};
 use crate::core::types::{Key, NsId, RowId, SeqNo};
 use crate::memory::config::Config;
 use crate::memory::dedup::{self, Dedup};
@@ -64,6 +64,12 @@ pub(crate) fn validate_insert(config: &Config, rec: &Record) -> Result<()> {
     if rec.vector.iter().any(|value| !value.is_finite()) {
         return Err(MnemeError::NonFinite);
     }
+    // 标量因子含非有限值会污染综合打分与遗忘公式,拒绝而非静默钳制(FC-GLOBAL-PRE-004)。
+    if rec.importance.is_some_and(|value| !value.is_finite())
+        || rec.confidence.is_some_and(|value| !value.is_finite())
+    {
+        return Err(MnemeError::NonFinite);
+    }
     if let Some(key) = &rec.key
         && key.len() > config.limits.key_bytes
     {
@@ -84,6 +90,60 @@ pub(crate) fn validate_insert(config: &Config, rec: &Record) -> Result<()> {
     }
     for (field, meta) in [("metadata", &rec.metadata), ("provenance", &rec.provenance)] {
         if let Some(meta) = meta {
+            let size = meta::size_bytes(meta);
+            if size > config.limits.meta_bytes {
+                return Err(MnemeError::TooLarge {
+                    field,
+                    limit: config.limits.meta_bytes,
+                    got: size,
+                });
+            }
+            let depth = meta::depth(meta);
+            if depth > config.limits.meta_depth as usize {
+                return Err(MnemeError::MetaTooDeep {
+                    limit: config.limits.meta_depth as usize,
+                    got: depth,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 校验更新补丁:向量维度/有限值与 text/metadata/provenance 限额(FC-MEM-PRE-002,
+/// 与 [`validate_insert`] 同口径;`Some(None)` 清空语义不携带新载荷,无需校验)。
+pub(crate) fn validate_patch(config: &Config, patch: &UpdatePatch) -> Result<()> {
+    if let Some(vector) = &patch.vector {
+        let expected = config.dimension.get();
+        if vector.len() != expected as usize {
+            return Err(MnemeError::DimensionMismatch {
+                expected,
+                got: vector.len(),
+            });
+        }
+        if vector.iter().any(|value| !value.is_finite()) {
+            return Err(MnemeError::NonFinite);
+        }
+    }
+    if patch.importance.is_some_and(|value| !value.is_finite())
+        || patch.confidence.is_some_and(|value| !value.is_finite())
+    {
+        return Err(MnemeError::NonFinite);
+    }
+    if let Some(Some(text)) = &patch.text
+        && text.len() > config.limits.text_bytes
+    {
+        return Err(MnemeError::TooLarge {
+            field: "text",
+            limit: config.limits.text_bytes,
+            got: text.len(),
+        });
+    }
+    for (field, meta) in [
+        ("metadata", &patch.metadata),
+        ("provenance", &patch.provenance),
+    ] {
+        if let Some(Some(meta)) = meta {
             let size = meta::size_bytes(meta);
             if size > config.limits.meta_bytes {
                 return Err(MnemeError::TooLarge {

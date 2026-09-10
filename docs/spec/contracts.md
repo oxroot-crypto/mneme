@@ -39,6 +39,8 @@
 
 | 日期 | 变更 |
 |---|---|
+| 2026-09 | 合并前契约审计复审修复:`feedback` 对不可见记录的判断补齐「逻辑过期」维度(此前仅查墓碑,过期记录会被误强化并占用幂等键,FC-SCORE-INV-027 实现落地);`dedup_threshold`/`threshold` 校验收紧为「`[0,1]` 内的有限值」(FC-GLOBAL-PRE-004/FC-MODEL-POST-006,与 `Builder::dedup_threshold` rustdoc 已声明的定义域对齐);并行扫描候选收集处的槽位下标 `expect` 登记为 `FC-GLOBAL-ERR-001` 第三处文档化例外(`FC-MEM-INV-004` 保证不可达);iter 的 rustdoc 与 16-api 残留「流式」措辞同步为 CPLX-005 非流式口径 |
+| 2026-09 | 合并前契约审计整改(P1):`update`/`update_by_rowid` 补丁路径补齐 text/metadata/provenance 限额校验(与 `insert` 同口径,FC-MEM-PRE-002/FC-GLOBAL-PRE-003);`SearchBuilder::fusion` 单独设置即返回 `Unsupported{feature}`(FC-MEM-ERR-002 落地,消除静默忽略);`importance`/`confidence`/边权/`touch` boost 含非有限值(NaN)→ `NonFinite` 拒绝、绝不入库(FC-GLOBAL-PRE-004 扩展,§0.2 `NonFinite` 语义扩至标量因子);`consolidate` 策略参数非法(`threshold` 非有限值、`max_cluster = 0`)与 `dedup_threshold`/`min_importance` 非有限值 → `Config`(此前为静默空转,`max_cluster = 0` 更会索引越界 panic,违反 FC-GLOBAL-ERR-001);并行扫描工作线程异常终止 → `Inconsistent`(绝不静默少结果);`feedback` 对不可见记录返回 `false` 且不占用幂等键(FC-SCORE-INV-027 语义收紧);CPLX-005 空间口径修正为 $O(N_c)$(物化 `Arc` 句柄,不复制记录体) |
 | 2026-09 | Rust 规范审计整改:补齐 L1 门面方法、`pred` 组合器与 varint 解码的 rustdoc `# Arguments` 段(约 55 处,纯文档,不改语义,并消除此前"L0 已补全"记录与 varint 实际状态的偏差);`SnapshotNamespace` 补 `Debug` 实现(加法性变更);`apply_patch` 拆分超 50 行函数;`search_builder.rs` 按主题拆出内部模块 `search_exec.rs`(公开 API 与执行语义不变);`FC-CORE-ERR-001` 测试断言从 `is_err()` 强化为 `Corrupted` 变体匹配 |
 | 2026-09 | 规范审计整改:§9.2.8 新增 FC-MODEL-CPLX-002(`consolidate` 聚类两两余弦 $O(n^2\cdot d)$,此前为未声明复杂度路径);公开 API 命名与签名按 rust 规范收敛(`relate_with_meta` → `relate_with_options` + `RelateOptions` 参数结构体,`Retention::w` → `access_weight`;布尔开关经项目所有者确认保留动词短语链式命名,按规范 §14 列为已声明偏差),同步 16-api-reference.md,语义不变 |
 | 2026-09 | 新增 `CPLX` 复杂度契约类型与 §9「算法复杂度契约」:为 L0–L6 全层逐操作登记时间/空间渐近上界,并定义验证方式、口径标注与复杂度回归门禁 |
@@ -74,11 +76,11 @@
 | `TooLarge { field, limit, got }` | 字段载荷超限额(key/text/meta 字节) | FC-GLOBAL-PRE-003、FC-MEM-PRE-002 | |
 | `UnsupportedVersion { file, found, max }` | 文件主版本过新 | FC-PERSIST-ERR-002 | L2 起使用 |
 | `Closed` | 库已关闭后经任意句柄读写 | FC-MEM-ERR-001、FC-MEM-STA-001 | 原 `Invalid("closed")` |
-| `NonFinite` | 向量分量含 `NaN`/`±Inf` | FC-GLOBAL-PRE-002、FC-MEM-PRE-001 | 原 `Invalid("向量分量必须是有限值")` |
+| `NonFinite` | 向量分量或 `importance`/`confidence`/边权/`boost` 等数值输入含 `NaN`/`±Inf`(会污染打分、遗忘公式与排序) | FC-GLOBAL-PRE-002、FC-GLOBAL-PRE-004、FC-MEM-PRE-001/003 | 原 `Invalid("向量分量必须是有限值")` |
 | `LimitExceeded { field, limit, got }` | 参数越上限(维度、`top_k`、`ef`) | FC-CORE-PRE-001、FC-GLOBAL-PRE-004、FC-MEM-PRE-003 | 原 `Invalid("top_k 超过上限")` 等 |
 | `MetaTooDeep { limit, got }` | metadata 嵌套深度超限 | FC-GLOBAL-PRE-003、FC-MEM-PRE-002 | 原 `Invalid("metadata 嵌套过深")` |
-| `Config { reason }` | 建库/查询配置非法(缺维度、无查询通道) | FC-MEM-STA-001 | 原 `Invalid("新建内存库必须指定维度")` 等 |
-| `Unsupported { feature }` | 能力延后到后续层,绝不静默降级 | FC-MEM-ERR-002 | open/backup/path/BM25/Fusion |
+| `Config { reason }` | 建库/查询配置非法(缺维度、无查询通道)、策略参数含非有限值(`min_importance`)或越界(`dedup_threshold`/`threshold` ∉ [0,1])或非法(`max_cluster = 0`) | FC-MEM-STA-001、FC-MODEL-POST-006、FC-LIFE-POST-002 | 原 `Invalid("新建内存库必须指定维度")` 等 |
+| `Unsupported { feature }` | 能力延后到后续层,绝不静默降级(`Fusion` 单独设置即拒绝,无需 text 通道) | FC-MEM-ERR-002 | open/backup/path/BM25/Fusion |
 | `Inconsistent { reason }` | 内部不变量被破坏 | FC-MEM-INV-004 | 原 `Invalid("去重命中但记录不可见")` |
 
 > **迁移说明(破坏性变更)**:`Invalid(&'static str)` 已移除。调用方若曾按字符串匹配
@@ -119,8 +121,8 @@
 | 编号 | 类型 | 形式化规范 | 对应测试 | 状态 |
 |---|---|---|---|---|
 | FC-MEM-PRE-001 | PRE | `insert` 向量长度 ≠ 建库维度 → `DimensionMismatch`;任一分量 `NaN`/`±Inf` → `NonFinite`,库内不被污染(FC-GLOBAL-PRE-001/002) | `tests/memory_contracts.rs::insert_rejects_dimension_and_non_finite` | Passed |
-| FC-MEM-PRE-002 | PRE | key ≤ `Limits.key_bytes`、text ≤ `text_bytes`、meta ≤ `meta_bytes` 且深度 ≤ `meta_depth`,否则 `TooLarge`/`MetaTooDeep`(FC-GLOBAL-PRE-003) | `tests/memory_contracts.rs::write_limits_reject_too_large`、`tests/memory_contracts.rs::write_meta_limits_reject_too_large` | Passed |
-| FC-MEM-PRE-003 | PRE | `top_k`/`ef` 超过 `Limits.top_k_max`/`ef_max` → `LimitExceeded`;`Scoring`/`confidence`/`importance` 越界钳制到 `[0,1]`(FC-GLOBAL-PRE-004) | `tests/memory_contracts.rs::importance_and_confidence_clamped`、`tests/query_contracts.rs::search_limits_reject_top_k_and_ef` | Passed |
+| FC-MEM-PRE-002 | PRE | key ≤ `Limits.key_bytes`、text ≤ `text_bytes`、meta ≤ `meta_bytes` 且深度 ≤ `meta_depth`,否则 `TooLarge`/`MetaTooDeep`(FC-GLOBAL-PRE-003);**`insert`/upsert/supersede/merge 与 `update` 补丁全部同口径**,更新失败的记录保持上一版本原样(零部分写入) | `tests/memory_contracts.rs::write_limits_reject_too_large`、`tests/memory_contracts.rs::write_meta_limits_reject_too_large`、`tests/memory_contracts.rs::write_limits_boundary_three_point`、`tests/memory_contracts.rs::update_enforces_write_limits` | Passed |
+| FC-MEM-PRE-003 | PRE | `top_k`/`ef` 超过 `Limits.top_k_max`/`ef_max` → `LimitExceeded`;`Scoring`/`confidence`/`importance` 越界钳制到 `[0,1]`;`importance`/`confidence`(含 `UpdatePatch` 与 `touch` boost)含非有限值(NaN)→ `NonFinite`,绝不入库(FC-GLOBAL-PRE-004) | `tests/memory_contracts.rs::importance_and_confidence_clamped`、`tests/query_contracts.rs::search_limits_reject_top_k_and_ef` | Passed |
 | FC-MEM-PRE-004 | PRE | 检索查询向量长度 ≠ 建库维度 → `DimensionMismatch`(与写入校验同口径,设计 03 §2.2) | `tests/query_contracts.rs::search_rejects_dimension_mismatch` | Passed |
 | FC-MEM-POST-001 | POST | 每次成功写入分配全库单调 `SeqNo`;同 key `Upsert` 保留既有 `RowId` 并写新物理版本;`RejectDuplicate` → `DuplicateKey`(I22) | `tests/memory_contracts.rs::upsert_keeps_rowid_and_rejects_duplicate` | Passed |
 | FC-MEM-POST-002 | POST | `insert_batch` 整批原子(I15):任一条维度/数值/限额校验失败 → 整批拒绝、零部分写入;`RejectDuplicate`/`Dedup::Reject` 为逐条结果,命中处返回 `Duplicate`,其余照常写入 | `tests/memory_contracts.rs::insert_batch_is_atomic_with_per_row_duplicates` | Passed |
@@ -135,7 +137,7 @@
 | FC-MEM-INV-004 | INV | `SlotId` 随物理版本单调递增、永不复用;槽位容量溢出(`u32::MAX`)返回结构化错误,绝不静默饱和 | `src/memory/table.rs::slot_id_for_rejects_overflow` | Passed |
 | FC-MEM-STA-001 | STA | 库生命周期五元组 `M=(States={Open,Closed}, Events={Close}, δ(Open,Close)=Closed, δ(Closed,Close)=Closed, s0=Open, F={Closed})`;`Closed` 后经任意句柄读写 → `Closed`;重复 `close` 幂等返回 `Ok` | `tests/life_contracts.rs::database_lifecycle_open_closed` | Passed |
 | FC-MEM-ERR-001 | ERR | `close` 后(经任意克隆句柄)读写返回 `Closed`;重复 `close` 返回 `Ok`(幂等) | `tests/life_contracts.rs::closed_database_rejects_operations` | Passed |
-| FC-MEM-ERR-002 | ERR | L1 尚未落地的能力以结构化 `Unsupported{feature}` 返回、绝不静默:`text`/`Fusion`(L4)、`open`/`backup_to`/`path`(L2) | `tests/life_contracts.rs::deferred_features_return_structured_errors` | Passed |
+| FC-MEM-ERR-002 | ERR | L1 尚未落地的能力以结构化 `Unsupported{feature}` 返回、绝不静默:`text`/`Fusion`(L4,`Fusion` 单独设置即拒绝)、`open`/`backup_to`/`path`(L2) | `tests/life_contracts.rs::deferred_features_return_structured_errors` | Passed |
 
 ---
 
@@ -169,7 +171,7 @@
 | FC-INDEX-POST-001 | POST | 过滤三档结果 ≡ 候选位图内暴力(集合相等) | 待补 | Planned |
 | FC-INDEX-POST-002 | POST | `ef → ∞` 时 HNSW 结果收敛于精确暴力 | 待补 | Planned |
 | FC-INDEX-POST-003 | POST | **排序全等性**:同一快照内任意两次 `execute()`(同参数)结果完全一致(同分按 RowId 升序) | `tests/query_contracts.rs::search_order_is_total_and_stable` | Passed |
-| FC-SCORE-INV-027 | INV | **I27**:同一 `(rowid, query_id)` 的反馈至多计一次 | `tests/query_contracts.rs::feedback_is_idempotent_per_query` | Passed |
+| FC-SCORE-INV-027 | INV | **I27**:同一 `(rowid, query_id)` 的反馈至多计一次;对不可见记录(不存在/已墓碑/已过期)的反馈返回 `false` 且**不占用幂等键**(后续该 `RowId` 重新可见时首次反馈仍生效) | `tests/query_contracts.rs::feedback_is_idempotent_per_query` | Passed |
 | FC-SCORE-POST-001 | POST | `Scoring::default()` 与未开启 `score()` 的排序全等 | `tests/query_contracts.rs::default_scoring_matches_similarity_order` | Passed |
 | FC-SCORE-POST-002 | POST | `Scoring::floor` 下的候选满足 `ŝ ≥ floor` 或 `S = 0` | 待补 | Planned |
 | FC-SCORE-POST-003 | POST | 放大 ef 后综合排序相对召回损失 ≤ 2% | 待补 | Planned |
@@ -193,7 +195,7 @@
 | FC-MODEL-POST-003 | POST | `supersede` 后旧版本 `valid_to` = 新版本 `valid_from`(历史可见性受 compaction 回收约束,I26) | `tests/model_contracts.rs::supersede_closes_previous_valid_to` | Passed |
 | FC-MODEL-POST-004 | POST | **版本链保留**:每个 RowId 的最新版本与 `history_horizon` 内的历史版本被保留;仅超期版本被回收,`as_of` 在窗口内可读 | 待补 | Planned |
 | FC-MODEL-POST-005 | POST | `predecessors(to, kinds)` 只返回 `edge.to == to` 且 `edge.kind ∈ kinds`、两端存活的边;`RelationIndex::Outgoing` 与 `Both` 结果一致(反向索引只加速、不改语义) | `tests/model_contracts.rs::predecessors_returns_incoming_edges` | Passed |
-| FC-MODEL-POST-006 | POST | `consolidate(policy)` 以 `threshold` 为聚类相似度下界:相似度 ≥ threshold 的近似重复聚为一簇,簇成员 ≥ 2 才合并;`keep_sources=true` 不删来源 | `tests/model_contracts.rs::consolidate_merges_cluster_and_keeps_sources` | Passed |
+| FC-MODEL-POST-006 | POST | `consolidate(policy)` 以 `threshold` 为聚类相似度下界:相似度 ≥ threshold 的近似重复聚为一簇,簇成员 ≥ 2 才合并;`keep_sources=true` 不删来源;策略参数非法(`threshold` 非有限值或越界 [0,1]、`max_cluster = 0`)→ `Config`,绝不静默空转或索引越界 | `tests/model_contracts.rs::consolidate_merges_cluster_and_keeps_sources`、`tests/model_contracts.rs::consolidate_rejects_invalid_policy` | Passed |
 | FC-MODEL-STA-001 | STA | 记忆版本五元组 `M=(S={Active,Shadowed,Reclaimed}, E={Update,Upsert,Delete,AsOf,Compact}, δ: Active×{Update,Upsert,Delete}→Shadowed(旧)∧Active(新), Shadowed×AsOf→Shadowed(历史可见), Shadowed×Compact→Reclaimed, s0=Active, F={Reclaimed})`;非法转移:当前读路径(`get`/`search`/`iter`/`count`)命中 `Shadowed` 必须不可见并显式拦截,绝不静默返回 | `tests/model_contracts.rs::model_version_lifecycle_states` | Passed |
 
 ---
@@ -209,7 +211,7 @@
 | FC-LIFE-INV-017 | INV | **I17**:`SnapshotHandle` 视图一致,后台 compaction 不影响 | 待补 | Planned |
 | FC-LIFE-INV-023 | INV | **I23**:自动遗忘默认关闭;删除可审计(墓碑在 `history_horizon` 内保留,默认永久,经 `iter_with(..., true)` 可见),绝不静默 | `tests/life_contracts.rs::retain_forgets_below_threshold` | Passed |
 | FC-LIFE-POST-001 | POST | `retain` 返回 `forgotten` 与 `sampled_ids` 与实际墓碑一致 | `tests/life_contracts.rs::retain_forgets_below_threshold` | Passed |
-| FC-LIFE-POST-002 | POST | 保留分公式 `score = importance·2^(−age/T½) + w·ln(1+access_count)`;`age = max(0, now − last_access)`,`T½=0` 时衰减项为 0,`age<0` 按 0 | `src/memory/lifecycle.rs::retention_score_formula` | Passed |
+| FC-LIFE-POST-002 | POST | 保留分公式 `score = importance·2^(−age/T½) + w·ln(1+access_count)`;`age = max(0, now − last_access)`,`T½=0` 时衰减项为 0,`age<0` 按 0;`min_importance` 含非有限值 → `Config`(绝不静默永不遗忘) | `src/memory/lifecycle.rs::retention_score_formula`、`tests/life_contracts.rs::error_taxonomy_is_specific` | Passed |
 
 ---
 
@@ -243,8 +245,8 @@
 | FC-GLOBAL-PRE-001 | PRE | 向量维度 ∈ [1, 65536];长度 ≠ 建库维度 → `DimensionMismatch`(写/查同口径) | `tests/memory_contracts.rs::insert_rejects_dimension_and_non_finite`、`tests/query_contracts.rs::search_rejects_dimension_mismatch` | Passed |
 | FC-GLOBAL-PRE-002 | PRE | 任一分量 `NaN`/`±Inf` → `NonFinite`,库内不被污染 | `tests/memory_contracts.rs::insert_rejects_dimension_and_non_finite` | Passed |
 | FC-GLOBAL-PRE-003 | PRE | key ≤ 1024B、text ≤ 1MiB、meta ≤ 64KiB、深度 ≤ 32 → 否则 `TooLarge`/`MetaTooDeep` | `tests/memory_contracts.rs::write_limits_reject_too_large`、`tests/memory_contracts.rs::write_meta_limits_reject_too_large`、`tests/memory_contracts.rs::write_limits_boundary_three_point` | Passed |
-| FC-GLOBAL-PRE-004 | PRE | `importance`/`confidence` 越界钳制到 [0,1];`top_k`/`ef` > 4096 → `LimitExceeded` | `tests/memory_contracts.rs::importance_and_confidence_clamped`、`tests/memory_contracts.rs::importance_confidence_boundary_three_point`、`tests/query_contracts.rs::search_limits_reject_top_k_and_ef` | Passed |
-| FC-GLOBAL-ERR-001 | ERR | 库绝不 panic;`filter!` 字面量与 async `spawn_blocking` 为文档化例外 | `tests/life_contracts.rs::l1_api_smoke_never_panics` | Passed |
+| FC-GLOBAL-PRE-004 | PRE | `importance`/`confidence` 越界钳制到 [0,1],含非有限值(NaN)→ `NonFinite` 拒绝(含 `UpdatePatch` 与 `touch` boost、关系边权);`top_k`/`ef` > 4096 → `LimitExceeded`;`dedup_threshold`/`threshold`/`min_importance` 等策略参数含非有限值 → `Config`;`dedup_threshold`/`threshold` 越界 [0,1] → `Config` | `tests/memory_contracts.rs::importance_and_confidence_clamped`、`tests/memory_contracts.rs::importance_confidence_boundary_three_point`、`tests/query_contracts.rs::search_limits_reject_top_k_and_ef`、`tests/life_contracts.rs::error_taxonomy_is_specific` | Passed |
+| FC-GLOBAL-ERR-001 | ERR | 库绝不 panic;文档化例外共三处:① `filter!` 字面量、② async `spawn_blocking`、③ 并行扫描候选收集处槽位下标的 `u32::try_from(..).expect`(`append_slot` 经 `slot_id_for` 拒绝溢出,`FC-MEM-INV-004` 保证不可达) | `tests/life_contracts.rs::l1_api_smoke_never_panics` | Passed |
 | FC-GLOBAL-ERR-002 | ERR | 错误分类矩阵(§0.2)各变体语义互不混淆:`Closed`/`NonFinite`/`LimitExceeded`/`MetaTooDeep`/`Config`/`Unsupported`/`Inconsistent` 各由专属条件触发 | `tests/life_contracts.rs::error_taxonomy_is_specific` | Passed |
 | FC-GLOBAL-PRE-005 | PRE | 时钟回拨经单调水位钳制;记录不会因回拨早消失 | 待补 | Planned |
 
@@ -303,7 +305,7 @@
 | FC-MEM-CPLX-002 | CPLX | 元数据过滤求值:时间 $O(N\cdot\|\phi\|)$,单行 $O(\|\phi\|)$(短路求值);空间 $O(N/8)$ | 解析证明(设计 03 §5.2)+ 哨兵 `tests/query_contracts.rs::filter_uses_kleene_three_valued_logic` | Passed |
 | FC-MEM-CPLX-003 | CPLX | 并行归并:时间 $O(C_{\text{block}}\cdot k\log k)$;空间 $O(C_{\text{block}}\cdot k)$ | 解析证明(设计 03 §4.3)+ 哨兵 `tests/query_contracts.rs::search_order_is_total_and_stable` | Passed |
 | FC-MEM-CPLX-004 | CPLX | `delete` / `touch`:时间 $O(\log n)$ 定位 + $O(1)$ 墓碑/统计更新;空间 $O(1)$ | 解析证明(HashMap 定位 + 版本链追加)+ 哨兵 `tests/memory_contracts.rs::delete_hides_records_from_reads` | Passed |
-| FC-MEM-CPLX-005 | CPLX | `iter(filter)`:时间 $O(N_c)$ 流式;空间 $O(1)$(不含调用方收集的结果集) | 流式单测 `tests/query_contracts.rs::iter_streams_filtered_records`(惰性,不物化全量) | Passed |
+| FC-MEM-CPLX-005 | CPLX | `iter(filter)`:时间 $O(N_c)$ 过滤 + $O(N_c\log N_c)$ RowId 排序;空间 $O(N_c)$(物化命中行的 `Arc` 句柄列表,**不复制记录体**;调用方收集的结果集另计) | 过滤/排序/墓碑哨兵 `tests/query_contracts.rs::iter_filters_and_sorts_by_rowid` | Passed |
 
 #### 9.2.3 L2 持久层(persist)
 
