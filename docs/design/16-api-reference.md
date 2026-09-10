@@ -24,7 +24,7 @@
 impl Mneme {
     /// 打开一个已初始化的本地目录记忆库。等价于 builder().path(dir).build()。
     /// 维度与度量从 MANIFEST 读回,无需重复指定;新建请用 builder().dimension(d).path(dir).build()。
-    /// L1 未落地:当前恒返回 `Unsupported`(见 §4),L2 起生效。
+    /// L2 已落地:持久库正常打开(维度/度量从 MANIFEST 读回)。
     pub fn open(path: impl AsRef<Path>) -> Result<Mneme>;
 
     /// 纯内存库(易失),维度必填。等价于 builder().dimension(d).build()(不设 path)。
@@ -48,11 +48,11 @@ impl Builder {
     pub fn retention(self, r: Option<Retention>) -> Self;   // 后台自动遗忘;默认 None = 关闭(见 07 §3.4)
     pub fn retain_interval(self, d: Duration) -> Self;      // 开启自动遗忘时的周期,默认 半衰期/4
     pub fn access_flush_interval(self, d: Duration) -> Self; // 默认 30s
-    pub fn compression(self, c: Compression) -> Self;       // 文本/元数据压缩,默认 None(见 11)
-    pub fn encryption(self, e: Option<Encryption>) -> Self; // 静态加密,feature `encrypt`(见 11)
-    pub fn storage(self, s: Arc<dyn Storage>) -> Self;      // 存储后端,默认 FsStorage;WASM/边缘自定义(见 12 §3)
-    pub fn read_only(self, yes: bool) -> Self;              // 只读共享模式(见 12 §2)
-    pub fn read_only_probe_interval(self, d: Duration) -> Self; // 只读实例探测新 MANIFEST 的周期,默认 1s
+    pub fn compression(self, c: Compression) -> Self;       // 文本/元数据压缩,默认 None(见 11;L11 落地,当前记录不启用)
+    pub fn encryption(self, e: Option<Encryption>) -> Self; // 静态加密,feature `encrypt`(见 11;L11 落地)
+    pub fn storage(self, s: Arc<dyn Storage>) -> Self;      // 存储后端,默认 FsStorage;WASM/边缘自定义(见 12 §3;L12 落地,当前内部 std::fs)
+    pub fn read_only(self, yes: bool) -> Self;              // 只读共享模式(见 12 §2;L2 已实现单进程只读,不创建锁/WAL)
+    pub fn read_only_probe_interval(self, d: Duration) -> Self; // 只读实例探测新 MANIFEST 的周期,默认 1s(L12 多进程只读时落地)
     pub fn verify_on_open(self, yes: bool) -> Self;         // 打开时全量校验各段 payload CRC,默认 false(见 04 §4.3)
     pub fn fail_fast_on_corruption(self, yes: bool) -> Self; // 损坏段直接拒绝启动,默认 false = 隔离剔除(见 04 §7)
     pub fn relation_index(self, r: RelationIndex) -> Self;  // 关系反向索引,默认 Outgoing(见 09 §2.3)
@@ -60,7 +60,7 @@ impl Builder {
     pub fn tuning(self, t: Tuning) -> Self;                 // 进阶调参,默认见 §2
     pub fn limits(self, l: Limits) -> Self;                 // 数据限额,见 §8
     pub fn clock(self, c: Arc<dyn Clock>) -> Self;          // 测试注入;默认 SystemClock
-    pub fn observer(self, o: Arc<dyn Observer>) -> Self;    // 可选可观测钩子,默认无(见 12 §4)
+    pub fn observer(self, o: Arc<dyn Observer>) -> Self;    // 可选可观测钩子,默认无(见 12 §4;L12 落地,当前无此 API)
     pub fn build(self) -> Result<Mneme>;
 }
 ```
@@ -297,7 +297,7 @@ impl Mneme {
 impl Mneme {
     pub fn snapshot(&self) -> SnapshotHandle;   // 钉住当前 ReaderView(含可变表快照)
     pub fn as_of(&self, ts_ms: i64) -> Result<SnapshotHandle>;  // 双时态历史读:版本链上取 tx_ms ≤ ts 的可见版本(默认永久保留,见 07 §4.2a)
-    pub fn backup_to(&self, dir: impl AsRef<Path>) -> Result<BackupReport>;  // 先 flush 再备份(见 §7);L1 未落地:当前恒返回 `Unsupported`(见 §4)
+    pub fn backup_to(&self, dir: impl AsRef<Path>) -> Result<BackupReport>;  // 先 flush 再备份(见 §7);L2 已落地(纯内存库返回 `Unsupported`)
     pub fn stats(&self) -> Result<Stats>;
     pub fn check(&self) -> Result<CheckReport>;  // fsck:L1 做 key 索引 ↔ 最新版本对账(FC-MEM-POST-008);L2 起扩展段 CRC/版本链等全量校验
     pub fn compact_control(&self) -> CompactionControl;  // pause()/resume()/state()
@@ -585,7 +585,7 @@ pub struct ConsolidateReport {
 | 只读探测周期 | `.read_only_probe_interval` | `1s` | 只读实例发现新 MANIFEST 的周期,见 [12 §2.1](12-deployment.md) |
 | 关系索引 | `.relation_index` | `Outgoing` | `Outgoing/Both`;`Both` 空间 ×2,见 [09 §2.3](09-memory-model.md) |
 | 并行度 | `.parallelism` | `0`(自动) | 扫描/建索引/合并的线程数;0 = `available_parallelism()` |
-| 可观测 | `.observer` | 无 | 可选事件钩子,见 [12 §4](12-deployment.md) |
+| 可观测 | `.observer` | 无 | 可选事件钩子,见 [12 §4](12-deployment.md);**L12 落地**,当前无此 API |
 | 进阶调参 | `.tuning` | 见下 | `Tuning` |
 | 数据限额 | `.limits` | 见 §8 | `Limits` |
 | 启动全量校验 | `.verify_on_open` | `false` | `true` 时打开即校验各段 payload CRC(慢),见 [04 §4.3](04-l2-persist.md) |
@@ -606,7 +606,7 @@ pub struct CompactionPolicy {
     pub tier_count: u32,     // 默认 4   同层合并阈值 T
     pub dead_ratio: f32,     // 默认 0.25 墓碑+过期占比触发线
     pub wal_bytes: u64,      // 默认 256MB WAL 压力触发线
-    pub wal_file_bytes: u64, // 默认 64MB  单个 WAL 文件轮转阈值(04 §3.2;WAL 运维参数,与 compaction 同组)
+    pub wal_file_bytes: u64, // 默认 64MB  单个 WAL 文件轮转阈值(L5 落地;L2 单文件、未使用,见 04 §3.2)
     pub segment_rows: u64,   // 默认 8192  段初始目标行数 B(07 §4.2)
     pub io_budget: f32,      // 默认 0.30 后台合并磁盘配额
     pub history_horizon: Option<Duration>, // 历史版本保留窗口,默认 None = 永久(07 §4.2a)
@@ -662,12 +662,12 @@ pub struct Tuning {
 > **设计理由**:记忆库的维度是数据的一部分,不能由调用方每次"猜"。
 > 让 MANIFEST 成为唯一事实来源,避免"同目录两种维度"导致的静默错读。
 >
-> **文件锁实现**:写实例打开时在目录下以 `create_new` 原子创建锁文件(跨平台通用),
-> 写入 `{ pid, 启动时间戳 }` 后持有其句柄;进程退出/`close()` 时删除。第二个**写**实例
-> 创建失败时**读取锁文件并校验持锁进程是否存活**(跨平台探活;无法探活的平台回退到
-> 时间戳 + 租约超时):持有者已死 → 视为陈旧锁并接管,否则返回 `Busy`。
-> 由此崩溃不会留下永久锁死(见 [04 §13](04-l2-persist.md))。
-> 无需依赖平台特有的 flock/LockFileEx。**只读实例不创建锁文件**,只探测写者状态
+> **文件锁实现**:写实例打开/新建库目录下常驻的 `LOCK` 文件,并对其调用
+> `std::fs::File::try_lock` 获取整文件 **OS 咨询锁**(Unix `flock`、Windows `LockFileEx`,
+> 由 `std` 封装,Rust 1.89 起稳定,本库 MSRV 1.93 满足)。第二个**写**实例 `try_lock` 失败(WouldBlock)即返回
+> `Busy`;**进程崩溃/退出时内核自动释放锁**,后续实例直接获取,无需租约刷新、心跳线程或
+> 陈旧锁接管,也绝不删除锁文件(删除会使不同 inode 各自加锁而破坏互斥,见 [04 §13](04-l2-persist.md))。
+> `close()` 释放句柄即解锁;锁文件本身保留。**只读实例不创建/不持锁,也不探测写者状态**
 > ([12 §2](12-deployment.md))。
 
 维度、度量之外的**可变配置**(fsync、去重、量化、HNSW、compaction、limits)
@@ -693,7 +693,7 @@ pub struct Tuning {
 | `NonFinite` | ❌ | 向量分量或 `importance`/`confidence`/边权/`boost` 含 `NaN`/`±Inf`,会污染排序与打分;修正输入 |
 | `Closed` | ❌ | 库已关闭;不要再使用该库的任何克隆句柄 |
 | `Config` | ❌ | 建库/查询配置非法(缺维度、无查询通道、MMR `lambda` 非有限值),策略参数含非有限值(`min_importance`/`access_weight`/`threshold`/`dedup_threshold`)或非法(如 `max_cluster = 0`) |
-| `Unsupported` | ❌ | 该能力延后到后续层(open/backup/text/Fusion;`Fusion` 单独设置即拒绝);按版本升级 |
+| `Unsupported` | ❌ | 该能力延后到后续层,或对当前形态不适用(text/Fusion;**纯内存库 `backup_to`**;只读模式写);`Fusion` 单独设置即拒绝;按版本升级 |
 | `Inconsistent` | ❌ | 内部不变量被破坏(应为 bug);上报并附上下文 |
 | `UnsupportedVersion` | ❌ | 库由更新版本的 Mneme 写入;升级库,勿降级读 |
 | `Corrupted` | ❌ | 数据损坏:立即停止写入,跑 `db.check()`,按 §7 恢复 |
@@ -768,13 +768,14 @@ Mneme 提供引擎级支撑——命名空间隔离、去重、TTL/遗忘、混�
 ### 7.1 常规备份
 
 ```rust
-db.backup_to("./backup")?;   // 一致性快照:硬链接同版本段文件(跨盘回退复制)
+db.backup_to("./backup")?;   // 一致性快照:先 flush,再复制段/MANIFEST/WAL(不做硬链接)
 ```
 
-**目标目录语义**:目标必须不存在或为空;若已含库内容则返回 `Unsupported`/`Busy`(不合并、不覆盖),
-避免把两次备份混在一起。备份写入是"先写全部文件、最后写 `current`/MANIFEST"的顺序,
+**目标目录语义**:目标必须不存在或为空;若已含库内容则返回 `Busy`(不合并、不覆盖),
+避免把两次备份混在一起。备份写入是"先写全部文件、最后写 `current`"的顺序,
 中途失败会留下一个不含合法 `current` 的目录——它无法被打开,重新备份即可(不污染源库)。
-`BackupReport.hardlinked` 标明是否走了硬链接路径。
+`BackupReport.hardlinked` 标记是否走硬链接;L2 始终**复制**文件,故恒为 `false`
+(硬链接是 L5 优化)。
 
 备份目录是一个**可独立打开**的完整库;验证:
 
@@ -785,16 +786,14 @@ b.check()?;                  // 全绿 = 备份有效(写进 CI,见 14 §6)
 
 ### 7.2 时间点恢复(PITR)
 
-MANIFEST 采用 write-once 版本文件并保留最近 2 个版本([04 §6](04-l2-persist.md))。
-若需要回到"上一个提交点",在备份目录中把 `current` 指向上一个版本号即可:
+**备份只含备份时刻的当前 MANIFEST**:`backup_to` 复制段文件、**当前 MANIFEST**、WAL 与
+`current`,**不保留更早的 MANIFEST 版本**([04 §6](04-l2-persist.md))。因此单份备份**不能**
+通过改 `current` 回滚到更早提交点;要支持 PITR,需按目标时间点**定期执行 `backup_to`**,
+每份备份各自独立可打开。
 
-```text
-backup/MANIFEST.000041   ← 上一个版本(保留)
-backup/MANIFEST.000042   ← 最新版本
-backup/current           ← 内容 "42";改成 "41" 即回滚一个提交点
-```
-
-回滚前请先对当前备份整体复制一份,避免误操作不可逆。
+实时库自身保留最近 2 个 MANIFEST 版本(write-once + 指针,`MANIFEST_KEEP = 2`,见
+[04 §6](04-l2-persist.md));若最新 `MANIFEST.*` 损坏,打开时扫描目录自动回退到上一合法版本
+([04 §7](04-l2-persist.md))。
 
 ### 7.3 损坏处置
 
@@ -828,7 +827,7 @@ backup/current           ← 内容 "42";改成 "41" 即回滚一个提交点
 | metadata 嵌套深度 | 32 层 | 防解析栈溢出 |
 | `top_k` | 4096 | [03 §2.2](03-l1-memory.md) |
 | `ef` | 4096 | 仅 L3+ |
-| WAL 单帧 payload | 16 MiB | 撕裂写检测与内存上界 |
+| WAL 单帧 payload | 16 MiB | 撕裂写检测与内存上界;**L2 保留限额,尚未在写路径强制** |
 | 命名空间深度 | 32 级 | `a/b/c/...`,对应 `Limits.ns_depth` |
 | 自定义关系类型 | 65520 个 | u16 编号空间,内置占用 0..=15;超限 `TooLarge` |
 
@@ -934,7 +933,7 @@ Mneme **不引入 `log`/`tracing` 依赖**(与"依赖极简"一致),运行时诊
 ## 本章小结
 
 - 完整 API 清单与签名(L1 冻结)、`Builder` 配置总表与推荐预设。
-- 打开已有库的校验规则、文件锁与陈旧锁接管;错误分类与重试建议。
+- 打开已有库的校验规则、文件锁(OS 咨询锁与 `Busy` 语义);错误分类与重试建议。
 - 线程安全保证、嵌入模型/框架集成方式、备份恢复 runbook、数据限额与保留字段。
 - 诊断统一走 `stats()`/`check()`/`Observer`,不引 `log`/`tracing`。
 - **本章定义**:I15、I16;并汇总 I17–I30 的面向使用者表述。

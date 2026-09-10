@@ -175,7 +175,7 @@
 | zone map 剪枝 | $O(\lceil N/1024\rceil \times \text{predicates})$ | 16B/块/字段 | [04 §5.2](04-l2-persist.md) |
 | bloom 判定 | $O(k) = O(7)$ | $1.44\log_2(1/p)$ bit/元素 | [04 §5.3](04-l2-persist.md) |
 | MANIFEST 提交 | $O(\text{segments})$ 写新文件 | 保留 2 版 | [04 §6](04-l2-persist.md) |
-| 恢复(open) | $O(\text{WAL replay})$ + 段头校验 | mmap 惰性 | [04 §7](04-l2-persist.md) |
+| 恢复(open) | $O(\text{段总字节} + \text{WAL 字节})$(逐段读入校验 + 回放) | $O(\text{段总字节} + \text{WAL 字节})$;L2 整读,mmap 惰性属 L3 | [04 §7](04-l2-persist.md) |
 | HNSW 构建 | $O(N \cdot d \cdot ef_c \cdot M_0)$ | ≈$(8M+20)$ B/节点 | [05 §4/§6.3](05-l3-hnsw.md) |
 | HNSW 查询 | 上界 $O(d \cdot ef \cdot M_0)$;实测 ≈ (2–5)·ef 次点积 | — | [05 §6.1](05-l3-hnsw.md) |
 | 层级分布 | $P(\ge l) = (1/M)^l$;层高 $O(\log_M N)$ | — | [05 §3.2](05-l3-hnsw.md) |
@@ -190,7 +190,7 @@
 | 单点写(insert) | $O(1)$ 内存 + WAL 追加;fsync 按策略 | $O(d)$ | [04 §3](04-l2-persist.md) |
 | 单点读(get key) | $O(\log n)$(key 索引二分)+ 一次记录读 | — | [04 §5.5](04-l2-persist.md) |
 | 单点读(get_by_rowid) | $O(\log n)$(版本链定位) | — | [04 §2.2](04-l2-persist.md) |
-| as_of(t) 历史读 | $O(S \cdot \log n)$ 定位版本链 + 查询;窗口受 `history_horizon` 约束 | 历史版本随窗口增长 | [04 §5.5](04-l2-persist.md) |
+| as_of(t) 历史读 | $O(V + N_c \cdot d)$ 单遍择版本($V$ = 物理版本总数);窗口受 `history_horizon` 约束 | $O(V + N_c)$ | [04 §5.5](04-l2-persist.md) |
 | delete / touch | $O(\log n)$ 定位 + 墓碑/统计更新 | — | [03 §2.3](03-l1-memory.md) |
 | iter(filter) | $O(N_c)$($N_c$ = 命中行) + $O(N_c\log N_c)$ 排序 | $O(N_c)$ `Arc` 句柄 | [03 §2.3](03-l1-memory.md) |
 | neighbors / predecessors | $O(\log E + \text{degree})$(`predecessors` 默认全段扫描) | $O(\text{degree})$ | [09 §2.3](09-memory-model.md) |

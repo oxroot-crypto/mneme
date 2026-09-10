@@ -6,7 +6,9 @@
 > **本章你将学到**:目录与文件布局 → 四种文件的字节图 → WAL 协议 → CRC 数学 →
 > zone map 与 Bloom filter 完整推导 → MANIFEST 原子性(Windows 专项) → 恢复流程。
 
-模块:`persist/{wal.rs, vsec.rs, msec.rs, delta.rs, edges.rs, manifest.rs, recover.rs, flush.rs, source.rs, storage.rs, trash.rs}`
+模块:`persist/{wal/, vsec.rs, msec/, edges.rs, manifest.rs, recover/, flush.rs, source.rs, storage.rs, trash.rs, store/}`
+(`store/` 是协调句柄 `Store`:实现内存引擎的 `PersistHook`、承接 `open`/`flush`/Checkpoint;
+`delta/` 编解码模块已删除,`delta` 数据区保留给 L5,见 §2.2a)
 
 ---
 
@@ -18,8 +20,7 @@ agent_memory/
 ├── MANIFEST.000041      # 旧版本 MANIFEST(write-once,保留最近 2 个)
 ├── MANIFEST.000042      # 当前版本 MANIFEST
 ├── wal/
-│   ├── wal_000001.log   # 预写日志(可多个,顺序编号)
-│   └── wal_000002.log
+│   └── wal_000001.log   # 预写日志(L2 只有这一个;多文件轮转是 L5,见 §3.2)
 ├── segments/
 │   ├── seg_000007.vsec  # 向量段(vectors + norm + 删除位图)
 │   ├── seg_000007.msec  # 元数据段(记录体 + 版本链表 + key 索引 + zone map + bloom + 倒排 + ns 统计)
@@ -97,9 +98,10 @@ agent_memory/
 80     ns_stats_offset / ns_stats_len 2×u64 → 命名空间级统计(§5.6)
 96     zmap_offset / zmap_len        2×u64  → zone maps(每字段)+ ttl_map(见数据区)
 112    bloom_offset / bloom_len      2×u64  → bloom 组
-128    delta_offset / delta_len      2×u64  → 跨段覆盖区(墓碑/更新/访问/关系,§2.2a)
-144    rel_offset / rel_len          2×u64  → 关系邻接索引(§2.2b)
-160    header_crc32                  u32
+128    delta_offset / delta_len      2×u64  → 跨段覆盖区(L2 恒空,保留给 L5,§2.2a)
+144    rel_offset / rel_len          2×u64  → 关系邻接索引(仅正向表,§2.2b)
+160    header_crc32                  u32    (覆盖 [0,160))
+164..192 padding                      (补齐到 64B 对齐;header_len = 192)
 --- 数据区 ----------------------------------------------------------
        doc_region: 连续的记录体(变长,记录体格式见下;段内顺序即 SlotId 顺序)
        version_table: (RowId u64, seqno u64, tx_ms i64, SlotId u32, doc_offset u64)
@@ -117,12 +119,19 @@ agent_memory/
                     (编码与打分见 [06 §3.4](06-l4-query.md);无文本记录时为空)
        ns_stats:    每命名空间一行 (NsId u32, doc_count u64, total_doc_len u64)
                     → 段内块级剪枝用(§5.6);BM25 的 N/avgdl 需跨段全局聚合
-       delta:       跨段覆盖区(§2.2a):墓碑/更新/访问/关系变更的持久化载体,
-                    使"作用于旧段记录的操作"不依赖 WAL 存活
+       delta:       跨段覆盖区(§2.2a):墓碑/更新/访问/关系变更的持久化载体(L5 目标);
+                    L2 写空,覆盖操作以墓碑/新版本进 version_table(§2.2a 落地状态)
        relations:   关系邻接索引(§2.2b):按 (from RowId) 排序的边表,供联想检索
 --- 尾部 ------------------------------------------------------------
        payload_crc32                 u32
 ```
+
+> **L2 落地状态**:定长头实际为 **192 B**(偏移 `0..160` 为字段区、`header_crc32` 在
+> 偏移 **160**、`164..192` 为对齐填充)。数据区中 `field_dict`、`inv`(倒排)、`zmap`
+> (zone map / ttl_map)、`bloom` 四类区在 L2 **写为 `len=0` 空占位**,构建与查询期下推求值属
+> **L4**(§5.1–§5.4 描述 L4 目标);`delta` 区恒为空(`delta: &[]`,保留给 L5,§2.2a);
+> `relations` 区只写**正向表**(§2.2b)。L2 段内实际写入内容的是 `doc_region`、
+> `version_table`、`key_index`、`ns_stats` 与正向 `relations`。
 
 **记录体(entry)格式**(doc_region 内,长度前缀):
 
@@ -156,7 +165,13 @@ agent_memory/
 > 的版本被回收。因此 `as_of(t)` 在保留窗口内始终可读,默认永久;需要控制磁盘时设置有限
 > horizon(见 [07 §4.2a](07-l5-life.md))。
 
-### 2.2a 跨段覆盖区(delta)
+### 2.2a 跨段覆盖区(delta,目标设计;L2 不写)
+
+> **L2 落地状态(重要)**:L2 使用**全量快照 flush**(§3.2),msec 的 `delta` 区**恒写空**
+> (`delta: &[]`),`src/persist/delta/**` 编解码模块已删除(未接线)。L2 把删除/更新持久化为
+> **完整新版本 + 墓碑**,写入 `version_table`/`key_index`(§2.2、§5.5),**不依赖 delta 区**;
+> 不变量 I19 由"全量快照 + WAL 不提前截断"保证,而非 delta。下述 delta 设计是 **L5 compaction**
+> 的目标形态。
 
 **问题**:`delete(key)` / `update(key, patch)` / `touch` / `relate` 作用的对象可能位于
 **更早的不可变段**。这些操作不能原地改写旧段(vsec 的 `dead` 位图只能标本段 SlotId,
@@ -200,6 +215,10 @@ relations: [from u64][to u64][kind u16][f32 weight][meta len+bytes] × edge_coun
            供 ns.predecessors() 以 O(log n + degree) 定位(见 09 §2.3)
 ```
 
+> **L2 落地状态**:段内 relations 区**只写正向表**(`edges::encode(&relations, false)`);
+> `RelationIndex::Both` 的反向表落盘属 **L5**。恢复时 `neighbors` 读段内正向表,
+> `predecessors` 的入边由**内存 `in_edges`**(WAL 重放 / 写状态)重建,不依赖段内反向表。
+
 - 边的可见性同样受 delta 的 Relate/Unrelate 与墓碑约束:任一端被删除,该边在读取时
   视为不可见(悬挂边不返回,compaction 时物理清除);
 - 关系边是**一等公民**但不参与向量打分,只作为检索的**扩展算子**([10 §3](10-scoring.md))。
@@ -225,7 +244,7 @@ seqno 为该写操作分配的全局单调序号(§3.1);回放据此跳过已落
 type: 1=Insert 2=Delete 3=Touch 4=Checkpoint 5=BatchBegin 6=BatchCommit
       7=DeleteRow 8=TouchRow 9=NsRegister 10=Update 11=UpdateRow 12=Relate 13=Unrelate
       14=RelKindRegister
-Insert     = 记录体(同 msec entry 格式,含 NsId)
+Insert     = 记录体(同 msec entry 格式,含 NsId)[u32 dim][f32 × dim]  # 记录体不含向量,故附向量副本供崩溃恢复
 Delete     = [NsId u32][key len+bytes]
 DeleteRow  = [RowId u64]                          # 无 key 记录按 RowId 删除
 Touch      = [NsId u32][key len+bytes][i64 at_ms][u32 access_delta][f32 importance_delta]
@@ -241,6 +260,12 @@ BatchBegin = [u32 record_count]                  # 后续连续"数据帧"(Inser
 BatchCommit= [u32 record_count][u32 batch_crc]   # 批提交标记;缺此帧则整批丢弃
 Checkpoint = [u64 watermark_seqno]
 ```
+
+> **L2 实际发出的帧**:`Insert`、`DeleteRow`、`TouchRow`、`Relate`、`Unrelate`、`NsRegister`,
+> 以及批量包裹 `BatchBegin`/`BatchCommit`。`Delete`(按 key)、`Touch`(按 key)、`Update`、
+> `UpdateRow`、`Checkpoint`、`RelKindRegister` 为**保留帧类型**:编号已分配、回放器可解析,
+> 但 L2 **不发出**(分别对应 L4/L5 的按 key 覆盖、局部更新与检查点能力;检查点在 L2 由
+> "全量快照 + WAL 重置"实现,§3.2)。
 
 > **`NsRegister` 的位置保证**:向一个新命名空间写入的**第一批** WAL 必须先写
 > `NsRegister`(必须在同批的 `BatchBegin` 之前,或更早),回放时据此重建 `path ↔ NsId` 并推进 `next_ns_id`
@@ -276,6 +301,7 @@ Checkpoint = [u64 watermark_seqno]
 56     active_count                      u32
 60     ns_count                          u32
 64     rel_kind_count                    u32     关系类型注册表条目数
+68..72 padding                                (补齐到 72 B;header_len = 72)
 --- 变长区(紧随固定头部) ----------------------------------------------
 [ NsEntry ] × ns_count:                  # 命名空间注册表(path ↔ NsId)
     u32 ns_id, u32 path_len, path bytes(UTF-8)
@@ -331,16 +357,16 @@ HNSW 入口是**每段一个**(与 [05 §7/§9](05-l3-hnsw.md) 的"每段独立�
 
 后续 flush 与崩溃恢复:
 ⑥ flush:可变表整体写成新段(seg_N.vsec + seg_N.msec);
-   作用于旧段的删除/更新/访问/关系写入该段 delta 区          [§2.1、§2.2a]
+   墓碑/新版本与正向关系表一并在段内(L2 的 delta 区恒为空)   [§2.1、§2.2a]
 ⑦ 写 MANIFEST.<v+1>.tmp → fsync → rename → 更新 current     [§2.4、§6]
-⑧ Checkpoint 帧记录 watermark_seqno → 截断旧 WAL            [§3.2]
+⑧ 提交 MANIFEST 记录 watermark_seqno → 重置(截断+重写头)WAL [§3.2]
 崩溃在任意一步:
    未提交 → 重放 WAL 中 seqno > watermark 的帧               [§3.3、§7]
-   已提交 → 覆盖条目已在段 delta 区,删除/更新不丢失(I19)     [§7 算例]
+   已提交 → 覆盖条目已随全量快照段落盘,删除/更新不丢失(I19)   [§7 算例]
 ```
 
 **【算例】vsec 头部与数据区的实际字节**:取 `dimension=4`、`row_count=2`、`quant=0`(F32)、`norm_col=1`
-(头部 64B;数据区 = vec `2×4×4=32B` + norm `2×4=8B` + del_bitmap 首块 `128B`;尾部 CRC 4B):
+(头部 64B;数据区 = vec 行跨距 `row_stride(4)=32B` × 2 = 64B + norm `2×4=8B` + del_bitmap 首块 `128B`;尾部 CRC 4B):
 
 ```text
 偏移   内容
@@ -355,13 +381,13 @@ HNSW 入口是**每段一个**(与 [05 §7/§9](05-l3-hnsw.md) 的"每段独立�
 24     ... created_unix_ms(i64)
 32     ... header_crc32(覆盖 [0,32))
 36     ... padding 至 64B
-64     vec[0] 4 个 f32(LE);vec[1] 紧随其后(共 32B)
-96     norm[0]、norm[1](各 1 个 f32,存范数平方,共 8B)
-104    del_bitmap 首块:16 个 u64(1024 bit;行 2 起为未用槽,恒 1=不可见)
-232    payload_crc32(覆盖 [64,232))
+64     vec[0]:4 个 f32(16B)+ 16B 补齐至 32B 行跨距;vec[1] 紧随其后(共 64B)
+128    norm[0]、norm[1](各 1 个 f32,存范数平方,共 8B)
+136    del_bitmap 首块:16 个 u64(1024 bit;行 2 起为未用槽,恒 1=不可见)
+264    payload_crc32(覆盖 [64,264))
 ```
 
-文件总大小 = 64 + 32 + 8 + 128 + 4 = **236 字节**。维度越大,`vec`/`norm` 区按 `d` 线性增长,
+文件总大小 = 64 + 64 + 8 + 128 + 4 = **268 字节**。维度越大,`vec`/`norm` 区按 `d` 线性增长,
 而 `del_bitmap` 只随行数增长——这就是"块粒度 1024 行"固定不变的原因。
 
 ---
@@ -373,8 +399,8 @@ HNSW 入口是**每段一个**(与 [05 §7/§9](05-l3-hnsw.md) 的"每段独立�
 ```text
 1. 取写锁(全局串行) → 为本次写操作分配全局单调 seqno(批内各帧依次分配;
    flush 以批为单位,保证一批不横跨 watermark)
-2. 构帧追加进 WalWriter 的缓冲区:单条写 = Insert/Delete/Touch;
-   `insert_batch` = BatchBegin + N×Insert + BatchCommit(整批一次组提交)
+2. 构帧追加进 WalWriter 的缓冲区:单条写 = Insert/DeleteRow/TouchRow(L2 不发出按 key 的
+   Delete/Touch,见 §2.3);`insert_batch` = BatchBegin + N×Insert + BatchCommit(整批一次组提交)
 3. 按 FsyncPolicy 等待持久确认:
      Always      → 每帧 write + fsync 后返回
      Batched(d)  → 写线程每 d 毫秒统一 write+fsync;提交者等待"自己的写入已 fsync"事件(水位 last_durable ≥ my_seqno)
@@ -390,34 +416,37 @@ last_error }`。提交者追加后 `wait_while(last_durable < my_seqno)`。
 
 ### 3.2 轮转与检查点
 
-- WAL 文件达 **64MB(默认)** → 换新文件,旧文件保留到 Checkpoint;
-- **整批不跨文件提交**:轮转只在帧边界发生,且 `BatchBegin…BatchCommit` 必须完整落在
-  同一个 WAL 文件内——若追加过程中将触达文件上限,先写完当前批再轮转。由此批原子性
-  (I15)不依赖跨文件逻辑,回放器也只需单文件即可判定整批取舍;
-- **Checkpoint(type 4)**:只有当**内存可变表 + 所有 seqno ≤ watermark 的覆盖操作**
-  (Delete/DeleteRow/Update/UpdateRow/Touch/TouchRow/Relate/Unrelate)都已随某个已提交
-  段的记录体、**version_table 版本链**或 delta 区(§2.2a)**持久物化**,才写入 Checkpoint
-  并记录 `watermark_seqno`;此后 `seqno ≤ watermark` 的 WAL 文件整体删除。
-  **这是防止"删除复活/更新丢失"的关键**(不变量 I19):只要某条墓碑或更新还只存在于 WAL,
-  就不得截断它。
-- **L2 阶段兜底**(还没有 compaction):WAL 总量超限(默认 256MB)即触发一次
-  "全量快照 flush"(把可变表整体写成一个段,并把覆盖操作写入该段 delta 区),保证 WAL 有界。
-  L5 之后该兜底由正规 compaction 取代。
+> **L2 落地状态**:L2 只有**一个** WAL 文件 `wal/wal_000001.log`,**不做轮转**。检查点 =
+> "全量快照 flush → 新 MANIFEST 记录 `watermark_seqno` → 重置(截断并重写文件头)该 WAL";
+> `Checkpoint` 帧类型(§2.3 type 4)保留但**不发出**。多文件轮转与按文件的保留/删除是 **L5**
+> 的 compaction 形态。
+
+- **L2 检查点流程**:`flush` 把整个可变表(含墓碑/新版本/正向关系表)写成**一个新段**的
+  `vsec + msec`,在 `MANIFEST.<v+1>` 中记录 `watermark_seqno = 当前 seqno` 并提交,随后
+  `WalWriter::reset` 把 `wal/wal_000001.log` 截断为空并重写文件头。截断发生在 MANIFEST 提交
+  **之后**,故任何已确认的覆盖操作(删除/更新/访问/关系)都已随快照段物化——**这是防止
+  "删除复活/更新丢失"的关键**(不变量 I19):只要某条墓碑或更新还只存在于 WAL,就不得截断它。
+- **L2 阶段兜底**(还没有 compaction):WAL 总量超限(默认 256MB,`CompactionPolicy.wal_bytes`)
+  即触发上述全量快照 flush,保证 WAL 有界(I4)。L5 之后该兜底由正规 compaction 取代。
+- **L5 目标(未落地)**:WAL 文件达 `wal_file_bytes`(默认 64MB)换新文件,旧文件保留到
+  Checkpoint;**整批不跨文件提交**——`BatchBegin…BatchCommit` 必须完整落在同一文件内,由此批
+  原子性(I15)不依赖跨文件逻辑,回放器单文件即可判定整批取舍。
 
 ### 3.3 回放(恢复路径的一部分,见 §7)
 
 按序读帧 → 校验 `len`/`crc` → 应用
-`type ∈ {Insert, Delete, DeleteRow, Touch, TouchRow, Update, UpdateRow, Relate, Unrelate}`
+`type ∈ {Insert, DeleteRow, TouchRow, Relate, Unrelate}`(L2 实际发出的数据帧;按 key 的
+`Delete`/`Touch` 与 `Update`/`UpdateRow` 为保留帧,§2.3;`NsRegister` 与批包裹另行处理)
 到内存可变表/覆盖层 → 遇坏帧即停并截断文件。**只回放 `seqno > manifest.watermark_seqno`
 的帧**——每帧头部都带 seqno(§2.3),`≤ watermark` 的操作已随段提交落盘。这样即使崩溃
-发生在"MANIFEST 已提交、Checkpoint 帧尚未写入"的窗口,也不会重复应用已落段的操作。
+发生在"MANIFEST 已提交、WAL 重置尚未执行"的窗口,也不会重复应用已落段的操作。
 
 **注册与水位恢复**:回放遇到 `NsRegister` 时把 `(NsId, path)` 并入内存注册表,并令
-`next_ns_id = max(next_ns_id, NsId + 1)`;遇到 `RelKindRegister` 时把 `(kind, name)` 并入
-关系类型注册表,并令 `next_rel_kind = max(next_rel_kind, kind + 1)`;
-遇到任意 `Insert`/`UpdateRow`/`Relate` 时,令 `next_rowid = max(next_rowid, rowid + 1)`。
-回放结束把注册表与水位写回 MANIFEST(不变量 I20)。这保证 MANIFEST 尚未更新就崩溃时,
-路径映射、关系类型与 ID 水位仍可精确恢复。
+`next_ns_id = max(next_ns_id, NsId + 1)`;遇到 `Insert`/`DeleteRow` 时,令
+`next_rowid = max(next_rowid, rowid + 1)`。`RelKindRegister` 为**保留帧**(L2 不发出、
+回放器忽略),故关系类型注册表与 `next_rel_kind` 在 L2 由 MANIFEST 的 `RelKindEntry`
+维护(§2.4);回放结束把注册表与水位写回 MANIFEST(不变量 I20)。这保证 MANIFEST 尚未更新
+就崩溃时,路径映射与 ID 水位仍可精确恢复。
 
 **批原子回放**:遇到 `BatchBegin` 时把批内后续帧(上述全部数据帧)先暂存,直到读到配对的
 `BatchCommit`(校验 `batch_crc` 与条数)才一次性应用;若在提交帧前遇坏帧/文件结束,
@@ -498,6 +527,10 @@ $O(n)$ 时间(查表法每字节 1 次表查 + XOR,8KB 表)、$O(1)$ 空间;`crc
 ---
 
 ## 5. msec 内的轻量索引
+
+> **L2 落地状态**:本节 §5.1–§5.4 的 `field_dict`、zone map/ttl_map、bloom、倒排在 L2
+> **写为 `len=0` 空占位**,其构建与查询期下推求值属 **L4**;`key_index`(§5.5)与 `ns_stats`
+> (§5.6)在 L2 已实际写入。字节布局与偏移见 §2.2。
 
 ### 5.1 字段字典
 
@@ -591,6 +624,10 @@ key 同时进入该字符串字段的 bloom(§5.3),不存在的 key 先被 bloom
   4. seqno 相同不可能(全局单调分配),故无并列。
 ```
 
+> **L2 落地状态**:来源 b)(段内 delta)在 L2 **恒空**(§2.2a);可见性完全由来源 a)
+> (`version_table` 版本链,含墓碑版本)与 c)(可变表/WAL 覆盖)解析。L2 的按 key 删除/访问在
+> WAL 中以 `DeleteRow`/`TouchRow` 落盘(§2.3),表现为版本链上的墓碑版本与内存访问统计。
+
 - upsert/update **保留 RowId**、追加新版本(seqno 更大)
   ([03 §2.1](03-l1-memory.md)),新旧版本可能落在不同段;
   上述规则保证 `get(key)` 总返回该 RowId 的最新可见版本;
@@ -670,11 +707,11 @@ open(dir):
  2. 校验各段头部 CRC(全量 CRC 视配置);头部损坏段 → 移入 trash/ 并从视图剔除
     (可配 fail-fast 模式:`Builder::fail_fast_on_corruption(true)`,直接报错拒绝启动)。只读实例(`read_only`)不写盘,
     仅跳过损坏段并从视图剔除,经 `stats()`/`check()` 报告
- 3. 打开 WAL 文件(按编号序),只重放 seqno > manifest.watermark_seqno 的帧(§3.3);
+ 3. 打开唯一的 WAL 文件(`wal/wal_000001.log`),只重放 seqno > manifest.watermark_seqno 的帧(§3.3);
     遇撕裂帧 → 可写实例截断该文件尾部;只读实例(`read_only`)不写盘,仅在内存中忽略
     该帧及其后(见 §13 只读模式)
- 4. 构建 ReaderView{ manifest 版本, 可变表 }:合并各段 version_table/delta 与 WAL 覆盖,
-    重建每个 RowId 的版本链与当前可见版本(§5.5) → 对外服务
+ 4. 构建 ReaderView{ manifest 版本, 可变表 }:合并各段 version_table 与 WAL 覆盖
+    (L2 的 delta 区恒空,§2.2a),重建每个 RowId 的版本链与当前可见版本(§5.5) → 对外服务
 不变量:恢复后的状态 = "已 fsync 确认的全部操作" 的重放结果(可多,不可错;
        Batched 策略下多出的只能是被 OS 已刷盘但确认事件未送达的帧,重放是幂等的)
 ```
@@ -697,13 +734,13 @@ stateDiagram-v2
 ```
 
 **【算例】崩溃窗口与水位回放**:写操作 `seqno 100–105` 已 fsync 进 WAL;`flush` 把可变表
-写成段并提交 `MANIFEST.000042`(其 `watermark_seqno = 105`);此时进程崩溃,`Checkpoint`
-帧尚未来得及写入。重启时:
+写成段并提交 `MANIFEST.000042`(其 `watermark_seqno = 105`);此时进程崩溃,WAL 重置
+尚未来得及执行。重启时:
 
 ```text
 读 current → MANIFEST.000042(watermark = 105)
 只回放 WAL 中 seqno > 105 的帧 → 100–105 不会被重复应用
-删除/更新等覆盖条目已随该段 delta 区落盘 → 截断 WAL 也不会"复活"或丢失(I19)
+删除/更新等覆盖条目已随该全量快照段落盘(墓碑/新版本) → 截断 WAL 也不会"复活"或丢失(I19)
 ```
 
 若崩溃发生在"WAL 已写、MANIFEST 未提交"的窗口,watermark 仍是旧值,`100–105` 会被完整
@@ -716,15 +753,15 @@ stateDiagram-v2
 ```text
 Reader = RwLock<Arc<ReaderView>>   ← [01 §2.1] 的具体形态
 ReaderView(不可变):
-  segments: Arc<[SegmentHandle]>     # 每段持有 source(Arc<mmap 或 File>) + delta 区
+  segments: Arc<[SegmentHandle]>     # 每段持有 source(Arc<mmap 或 File>);L2 的 delta 区恒空
   mutable: Arc<MutableSnapshot>      # 取视图时可变表+覆盖层的不可变快照(WAL 已应用部分)
   watermark: SeqNo
-读: 拿读锁 clone Arc → 放锁 → 段扫描 + delta/可变表覆盖 → 全局归并(§5.5)
-删除/更新/插入: 修改可变表覆盖层 → flush 时生成新段(含 delta 区) → 提交新 MANIFEST → 写锁内换 Arc
+读: 拿读锁 clone Arc → 放锁 → 段扫描 + 可变表覆盖 → 全局归并(§5.5)
+删除/更新/插入: 修改可变表覆盖层 → flush 时写成全量快照新段(墓碑/新版本) → 提交新 MANIFEST → 写锁内换 Arc
 ```
 
-> **覆盖层是可持久的**:视图里的墓碑/更新既来自 WAL 重放,也来自各段已提交的 delta 区
-> (§2.2a)。因此 `flush` 之后即便 WAL 被 Checkpoint 截断,删除与更新依然有效(I19)。
+> **覆盖层是可持久的**:视图里的墓碑/更新来自 WAL 重放,以及**全量快照段内的墓碑/新版本**
+> (L2;`delta` 区恒空,§2.2a)。因此 `flush` 之后即便 WAL 被重置截断,删除与更新依然有效(I19)。
 
 > **可变表也是检索数据源**:除可见性合并外,可变表中**尚未落段**的记录同时参与检索——
 > 向量侧作为一个"内存段"参与暴力扫描([05 §9](05-l3-hnsw.md)),BM25 侧经内存增量倒排
@@ -758,7 +795,7 @@ Windows 不允许删除被 mmap/句柄打开的文件。方案:
 ### 10.1 崩溃注入:`FsyncHook`
 
 ```rust
-/// 待注入的 I/O 动作(仅测试 builder 暴露)。
+/// 待注入的 I/O 动作。
 pub enum IoAction {
     Write { file: &'static str, offset: u64, len: usize },
     Fsync { file: &'static str },
@@ -771,8 +808,11 @@ pub trait FsyncHook: Send + Sync {
 }
 ```
 
-仅测试 builder 暴露。用法见 [14 §2](14-testing.md):在随机点"杀死"进程,
-断言恢复后状态 = 已确认操作前缀。
+经 `Builder::fsync_hook` 公开注入(测试用 seam;生产不设置即无开销)。
+用法见 [14 §2](14-testing.md):在随机点"杀死"进程,断言恢复后状态 = 已确认操作前缀。
+
+> **L2 落地状态**:L2 只经此钩子发出 `Write` 与 `Fsync` 两种动作;`Rename` 变体**保留**给
+> L5 compaction 的段移动,L2 的段移动直接经 `trash` 模块完成,不发出 `Rename` 动作。
 
 ### 10.2 时间源:`Clock`
 
@@ -799,9 +839,9 @@ pub trait SegmentSource: Send + Sync {
 }
 ```
 
-`MmapSource`(feature `mmap`,memmap2)与 `FileSource`(std,`seek+read`)。
-索引层与恢复层只依赖此 trait——mmap 是**优化**而非功能依赖,任何平台不支持时可整体退化为
-`FileSource`(读吞吐降,正确性不变)。
+L2 提供 `FileSource`(std,`seek+read`);`MmapSource`(feature `mmap`,memmap2)按依赖
+白名单([01 §5](01-overview.md))自 **L3** 引入。索引层与恢复层只依赖此 trait——
+mmap 是**优化**而非功能依赖,任何平台不支持时可整体退化为 `FileSource`(读吞吐降,正确性不变)。
 
 ---
 
@@ -840,7 +880,7 @@ pub trait SegmentSource: Send + Sync {
 | WAL 未知帧类型 | 回放遇到 `type` 不在定义内 | **停止回放并报错**(不静默跳过) | 升级库版本;切勿手工改 WAL |
 | mmap 失败 | 平台/文件系统不支持 | 自动退化为 `FileSource` | 无(功能不变,吞吐下降) |
 | 时钟回拨 | `Clock` 返回变小 | 以历史最大水位钳制(本章 §10.2) | 无 |
-| 崩溃残留锁文件 | 上次进程未正常退出 | 打开时校验锁内 PID/时间戳,陈旧则接管([16 §3](16-api-reference.md)) | 无(自动接管) |
+| 崩溃残留锁文件 | 上次进程未正常退出 | OS 咨询锁随进程终止由内核自动释放(`File::try_lock`),下次打开直接获取;`LOCK` 文件保留不删([16 §3](16-api-reference.md)) | 无(自动释放) |
 
 **原则**:任何失败都不得静默返回错误数据(I2);宁可拒绝启动或返回 `Err`,
 也不做"尽力而为"的猜测。用户侧完整 runbook 见 [16 §7](16-api-reference.md)。
@@ -849,7 +889,9 @@ pub trait SegmentSource: Send + Sync {
 
 **向上提供**:
 
-1. `Database: VectorStore`([03 §8](03-l1-memory.md) trait 的持久实现);
+1. 持久化的 `Mneme` 引擎——与 L1 完全相同的公开签名(见 [03 §8](03-l1-memory.md)),
+   不再是易失内存实现;`VectorStore` 内部 trait 按 [03 §8](03-l1-memory.md) 推迟到 L3
+   随 HNSW 引入,故本层不新增该 trait 的实现分歧;
 2. 段格式编解码(`vsec/msec/wal/manifest` 的 read/write/replay,含 version_table 版本链,字节布局本章 §2);
 3. `SegmentSource` 抽象、`FsyncHook` / `Clock` 注入点、`trash` 管理;
 4. 事务语义:单次 `insert_batch` 原子(要么整批进 WAL,要么整批不出现);
@@ -867,19 +909,22 @@ pub trait SegmentSource: Send + Sync {
   线性增长,由 `history_horizon` 控制(默认永久);
 - I18 只接受 `major(format_version) ≤ major(max_supported)` 的文件,主版本更高的拒绝打开(§12);
 - **I19 覆盖持久性**:任何已返回 `Ok` 的 `delete`/`update`/`touch`/`relate` 操作,在任意
-  崩溃 + WAL 截断后仍然生效——因为其覆盖条目要么在 WAL,要么已在某个已提交段的 delta 区;
-  Checkpoint 绝不在覆盖条目物化前截断 WAL(§3.2);被删除记录**永不复活**(验收 [14 §2.4](14-testing.md));
+  崩溃 + WAL 截断后仍然生效——因为其覆盖条目要么在 WAL,要么已随某个已提交的**全量快照段**
+  (墓碑/新版本)落盘;WAL 只在覆盖物化后才重置截断(§3.2);被删除记录**永不复活**
+  (验收 [14 §2.4](14-testing.md));
 - **I20 注册与水位可恢复**:`path ↔ NsId` 映射与 `next_ns_id`/`next_rowid` 水位可由
   "MANIFEST + WAL 中 `NsRegister`/数据帧"完整重建,NsId/RowId 永不复用(§3.3);
 - **版本链保留(I26 的存储侧保证)**:每个 RowId 的最新版本与事务时间在
   `CompactionPolicy.history_horizon` 内的历史版本(默认 `None` = 永久)被保留;
-  版本链在重启/compaction 后可由 `version_table` + delta 重建,`as_of(t)` 据此解析(§2.2、§5.5)。
+  版本链在重启/compaction 后可由 `version_table`(L2;L5 起再由 `delta` 区补充)重建,`as_of(t)` 据此解析(§2.2、§5.5)。
 
 ## 本章小结
 
 - 目录布局 + `vsec/msec/hidx/MANIFEST/WAL` 的**字节级格式**是本层的核心产出。
-- WAL 组提交、帧 CRC、`BatchBegin/Commit`、Checkpoint 与 watermark 保证崩溃一致性。
-- **delta 覆盖区**把"作用于旧段记录"的删除/更新/访问/关系持久化,是 I19 的关键。
+- WAL 组提交、帧 CRC、`BatchBegin/Commit` 与 MANIFEST watermark + WAL 重置保证崩溃一致性
+  (`Checkpoint` 帧类型保留、L2 不发出)。
+- **全量快照 flush**(L2)把"作用于旧段记录"的删除/更新/访问/关系随新段(墓碑/新版本)持久化,
+  是 I19 的关键;**delta 覆盖区**是 L5 compaction 的目标形态(L2 恒空)。
 - MANIFEST 用 write-once + 指针规避 Windows 替换语义,trash 做延迟删除。
 - **本章不变量**:I1–I4、I18–I20,以及版本链的存储侧保留保证(I26)。
 

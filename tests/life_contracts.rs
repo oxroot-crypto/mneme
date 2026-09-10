@@ -47,16 +47,14 @@ fn deferred_features_return_structured_errors() {
         Err(mneme::MnemeError::Unsupported { .. })
     ));
     assert!(matches!(
-        Mneme::open("./nowhere"),
-        Err(mneme::MnemeError::Unsupported { .. })
-    ));
-    assert!(matches!(
         db.backup_to("./nowhere"),
         Err(mneme::MnemeError::Unsupported { .. })
     ));
+    // `open`/`path` 已在 L2 落地:新建持久库缺维度返回 `Config`,不再是 `Unsupported`。
+    let dir = tempfile::tempdir().expect("tempdir");
     assert!(matches!(
-        Mneme::builder().dimension(2).path("./x").build(),
-        Err(mneme::MnemeError::Unsupported { .. })
+        Mneme::open(dir.path().join("new_db")),
+        Err(mneme::MnemeError::Config { .. })
     ));
 }
 
@@ -173,13 +171,11 @@ fn error_taxonomy_is_specific() {
         ns.insert(Record::new(vec![1.0])),
         Err(mneme::MnemeError::DimensionMismatch { .. })
     ));
+    // `open`/`path` 已在 L2 落地:新建持久库缺维度 → `Config`(不再是 `Unsupported`)。
+    let dir = tempfile::tempdir().expect("tempdir");
     assert!(matches!(
-        Mneme::open("./nowhere"),
-        Err(mneme::MnemeError::Unsupported { .. })
-    ));
-    assert!(matches!(
-        Mneme::builder().dimension(2).path("./x").build(),
-        Err(mneme::MnemeError::Unsupported { .. })
+        Mneme::open(dir.path().join("new_db")),
+        Err(mneme::MnemeError::Config { .. })
     ));
     assert!(matches!(
         Mneme::builder().build(),

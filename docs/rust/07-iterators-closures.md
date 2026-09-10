@@ -204,7 +204,7 @@ pub(crate) fn write_tx<T>(&self, f: impl FnOnce(&mut WriterState) -> Result<T>) 
 }
 ```
 
-见 [`src/memory/table.rs`](../../src/memory/table.rs)。`impl FnOnce(...)` 是 `F: FnOnce(...)`
+见 [`src/memory/table/state.rs`](../../src/memory/table/state.rs)。`impl FnOnce(...)` 是 `F: FnOnce(...)`
 的简写(见 [06 §2.3](06-generics-traits.md)):闭包只调用一次,所以用**最宽松**的 `FnOnce`;
 若写成 `Fn`,那些会移动捕获值的闭包反而用不了。
 

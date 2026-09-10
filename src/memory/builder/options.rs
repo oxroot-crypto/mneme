@@ -18,7 +18,7 @@ use crate::memory::lifecycle::Retention;
 use super::Builder;
 
 impl Builder {
-    /// 设置存储目录;L1 尚未实现持久化,设置后 `build()` 返回 `Unsupported`。
+    /// 设置存储目录;设置后 `build()` 打开/新建持久库(设计 04 §1)。
     ///
     /// # Arguments
     ///
@@ -57,6 +57,7 @@ impl Builder {
     /// 携带度量的构建器(链式)。
     pub fn metric(mut self, metric: Metric) -> Self {
         self.metric = metric;
+        self.metric_explicit = true;
         self
     }
 
@@ -200,7 +201,7 @@ impl Builder {
         self
     }
 
-    /// 设置压缩策略(仅记录,L2 生效)。
+    /// 设置压缩策略(仅记录,实现归 L11 安全存储;L2 预留磁盘扩展区)。
     ///
     /// # Arguments
     ///
@@ -284,7 +285,7 @@ impl Builder {
         self
     }
 
-    /// 只读共享模式(仅记录,L12 生效)。
+    /// 只读共享模式(L2 已实现单进程只读打开:不持锁、不写盘)。
     ///
     /// # Arguments
     ///
@@ -323,6 +324,36 @@ impl Builder {
     /// 携带 fail-fast 开关的构建器(链式)。
     pub fn fail_fast_on_corruption(mut self, fail_fast: bool) -> Self {
         self.fail_fast_on_corruption = fail_fast;
+        self
+    }
+
+    /// 注入 I/O 前置钩子(测试崩溃注入;设计 04 §10.1)。
+    ///
+    /// # Arguments
+    ///
+    /// * `hook` - 在每次 write/fsync/rename 前调用的回调;返回 `Err` 即注入故障。
+    ///
+    /// # Returns
+    ///
+    /// 携带钩子的构建器(链式)。
+    ///
+    /// # Examples
+    /// ```
+    /// use std::sync::Arc;
+    /// use mneme::{Builder, FsyncHook, IoAction};
+    ///
+    /// struct Noop;
+    /// impl FsyncHook for Noop {
+    ///     fn before(&self, _action: IoAction<'_>) -> std::io::Result<()> {
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// let builder = Builder::default().fsync_hook(Arc::new(Noop));
+    /// # let _ = builder;
+    /// ```
+    pub fn fsync_hook(mut self, hook: Arc<dyn crate::FsyncHook>) -> Self {
+        self.fsync_hook = Some(hook);
         self
     }
 }

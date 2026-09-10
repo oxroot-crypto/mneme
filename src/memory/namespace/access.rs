@@ -7,7 +7,7 @@ use crate::core::meta::Meta;
 use crate::core::options::{Feedback, QueryId, RelationKind};
 use crate::core::types::{Key, RowId};
 use crate::memory::mutate_helpers::{lower_confidence, touch_rowid};
-use crate::memory::relation::{self, Edge};
+use crate::memory::relation::Edge;
 use crate::memory::write_helpers::latest_live;
 
 use super::Namespace;
@@ -135,8 +135,7 @@ impl Namespace {
                         weight: 1.0,
                         metadata: Meta::Null,
                     };
-                    relation::upsert_edge(Arc::make_mut(&mut ws.out_edges), edge.clone());
-                    relation::upsert_edge(Arc::make_mut(&mut ws.in_edges), edge);
+                    ws.relate_edge(edge);
                 }
             }
             // 生效成功后再登记幂等键:中途失败不占用键,调用方可重试(FC-SCORE-INV-027)。

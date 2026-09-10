@@ -1,11 +1,9 @@
 //! `Namespace` 关系边操作(`namespace/relation.rs`)。
 
-use std::sync::Arc;
-
 use crate::core::error::{MnemeError, Result};
 use crate::core::options::RelationKind;
 use crate::core::types::RowId;
-use crate::memory::relation::{self, Edge, RelateOptions};
+use crate::memory::relation::{Edge, RelateOptions};
 
 use super::Namespace;
 impl Namespace {
@@ -79,8 +77,7 @@ impl Namespace {
                 weight: options.weight.clamp(0.0, 1.0),
                 metadata: options.metadata,
             };
-            relation::upsert_edge(Arc::make_mut(&mut ws.out_edges), edge.clone());
-            relation::upsert_edge(Arc::make_mut(&mut ws.in_edges), edge);
+            ws.relate_edge(edge);
             Ok(())
         })
     }
@@ -119,9 +116,7 @@ impl Namespace {
             if ws.closed {
                 return Err(MnemeError::Closed);
             }
-            let removed = relation::remove_edge(Arc::make_mut(&mut ws.out_edges), from, to, kind);
-            relation::remove_edge(Arc::make_mut(&mut ws.in_edges), to, from, kind);
-            Ok(removed)
+            Ok(ws.unrelate_edge(from, to, kind))
         })
     }
 

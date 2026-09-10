@@ -3,8 +3,9 @@
 > **Mneme**(μνήμη,古希腊语"记忆";记忆女神 Mnemosyne 的同源词)是一个纯 Rust 编写的**嵌入型向量存储引擎**,
 > 专为 **AI Agent 的超长期记忆层**设计:进程内运行、无需服务端、数据经年累月增长而不失控。
 
-**状态**:开发中(尚未发布到 crates.io)。**L0 原语层(`src/core/`)与 L1 内存引擎(`src/memory/`)**已实现
-并通过形式化契约验收,后续按 L2→L6 逐层推进,每层完成时都是一个可独立交付的完整产品。
+**状态**:开发中(尚未发布到 crates.io)。**L0 原语层(`src/core/`)、L1 内存引擎(`src/memory/`)
+与 L2 持久层(`src/persist/`)**已实现并通过形式化契约验收,后续按 L3→L6 逐层推进,
+每层完成时都是一个可独立交付的完整产品。
 设计与验收标准见 [docs/DESIGN.md](docs/DESIGN.md)。
 
 ---
@@ -28,12 +29,12 @@ LLM 每次对话结束就"忘光"上下文之外的一切。要让 Agent 长期�
 | **记忆感知排序** | 相似度 + 新鲜度 + 重要度 + 访问频次 + 可信度可配置组合;联想扩展 |
 | **记忆模型** | 关系图(联想检索)、双时态 `as_of` 时间旅行(历史版本默认永久保留,可配保留期)、`supersede` 信念修订、来源/可信度、记忆沉淀 |
 | 记忆生命周期 | TTL 两阶段过期、指数遗忘曲线、访问强化、命名空间隔离(自动遗忘默认关闭) |
-| 持久化 | WAL + 不可变段 + delta 覆盖区 + MANIFEST 原子提交,任意点掉电可恢复、删除不复活 |
+| 持久化 | WAL + 不可变段 + MANIFEST 原子提交,任意点掉电可恢复、删除不复活 |
 | 超长期 | size-tiered compaction,写放大 O(log N)、活跃段数有界 |
 | 量化 | i8 / f16 量化副本 + 两阶段重打分,查询带宽 i8 ÷4 / f16 ÷2(f32 原向量保留供精排,故磁盘不缩减) |
 | **存储安全**(可选) | AES-256-GCM 静态加密、文本/元数据压缩 |
 | **部署形态** | 多进程只读共享;`Storage` 抽象支持 WASM/边缘适配;可观测事件钩子 |
-| 依赖极简 | 非 feature 强依赖白名单 4 个小 crate(默认开 `mmap` 共 5 个;均为直接依赖,`serde_json` 另带入 itoa/ryu/memchr 等极少数传递依赖),复杂算法全部自研;加密/压缩均为可选 feature |
+| 依赖极简 | 当前非 feature 强依赖白名单 4 个小 crate(均为直接依赖,`serde_json` 另带入 itoa/ryu/memchr 等极少数传递依赖);规划中默认开 `mmap` 时共 5 个(**L3**);复杂算法全部自研;加密/压缩均为可选 feature |
 
 ## 安装
 
@@ -87,9 +88,12 @@ fn main() -> mneme::Result<()> {
 
 ## Feature 开关
 
+> **尚未定义**:`Cargo.toml` 目前**没有 `[features]` 段**;下表是规划中的 feature 与所属层,
+> 均未在当前版本生效(`mmap` 的 `memmap2` 随 **L3** 引入,[01 §5](docs/design/01-overview.md))。
+
 | feature | 默认 | 说明 |
 |---|---|---|
-| `mmap` | ✅ 开 | 段文件 mmap 零拷贝读;关闭后走 `Read + Seek` 兜底 |
+| `mmap` | ✅ 开(规划) | 段文件 mmap 零拷贝读(**L3**);关闭后走 `Read + Seek` 兜底 |
 | `async` | ❌ 关 | 提供 `insert().await` 等 async 门面(`spawn_blocking` 薄包装) |
 | `quant-f16` | ❌ 关 | f16 量化副本;关闭时只有 f32 / i8 |
 | `encrypt` | ❌ 关 | AES-256-GCM 静态加密 |
@@ -131,8 +135,8 @@ mdbook build               # 输出到 book/
 
 ## 开发与测试
 
-> 当前已实现 L0 原语层与 L1 内存引擎,下列命令即可运行;`cargo test --features async`(async 门面
-> 等价性)等 feature 相关命令待对应层(含 `[features]` 定义)落地后加入。
+> 当前已实现 L0 原语层、L1 内存引擎与 L2 持久层,下列命令即可运行;`cargo test --features async`
+> (async 门面等价性)等 feature 相关命令待对应层(含 `[features]` 定义)落地后加入。
 
 ```bash
 cargo fmt --all -- --check
@@ -142,8 +146,8 @@ cargo doc --no-deps              # 公开项 100% 文档覆盖(#![deny(missing_d
 cargo bench                      # criterion 基准(L3 起)
 ```
 
-CI 分 fast / middle / heavy / fuzz 四档,矩阵覆盖 Linux(x86_64/aarch64)与
-Windows(x86_64),详见 [14 §7](docs/design/14-testing.md)。
+CI 阶段(fast / middle / heavy / fuzz 四档,矩阵覆盖 Linux 与 Windows)**目前仅在
+[14 §7](docs/design/14-testing.md) 中定义**;仓库尚未提交 CI 配置文件,上列命令需手动运行。
 
 ## MSRV
 
