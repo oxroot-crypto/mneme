@@ -3,9 +3,12 @@
 > **本套文档写给谁**:完全没写过 Rust、但会用至少一门其他语言(如 Python/Java/C/Go/JavaScript)
 > 写代码的人。你不需要任何 Rust 基础,也不需要 AI 或数据库背景。
 >
-> **本套文档想解决什么**:让你能**独立读懂 `mneme` 的源码**(当前是 L0 原语层 `src/core/`),
-> 并具备继续参与 L1–L6 开发所需的最小 Rust 知识。所有语法点都锚定在 mneme 的真实代码上,
-> 不讲"为了教语法而教语法"的空例子。
+> **本套文档想解决什么**:让你能**独立读懂 `mneme` 的源码**。本套以 L0 原语层
+> `src/core/` 为教材,并把 L1 内存引擎 `src/memory/` 新引入的 Rust 知识
+> (`Arc` 共享所有权、写时复制、`Mutex`/`RwLock` 守卫、`move` 闭包写事务、
+> `dyn` 策略与函数指针、构建者模式)**回填到各章对应小节**(见 §4 对照表);
+> L1 的业务语义与分文件阅读路线见 [设计 03 L1 内存引擎](../design/03-l1-memory.md)。
+> 所有语法点都锚定在 mneme 的真实代码上,不讲"为了教语法而教语法"的空例子。
 >
 > **预计阅读**:6–10 小时(边读边敲会更快掌握)。建议**开着源码对照阅读**。
 
@@ -30,7 +33,7 @@ Rust 的通用教材很多(见 §5),但它们有两个问题:
 
 - **顺序读**:01 → 10。每章只依赖前面章节,不跳步。
 - **边读边跑**:每章末尾有「动手练习」,在 `examples/` 下新建一个文件敲一遍(或用临时 crate)。
-  **不要直接改 `src/core/`**:库里的公开项受 `#![deny(missing_docs)]` 约束,乱加还会污染源码。
+  **不要直接改 `src/core/` 与 `src/memory/`**:库里的公开项受 `#![deny(missing_docs)]` 约束,乱加还会污染源码。
   光看不敲,Rust 的所有权和借用是学不会的。
 - **对照源码**:遇到 `文件:行号` 就跳过去看完整上下文。
 - **不要背语法**:Rust 编译器报错信息极其友好,学会"看报错 → 改代码"比背规则更重要。
@@ -45,12 +48,12 @@ Rust 的通用教材很多(见 §5),但它们有两个问题:
 | 章 | 标题 | 一句话 | 读完后你能看懂 mneme 里的…… |
 |---|---|---|---|
 | [01](01-toolchain.md) | 工具链与 Cargo | `cargo` 怎么构建、测试、出文档 | `Cargo.toml`、edition、MSRV、`cargo test/doc` |
-| [02](02-values-and-ownership.md) | 值、类型与所有权 | Rust 最独特、也最容易卡住的部分 | `u32`/`f32`、`mut`、移动/复制/克隆、newtype |
-| [03](03-structs-enums-impl.md) | 结构体、枚举与 impl | 用类型描述数据、用 `impl` 挂行为 | `RowId`、`Metric`、`MnemeError`、`#[derive]` |
-| [04](04-borrowing-strings-slices.md) | 引用、借用、生命周期与字符串 | `&`、`&mut`、`&str`/`String`/`Arc<str>` | `dot(a, b)`、`Key`、`get_path` 的 `'v` |
+| [02](02-values-and-ownership.md) | 值、类型与所有权 | Rust 最独特、也最容易卡住的部分 | `u32`/`f32`、`mut`、移动/复制/克隆、newtype、`Arc`/写时复制 |
+| [03](03-structs-enums-impl.md) | 结构体、枚举与 impl | 用类型描述数据、用 `impl` 挂行为 | `RowId`、`Metric`、`MnemeError`、`#[derive]`、`Builder` 链 |
+| [04](04-borrowing-strings-slices.md) | 引用、借用、生命周期与字符串 | `&`、`&mut`、`&str`/`String`/`Arc<str>` | `dot(a, b)`、`Key`、`get_path` 的 `'v`、锁守卫 |
 | [05](05-errors.md) | 错误处理 | `Option`/`Result`/`?`/`thiserror` | `MnemeError`、`Result<T>`、varint 的畸形输入 |
-| [06](06-generics-traits.md) | 泛型与 trait | 一套代码适配多种类型 | `TopK<T: Ord>`、`Clock`、`From`/`Display` |
-| [07](07-iterators-closures.md) | 迭代器与闭包 | 用链式调用替代手写循环 | `dot_scalar`、`TopK::into_sorted_vec` |
+| [06](06-generics-traits.md) | 泛型与 trait | 一套代码适配多种类型 | `TopK<T: Ord>`、`Clock`、`From`/`Display`、`dyn` 策略 |
+| [07](07-iterators-closures.md) | 迭代器与闭包 | 用链式调用替代手写循环 | `dot_scalar`、`TopK::into_sorted_vec`、`write_tx` 闭包 |
 | [08](08-modules-docs.md) | 模块、可见性与文档 | 代码怎么分文件、怎么暴露 | `lib.rs`、`core/mod.rs`、`//!` 与 `///` |
 | [09](09-cfg-unsafe-simd.md) | 条件编译、unsafe 与 SIMD | 跨平台与手写向量指令 | `simd.rs` 的 `#[cfg(target_arch)]`、`unsafe` |
 | [10](10-testing.md) | 测试与属性测试 | `#[test]`、doctest、`proptest` | `tests/core_contracts.rs`、契约测试 |
@@ -78,6 +81,20 @@ Rust 的通用教材很多(见 §5),但它们有两个问题:
 | `src/core/options/*.rs` | `struct`、`enum`、`Default`、`#[default]`、嵌套 `Option` | [03](03-structs-enums-impl.md)、[06](06-generics-traits.md) |
 | `src/core/mod.rs` | 模块组织、`//!` 模块文档 | [08](08-modules-docs.md) |
 | `tests/core_contracts.rs` | 集成测试、`proptest`、契约追溯 | [10](10-testing.md) |
+
+L1(`src/memory/`)新引入的 Rust 特性已**回填到对应章节**,不在上表重复:
+
+| L1 新特性 | 落在哪一节 |
+|---|---|
+| `Arc<T>` 共享所有权、`Arc::make_mut` 写时复制 | [02 §3.7](02-values-and-ownership.md) |
+| 链式构建者模式(`mut self -> Self`) | [03 §2.2.3](03-structs-enums-impl.md) |
+| `Mutex`/`RwLock` 与守卫、锁中毒恢复 | [04 §5.1](04-borrowing-strings-slices.md) |
+| trait 对象(`Arc<dyn Trait>`)与函数指针回调 | [06 §4.2](06-generics-traits.md) |
+| `move` 闭包、`FnOnce` 与 `write_tx` 写事务 | [07 §4.3](07-iterators-closures.md) |
+| `include_str!` 契约追溯门禁(元测试) | [10 §5.1](10-testing.md) |
+
+> L1 的业务语义(命名空间、写事务、去重、双时态等)不属于语言教学,见
+> [设计 03 L1 内存引擎](../design/03-l1-memory.md)。
 
 ---
 

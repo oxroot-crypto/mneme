@@ -73,6 +73,10 @@ pub fn encode_u32(mut value: u32, out: &mut Vec<u8>) {
 
 /// 从 `input` 解码一个 varint 编码的 `u64`。
 ///
+/// # Arguments
+/// * `input` - varint 字节序列;`u64` 的合法表示最长 10 字节,输入被截断或
+///   数值溢出时按 `# Errors` 报 `Corrupted`。
+///
 /// # Returns
 ///
 /// 成功时返回 `(解码值, 消耗字节数)`。
@@ -112,6 +116,9 @@ pub fn decode_u64(input: &[u8]) -> Result<(u64, usize)> {
 }
 
 /// 从 `input` 解码一个 varint 编码的 `u32`。
+///
+/// # Arguments
+/// * `input` - varint 字节序列;`u32` 的合法表示最长 5 字节(末组仅 4 个有效位)。
 ///
 /// # Returns
 ///

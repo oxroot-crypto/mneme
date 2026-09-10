@@ -54,7 +54,10 @@ impl RelationKind {
 pub struct Edge { pub from: RowId, pub to: RowId, pub kind: RelationKind, pub weight: f32, pub metadata: Meta }
 
 ns.relate(from, to, kind, weight)?;        // 幂等:同 (from,to,kind) 覆盖 weight(metadata 不变)
-ns.relate_with_meta(from, to, kind, weight, meta)?;  // 幂等:同时覆盖 weight 与 metadata
+ns.relate_with_options(
+    from, to,
+    RelateOptions::new(kind, weight).metadata(meta),
+)?;                                        // 幂等:同时覆盖 weight 与 metadata
 ns.unrelate(from, to, kind)?;              // 返回是否命中
 let edges: Vec<Edge> = ns.neighbors(from, &[RelationKind::SUPPORTS])?;       // 出边
 let in_edges: Vec<Edge> = ns.predecessors(to, &[RelationKind::SUPPORTS])?;  // 入边(见 §2.3)
@@ -139,13 +142,18 @@ ns.supersede(key, new_record)?;   // 语义糖:update 同 key + 将旧版本 val
 `supersede` 把"更新"与"有效时间闭区间"绑定:旧事实在有效时间上被新事实取代,但**历史版本被
 保留**(默认永久,受 `history_horizon` 约束,[07 §4.2a](07-l5-life.md))。这与普通 `update`
 (整体替换、旧版本仅被遮蔽)的区别是:`supersede` 保留"曾经为真"的语义,且历史经版本链可查。
+由于是 `update 同 key`,新记录**沿用目标 key**:`new_record` 省略 key 时继承首参 `key`;
+显式给出且冲突 → `KeyMismatch`,绝不静默改 key 或留下悬挂 `key_index`。已墓碑记录与
+`update` 同口径返回 `NotFound`——墓碑不因 `supersede` 复活([FC-MODEL-POST-003](../spec/contracts.md))。
 
 ### 3.4 矛盾与一致
 
 - `RelationKind::CONTRADICTS` 只是标注,引擎**不自动裁决**谁对;排序时由 [10 §2](10-scoring.md)
   的 `confidence` 与 `recency` 决定倾向,最终由宿主/Agent 决策;
-- `db.check()` 报告"同 key 有效时间重叠的活版本"(可能是未 `supersede` 的更新遗漏),
-  作为一致性建议,不阻断;
+- `db.check()` 在 L1 校验 key 索引 ↔ 最新物理版本对账:索引指向不存在的版本,或最新版本
+  `ns_id`/`key` 与索引不符才报告不一致,墓碑/逻辑过期记录不算不一致
+  ([FC-MEM-POST-008](../spec/contracts.md));L2 起扩展为段 CRC、RowId 版本链一致性、
+  「同 key 有效时间重叠的活版本」等全量校验与建议;建议不阻断;
 - **版本状态(STA 契约用语,对应 [FC-MODEL-STA-001](../spec/contracts.md))**:同一 RowId 的物理版本
   从 `Active`(seqno 最大、当前查询可见)变为 `Shadowed`(被更新遮蔽、当前查询不可见,
   但仍可经 `as_of` 历史读),再在超出 `history_horizon` 后变为 `Reclaimed`(物理回收、彻底不可见)。
@@ -235,7 +243,7 @@ DERIVED_FROM: S→m1, S→m2, S→m4
 
 **向上提供**:
 
-1. 关系:类型注册表、`relate/relate_with_meta/unrelate/neighbors/predecessors`、联想扩展的数据源(不变量 I25);
+1. 关系:类型注册表、`relate/relate_with_options/unrelate/neighbors/predecessors`、联想扩展的数据源(不变量 I25);
 2. 双时态:`valid_from/valid_to`、`as_of(ts)`、`supersede`(不变量 I26);
 3. 来源/可信度:`confidence`/`provenance` 字段与过滤;
 4. 沉淀:`consolidate(policy)` 与 `ConsolidateReport`。

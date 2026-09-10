@@ -85,7 +85,7 @@ $$E_{\text{eff}} = I \cdot 2^{-t/T_{1/2}} + w \cdot \ln(1 + c)$$
 **为什么增益是 $\ln(1+c)$?** 其导数 $\frac{d}{dc}\ln(1+c) = \frac{1}{1+c}$
 单调递减——第 1 次回忆的强化远大于第 100 次(边际递减),符合直觉;
 且 $\ln$ 增长极慢,任何记忆都无法靠刷访问次数变成"不朽"
-($c = 10^6$ 也只加 $w \times 13.8$),$w$ 默认 0.05、经 `Retention::w` 配置。
+($c = 10^6$ 也只加 $w \times 13.8$),$w$ 默认 0.05、经 `Retention::access_weight` 配置。
 
 ### 3.4 Retain 算法与算例
 
@@ -249,7 +249,7 @@ ns.iter(None)?;                 // 遍历/导出一个命名空间的全部活�
   仅调用过 `namespace()` 但从未写入的空空间不会出现(它也不占物理空间);
 - **路径规范**:路径为 `/` 分隔的段序列;`namespace(path)` 会规范化(去除首尾 `/`、
   合并连续 `/`),规范化后为空视为根命名空间,最多 `Limits.ns_depth` 级。由于
-  `namespace()` 不返回 `Result`,超深/含非法字符等错误在**首次写入**时以 `Invalid` 报告;
+  `namespace()` 不返回 `Result`,超深/含非法字符等错误在**首次写入**时以 `Config` 报告;
 - per-NS 统计:来自 msec 的 `ns_stats`(每段每命名空间的 `doc_count`/`total_doc_len`,
   [04 §5.6](04-l2-persist.md))聚合(`db.stats()` 的 `per_namespace`)。
 

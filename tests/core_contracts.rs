@@ -14,13 +14,14 @@
 //! * FC-CORE-INV-002  —— 公开 API 不 panic
 //! * FC-CORE-ERR-001  —— varint 畸形输入结构化报错
 //! * FC-CORE-ERR-002  —— 余弦零向量返回 0
+//! * FC-CORE-CPLX-005 —— varint 编解码 10 字节上界与最小编码(§9.2.1)
 
 use std::cmp::Ordering;
 
 use mneme::meta::{as_bool, as_f64, as_i64, as_str, as_ts, get_path};
 use mneme::simd::{dot, dot_scalar};
 use mneme::varint::{decode_u32, decode_u64, encode_u32, encode_u64};
-use mneme::{Dimension, Metric, RelationKind, TopK, json};
+use mneme::{Dimension, Metric, MnemeError, RelationKind, TopK, json};
 use proptest::prelude::*;
 
 /// 参照实现:按"最优在前、同分载荷升序"排序后取前 k 个。
@@ -106,14 +107,26 @@ fn relation_kind_builtins() {
     assert_eq!(RelationKind::FIRST_CUSTOM, 16);
 }
 
-/// FC-CORE-ERR-001
+/// FC-CORE-ERR-001(畸形输入必须返回结构化的 `Corrupted` 变体,而非其他错误类)
 #[test]
 fn varint_malformed() {
-    assert!(decode_u64(&[0x80]).is_err(), "截断必须报错");
-    assert!(decode_u64(&[]).is_err(), "空输入必须报错");
-    assert!(decode_u64(&[0x80; 11]).is_err(), "超长必须报错");
-    assert!(decode_u64(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02]).is_err());
-    assert!(decode_u32(&[0x80, 0x80, 0x80, 0x80, 0x10]).is_err());
+    assert!(
+        matches!(decode_u64(&[0x80]), Err(MnemeError::Corrupted { .. })),
+        "截断必须报 Corrupted"
+    );
+    assert!(matches!(decode_u64(&[]), Err(MnemeError::Corrupted { .. })));
+    assert!(matches!(
+        decode_u64(&[0x80; 11]),
+        Err(MnemeError::Corrupted { .. })
+    ));
+    assert!(matches!(
+        decode_u64(&[0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x02]),
+        Err(MnemeError::Corrupted { .. })
+    ));
+    assert!(matches!(
+        decode_u32(&[0x80, 0x80, 0x80, 0x80, 0x10]),
+        Err(MnemeError::Corrupted { .. })
+    ));
 }
 
 /// FC-CORE-ERR-002
@@ -212,7 +225,16 @@ proptest! {
         let b = &b[..len];
         let vectorized = dot(a, b);
         let scalar = dot_scalar(a, b);
-        let tolerance = 1e-4 * (1.0 + scalar.abs());
+        // 两种实现的差异来自 f32 累加的舍入顺序,上界 ≈ γ_n · Σ|a_i·b_i|
+        // (γ_n = n·ε/(1 − n·ε));固定容差在长向量下会偶发误报,按 4 倍余量随长度缩放。
+        let sum_abs: f32 = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| x.abs() * y.abs())
+            .sum();
+        let n = a.len() as f32;
+        let gamma = (n * f32::EPSILON) / (1.0 - n * f32::EPSILON);
+        let tolerance = 4.0 * gamma * sum_abs + 1e-5;
         prop_assert!(
             (vectorized - scalar).abs() <= tolerance,
             "dot={vectorized} scalar={scalar}"
