@@ -77,7 +77,7 @@ let in_edges: Vec<Edge> = ns.predecessors(to, &[RelationKind::SUPPORTS])?;  // �
 | 形态 | 位置 |
 |---|---|
 | 内存增量 | `WriterState.relations`([03 §3](03-l1-memory.md)) |
-| 持久化 | 段内 relations 区([04 §2.2b](04-l2-persist.md));变更经 WAL `Relate`/`Unrelate` 帧 + delta 区 |
+| 持久化 | 全量快照段的 relations 区([04 §2.2b](04-l2-persist.md),仅正向表;反向边恢复时在内存重建);变更经 WAL `Relate`/`Unrelate` 帧(delta 区属 L5,L2 恒空) |
 | 可见性 | 任一端被删除 → 边视为悬挂、不返回;compaction 物理清除 |
 
 - **不变量 I25**:`neighbors` 只返回两端都活着的边;删除/遗忘一端后,边**立即**在视图上失效
@@ -248,7 +248,7 @@ DERIVED_FROM: S→m1, S→m2, S→m4
 3. 来源/可信度:`confidence`/`provenance` 字段与过滤;
 4. 沉淀:`consolidate(policy)` 与 `ConsolidateReport`。
 
-**依赖**:L0(类型)、L2(delta/relations 持久化)、L3(近邻查询用于聚类)、L4(计划器用于 filter)、L5(compaction/tombstone)。
+**依赖**:L0(类型)、L2(relations 持久化)、L3(近邻查询用于聚类)、L4(计划器用于 filter)、L5(compaction/tombstone;delta 覆盖区)。
 
 **不变量**:I22(稳定 RowId)、I24(更新原子可见)、I25(关系一致)、I26(双时态一致;历史默认永久保留,受 `history_horizon` 约束)。
 

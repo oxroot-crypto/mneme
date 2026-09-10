@@ -21,7 +21,7 @@ crc32fast = "1"
 
 [dev-dependencies]
 proptest = "1"
-# 持久层测试用临时目录(白名单内,见 docs/design/01-overview.md §5.1)。
+# 持久层测试用临时目录(白名单内,见 docs/design/01-overview.md §5)。
 tempfile = "3"
 
 [profile.release]

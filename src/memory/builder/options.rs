@@ -201,7 +201,7 @@ impl Builder {
         self
     }
 
-    /// 设置压缩策略(仅记录,L2 生效)。
+    /// 设置压缩策略(仅记录,实现归 L11 安全存储;L2 预留磁盘扩展区)。
     ///
     /// # Arguments
     ///
@@ -285,7 +285,7 @@ impl Builder {
         self
     }
 
-    /// 只读共享模式(仅记录,L12 生效)。
+    /// 只读共享模式(L2 已实现单进程只读打开:不持锁、不写盘)。
     ///
     /// # Arguments
     ///
@@ -336,7 +336,23 @@ impl Builder {
     /// # Returns
     ///
     /// 携带钩子的构建器(链式)。
-    pub fn fsync_hook(mut self, hook: std::sync::Arc<dyn crate::persist::hook::FsyncHook>) -> Self {
+    ///
+    /// # Examples
+    /// ```
+    /// use std::sync::Arc;
+    /// use mneme::{Builder, FsyncHook, IoAction};
+    ///
+    /// struct Noop;
+    /// impl FsyncHook for Noop {
+    ///     fn before(&self, _action: IoAction<'_>) -> std::io::Result<()> {
+    ///         Ok(())
+    ///     }
+    /// }
+    ///
+    /// let builder = Builder::default().fsync_hook(Arc::new(Noop));
+    /// # let _ = builder;
+    /// ```
+    pub fn fsync_hook(mut self, hook: Arc<dyn crate::FsyncHook>) -> Self {
         self.fsync_hook = Some(hook);
         self
     }

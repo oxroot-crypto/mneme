@@ -35,6 +35,12 @@ pub(crate) const HEADER_LEN: u16 = 192;
 const HEADER_CRC_COVER: usize = 160;
 /// 墓碑版本在 `version_table` 中的 `doc_offset` 哨兵(无记录体)。
 pub(crate) const TOMBSTONE_DOC_OFFSET: u64 = u64::MAX;
+/// `version_table` 单行定长字节数。
+const VERSION_ROW_BYTES: usize = 36;
+/// `ns_stats` 单行定长字节数。
+const NS_STAT_ROW_BYTES: usize = 20;
+/// 各数据区起点的对齐字节数。
+const REGION_ALIGN: usize = 8;
 
 const FLAG_KEY: u8 = 1 << 0;
 const FLAG_TEXT: u8 = 1 << 1;
@@ -138,7 +144,7 @@ pub(crate) struct MsecInput<'a> {
     pub(crate) slots: &'a [SlotMeta],
     /// 命名空间统计。
     pub(crate) ns_stats: &'a [NsStatRow],
-    /// 预编码的 delta 区(见 [`crate::persist::delta`]);无覆盖时为 `&[]`。
+    /// 预编码的 delta(跨段覆盖)区;L2 全量快照恒为 `&[]`,该区保留给 L5 compaction。
     pub(crate) delta: &'a [u8],
     /// 预编码的 relations 区(见 [`crate::persist::edges`]);无边时为 `&[]`。
     pub(crate) relations: &'a [u8],

@@ -34,8 +34,6 @@
 pub mod core;
 pub mod memory;
 
-// L2 持久层。M1 阶段仅编解码与单元测试使用,M2 接线进引擎后移除该 allow。
-#[allow(dead_code)]
 mod persist;
 
 pub use crate::core::error::{MnemeError, Result};

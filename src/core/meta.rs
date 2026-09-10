@@ -169,7 +169,7 @@ pub(crate) fn size_bytes(value: &Meta) -> usize {
     serde_json::to_vec(value).map_or(usize::MAX, |bytes| bytes.len())
 }
 
-/// 把 JSON 值序列化为紧凑字节(L2 持久层 `msec`/`delta` 编码用)。
+/// 把 JSON 值序列化为紧凑字节(L2 持久层 `msec` 编码用)。
 ///
 /// 序列化唯一的失败分支是 `usize`/`f64` 极端值,此时返回空串由调用方按损坏处理。
 ///
@@ -184,7 +184,7 @@ pub(crate) fn to_bytes(value: &Meta) -> Vec<u8> {
     serde_json::to_vec(value).unwrap_or_default()
 }
 
-/// 从紧凑字节反序列化 JSON 值(L2 持久层 `msec`/`delta` 解码用)。
+/// 从紧凑字节反序列化 JSON 值(L2 持久层 `msec` 解码用)。
 ///
 /// # Arguments
 ///

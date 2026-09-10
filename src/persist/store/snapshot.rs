@@ -92,51 +92,35 @@ impl Store {
 
         let (version, manifest) = self.versioned_manifest();
 
-        let mut files = 0_usize;
-        let mut bytes = 0_u64;
-        let mut copy = |rel: &str| -> Result<()> {
-            if let Some(content) = storage::read_file_opt(&self.root, rel)? {
-                bytes += content.len() as u64;
-                files += 1;
-                storage::write_atomic(target, rel, &content)?;
-            }
-            Ok(())
-        };
-
+        let mut counts = CopyCounts::default();
         for segment in &manifest.segments {
-            copy(&format!("{SEGMENTS_DIR}/{}", vsec_name(segment.segment_id)))?;
-            copy(&format!("{SEGMENTS_DIR}/{}", msec_name(segment.segment_id)))?;
+            // 被 MANIFEST 引用的段必须存在;缺失即备份不可信,绝不静默产出残档。
+            copy_required(
+                &self.root,
+                target,
+                &format!("{SEGMENTS_DIR}/{}", vsec_name(segment.segment_id)),
+                &mut counts,
+            )?;
+            copy_required(
+                &self.root,
+                target,
+                &format!("{SEGMENTS_DIR}/{}", msec_name(segment.segment_id)),
+                &mut counts,
+            )?;
         }
-        copy(&manifest_name(version))?;
-        copy(WAL_FILE)?;
+        copy_required(&self.root, target, &manifest_name(version), &mut counts)?;
+        // WAL 可以在只读实例中不存在,故为可选。
+        copy_optional(&self.root, target, WAL_FILE, &mut counts)?;
+        let CopyCounts { files, bytes } = counts;
         // `current` 最后写:中途失败则备份不可打开,不会误认为完整。
-        storage::write_atomic(target, CURRENT_FILE, version.to_string().as_bytes())?;
-        files += 1;
-        bytes += version.to_string().len() as u64;
+        let current = version.to_string();
+        storage::write_atomic(target, CURRENT_FILE, current.as_bytes())?;
 
         Ok(crate::memory::ops::BackupReport {
-            files,
-            bytes,
+            files: files + 1,
+            bytes: bytes + current.len() as u64,
             hardlinked: false,
         })
-    }
-
-    /// 当前 MANIFEST 快照(克隆)。
-    fn manifest_snapshot(&self) -> Manifest {
-        self.manifest
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .manifest
-            .clone()
-    }
-
-    /// 当前 `(版本号, MANIFEST)` 快照。
-    fn versioned_manifest(&self) -> (u64, Manifest) {
-        let guard = self
-            .manifest
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        (guard.version, guard.manifest.clone())
     }
 
     /// 由当前写状态与刚物化的段构造下一个 MANIFEST 版本。
@@ -201,6 +185,34 @@ impl Store {
         wal.reset()?;
         Ok(())
     }
+}
+
+/// 备份已复制文件数与字节数。
+#[derive(Default)]
+struct CopyCounts {
+    files: usize,
+    bytes: u64,
+}
+
+/// 复制一个必须存在的库内文件;缺失返回 [`MnemeError::Corrupted`]。
+fn copy_required(root: &Path, target: &Path, rel: &str, counts: &mut CopyCounts) -> Result<()> {
+    let content = storage::read_file(root, rel).map_err(|_| MnemeError::Corrupted {
+        segment: None,
+        reason: format!("备份:必存文件缺失或不可读:{rel}"),
+    })?;
+    counts.files += 1;
+    counts.bytes += content.len() as u64;
+    storage::write_atomic(target, rel, &content)
+}
+
+/// 复制一个可选文件(如只读实例中不存在的 WAL);缺失则跳过。
+fn copy_optional(root: &Path, target: &Path, rel: &str, counts: &mut CopyCounts) -> Result<()> {
+    if let Some(content) = storage::read_file_opt(root, rel)? {
+        counts.files += 1;
+        counts.bytes += content.len() as u64;
+        storage::write_atomic(target, rel, &content)?;
+    }
+    Ok(())
 }
 
 /// 旧段文件名列表(用于移入 `trash/`)。

@@ -49,11 +49,12 @@ fn apply_frame(state: &mut WriterState, seqno: u64, kind: FrameKind, payload: &[
         FrameKind::NsRegister => apply_ns_register(state, payload),
         FrameKind::Insert => apply_insert(state, payload),
         FrameKind::DeleteRow => {
-            let rowid = RowId::new(wal::decode_delete_row(payload)?);
+            let (rowid, tx_ms) = wal::decode_delete_row(payload)?;
+            let rowid = RowId::new(rowid);
             if rowid.get() >= state.next_rowid {
                 state.next_rowid = rowid.get() + 1;
             }
-            let _ = state.tombstone(rowid, 0, SeqNo::new(seqno))?;
+            state.tombstone(rowid, tx_ms, SeqNo::new(seqno))?;
             Ok(())
         }
         FrameKind::TouchRow => {
@@ -86,13 +87,13 @@ fn apply_ns_register(state: &mut WriterState, payload: &[u8]) -> Result<()> {
 
 /// 应用 `Insert` 帧。
 fn apply_insert(state: &mut WriterState, payload: &[u8]) -> Result<()> {
-    let (entry, vector) = wal::decode_insert(payload)?;
+    let (entry, vector, tx_ms) = wal::decode_insert(payload)?;
     let slot = slot_from_entry(
         state,
         SlotFromEntry {
             entry: &entry,
             vector,
-            tx_ms: entry.created_at_ms,
+            tx_ms,
             deleted: false,
         },
     );

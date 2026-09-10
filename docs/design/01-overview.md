@@ -176,8 +176,8 @@ mneme/
 ├── src/
 │   ├── lib.rs          # 门面:Mneme / Namespace / Builder;pub use 公开类型
 │   ├── core/           # L0:types.rs error.rs metric.rs simd.rs varint.rs meta.rs heap.rs options/
-│   ├── memory/         # L1:engine.rs engine_ops.rs builder.rs namespace/ snapshot.rs snapshot_scan.rs search_builder.rs search_exec.rs expand.rs rerank.rs table.rs bitset.rs search.rs pred.rs pred_eval.rs record.rs write_helpers.rs mutate_helpers.rs dedup.rs relation.rs temporal.rs score.rs lifecycle.rs ops.rs config.rs
-│   ├── persist/        # L2:wal.rs vsec.rs msec.rs delta.rs edges.rs manifest.rs recover.rs flush.rs source.rs storage.rs trash.rs store.rs
+│   ├── memory/         # L1:engine.rs engine_ops.rs builder/ namespace/ snapshot.rs snapshot_scan.rs search_builder.rs search_exec.rs expand.rs rerank.rs table/ bitset.rs search.rs pred.rs pred_eval.rs record.rs write_helpers.rs mutate_helpers.rs dedup.rs relation.rs temporal.rs score.rs lifecycle.rs ops.rs config.rs
+│   ├── persist/        # L2:mod.rs codec.rs hook.rs wal/ msec/ recover/ store/ vsec.rs manifest.rs edges.rs flush.rs source.rs storage.rs trash.rs
 │   ├── index/          # L3:hnsw.rs graph.rs filtered.rs merge.rs rebuild.rs
 │   ├── query/          # L4:parse.rs plan.rs zmap.rs bm25.rs fusion.rs result_dedup.rs exec.rs
 │   ├── life/           # L5:ttl.rs retain.rs access.rs namespace.rs compact.rs backup.rs stats.rs
@@ -212,8 +212,8 @@ compaction 调度、分词)**全部自研**。
 | `memmap2` | mmap 零拷贝读 | L3 起 | feature `mmap`(默认开);关闭走 `Read+Seek` 兜底 |
 | `half` | f16 转换 | L6 | feature `quant-f16` |
 | `tokio` | async 门面 | 门面 | feature `async`(默认关);核心零 tokio |
-| `aes-gcm` | 静态加密 AEAD | L2 | feature `encrypt`(默认关);仅 `crypto/` 接触 |
-| `zstd` | 可选更强压缩 | L2 | feature `compress-zstd`(默认关);内置 LZ4 风格 codec 无依赖 |
+| `aes-gcm` | 静态加密 AEAD | L11 | feature `encrypt`(默认关);仅 `crypto/` 接触([11 §2](11-security-storage.md)) |
+| `zstd` | 可选更强压缩 | L11 | feature `compress-zstd`(默认关);内置 LZ4 风格 codec 无依赖([11 §3](11-security-storage.md)) |
 
 > **默认构建口径**:`thiserror` + `serde` + `serde_json` + `crc32fast` = 4 个**直接**强依赖
 > (`serde_json` 另带入 `itoa`/`ryu`/`memchr` 等极少数传递依赖);

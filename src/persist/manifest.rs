@@ -27,6 +27,8 @@ use crate::persist::{
 pub(crate) const MAGIC: [u8; 4] = *b"MNF1";
 /// 定长头部长度(字节)。
 pub(crate) const HEADER_LEN: u16 = 72;
+/// 单个段条目的定长字节数(见 [`parse_segments`] 字段顺序)。
+const SEGMENT_ENTRY_BYTES: usize = 55;
 
 /// 命名空间注册项(`path ↔ NsId`)。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,9 +273,9 @@ fn parse_header(bytes: &[u8]) -> Result<ManifestHeader> {
     })
 }
 
-/// 解析命名空间条目列表。
+/// 解析命名空间条目列表(按剩余字节数设预分配上界,抵御损坏计数)。
 fn parse_namespaces(cursor: &mut Cursor<'_>, count: usize) -> Result<Vec<NsEntry>> {
-    let mut namespaces = Vec::with_capacity(count);
+    let mut namespaces = Vec::with_capacity(count.min(cursor.remaining() / 8));
     for _ in 0..count {
         let ns_id = cursor.u32()?;
         let len = cursor.u32()? as usize;
@@ -283,9 +285,9 @@ fn parse_namespaces(cursor: &mut Cursor<'_>, count: usize) -> Result<Vec<NsEntry
     Ok(namespaces)
 }
 
-/// 解析关系类型条目列表。
+/// 解析关系类型条目列表(按剩余字节数设预分配上界,抵御损坏计数)。
 fn parse_rel_kinds(cursor: &mut Cursor<'_>, count: usize) -> Result<Vec<RelKindEntry>> {
-    let mut rel_kinds = Vec::with_capacity(count);
+    let mut rel_kinds = Vec::with_capacity(count.min(cursor.remaining() / 6));
     for _ in 0..count {
         let kind = cursor.u16()?;
         let len = cursor.u32()? as usize;
@@ -295,9 +297,9 @@ fn parse_rel_kinds(cursor: &mut Cursor<'_>, count: usize) -> Result<Vec<RelKindE
     Ok(rel_kinds)
 }
 
-/// 解析段条目列表。
+/// 解析段条目列表(每条定长 55 B;按剩余字节数设预分配上界,抵御损坏计数)。
 fn parse_segments(cursor: &mut Cursor<'_>, count: usize) -> Result<Vec<SegmentEntry>> {
-    let mut segments = Vec::with_capacity(count);
+    let mut segments = Vec::with_capacity(count.min(cursor.remaining() / SEGMENT_ENTRY_BYTES));
     for _ in 0..count {
         segments.push(SegmentEntry {
             segment_id: cursor.u32()?,

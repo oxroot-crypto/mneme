@@ -18,15 +18,18 @@ pub(crate) struct RelateSpec<'a> {
     pub(crate) meta: &'a Meta,
 }
 
-/// 编码 `Insert` 负载:`[记录体(含长度前缀)][u32 dim][f32 × dim]`。
+/// 编码 `Insert` 负载:`[记录体(含长度前缀)][i64 tx_ms][u32 dim][f32 × dim]`。
 ///
 /// 记录体(设计 04 §2.3)只含元数据不含向量,故 WAL 追加向量副本以支持崩溃恢复;
 /// 该字段是对设计 §2.3 的必要补全(否则未 flush 的记录重启后向量丢失)。
+/// `tx_ms` 是版本事务时间,独立于记录体的 `created_at_ms`(后者在 update/touch 后
+/// 保持不变),缺失会使崩溃恢复后的 `as_of` 历史错乱。
 ///
 /// # Errors
 /// 记录体或向量长度超限时返回 [`MnemeError::TooLarge`]。
-pub(crate) fn encode_insert(entry: &EntryData, vector: &[f32]) -> Result<Vec<u8>> {
+pub(crate) fn encode_insert(entry: &EntryData, vector: &[f32], tx_ms: i64) -> Result<Vec<u8>> {
     let mut out = msec::encode_entry(entry)?;
+    put_i64(&mut out, tx_ms);
     let dim = u32::try_from(vector.len()).map_err(|_| MnemeError::TooLarge {
         field: "wal insert vector",
         limit: u32::MAX as usize,
@@ -39,25 +42,31 @@ pub(crate) fn encode_insert(entry: &EntryData, vector: &[f32]) -> Result<Vec<u8>
     Ok(out)
 }
 
-/// 解码 `Insert` 负载,返回 `(记录体, 向量)`。
+/// 解码 `Insert` 负载,返回 `(记录体, 向量, tx_ms)`。
 ///
 /// # Errors
 /// 记录体或向量损坏时返回 [`MnemeError::Corrupted`]。
-pub(crate) fn decode_insert(payload: &[u8]) -> Result<(EntryData, Vec<f32>)> {
+pub(crate) fn decode_insert(payload: &[u8]) -> Result<(EntryData, Vec<f32>, i64)> {
     let entry = msec::entry_from_prefix(payload)?;
     let total_len = u32::from_le_bytes(payload[0..4].try_into().unwrap_or([0; 4])) as usize;
-    let mut cursor = Cursor::new(&payload[4 + total_len..], "wal insert 向量");
+    let vector_start = 4 + total_len;
+    let mut cursor = Cursor::new(&payload[vector_start..], "wal insert 向量");
+    let tx_ms = cursor.i64()?;
     let dim = cursor.u32()? as usize;
-    let mut vector = Vec::with_capacity(dim);
+    // 按剩余字节数上界预分配,避免损坏文件里的大 dim 触发超额分配(设计 04 §11)。
+    let mut vector = Vec::with_capacity(dim.min(cursor.remaining() / 4));
     for _ in 0..dim {
         vector.push(f32::from_le_bytes(
             cursor.take(4)?.try_into().unwrap_or([0; 4]),
         ));
     }
-    Ok((entry, vector))
+    Ok((entry, vector, tx_ms))
 }
 
 /// 编码 `Delete` 负载 `[NsId u32][key len+bytes]`。
+///
+/// 仅测试/协议夹具使用:运行时删除走 `DeleteRow`。
+#[cfg(test)]
 pub(crate) fn encode_delete(ns_id: u32, key: &str) -> Vec<u8> {
     let mut out = Vec::new();
     put_u32(&mut out, ns_id);
@@ -67,8 +76,11 @@ pub(crate) fn encode_delete(ns_id: u32, key: &str) -> Vec<u8> {
 
 /// 解码 `Delete` 负载。
 ///
+/// 仅测试/协议夹具使用:运行时删除走 `DeleteRow`。
+///
 /// # Errors
 /// 长度越界或 key 非 UTF-8 时返回 [`MnemeError::Corrupted`]。
+#[cfg(test)]
 pub(crate) fn decode_delete(payload: &[u8]) -> Result<(u32, Arc<str>)> {
     let mut cursor = Cursor::new(payload, "wal delete");
     let ns_id = cursor.u32()?;
@@ -80,20 +92,23 @@ pub(crate) fn decode_delete(payload: &[u8]) -> Result<(u32, Arc<str>)> {
     Ok((ns_id, Arc::from(key)))
 }
 
-/// 编码 `DeleteRow` 负载。
-pub(crate) fn encode_delete_row(rowid: u64) -> Vec<u8> {
+/// 编码 `DeleteRow` 负载 `[RowId][i64 tx_ms]`。
+///
+/// `tx_ms` 用于崩溃恢复后重建墓碑的事务时间,使删除前的 `as_of` 历史正确。
+pub(crate) fn encode_delete_row(rowid: u64, tx_ms: i64) -> Vec<u8> {
     let mut out = Vec::new();
     put_u64(&mut out, rowid);
+    put_i64(&mut out, tx_ms);
     out
 }
 
-/// 解码 `DeleteRow` 负载。
+/// 解码 `DeleteRow` 负载,返回 `(RowId, tx_ms)`。
 ///
 /// # Errors
 /// 长度不足时返回 [`MnemeError::Corrupted`]。
-pub(crate) fn decode_delete_row(payload: &[u8]) -> Result<u64> {
+pub(crate) fn decode_delete_row(payload: &[u8]) -> Result<(u64, i64)> {
     let mut cursor = Cursor::new(payload, "wal delete_row");
-    cursor.u64()
+    Ok((cursor.u64()?, cursor.i64()?))
 }
 
 /// 编码 `TouchRow` 负载 `[RowId][i64 at_ms][u32 access_delta][f32 importance_delta]`。
@@ -169,6 +184,9 @@ pub(crate) fn decode_unrelate(payload: &[u8]) -> Result<(u64, u64, u16)> {
 }
 
 /// 编码 `Checkpoint` 负载。
+///
+/// 仅测试/协议夹具使用:L2 Checkpoint 经 MANIFEST 水位 + `WalWriter::reset` 落地。
+#[cfg(test)]
 pub(crate) fn encode_checkpoint(watermark_seqno: u64) -> Vec<u8> {
     let mut out = Vec::new();
     put_u64(&mut out, watermark_seqno);
@@ -177,8 +195,11 @@ pub(crate) fn encode_checkpoint(watermark_seqno: u64) -> Vec<u8> {
 
 /// 解码 `Checkpoint` 负载。
 ///
+/// 仅测试/协议夹具使用。
+///
 /// # Errors
 /// 长度不足时返回 [`MnemeError::Corrupted`]。
+#[cfg(test)]
 pub(crate) fn decode_checkpoint(payload: &[u8]) -> Result<u64> {
     let mut cursor = Cursor::new(payload, "wal checkpoint");
     cursor.u64()
@@ -229,12 +250,4 @@ pub(crate) fn decode_ns_register(payload: &[u8]) -> Result<(u32, Arc<str>)> {
         reason: format!("wal: path 非 UTF-8:{error}"),
     })?;
     Ok((ns_id, Arc::from(path)))
-}
-
-/// 编码 `RelKindRegister` 负载 `[kind u16][name len+bytes]`。
-pub(crate) fn encode_rel_kind_register(kind: u16, name: &str) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(&kind.to_le_bytes());
-    put_bytes_u32(&mut out, name.as_bytes());
-    out
 }

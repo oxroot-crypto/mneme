@@ -49,11 +49,12 @@ impl WalWriter {
     /// # Errors
     /// I/O 失败返回 [`MnemeError::Io`]。
     pub(super) fn open_or_create(root: &Path, config: WalConfig) -> Result<Self> {
-        storage::ensure_dir(&root.join(WAL_DIR))?;
         let path = storage::resolve(root, WAL_FILE)?;
         if config.read_only {
+            // 只读实例不建目录、不创建文件;WAL 不存在时仅不持有句柄。
             return open_read_only(path, config);
         }
+        storage::ensure_dir(&root.join(WAL_DIR))?;
         if let Some(file) = reuse_existing(root, &path, config.dimension, config.metric)? {
             return Ok(Self::from_parts(Some(file), config));
         }
@@ -117,6 +118,30 @@ impl WalWriter {
         if let Some(hook) = &hook {
             hook.before(IoAction::Fsync { file: WAL_FILE })?;
         }
+        file.sync_all()?;
+        Ok(())
+    }
+
+    /// 当前 WAL 文件字节长度(用于写事务失败时回滚截断点)。
+    ///
+    /// # Errors
+    /// 元数据读取失败时返回 [`MnemeError::Io`]。
+    pub(super) fn len(&self) -> Result<u64> {
+        match &self.file {
+            Some(file) => Ok(file.metadata()?.len()),
+            None => Ok(0),
+        }
+    }
+
+    /// 回滚到 `len`:截断文件并 seek 到末尾,丢弃本次事务已写入的半写/未确认帧。
+    ///
+    /// # Errors
+    /// 只读实例返回 [`MnemeError::Unsupported`];I/O 失败返回 [`MnemeError::Io`]。
+    pub(super) fn rollback_to(&mut self, len: u64) -> Result<()> {
+        let file = self.writable()?;
+        file.set_len(len)?;
+        use std::io::{Seek, SeekFrom};
+        file.seek(SeekFrom::Start(len))?;
         file.sync_all()?;
         Ok(())
     }

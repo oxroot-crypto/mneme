@@ -25,31 +25,23 @@ impl PersistHook for Store {
                 feature: "只读模式写入",
             });
         }
+        let batch_count = u32::try_from(ops.len()).map_err(|_| MnemeError::TooLarge {
+            field: "wal batch",
+            limit: u32::MAX as usize,
+            got: ops.len(),
+        })?;
         let mut wal = self
             .wal
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let batch = ops.len() > 1;
-        if batch {
-            wal.append(
-                0,
-                FrameKind::BatchBegin,
-                &wal::encode_batch_begin(ops.len() as u32),
-            )?;
+        // 事务起点:任一 append/sync 失败即截断回此处,丢弃半写/未确认帧。
+        // 否则「返回 Err 却已落盘」或残帧永久遮挡后续已 fsync 的写(FC-PERSIST-INV-001)。
+        let start = wal.len()?;
+        if let Err(error) = append_transaction(&mut wal, ops, batch_count) {
+            // reason: 回滚失败无法再传播(仅能保留原错误);尽力截断以恢复一致性。
+            wal.rollback_to(start).ok();
+            return Err(error);
         }
-        for op in ops {
-            append_op(&mut wal, op)?;
-        }
-        if batch {
-            let crc = crc32(&[ops.len() as u8]);
-            wal.append(
-                0,
-                FrameKind::BatchCommit,
-                &wal::encode_batch_commit(ops.len() as u32, crc),
-            )?;
-        }
-        // 整个写事务只 fsync 一次(组提交)。
-        wal.sync()?;
         Ok(())
     }
 
@@ -66,11 +58,36 @@ impl PersistHook for Store {
     }
 }
 
-/// 追加单条写操作到 WAL(不含批边界与 fsync)。
-fn append_op(wal: &mut WalWriter, op: &WriteOp) -> Result<()> {
-    let (seqno, kind) = op_dispatch(op);
-    let payload = op_payload(op)?;
-    wal.append(seqno, kind, &payload)
+/// 追加一个写事务的全部帧并组提交 fsync;任一步失败即返回错误(由调用方回滚)。
+fn append_transaction(wal: &mut WalWriter, ops: &[WriteOp], batch_count: u32) -> Result<()> {
+    let batch = ops.len() > 1;
+    if batch {
+        wal.append(
+            0,
+            FrameKind::BatchBegin,
+            &wal::encode_batch_begin(batch_count),
+        )?;
+    }
+    // 批 CRC 覆盖批内全部帧负载;回放时按计数与 CRC 校验原子边界(设计 04 §3.3)。
+    let mut batch_crc_input = Vec::new();
+    for op in ops {
+        let (seqno, kind) = op_dispatch(op);
+        let payload = op_payload(op)?;
+        if batch {
+            batch_crc_input.extend_from_slice(&payload);
+        }
+        wal.append(seqno, kind, &payload)?;
+    }
+    if batch {
+        let crc = crc32(&batch_crc_input);
+        wal.append(
+            0,
+            FrameKind::BatchCommit,
+            &wal::encode_batch_commit(batch_count, crc),
+        )?;
+    }
+    // 整个写事务只 fsync 一次(组提交)。
+    wal.sync()
 }
 
 /// 取写操作的 `(seqno, 帧类型)`。
@@ -91,9 +108,9 @@ fn op_payload(op: &WriteOp) -> Result<Vec<u8>> {
         WriteOp::NsRegister { ns_id, path } => wal::encode_ns_register(*ns_id, path),
         WriteOp::Insert { slot } => {
             let entry = entry_from_slot(slot);
-            wal::encode_insert(&entry, &slot.vector)?
+            wal::encode_insert(&entry, &slot.vector, slot.tx_ms)?
         }
-        WriteOp::DeleteRow { rowid, .. } => wal::encode_delete_row(rowid.get()),
+        WriteOp::DeleteRow { rowid, tx_ms, .. } => wal::encode_delete_row(rowid.get(), *tx_ms),
         WriteOp::Access {
             rowid,
             at_ms,

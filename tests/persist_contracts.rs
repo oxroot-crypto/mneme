@@ -5,14 +5,18 @@
 //! 本文件的条目双向相等,由 `tests/contract_traceability.rs` 机械校验。
 //!
 //! 覆盖的契约:`FC-PERSIST-INV-001`、`FC-PERSIST-INV-002`、`FC-PERSIST-INV-003`、
-//! `FC-PERSIST-INV-004`、`FC-PERSIST-INV-019`、`FC-PERSIST-INV-020`、
+//! `FC-PERSIST-INV-004`、`FC-PERSIST-INV-005`、`FC-PERSIST-INV-006`、
+//! `FC-PERSIST-INV-019`、`FC-PERSIST-INV-020`、
 //! `FC-PERSIST-POST-001`、`FC-PERSIST-POST-002`、`FC-PERSIST-POST-003`、
-//! `FC-PERSIST-POST-004`、`FC-PERSIST-POST-005`、`FC-PERSIST-STA-001`、
-//! `FC-PERSIST-STA-002`、`FC-PERSIST-ERR-002`、`FC-PERSIST-ERR-003`、
-//! `FC-PERSIST-ERR-004`、`FC-PERSIST-ERR-005`、`FC-PERSIST-CPLX-001`、`FC-PERSIST-CPLX-007`、
+//! `FC-PERSIST-POST-004`、`FC-PERSIST-POST-005`、`FC-PERSIST-POST-006`、
+//! `FC-PERSIST-STA-001`、`FC-PERSIST-STA-002`、`FC-PERSIST-STA-003`、
+//! `FC-PERSIST-ERR-002`、`FC-PERSIST-ERR-003`、`FC-PERSIST-ERR-004`、
+//! `FC-PERSIST-ERR-005`、`FC-PERSIST-ERR-006`、`FC-PERSIST-ERR-007`、`FC-PERSIST-CPLX-001`、`FC-PERSIST-CPLX-007`、
 //! `FC-PERSIST-CPLX-008`、`FC-PERSIST-CPLX-009`、`FC-PERSIST-CPLX-010`。
 //!
 //! 片级编解码的损坏检出与版本拒绝见各 `src/persist/*.rs` 单元测试。
+
+mod common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -263,6 +267,64 @@ fn injected_wal_failure_keeps_confirmed_prefix() {
     db.close().expect("close");
 }
 
+/// **FC-PERSIST-INV-001(I1)**:写事务的 append/sync 失败时截断半写帧——
+/// 返回 `Err` 的写绝不持久,且不遮挡后续已确认写。
+#[test]
+fn injected_fsync_failure_rolls_back_frames() {
+    /// 在第 `fail_on` 次 WAL fsync(0 基)前返回错误的钩子。
+    struct FailFsyncAt {
+        count: AtomicUsize,
+        fail_on: usize,
+    }
+    impl FsyncHook for FailFsyncAt {
+        fn before(&self, action: IoAction<'_>) -> std::io::Result<()> {
+            if let IoAction::Fsync { file } = action
+                && file.starts_with("wal/")
+            {
+                let n = self.count.fetch_add(1, Ordering::SeqCst);
+                if n == self.fail_on {
+                    return Err(std::io::Error::other("injected WAL fsync failure"));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let hook = Arc::new(FailFsyncAt {
+        count: AtomicUsize::new(0),
+        fail_on: 0,
+    });
+    {
+        let db = Builder::default()
+            .dimension(2)
+            .path(dir.path())
+            .fsync_hook(Arc::clone(&hook) as Arc<dyn FsyncHook>)
+            .build()
+            .expect("build");
+        let ns = db.namespace("demo");
+        assert!(
+            ns.insert(Record::new(vec![1.0, 0.0]).key("a")).is_err(),
+            "fsync 失败必须使写事务报错"
+        );
+        // fsync 仅失败一次;后续已确认写必须成功。
+        ns.insert(Record::new(vec![0.0, 1.0]).key("b"))
+            .expect("second insert");
+    }
+
+    let db = Mneme::open(dir.path()).expect("reopen");
+    let ns = db.namespace("demo");
+    assert!(
+        ns.get("a").expect("get a").is_none(),
+        "失败的写绝不持久(半写帧已被截断)"
+    );
+    assert!(
+        ns.get("b").expect("get b").is_some(),
+        "后续已确认写不得被残帧遮挡"
+    );
+    db.close().expect("close");
+}
+
 /// **FC-PERSIST-POST-005**:`relate`/`unrelate` 仅存于 WAL 时崩溃,回放后仍生效。
 #[test]
 fn relate_and_unrelate_survive_crash() {
@@ -304,7 +366,7 @@ fn relate_and_unrelate_survive_crash() {
     db.close().expect("close");
 }
 
-/// **FC-PERSIST-POST-005**:`touch` 的 importance 强化经 WAL 在崩溃后保留。
+/// **FC-PERSIST-POST-005**:`touch` 的 importance 强化与访问统计经 WAL 在崩溃后保留。
 #[test]
 fn touch_boost_survives_crash() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -318,6 +380,11 @@ fn touch_boost_survives_crash() {
     let ns = db.namespace("demo");
     let rec = ns.get("a").expect("get").expect("visible");
     assert!((rec.importance() - 0.8).abs() < 1e-6);
+    // `TouchRow` 帧的访问统计必须回放恢复(仅 importance 由版本 `Insert` 承载)。
+    let touched = ns
+        .count(Some(mneme::Expr::field("access_count").eq(1)))
+        .expect("count access_count");
+    assert_eq!(touched, 1, "TouchRow 回放必须恢复访问统计");
     db.close().expect("close");
 }
 
@@ -683,4 +750,311 @@ fn dimension_mismatch_rejected_on_open() {
         Builder::default().dimension(8).path(dir.path()).build(),
         Err(mneme::MnemeError::DimensionMismatch { .. })
     ));
+}
+
+/// **FC-PERSIST-INV-005(I1)**:WAL 撕裂尾部在可写重开时被物理截断,其后追加的
+/// 已确认写入不会因残尾被永久屏蔽而丢失。
+#[test]
+fn torn_wal_tail_truncated_on_reopen() {
+    use std::io::Write as _;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let db = build(dir.path(), 2);
+        db.namespace("demo")
+            .insert(Record::new(vec![1.0, 0.0]).key("a"))
+            .expect("a");
+    } // drop:WAL 仅含已 fsync 的帧
+
+    // 模拟撕裂帧:在 WAL 末尾追加不足一帧的垃圾字节。
+    {
+        let wal = dir.path().join("wal").join("wal_000001.log");
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&wal)
+            .expect("open wal");
+        file.write_all(&[0xFF, 0x00, 0x01, 0x02])
+            .expect("append tail");
+        file.sync_all().expect("sync");
+    }
+
+    {
+        let db = Mneme::open(dir.path()).expect("reopen");
+        let ns = db.namespace("demo");
+        assert!(ns.get("a").expect("get a").is_some(), "有效前缀必须恢复");
+        ns.insert(Record::new(vec![0.0, 1.0]).key("b"))
+            .expect("insert b");
+    } // drop:截断后追加的 b 必须保留
+
+    let db = Mneme::open(dir.path()).expect("reopen2");
+    let ns = db.namespace("demo");
+    assert!(ns.get("a").expect("get a").is_some());
+    assert!(
+        ns.get("b").expect("get b").is_some(),
+        "撕裂尾部之后的已确认写入不得丢失"
+    );
+    db.close().expect("close");
+}
+
+/// **FC-PERSIST-INV-005(I1)**:WAL 短于文件头(Checkpoint 重置中途崩溃)在可写重开时
+/// 被重建,绝不因半截头拒绝打开。
+#[test]
+fn short_wal_header_is_recreated_on_open() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let db = build(dir.path(), 2);
+        db.namespace("demo")
+            .insert(Record::new(vec![1.0, 0.0]).key("a"))
+            .expect("a");
+        db.close().expect("close"); // flush → WAL 重置为仅 32B 文件头
+    }
+    let wal = dir.path().join("wal").join("wal_000001.log");
+    std::fs::write(&wal, b"WAL1").expect("truncate wal"); // 5B < 32B
+
+    let db = Mneme::open(dir.path()).expect("reopen");
+    assert!(
+        db.namespace("demo").get("a").expect("get a").is_some(),
+        "段数据不受半截 WAL 头影响"
+    );
+    db.close().expect("close");
+}
+
+/// **FC-PERSIST-ERR-007(I1/I15)**:崩溃在 `BatchCommit` 前(批未闭合)时,未闭合批的
+/// 字节在重开时被截断,绝不残留并吞掉后续单操作事务(删除不复活)。
+#[test]
+fn unclosed_batch_tail_does_not_swallow_later_writes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let db = build(dir.path(), 2);
+        let ns = db.namespace("demo");
+        ns.insert_batch(vec![
+            Record::new(vec![1.0, 0.0]).key("a"),
+            Record::new(vec![0.0, 1.0]).key("b"),
+        ])
+        .expect("batch1");
+        ns.insert_batch(vec![
+            Record::new(vec![0.5, 0.5]).key("c"),
+            Record::new(vec![0.2, 0.8]).key("d"),
+        ])
+        .expect("batch2");
+    }
+    // 撕裂最后一个 `BatchCommit` 帧(截掉其尾部),形成未闭合批。
+    let wal = dir.path().join("wal").join("wal_000001.log");
+    let len = std::fs::metadata(&wal).expect("meta").len();
+    {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&wal)
+            .expect("open wal");
+        file.set_len(len - 5).expect("truncate");
+        file.sync_all().expect("sync");
+    }
+
+    {
+        let db = Mneme::open(dir.path()).expect("reopen1");
+        let ns = db.namespace("demo");
+        assert!(ns.get("a").expect("a").is_some());
+        assert!(ns.get("c").expect("c").is_none(), "未闭合批不得应用");
+        // 单操作事务:delete 不产生 `BatchBegin`。
+        assert!(ns.delete("a").expect("delete a"));
+    } // drop
+
+    let db = Mneme::open(dir.path()).expect("reopen2");
+    assert!(
+        db.namespace("demo").get("a").expect("get a").is_none(),
+        "已确认删除不得被残留未闭合批吞掉而复活"
+    );
+    db.close().expect("close");
+}
+
+/// **FC-PERSIST-INV-006**:WAL 落盘成功即提交点;其后 flush 失败不回滚已提交写,
+/// 也不产生「返回失败却重启可见」的矛盾。
+#[test]
+fn flush_failure_does_not_lose_committed_write() {
+    struct FailSegment;
+    impl FsyncHook for FailSegment {
+        fn before(&self, action: IoAction<'_>) -> std::io::Result<()> {
+            if let IoAction::Write { file, .. } = action
+                && file.starts_with("segments/")
+            {
+                return Err(std::io::Error::other("injected segment write failure"));
+            }
+            Ok(())
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let compaction = mneme::CompactionPolicy {
+        wal_bytes: 32,
+        ..Default::default()
+    };
+    {
+        let db = Builder::default()
+            .dimension(2)
+            .compaction(compaction)
+            .path(dir.path())
+            .fsync_hook(Arc::new(FailSegment))
+            .build()
+            .expect("build");
+        db.namespace("demo")
+            .insert(Record::new(vec![1.0, 0.0]).key("a"))
+            .expect("已提交写不得因后台 flush 失败而报错");
+        assert!(
+            db.stats().expect("stats").wal_bytes > 32,
+            "flush 失败可由 wal_bytes 超过阈值观测到"
+        );
+    } // drop
+
+    let db = Mneme::open(dir.path()).expect("reopen");
+    assert!(
+        db.namespace("demo").get("a").expect("get a").is_some(),
+        "WAL 重放恢复已提交写"
+    );
+    db.close().expect("close");
+}
+
+/// **FC-PERSIST-STA-003**:首次 flush 在段已写、MANIFEST 未提交时崩溃;
+/// 重开以 WAL 为准恢复并清理未提交孤儿段,绝不误判为 `Corrupted`。
+#[test]
+fn first_flush_crash_recovers_from_wal() {
+    struct FailManifest;
+    impl FsyncHook for FailManifest {
+        fn before(&self, action: IoAction<'_>) -> std::io::Result<()> {
+            if let IoAction::Write { file, .. } = action
+                && file.starts_with("MANIFEST.")
+            {
+                return Err(std::io::Error::other("injected manifest write failure"));
+            }
+            Ok(())
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let db = Builder::default()
+            .dimension(2)
+            .path(dir.path())
+            .fsync_hook(Arc::new(FailManifest))
+            .build()
+            .expect("build");
+        db.namespace("demo")
+            .insert(Record::new(vec![1.0, 0.0]).key("a"))
+            .expect("a");
+        assert!(
+            db.flush().is_err(),
+            "注入的 MANIFEST 写失败必须使 flush 报错"
+        );
+    }
+    let orphan = dir.path().join("segments").join("seg_000000.vsec");
+    assert!(orphan.exists(), "崩溃点应留下已写段文件");
+
+    let db = Mneme::open(dir.path()).expect("以 WAL 为准重开");
+    let ns = db.namespace("demo");
+    assert!(ns.get("a").expect("get a").is_some(), "WAL 恢复记录");
+    assert!(!orphan.exists(), "未提交孤儿段在可写打开时被清理");
+    db.close().expect("close");
+}
+
+/// **FC-PERSIST-POST-006**:事务时间随 WAL 持久化,崩溃恢复后 `as_of` 历史正确
+/// (删除前时点仍可见、删除后不可见)。
+#[test]
+fn as_of_history_survives_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clock = common::FakeClock::default();
+    {
+        clock.set(1_000);
+        let db = Builder::default()
+            .dimension(2)
+            .clock(Arc::new(clock.clone()))
+            .path(dir.path())
+            .build()
+            .expect("build");
+        let ns = db.namespace("demo");
+        ns.insert(Record::new(vec![1.0, 0.0]).key("a")).expect("a");
+        clock.set(2_000);
+        assert!(ns.delete("a").expect("delete"));
+    } // drop:WAL 含 Insert(tx=1000) 与 DeleteRow(tx=2000)
+
+    let db = Mneme::open(dir.path()).expect("reopen");
+    let at_1500 = db.as_of(1_500).expect("as_of");
+    assert!(
+        at_1500.namespace("demo").get("a").expect("get").is_some(),
+        "删除前的 as_of 时点仍应可见"
+    );
+    assert!(db.namespace("demo").get("a").expect("get").is_none());
+    db.close().expect("close");
+}
+
+/// **FC-PERSIST-ERR-006(I2/I3)**:MANIFEST 引用的段文件缺失 → `Corrupted`,
+/// 绝不静默少返回数据。
+#[test]
+fn referenced_segment_missing_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let db = build(dir.path(), 2);
+        db.namespace("demo")
+            .insert(Record::new(vec![1.0, 0.0]).key("a"))
+            .expect("a");
+        db.close().expect("close");
+    }
+    std::fs::remove_file(dir.path().join("segments").join("seg_000000.msec")).expect("remove msec");
+    assert!(matches!(
+        Mneme::open(dir.path()),
+        Err(mneme::MnemeError::Corrupted { .. })
+    ));
+}
+
+/// **FC-PERSIST-ERR-006(I2/I3)**:MANIFEST 引用的段文件为空 → `Corrupted`。
+#[test]
+fn referenced_segment_empty_is_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let db = build(dir.path(), 2);
+        db.namespace("demo")
+            .insert(Record::new(vec![1.0, 0.0]).key("a"))
+            .expect("a");
+        db.close().expect("close");
+    }
+    std::fs::write(dir.path().join("segments").join("seg_000000.vsec"), b"").expect("empty vsec");
+    assert!(matches!(
+        Mneme::open(dir.path()),
+        Err(mneme::MnemeError::Corrupted { .. })
+    ));
+}
+
+/// **FC-PERSIST-ERR-003**:只读打开绝不改动文件系统(不建目录、不清 trash)。
+#[test]
+fn read_only_open_does_not_mutate() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let db = build(dir.path(), 2);
+        db.namespace("demo")
+            .insert(Record::new(vec![1.0, 0.0]).key("a"))
+            .expect("a");
+        db.close().expect("close");
+    }
+    let trash = dir.path().join("trash");
+    std::fs::create_dir_all(&trash).expect("mkdir trash");
+    let junk = trash.join("keep.me");
+    std::fs::write(&junk, b"x").expect("write junk");
+
+    let db = Builder::default()
+        .read_only(true)
+        .path(dir.path())
+        .build()
+        .expect("read only open");
+    assert!(junk.exists(), "只读打开不得清理 trash");
+    db.close().expect("close");
+
+    // 只读打开不存在的库必须报错,而不是创建目录树。
+    let missing = dir.path().join("does-not-exist");
+    assert!(matches!(
+        Builder::default()
+            .read_only(true)
+            .dimension(2)
+            .path(&missing)
+            .build(),
+        Err(mneme::MnemeError::Config { .. })
+    ));
+    assert!(!missing.exists(), "只读打开不得创建目录");
 }

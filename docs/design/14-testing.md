@@ -65,6 +65,10 @@
 
 ## 2. 崩溃注入(I1–I4,I15,I16 的验收)
 
+> **L2 落地状态**:基于 `FsyncHook` 的确定性崩溃/撕裂写测试已实现并通过
+> (`tests/persist_contracts.rs`);下述"1000 次 × 10k 操作"的 **proptest 崩溃前缀 harness**
+> 与 CI 每夜抽样**尚未接入**,是后续落地目标(见 §7)。
+
 **方法论**:`FsyncHook`([04 §10](04-l2-persist.md))在每次 write/fsync/rename 前被调用,
 测试注入三种故障:
 
@@ -116,7 +120,7 @@ key 索引:   随机 key 集写入 → 重启 → 每个存活 key 的 get(key) 
             MMR lambda 非有限值、dedup_threshold/threshold 越界 [0,1] → Config;
             insert_batch 中 Merge 回调产物超限 → 整批回滚、零部分写入(FC-MEM-POST-002);
             update 超限 patch → TooLarge/MetaTooDeep 且保持原版本;库内数据不被污染(03 §2.1)
-陈旧锁:     模拟持锁进程死亡 → 再次 open 能自动接管而非永久 Busy(16 §3)
+文件锁:     活实例持有 → Busy;持锁进程死亡(OS 咨询锁自动释放)→ 再次 open 成功而非永久 Busy(16 §3)
 稳定RowId:  同 key 连续 update/upsert 多轮 → RowId 始终不变(或按语义稳定),
             访问统计与关系边仍指向同一逻辑记忆(I22)
 去重语义:   Dedup::Merge 就地更新并返回 Merged(old)、保留旧 RowId;Dedup::Replace 生成新 RowId
@@ -129,10 +133,10 @@ key 索引:   随机 key 集写入 → 重启 → 每个存活 key 的 get(key) 
 ```text
 对"记录在旧段"的场景:
   写记录 → flush 成段 → delete(key) / update(key,patch) / touch(key,boost) →
-  在 Checkpoint 之前/之后任意点崩溃 → 重开:
+  在 WAL 重置之前/之后任意点崩溃(L2:全量快照 flush 提交 MANIFEST 后再重置 WAL) → 重开:
     删除的记录永不复活;update 的字段与 touch 的 importance 提升仍生效
-  再触发多轮 compaction 后重复断言
-反例保护:人为让 Checkpoint 在 delta 未落段时截断 → 必须拒绝截断(FC-PERSIST-POST-002)
+  再触发多轮 compaction 后重复断言(L5)
+反例保护:在覆盖条目物化(随快照段落盘)前截断 WAL → 必须拒绝(FC-PERSIST-POST-002)
 ```
 
 ### 2.5 注册与水位恢复(I20)
@@ -343,10 +347,13 @@ valid_time 过期不触发物理删除
 | middle | L2 崩溃抽样 + L3 召回 + L4 集成 | 每次 MR |
 | heavy | 全量崩溃注入 + criterion + 长跑 | 每夜/每周 |
 | fuzz | cargo-fuzz | 每夜 |
-| mutation | `cargo-mutants`(配置见根目录 `mutants.toml`):存活变异体 = 约束遗漏测试,须补测试后重跑 | L2 起,每夜 |
+| mutation | `cargo-mutants`(配置见根目录 `mutants.toml`):存活变异体 = 约束遗漏测试,须补测试后重跑 | 计划(L2 起,未接线) |
 
 矩阵平台:Linux(x86_64/aarch64)+ Windows(x86_64,重点覆盖
 [04 §6](04-l2-persist.md)/[04 §9](04-l2-persist.md) 的平台专项)。
+
+> **落地状态**:仓库**尚未提交 CI 配置文件**,上表为规划结构;`cargo-mutants` 与全量
+> 崩溃前缀属性测试尚未接线,L2 目前只有基于 `FsyncHook` 的定向崩溃测试(§2)。
 
 ---
 

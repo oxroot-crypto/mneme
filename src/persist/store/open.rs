@@ -54,11 +54,20 @@ impl Store {
         root: &Path,
         options: OpenOptions,
     ) -> Result<(Arc<Store>, WriterState, u32, Metric)> {
-        prepare_dirs(root)?;
+        // 只读实例绝不写盘:不建目录、不清 trash、不删孤儿,只要求库目录已存在。
+        if options.read_only {
+            if !storage::exists(root)? {
+                return Err(MnemeError::Config {
+                    reason: "只读模式要求库目录已存在",
+                });
+            }
+        } else {
+            prepare_dirs(root)?;
+        }
         let lock = acquire_lock(root, options.read_only)?;
-        trash::purge(root)?;
         // 清理崩溃残留的 `Building` 半成品(ATOMIC 写的 `.tmp`);只读实例亦只读取、不删除。
         if !options.read_only {
+            trash::purge(root)?;
             manifest_io::cleanup_orphans(root)?;
         }
 
@@ -124,22 +133,41 @@ fn load_or_init_manifest(
     requested_metric: Option<Metric>,
 ) -> Result<(Manifest, u64)> {
     let loaded = manifest_io::load_manifest(root)?;
-    // 段文件存在却无 MANIFEST:不一致状态,拒绝当作新库覆盖既有数据(设计 16 §3)。
-    if loaded.is_none() && !manifest_io::segment_files(root)?.is_empty() {
-        return Err(MnemeError::Corrupted {
-            segment: None,
-            reason: "段文件存在但无 MANIFEST,拒绝覆盖".to_string(),
-        });
-    }
     match loaded {
         Some((manifest, version)) => {
             verify_requested_identity(&manifest, requested_dimension, requested_metric)?;
             Ok((manifest, version))
         }
-        None => Ok((
-            init_manifest_from_wal(root, requested_dimension, requested_metric)?,
-            0,
-        )),
+        None => {
+            // 无任何合法 MANIFEST:
+            // - 段文件存在且 WAL 含可应用帧 → 「首次 flush 中途崩溃」,段是未提交孤儿,
+            //   以 WAL 为准重建、随后清理孤儿段,绝不因此拒绝打开而丢数据;
+            // - 段文件存在但 WAL 无可应用帧(无 WAL / 空 WAL / 仅头)→ 来源不明
+            //   (可能是 MANIFEST 丢失),拒绝当作新库覆盖(设计 16 §3)。
+            let has_segments = !manifest_io::segment_files(root)?.is_empty();
+            if has_segments && !wal_has_frames(root)? {
+                return Err(MnemeError::Corrupted {
+                    segment: None,
+                    reason: "段文件存在但无 MANIFEST 且 WAL 无可应用帧,拒绝覆盖".to_string(),
+                });
+            }
+            Ok((
+                init_manifest_from_wal(root, requested_dimension, requested_metric)?,
+                0,
+            ))
+        }
+    }
+}
+
+/// WAL 是否含至少一个完整可应用帧(用于区分「首次 flush 崩溃」与「MANIFEST 丢失」)。
+fn wal_has_frames(root: &Path) -> Result<bool> {
+    let Some(bytes) = storage::read_file_opt(root, WAL_FILE)? else {
+        return Ok(false);
+    };
+    match wal::visit_frames(&bytes, |_, _, _, _| Ok(())) {
+        Ok(valid_len) => Ok(valid_len > wal::FILE_HEADER_LEN),
+        // 头部损坏视作无可应用帧(来源不明,交由上层拒绝覆盖)。
+        Err(_) => Ok(false),
     }
 }
 
@@ -247,9 +275,13 @@ fn load_write_state(
             .collect();
         trash::move_to_trash(root, &names)?;
     }
-    // 回放 WAL(仅 seqno > watermark)。
+    // 回放 WAL(仅 seqno > watermark),并在可写打开时截断撕裂尾部。
     if let Some(bytes) = storage::read_file_opt(root, WAL_FILE)? {
-        recover::replay_wal(&mut state, &bytes, manifest.watermark_seqno)?;
+        let valid_len = recover::replay_wal(&mut state, &bytes, manifest.watermark_seqno)?;
+        // 撕裂帧之后的字节会永久屏蔽后续追加,必须物理截断后再复用该 WAL。
+        if !options.read_only && valid_len < bytes.len() {
+            storage::truncate(root, WAL_FILE, valid_len as u64)?;
+        }
     }
     Ok(state)
 }

@@ -25,6 +25,8 @@ pub(crate) const MAGIC: [u8; 4] = *b"VSC1";
 pub(crate) const HEADER_LEN: u16 = 64;
 /// 每行向量的对齐粒度(字节)。
 const ROW_ALIGN: usize = 32;
+/// 建库维度定义域上界(FC-CORE-PRE-001)。
+const MAX_DIMENSION: u32 = 65536;
 /// 删除位图分块行数。
 const BITMAP_BLOCK_ROWS: usize = 1024;
 /// 删除位图单块字节数(16 × u64)。
@@ -203,26 +205,21 @@ fn set_bit(bitmap: &mut [u8], row: usize) {
 /// 魔数/版本/`header_len`/头部 CRC 不符、布局不一致或 `quant != 0` 时返回结构化错误。
 pub(crate) fn parse(bytes: &[u8]) -> Result<VsecView<'_>> {
     let header = parse_header(bytes)?;
-    let stride = row_stride(header.dimension);
-    let vec_len = (header.row_count as usize)
-        .checked_mul(stride)
-        .ok_or_else(|| MnemeError::Corrupted {
+    // 维度必须落在建库定义域 [1, 65536](FC-CORE-PRE-001);损坏文件可能为 0/超大值。
+    if !(1..=MAX_DIMENSION).contains(&header.dimension) {
+        return Err(MnemeError::Corrupted {
             segment: None,
-            reason: "vsec: 向量区长度溢出".to_string(),
-        })?;
-    let norm_len = if header.norm_col {
-        (header.row_count as usize) * 4
-    } else {
-        0
-    };
-    let bitmap_len = bitmap_bytes(header.row_count);
-    let expected = HEADER_LEN as usize + vec_len + norm_len + bitmap_len + 4;
+            reason: format!("vsec: 维度 {} 越界", header.dimension),
+        });
+    }
+    let expected = expected_file_len(&header)?;
     if bytes.len() != expected {
         return Err(MnemeError::Corrupted {
             segment: None,
             reason: format!("vsec: 文件长度 {} 应为 {expected}", bytes.len()),
         });
     }
+    let stride = row_stride(header.dimension);
     let data = &bytes[HEADER_LEN as usize..bytes.len() - 4];
     let payload_crc = u32::from_le_bytes([
         bytes[bytes.len() - 4],
@@ -234,11 +231,42 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<VsecView<'_>> {
         header,
         data,
         stride,
-        vec_len,
-        norm_len,
         payload_crc,
         payload_crc_ok: None,
     })
+}
+
+/// 计算 vsec 文件的期望总长度:头 + 向量区 + norm 区 + 位图 + 尾 CRC。
+///
+/// 全用 checked 运算:损坏的 `row_count`/`dimension` 不得让长度回绕而绕过校验。
+///
+/// # Errors
+/// 任一分量溢出 `usize` 时返回 [`MnemeError::Corrupted`]。
+fn expected_file_len(header: &VsecHeader) -> Result<usize> {
+    let rows = header.row_count as usize;
+    let vec_len = rows
+        .checked_mul(row_stride(header.dimension))
+        .ok_or_else(|| corrupt("向量区长度溢出"))?;
+    let norm_len = if header.norm_col {
+        rows.checked_mul(4)
+            .ok_or_else(|| corrupt("norm 区长度溢出"))?
+    } else {
+        0
+    };
+    (HEADER_LEN as usize)
+        .checked_add(vec_len)
+        .and_then(|value| value.checked_add(norm_len))
+        .and_then(|value| value.checked_add(bitmap_bytes(header.row_count)))
+        .and_then(|value| value.checked_add(4))
+        .ok_or_else(|| corrupt("文件期望长度溢出"))
+}
+
+/// 构造 vsec 文件级损坏错误。
+fn corrupt(reason: &str) -> MnemeError {
+    MnemeError::Corrupted {
+        segment: None,
+        reason: format!("vsec: {reason}"),
+    }
 }
 
 /// 校验并解析 vsec 定长头部。
@@ -298,14 +326,13 @@ pub(crate) struct VsecView<'a> {
     header: VsecHeader,
     data: &'a [u8],
     stride: usize,
-    vec_len: usize,
-    norm_len: usize,
     payload_crc: u32,
     payload_crc_ok: Option<bool>,
 }
 
 impl VsecView<'_> {
-    /// 头部。
+    /// 头部(仅测试用;运行时经 [`VsecView::row_count`] / [`VsecView::vector`])。
+    #[cfg(test)]
     pub(crate) const fn header(&self) -> VsecHeader {
         self.header
     }
@@ -335,26 +362,16 @@ impl VsecView<'_> {
         Some(vector)
     }
 
-    /// 第 `row` 行的范数平方;`norm_col = false` 或行越界时返回 `None`。
-    pub(crate) fn norm_sq(&self, row: usize) -> Option<f32> {
-        if !self.header.norm_col || row >= self.header.row_count as usize {
-            return None;
-        }
-        let start = self.vec_len + row * 4;
-        Some(f32::from_le_bytes([
-            self.data[start],
-            self.data[start + 1],
-            self.data[start + 2],
-            self.data[start + 3],
-        ]))
-    }
-
-    /// 第 `row` 行是否不可见(删除位图置位)。
+    /// 第 `row` 行是否不可见(删除位图置位,仅测试用)。
+    #[cfg(test)]
     pub(crate) fn is_dead(&self, row: usize) -> bool {
         if row >= self.header.row_count as usize {
             return true;
         }
-        let bitmap = &self.data[self.vec_len + self.norm_len..];
+        let rows = self.header.row_count as usize;
+        let vec_len = rows * self.stride;
+        let norm_len = if self.header.norm_col { rows * 4 } else { 0 };
+        let bitmap = &self.data[vec_len + norm_len..];
         let block = row / BITMAP_BLOCK_ROWS;
         let within = row % BITMAP_BLOCK_ROWS;
         let word = within / 64;
@@ -389,11 +406,6 @@ impl VsecView<'_> {
                 reason: "vsec: payload_crc32 不符".to_string(),
             })
         }
-    }
-
-    /// 数据区总字节数(向量 + norm + 位图)。
-    pub(crate) const fn data_len(&self) -> usize {
-        self.data.len()
     }
 }
 

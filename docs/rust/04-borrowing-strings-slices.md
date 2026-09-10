@@ -5,7 +5,7 @@
 > **前置**:[02](02-values-and-ownership.md)、[03](03-structs-enums-impl.md) 章。
 > **对应源码**:[`src/core/types.rs`](../../src/core/types.rs)、[`src/core/simd.rs`](../../src/core/simd.rs)、
 > [`src/core/meta.rs`](../../src/core/meta.rs)、[`src/core/options/clock.rs`](../../src/core/options/clock.rs)、
-> [`src/memory/table.rs`](../../src/memory/table.rs)。
+> [`src/memory/table/state.rs`](../../src/memory/table/state.rs)。
 
 [02 章](02-values-and-ownership.md)说,把值传给函数会**移动所有权**。但大多数时候我们只想"看一眼"
 数据,不想把所有权交出去。这就是**借用(borrowing)**:用引用 `&` 借用,用完还回去。
@@ -290,7 +290,7 @@ pub(crate) struct Table {
 }
 ```
 
-见 [`src/memory/table.rs`](../../src/memory/table.rs)。
+见 [`src/memory/table/state.rs`](../../src/memory/table/state.rs)。
 
 - `Mutex<T>`(互斥锁)保证同一时刻只有一个写者;`RwLock<T>`(读写锁)允许多个读者**并发**、
   写者独占。写路径慢且要串行,读路径要尽可能并发——所以各用一把合适的锁。
@@ -307,7 +307,7 @@ pub(crate) fn write(&self) -> MutexGuard<'_, WriterState> {
 }
 ```
 
-见 [`src/memory/table.rs`](../../src/memory/table.rs)。
+见 [`src/memory/table/state.rs`](../../src/memory/table/state.rs)。
 
 - `lock()` 返回 `LockResult`:持锁线程 panic 会让锁**中毒(poisoned)**,后续 `lock()` 得到 `Err`。
   mneme 的选择是**恢复数据继续**(不让一次 panic 永久废掉整库),所以用

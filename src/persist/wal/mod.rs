@@ -112,7 +112,8 @@ impl FrameKind {
     }
 }
 
-/// 一帧 WAL 记录。
+/// 一帧 WAL 记录(仅测试用;运行时回放走流式 [`visit_frames`])。
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Frame {
     /// 全局单调写序号。
@@ -123,7 +124,8 @@ pub(crate) struct Frame {
     pub(crate) payload: Vec<u8>,
 }
 
-/// 回放结果:有效帧 + 有效字节长度(撕裂帧之前的长度)。
+/// 回放结果:有效帧 + 有效字节长度(撕裂帧之前的长度,仅测试用)。
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Replay {
     /// 完整且 CRC 正确的帧序列。
@@ -179,7 +181,7 @@ mod tests {
         bytes.extend_from_slice(&encode_frame(
             1,
             FrameKind::Insert,
-            &encode_insert(&entry(), &[1.0, 2.0]).expect("insert"),
+            &encode_insert(&entry(), &[1.0, 2.0], 42).expect("insert"),
         ));
         bytes.extend_from_slice(&encode_frame(2, FrameKind::Delete, &encode_delete(1, "k")));
         bytes.extend_from_slice(&encode_frame(
@@ -195,7 +197,7 @@ mod tests {
         assert_eq!(replay.frames[0].kind, FrameKind::Insert);
         assert_eq!(
             decode_insert(&replay.frames[0].payload).expect("insert"),
-            (entry(), vec![1.0, 2.0])
+            (entry(), vec![1.0, 2.0], 42)
         );
         assert_eq!(
             decode_delete(&replay.frames[1].payload).expect("delete"),

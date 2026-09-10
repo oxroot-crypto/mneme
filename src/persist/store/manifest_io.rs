@@ -143,27 +143,36 @@ fn prune_manifests(root: &Path) -> Result<()> {
 }
 
 /// 读取 MANIFEST 所列各段的字节。
+///
+/// MANIFEST 引用的段文件必须存在且非空;缺失或空文件表示 I3/I2 被破坏,返回
+/// [`MnemeError::Corrupted`] 而非静默跳过(否则会无声丢数据)。
 pub(super) fn read_segment_bytes(root: &Path, manifest: &Manifest) -> Result<Vec<SegmentBytes>> {
     let mut segments = Vec::new();
     for segment in &manifest.segments {
-        let vsec = storage::read_file_opt(
-            root,
-            &format!("{SEGMENTS_DIR}/{}", vsec_name(segment.segment_id)),
-        )?
-        .unwrap_or_default();
-        let msec = storage::read_file_opt(
-            root,
-            &format!("{SEGMENTS_DIR}/{}", msec_name(segment.segment_id)),
-        )?
-        .unwrap_or_default();
-        if vsec.is_empty() && msec.is_empty() {
-            continue;
-        }
+        let id = segment.segment_id;
+        let vsec = read_required_segment(root, id, &vsec_name(id))?;
+        let msec = read_required_segment(root, id, &msec_name(id))?;
         segments.push(SegmentBytes {
-            segment_id: segment.segment_id,
+            segment_id: id,
             vsec,
             msec,
         });
     }
     Ok(segments)
+}
+
+/// 读取一个被 MANIFEST 引用的段文件;不存在或为空返回 [`MnemeError::Corrupted`]。
+fn read_required_segment(root: &Path, segment_id: u32, name: &str) -> Result<Vec<u8>> {
+    let rel = format!("{SEGMENTS_DIR}/{name}");
+    let bytes = storage::read_file_opt(root, &rel)?.ok_or_else(|| MnemeError::Corrupted {
+        segment: Some(crate::core::types::SegmentId::new(segment_id)),
+        reason: format!("MANIFEST 引用的段文件缺失:{name}"),
+    })?;
+    if bytes.is_empty() {
+        return Err(MnemeError::Corrupted {
+            segment: Some(crate::core::types::SegmentId::new(segment_id)),
+            reason: format!("MANIFEST 引用的段文件为空:{name}"),
+        });
+    }
+    Ok(bytes)
 }

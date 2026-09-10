@@ -6,7 +6,7 @@
 > **本章你将学到**:API 语义细则 → 内存表结构 → 暴力扫描 → 过滤 AST → 去重预检。
 
 模块:`memory/{engine.rs, engine_ops.rs, builder.rs, namespace/, snapshot.rs, snapshot_scan.rs,
-search_builder.rs, search_exec.rs, expand.rs, rerank.rs, table.rs, bitset.rs, search.rs, pred.rs,
+search_builder.rs, search_exec.rs, expand.rs, rerank.rs, table/(mod,handle,state,view,write_op).rs, bitset.rs, search.rs, pred.rs,
 pred_eval.rs, record.rs, write_helpers.rs, mutate_helpers.rs, dedup.rs, relation.rs,
 temporal.rs, score.rs, lifecycle.rs, ops.rs, config.rs}`——`engine.rs` 承载库句柄 `Mneme`
 (统计/fsck/落盘门面在 `engine_ops.rs`),`namespace/` 承载 `Namespace` 的写/读/访问/
@@ -139,7 +139,7 @@ impl Mneme {
 
 ---
 
-## 3. 内存表结构:`table.rs`
+## 3. 内存表结构:`table/`
 
 ```text
 Table

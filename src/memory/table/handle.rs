@@ -95,14 +95,14 @@ impl Table {
                 let ops = std::mem::take(&mut ws.pending);
                 if let Some(persist) = &self.persist {
                     if let Err(error) = persist.log(&ops) {
+                        // WAL 未落盘:整批回滚,写入对读者零可见(FC-MEM-POST-002)。
                         *ws = snapshot;
                         return Err(error);
                     }
-                    // WAL 容量等阈值兜底:越界即全量快照 flush(设计 04 §3.2)。
-                    if let Err(error) = persist.maybe_flush(&ws, &self.config) {
-                        *ws = snapshot;
-                        return Err(error);
-                    }
+                    // WAL 落盘即提交点:其后 flush 仅回收 WAL(全量快照),失败不回滚,
+                    // 否则内存回滚与重启后 WAL 重放会矛盾(「失败却持久」)。失败不丢:
+                    // WAL 持续增长并由下次写重试,`stats().wal_bytes` 可观测(设计 04 §3.2)。
+                    persist.maybe_flush(&ws, &self.config).ok();
                 }
                 self.publish(&ws);
                 Ok(value)

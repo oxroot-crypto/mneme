@@ -5,7 +5,9 @@ use crate::core::metric::Metric;
 use crate::persist::vsec::{metric_from_u8, metric_to_u8};
 use crate::persist::{FORMAT_VERSION, check_version, crc32};
 
-use super::{FILE_HEADER_LEN, FRAME_HEADER_LEN, Frame, FrameKind, MAGIC, Replay, WalHeader};
+use super::{FILE_HEADER_LEN, FRAME_HEADER_LEN, FrameKind, MAGIC, WalHeader};
+#[cfg(test)]
+use super::{Frame, Replay};
 
 /// 编码 WAL 文件头(32 字节,CRC 覆盖 `[0,12)`)。
 pub(crate) fn encode_file_header(dimension: u32, metric: Metric) -> [u8; FILE_HEADER_LEN] {
@@ -69,9 +71,10 @@ pub(crate) fn encode_frame(seqno: u64, kind: FrameKind, payload: &[u8]) -> Vec<u
 /// # Errors
 /// 文件头损坏,或遇到未知帧类型(FC-PERSIST-ERR-001,绝不静默跳过)时返回错误。
 /// 尾部撕裂帧(长度不足/CRC 不符)不计入 `frames` 并停止回放,由调用方截断。
+#[cfg(test)]
 pub(crate) fn replay(bytes: &[u8]) -> Result<Replay> {
     let mut frames = Vec::new();
-    let valid_len = visit_frames(bytes, |seqno, kind, payload| {
+    let valid_len = visit_frames(bytes, |seqno, kind, payload, _end| {
         frames.push(Frame {
             seqno,
             kind,
@@ -82,15 +85,16 @@ pub(crate) fn replay(bytes: &[u8]) -> Result<Replay> {
     Ok(Replay { frames, valid_len })
 }
 
-/// 流式遍历 WAL 帧,每帧以 `on_frame(seqno, kind, payload)` 回调,不整体物化
-/// (空间 `O(1)`,批缓冲由调用方自理;设计 04 §3.4)。返回有效字节长度。
+/// 流式遍历 WAL 帧,每帧以 `on_frame(seqno, kind, payload, frame_end)` 回调,不整体
+/// 物化(空间 `O(1)`,批缓冲由调用方自理;设计 04 §3.4)。`frame_end` 为该帧结束的
+/// 绝对字节偏移,便于调用方记录「已提交位置」并截断未提交尾部。返回有效字节长度。
 ///
 /// # Errors
 /// 文件头损坏或未知帧类型(FC-PERSIST-ERR-001)时返回结构化错误;
 /// 尾部撕裂帧(长度不足/CRC 不符)停止遍历并返回其前长度。
 pub(crate) fn visit_frames(
     bytes: &[u8],
-    mut on_frame: impl FnMut(u64, FrameKind, &[u8]) -> Result<()>,
+    mut on_frame: impl FnMut(u64, FrameKind, &[u8], usize) -> Result<()>,
 ) -> Result<usize> {
     parse_file_header(bytes)?;
     let mut offset = FILE_HEADER_LEN;
@@ -128,7 +132,7 @@ pub(crate) fn visit_frames(
             });
         };
         let payload = &bytes[offset + FRAME_HEADER_LEN..frame_end];
-        on_frame(seqno, kind, payload)?;
+        on_frame(seqno, kind, payload, frame_end)?;
         offset = frame_end;
     }
     Ok(offset)

@@ -11,7 +11,28 @@ use crate::memory::bitset::BitSet;
 use crate::memory::relation::Edge;
 
 use super::view::ReaderView;
-use super::{AccessStat, WriteOp, slot_id_for};
+use super::write_op::WriteOp;
+
+/// 单条记录的访问统计(内存累积;L5 起落盘)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AccessStat {
+    /// 最近一次访问时刻(Unix 毫秒)。
+    pub last_access_ms: i64,
+    /// 累计访问次数。
+    pub access_count: u32,
+}
+
+/// 把槽位下标映射为 `SlotId`;超出 `u32::MAX` 时返回结构化错误,绝不静默饱和
+/// (FC-MEM-INV-004)。
+pub(crate) fn slot_id_for(len: usize) -> Result<SlotId> {
+    u32::try_from(len)
+        .map(SlotId::new)
+        .map_err(|_| MnemeError::LimitExceeded {
+            field: "slots",
+            limit: u32::MAX as usize,
+            got: len,
+        })
+}
 
 /// 一个物理版本(不可变,`Arc` 共享)。下标即 `SlotId`。
 #[derive(Debug, Clone)]
@@ -74,6 +95,7 @@ pub(crate) struct WriterState {
 }
 
 impl WriterState {
+    /// 构造空写状态(无段、无版本、`SeqNo`/`RowId`/`NsId` 水位从零开始)。
     pub(crate) fn new() -> Self {
         Self {
             slots: Arc::new(Vec::new()),
@@ -219,13 +241,18 @@ impl WriterState {
         ensure_key_available(self, &slot_data)?;
         let deleted = slot_data.deleted;
         let seqno = slot_data.seqno;
+        let tx_ms = slot_data.tx_ms;
         self.hide_latest(rowid);
         let arc = Arc::new(slot_data);
         Arc::make_mut(&mut self.slots).push(Arc::clone(&arc));
         self.link_version(rowid, slot);
         // 记录待持久化操作:墓碑落 `DeleteRow`,其余落完整新版本 `Insert`。
         if deleted {
-            self.pending.push(WriteOp::DeleteRow { rowid, seqno });
+            self.pending.push(WriteOp::DeleteRow {
+                rowid,
+                seqno,
+                tx_ms,
+            });
         } else {
             self.pending.push(WriteOp::Insert { slot: arc });
         }
@@ -288,4 +315,28 @@ fn ensure_key_available(ws: &WriterState, slot_data: &SlotData) -> Result<()> {
         return Err(MnemeError::DuplicateKey(key.clone()));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FC-MEM-INV-004
+    #[test]
+    fn slot_id_for_rejects_overflow() {
+        assert_eq!(slot_id_for(0).expect("0 合法").get(), 0);
+        assert_eq!(
+            slot_id_for(u32::MAX as usize).expect("上界合法").get(),
+            u32::MAX
+        );
+        let overflow = u32::MAX as usize + 1;
+        assert!(matches!(
+            slot_id_for(overflow),
+            Err(MnemeError::LimitExceeded {
+                field: "slots",
+                limit,
+                got,
+            }) if limit == u32::MAX as usize && got == overflow
+        ));
+    }
 }

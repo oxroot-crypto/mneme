@@ -37,14 +37,13 @@ impl std::fmt::Debug for Mneme {
 }
 
 impl Mneme {
-    /// 打开一个已初始化的本地目录记忆库(持久化在 L2 实现)。
+    /// 打开(或按需创建)一个本地目录记忆库(L2 持久化实现)。
     ///
     /// # Arguments
-    /// * `_path` - 已初始化库的目录路径;L1 阶段忽略,恒返回 `Unsupported`,
-    ///   L2 持久层落地后生效。
+    /// * `path` - 库目录路径;不存在时按默认配置新建(维度需经 [`Mneme::builder`] 指定)。
     ///
     /// # Errors
-    /// 当前恒返回 [`MnemeError::Unsupported`]。
+    /// 目录不可用、锁被占、MANIFEST/段损坏或维度冲突时返回结构化错误。
     ///
     /// # Examples
     /// ```no_run
@@ -264,8 +263,14 @@ impl Mneme {
                 feature: "备份(backup_to, 纯内存库)",
             });
         };
+        // 持写锁跨 flush 与复制:阻止并发写触发阈值 flush 把正在复制的段移入 trash,
+        // 保证备份的段集合与 MANIFEST 一致(FC-PERSIST-POST-004)。
+        let ws = self.table.write();
+        if ws.closed {
+            return Err(MnemeError::Closed);
+        }
         if !self.config.read_only {
-            self.flush()?;
+            store.flush(&ws, &self.config)?;
         }
         store.backup_to(dir.as_ref())
     }

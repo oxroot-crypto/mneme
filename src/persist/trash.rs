@@ -48,6 +48,8 @@ pub(crate) fn bytes(root: &Path) -> Result<u64> {
     let dir = root.join(TRASH_DIR);
     let mut total = 0_u64;
     for name in storage::list_dir(root, TRASH_DIR)? {
+        // reason: stats 为尽力而为;单个文件元数据读取失败仅少计字节,
+        // 不影响正确性(与 `Store::wal_bytes` 同口径)。
         if let Ok(metadata) = std::fs::metadata(dir.join(&name)) {
             total += metadata.len();
         }

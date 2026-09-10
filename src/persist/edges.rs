@@ -21,6 +21,9 @@ use crate::persist::{
 pub(crate) const MAGIC: [u8; 4] = *b"EDG1";
 /// 反向表存在标志。
 const FLAG_REVERSE: u16 = 1 << 0;
+/// 单条边的最小编码字节数:`from(8)+to(8)+kind(2)+weight(4)+meta 长度(4)`。
+/// 用于按剩余字节数为边数预分配设上界,避免损坏文件的大计数触发超额分配。
+const MIN_EDGE_BYTES: usize = 26;
 
 /// 一条关系边。
 #[derive(Debug, Clone, PartialEq)]
@@ -79,6 +82,10 @@ pub(crate) struct EdgeView {
     /// 正向边(`(from, kind, to)` 升序)。
     pub(crate) forward: Vec<EdgeData>,
     /// 反向边(`(to, kind, from)` 升序);未存储时为空。
+    ///
+    /// L2 段只写正向表,`predecessors` 的入边由内存 `in_edges` 重建,故本字段在
+    /// 运行时不被读取(仅编解码往返测试);反向索引落盘属 L5(设计 04 §2.2b)。
+    #[allow(dead_code)]
     pub(crate) reverse: Vec<EdgeData>,
 }
 
@@ -104,16 +111,17 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<EdgeView> {
     let flags = cursor.u16()?;
     let forward_count = cursor.u32()? as usize;
     let reverse_count = cursor.u32()? as usize;
-    let mut read_edges = |count: usize| -> Result<Vec<EdgeData>> {
-        let mut edges = Vec::with_capacity(count);
+    let read_edges = |cursor: &mut Cursor<'_>, count: usize| -> Result<Vec<EdgeData>> {
+        // 上界预分配:每条边至少 MIN_EDGE_BYTES,损坏计数不会超额分配。
+        let mut edges = Vec::with_capacity(count.min(cursor.remaining() / MIN_EDGE_BYTES));
         for _ in 0..count {
-            edges.push(decode_edge(&mut cursor)?);
+            edges.push(decode_edge(cursor)?);
         }
         Ok(edges)
     };
-    let forward = read_edges(forward_count)?;
+    let forward = read_edges(&mut cursor, forward_count)?;
     let reverse = if flags & FLAG_REVERSE != 0 {
-        read_edges(reverse_count)?
+        read_edges(&mut cursor, reverse_count)?
     } else {
         Vec::new()
     };

@@ -2,7 +2,8 @@
 //!
 //! - 目录布局遵循设计 04 §1:`current` / `MANIFEST.<v>` / `wal/` / `segments/` / `trash/`;
 //! - 所有元数据文件先写 `.tmp` 再 `rename` 提交,绝不原地覆盖(设计 04 §6);
-//! - [`FileLock`] 提供单写者独占(设计 16 §3):`create_new` + PID/时间戳,陈旧则接管;
+//! - [`FileLock`] 提供单写者独占(设计 16 §3):基于 `std::fs::File::try_lock` 的
+//!   OS 咨询锁,进程异常终止由内核自动释放,无需租约/接管;
 //! - [`Store`] 协调 WAL 追加、全量快照 flush 与恢复,是 L2 持久化的核心句柄。
 //!
 //! > L2 采用**全量快照 flush**(设计 04 §3.2 的 L2 兜底):`flush` 把整个可变表写成
@@ -12,7 +13,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::core::error::{MnemeError, Result};
 
@@ -31,16 +31,6 @@ pub(crate) const LOCK_FILE: &str = "LOCK";
 
 /// 保留的 MANIFEST 版本数(设计 04 §6:任意一步崩溃至少留一个完整可用版本)。
 pub(crate) const MANIFEST_KEEP: usize = 2;
-
-/// 锁文件的陈旧阈值(毫秒):超过该时长未被持有的锁视为崩溃残留,可接管。
-const LOCK_STALE_MS: i64 = 24 * 60 * 60 * 1000;
-
-/// 当前 Unix 毫秒(仅用于锁/文件时间戳,不参与业务时间语义)。
-fn now_unix_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_millis() as i64)
-}
 
 /// MANIFEST 版本文件名(如 `MANIFEST.000042`)。
 pub(crate) fn manifest_name(version: u64) -> String {
@@ -102,6 +92,7 @@ pub(crate) fn write_atomic(root: &Path, rel: &str, bytes: &[u8]) -> Result<()> {
 ///
 /// # Errors
 /// 目标已存在或 I/O 失败时返回 [`MnemeError::Io`]。
+#[cfg(test)]
 pub(crate) fn write_new(root: &Path, rel: &str, bytes: &[u8]) -> Result<()> {
     let target = resolve(root, rel)?;
     let mut file = OpenOptions::new()
@@ -113,17 +104,16 @@ pub(crate) fn write_new(root: &Path, rel: &str, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// 打开文件并追加写入 + fsync(返回写入后的文件长度)。
+/// 把文件截断到 `len` 字节并 fsync(用于丢弃 WAL 撕裂尾部)。
 ///
 /// # Errors
-/// I/O 失败时返回 [`MnemeError::Io`]。
-pub(crate) fn append_sync(root: &Path, rel: &str, bytes: &[u8]) -> Result<u64> {
+/// 文件不存在或 I/O 失败时返回 [`MnemeError::Io`]。
+pub(crate) fn truncate(root: &Path, rel: &str, len: u64) -> Result<()> {
     let target = resolve(root, rel)?;
-    let mut file = OpenOptions::new().append(true).open(&target)?;
-    file.write_all(bytes)?;
+    let file = OpenOptions::new().write(true).open(&target)?;
+    file.set_len(len)?;
     file.sync_all()?;
-    let len = file.metadata()?.len();
-    Ok(len)
+    Ok(())
 }
 
 /// 读取整个文件。
@@ -232,12 +222,16 @@ fn sync_parent(path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// 独占文件锁:首个写者 `create_new(LOCK)` 成功,后续写者失败直到锁释放。
+/// 独占文件锁:基于 `std::fs::File::try_lock` 的 OS 咨询锁。
 ///
-/// 陈旧锁(记录 PID 等于当前进程,或时间戳为 0)会被接管——覆盖崩溃残留
-/// (设计 16 §3)。PID 存活探测受 `std` 限制,跨进程活锁仍返回 [`MnemeError::Busy`]。
+/// 锁文件 `LOCK` 常驻不删除——删除会使不同 inode 各自可加锁,反而破坏互斥。
+/// 互斥语义由内核持有的咨询锁提供:活实例持有时其它实例 `try_lock` 返回
+/// [`std::fs::TryLockError::WouldBlock`](→ [`MnemeError::Busy`]);进程崩溃/退出时
+/// 内核自动释放,后续实例可直接获取。无需租约刷新、心跳线程或陈旧接管
+/// (设计 16 §3;`File::try_lock` 自 MSRV 1.93 起稳定,Windows 用 `LockFileEx`)。
 pub(crate) struct FileLock {
-    path: PathBuf,
+    /// 持有 OS 咨询锁的文件句柄;`Drop` 关闭句柄即释放锁。
+    _file: File,
 }
 
 impl FileLock {
@@ -247,59 +241,27 @@ impl FileLock {
     /// 锁被其他活实例持有时返回 [`MnemeError::Busy`];I/O 失败返回 [`MnemeError::Io`]。
     pub(crate) fn acquire(root: &Path) -> Result<Self> {
         let path = root.join(LOCK_FILE);
-        let pid = std::process::id();
-        let content = format!("{pid}\n{}\n", now_unix_ms());
-        match OpenOptions::new().write(true).create_new(true).open(&path) {
-            Ok(mut file) => {
-                file.write_all(content.as_bytes())?;
-                file.sync_all()?;
-                Ok(Self { path })
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        match file.try_lock() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                Err(MnemeError::Busy("库目录已被另一实例打开"))
             }
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                if Self::is_stale(&path)? {
-                    remove_if_exists(&path)?;
-                    Self::acquire(root)
-                } else {
-                    Err(MnemeError::Busy("库目录已被另一实例打开"))
-                }
-            }
-            Err(error) => Err(error.into()),
+            Err(std::fs::TryLockError::Error(error)) => Err(error.into()),
         }
-    }
-
-    /// 判断既有锁是否陈旧(可接管)。
-    fn is_stale(path: &Path) -> Result<bool> {
-        let content = match fs::read_to_string(path) {
-            Ok(content) => content,
-            // 读不到(空文件/权限)按陈旧处理,以便恢复。
-            Err(_) => return Ok(true),
-        };
-        let mut lines = content.lines();
-        if lines
-            .next()
-            .and_then(|pid| pid.parse::<u32>().ok())
-            .is_none()
-        {
-            return Ok(true);
-        }
-        let stamp: i64 = lines
-            .next()
-            .and_then(|value| value.parse().ok())
-            .unwrap_or(0);
-        // 时间戳为 0 或超过陈旧阈值即视为崩溃残留(设计 16 §3)。
-        Ok(stamp == 0 || now_unix_ms().saturating_sub(stamp) > LOCK_STALE_MS)
-    }
-
-    /// 锁文件路径。
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
     }
 }
 
 impl Drop for FileLock {
     fn drop(&mut self) {
-        // reason: `Drop` 无法传播错误;锁文件残留由下次 `acquire` 的陈旧检测兜底。
-        fs::remove_file(&self.path).ok();
+        // 显式解锁(等价于关闭句柄);锁文件保留,避免 inode 分裂破坏互斥。
+        // reason: `Drop` 无法传播错误;句柄随本结构体关闭也会由内核释放锁。
+        self._file.unlock().ok();
     }
 }
 
@@ -346,12 +308,24 @@ mod tests {
         assert!(FileLock::acquire(dir.path()).is_ok());
     }
 
-    /// 陈旧锁(时间戳为 0)被接管,不留 `Busy`。
+    /// 锁文件已存在但无 OS 持有者(如崩溃残留)时不阻塞——OS 咨询锁已随进程释放。
     #[test]
-    fn file_lock_takes_over_stale_lock() {
+    fn file_lock_acquires_when_lock_file_exists() {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join(LOCK_FILE), b"999\n0\n").expect("write stale lock");
         assert!(FileLock::acquire(dir.path()).is_ok());
+    }
+
+    /// `Drop` 释放锁但不删除锁文件,避免不同 inode 各自加锁破坏互斥。
+    #[test]
+    fn file_lock_file_persists_after_drop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let lock = FileLock::acquire(dir.path()).expect("acquire");
+        let path = dir.path().join(LOCK_FILE);
+        assert!(path.exists());
+        drop(lock);
+        assert!(path.exists(), "锁文件应保留");
+        assert!(FileLock::acquire(dir.path()).is_ok(), "释放后可重新获取");
     }
 
     /// MANIFEST 文件名解析。

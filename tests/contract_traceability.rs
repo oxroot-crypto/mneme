@@ -33,13 +33,16 @@ const LIFE_TESTS: &str = include_str!("life_contracts.rs");
 const PERSIST_TESTS: &str = include_str!("persist_contracts.rs");
 /// 承载操作计数单测的源码文件。
 const SRC_SEARCH: &str = include_str!("../src/memory/search.rs");
-const SRC_TABLE: &str = include_str!("../src/memory/table/mod.rs");
+const SRC_TABLE: &str = include_str!("../src/memory/table/state.rs");
 const SRC_LIFECYCLE: &str = include_str!("../src/memory/lifecycle.rs");
 /// L2 编解码源码(片级损坏/版本拒绝单测被契约引用)。
 const SRC_VSEC: &str = include_str!("../src/persist/vsec.rs");
 const SRC_MSEC: &str = include_str!("../src/persist/msec/mod.rs");
 const SRC_WAL: &str = include_str!("../src/persist/wal/mod.rs");
 const SRC_MANIFEST: &str = include_str!("../src/persist/manifest.rs");
+/// L2 恢复/锁源码(批原子校验、独占锁语义单测被契约引用)。
+const SRC_RECOVER_REPLAY: &str = include_str!("../src/persist/recover/replay.rs");
+const SRC_STORAGE: &str = include_str!("../src/persist/storage.rs");
 
 /// 契约测试文件(孤立检查与覆盖声明检查的范围)。
 const CONTRACT_TEST_FILES: [(&str, &str); 6] = [
@@ -52,7 +55,7 @@ const CONTRACT_TEST_FILES: [(&str, &str); 6] = [
 ];
 
 /// 契约引用的测试可能落在的全部文件(路径必须与 `contracts.md` 中书写一致)。
-const SOURCES: [(&str, &str); 13] = [
+const SOURCES: [(&str, &str); 15] = [
     ("tests/core_contracts.rs", CORE_TESTS),
     ("tests/memory_contracts.rs", MEMORY_TESTS),
     ("tests/query_contracts.rs", QUERY_TESTS),
@@ -60,12 +63,14 @@ const SOURCES: [(&str, &str); 13] = [
     ("tests/life_contracts.rs", LIFE_TESTS),
     ("tests/persist_contracts.rs", PERSIST_TESTS),
     ("src/memory/search.rs", SRC_SEARCH),
-    ("src/memory/table/mod.rs", SRC_TABLE),
+    ("src/memory/table/state.rs", SRC_TABLE),
     ("src/memory/lifecycle.rs", SRC_LIFECYCLE),
     ("src/persist/vsec.rs", SRC_VSEC),
     ("src/persist/msec/mod.rs", SRC_MSEC),
     ("src/persist/wal/mod.rs", SRC_WAL),
     ("src/persist/manifest.rs", SRC_MANIFEST),
+    ("src/persist/recover/replay.rs", SRC_RECOVER_REPLAY),
+    ("src/persist/storage.rs", SRC_STORAGE),
 ];
 
 /// 契约编号的类型段(五维 + CPLX,见 `contracts.md` §0)。

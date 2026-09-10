@@ -7,8 +7,8 @@ use crate::persist::{Cursor, check_version, crc32};
 
 use super::entry::decode_entry;
 use super::{
-    EntryData, HEADER_CRC_COVER, HEADER_LEN, KeyIndexRow, MAGIC, NsStatRow, Region, Regions,
-    TOMBSTONE_DOC_OFFSET, VersionRow,
+    EntryData, HEADER_CRC_COVER, HEADER_LEN, KeyIndexRow, MAGIC, NS_STAT_ROW_BYTES, NsStatRow,
+    Region, Regions, TOMBSTONE_DOC_OFFSET, VERSION_ROW_BYTES, VersionRow,
 };
 
 /// 头部解析结果:行数、8 个数据区与 payload CRC。
@@ -33,7 +33,6 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<MsecView<'_>> {
         version_table: slice_of(bytes, header.regions.version),
         key_index: slice_of(bytes, header.regions.key),
         ns_stats: slice_of(bytes, header.regions.ns_stats),
-        delta: slice_of(bytes, header.regions.delta),
         relations: slice_of(bytes, header.regions.rel),
         payload_crc: header.payload_crc,
         payload_crc_ok: None,
@@ -151,7 +150,6 @@ pub(crate) struct MsecView<'a> {
     version_table: &'a [u8],
     key_index: &'a [u8],
     ns_stats: &'a [u8],
-    delta: &'a [u8],
     relations: &'a [u8],
     payload_crc: u32,
     payload_crc_ok: Option<bool>,
@@ -168,13 +166,13 @@ impl MsecView<'_> {
     /// # Errors
     /// 长度非 36 的倍数时返回 [`MnemeError::Corrupted`]。
     pub(crate) fn version_rows(&self) -> Result<Vec<VersionRow>> {
-        if !self.version_table.len().is_multiple_of(36) {
+        if !self.version_table.len().is_multiple_of(VERSION_ROW_BYTES) {
             return Err(MnemeError::Corrupted {
                 segment: None,
                 reason: "msec: version_table 长度非法".to_string(),
             });
         }
-        let mut rows = Vec::with_capacity(self.version_table.len() / 36);
+        let mut rows = Vec::with_capacity(self.version_table.len() / VERSION_ROW_BYTES);
         let mut cursor = Cursor::new(self.version_table, "msec version_table");
         while !cursor.is_empty() {
             rows.push(VersionRow {
@@ -220,13 +218,13 @@ impl MsecView<'_> {
     /// # Errors
     /// 长度非 20 的倍数时返回 [`MnemeError::Corrupted`]。
     pub(crate) fn ns_stat_rows(&self) -> Result<Vec<NsStatRow>> {
-        if !self.ns_stats.len().is_multiple_of(20) {
+        if !self.ns_stats.len().is_multiple_of(NS_STAT_ROW_BYTES) {
             return Err(MnemeError::Corrupted {
                 segment: None,
                 reason: "msec: ns_stats 长度非法".to_string(),
             });
         }
-        let mut rows = Vec::with_capacity(self.ns_stats.len() / 20);
+        let mut rows = Vec::with_capacity(self.ns_stats.len() / NS_STAT_ROW_BYTES);
         let mut cursor = Cursor::new(self.ns_stats, "msec ns_stats");
         while !cursor.is_empty() {
             rows.push(NsStatRow {
@@ -236,11 +234,6 @@ impl MsecView<'_> {
             });
         }
         Ok(rows)
-    }
-
-    /// delta 区原始字节(可能为空)。
-    pub(crate) const fn delta_bytes(&self) -> &[u8] {
-        self.delta
     }
 
     /// relations 区原始字节(可能为空)。
@@ -260,15 +253,24 @@ impl MsecView<'_> {
             segment: None,
             reason: "msec: doc_offset 超出 usize".to_string(),
         })?;
-        if start + 4 > self.data.len() {
+        // 全用 checked 加法:损坏的 doc_offset 不得让下标回绕而越界切片(FC-GLOBAL-ERR-001)。
+        let body_start = start.checked_add(4).ok_or_else(|| MnemeError::Corrupted {
+            segment: None,
+            reason: "msec: doc_offset 溢出".to_string(),
+        })?;
+        if body_start > self.data.len() {
             return Err(MnemeError::Corrupted {
                 segment: None,
                 reason: "msec: doc_offset 越界".to_string(),
             });
         }
         let total_len = read_u32_at(self.data, start) as usize;
-        let body_start = start + 4;
-        let body_end = body_start + total_len;
+        let body_end = body_start
+            .checked_add(total_len)
+            .ok_or_else(|| MnemeError::Corrupted {
+                segment: None,
+                reason: "msec: 记录体长度溢出".to_string(),
+            })?;
         if body_end > self.data.len() {
             return Err(MnemeError::Corrupted {
                 segment: None,

@@ -61,7 +61,7 @@ impl SegmentSource for FileSource {
     }
 
     fn read_at(&self, off: u64, buf: &mut [u8]) -> std::io::Result<()> {
-        // 锁中毒时恢复内部句柄继续工作(与 table.rs 的锁口径一致,不 panic)。
+        // 锁中毒时恢复内部句柄继续工作(与 `memory/table/handle.rs` 的锁口径一致,不 panic)。
         let mut file = self
             .file
             .lock()

@@ -9,7 +9,8 @@ use crate::persist::{FORMAT_VERSION, align_up, crc32, put_bytes_u32, put_i64, pu
 use super::{
     EntryData, FLAG_ACCESS, FLAG_CONFIDENCE, FLAG_IMPORTANCE, FLAG_KEY, FLAG_PROVENANCE, FLAG_TEXT,
     FLAG_TTL, FLAG_VALID_TIME, HEADER_CRC_COVER, HEADER_LEN, KeyIndexRow, MAGIC, MsecInput,
-    NsStatRow, Region, Regions, SlotMeta, TOMBSTONE_DOC_OFFSET, VersionRow,
+    NS_STAT_ROW_BYTES, NsStatRow, REGION_ALIGN, Region, Regions, SlotMeta, TOMBSTONE_DOC_OFFSET,
+    VERSION_ROW_BYTES, VersionRow,
 };
 
 /// 编码一个完整的 msec 文件。
@@ -119,7 +120,7 @@ fn assemble_regions(
 
 /// 追加一个数据区到 `data`(起点对齐 8 B),返回其**文件绝对**偏移/长度。
 fn append_region(data: &mut Vec<u8>, bytes: &[u8]) -> Region {
-    let aligned = align_up(data.len(), 8);
+    let aligned = align_up(data.len(), REGION_ALIGN);
     data.resize(aligned, 0);
     let offset = HEADER_LEN as u64 + data.len() as u64;
     data.extend_from_slice(bytes);
@@ -248,7 +249,7 @@ fn encode_entry_fields(payload: &mut Vec<u8>, entry: &EntryData) {
 
 /// 编码版本链表(定长 36 B/行)。
 fn encode_version_table(rows: &[VersionRow]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(rows.len() * 36);
+    let mut out = Vec::with_capacity(rows.len() * VERSION_ROW_BYTES);
     for row in rows {
         put_u64(&mut out, row.rowid);
         put_u64(&mut out, row.seqno);
@@ -275,7 +276,7 @@ fn encode_key_index(rows: &[KeyIndexRow]) -> Vec<u8> {
 
 /// 编码命名空间统计(定长 20 B/行)。
 fn encode_ns_stats(rows: &[NsStatRow]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(rows.len() * 20);
+    let mut out = Vec::with_capacity(rows.len() * NS_STAT_ROW_BYTES);
     for row in rows {
         put_u32(&mut out, row.ns_id);
         put_u64(&mut out, row.doc_count);
