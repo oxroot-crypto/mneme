@@ -58,3 +58,4 @@ pub use crate::memory::{
     ScoreBreakdown, SearchBuilder, SegmentStat, SnapshotHandle, SnapshotNamespace, Stats,
     StorageStat, Summarizer, UpdateOutcome, Val,
 };
+pub use crate::persist::hook::{FsyncHook, IoAction};

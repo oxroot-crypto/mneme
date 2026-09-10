@@ -241,13 +241,16 @@ impl Mneme {
         })
     }
 
-    /// 备份到目录(持久化在 L2 实现)。
+    /// 备份到目录:先 `flush`(非只读时)再复制段/MANIFEST/WAL,`current` 最后写。
+    ///
+    /// 纯内存库无持久内容,返回 [`MnemeError::Unsupported`]。
     ///
     /// # Arguments
-    /// * `_dir` - 备份目标目录;L1 阶段忽略,恒返回 `Unsupported`。
+    /// * `dir` - 备份目标目录;必须不存在或为空。
     ///
     /// # Errors
-    /// 当前恒返回 [`MnemeError::Unsupported`]。
+    /// 纯内存库返回 [`MnemeError::Unsupported`];目标非空返回 [`MnemeError::Busy`];
+    /// I/O 失败返回 [`MnemeError::Io`]。
     ///
     /// # Examples
     /// ```
@@ -255,10 +258,16 @@ impl Mneme {
     /// let db = Mneme::in_memory(2).unwrap();
     /// assert!(db.backup_to("backup").is_err());
     /// ```
-    pub fn backup_to(&self, _dir: impl AsRef<Path>) -> Result<BackupReport> {
-        Err(MnemeError::Unsupported {
-            feature: "备份(backup_to, L2)",
-        })
+    pub fn backup_to(&self, dir: impl AsRef<Path>) -> Result<BackupReport> {
+        let Some(store) = &self.store else {
+            return Err(MnemeError::Unsupported {
+                feature: "备份(backup_to, 纯内存库)",
+            });
+        };
+        if !self.config.read_only {
+            self.flush()?;
+        }
+        store.backup_to(dir.as_ref())
     }
 
     /// 关闭共享库:标记关闭并释放资源;幂等。

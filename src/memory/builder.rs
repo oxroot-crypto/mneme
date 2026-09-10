@@ -18,6 +18,7 @@ use crate::memory::engine::Mneme;
 use crate::memory::lifecycle::Retention;
 use crate::memory::ops::CompactionControl;
 use crate::memory::table::{PersistHook, Table};
+use crate::persist::hook::FsyncHook;
 use crate::persist::store::Store;
 
 mod options;
@@ -53,6 +54,7 @@ pub struct Builder {
     read_only: bool,
     verify_on_open: bool,
     fail_fast_on_corruption: bool,
+    fsync_hook: Option<Arc<dyn FsyncHook>>,
 }
 
 impl Default for Builder {
@@ -81,6 +83,7 @@ impl Default for Builder {
             read_only: false,
             verify_on_open: false,
             fail_fast_on_corruption: false,
+            fsync_hook: None,
         }
     }
 }
@@ -121,6 +124,7 @@ impl Builder {
                     self.read_only,
                     self.verify_on_open,
                     self.fail_fast_on_corruption,
+                    self.fsync_hook.clone(),
                 )?;
                 (Some(store), Some(state), dimension, metric)
             }

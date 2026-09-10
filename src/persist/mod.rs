@@ -25,6 +25,7 @@
 pub(crate) mod delta;
 pub(crate) mod edges;
 pub(crate) mod flush;
+pub(crate) mod hook;
 pub(crate) mod manifest;
 pub(crate) mod msec;
 pub(crate) mod recover;

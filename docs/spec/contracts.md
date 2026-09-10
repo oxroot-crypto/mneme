@@ -39,6 +39,7 @@
 
 | 日期 | 变更 |
 |---|---|
+| 2026-09 | 落地 L2 加固(M3):新增 `persist/hook.rs` 的公开 `FsyncHook`/`IoAction` 与 `Builder::fsync_hook`(测试崩溃注入,设计 04 §10.1),WAL 写/fsync 与段/MANIFEST 写前置触发;`Store::backup_to` 实现(flush → 复制段/MANIFEST/WAL → `current` 最后写,产物可独立 open,设计 16 §7);`Mneme::backup_to` 接线。新增测试 `injected_wal_failure_keeps_confirmed_prefix`(FC-PERSIST-INV-001)与 `backup_is_independently_openable`(新增 `FC-PERSIST-POST-004`);新增 `FC-PERSIST-POST-005`(Planned:`touch`/`relate` WAL 帧持久性待补,当前仅经 flush 快照持久),`FC-PERSIST-INV-019` 收敛为「记录级」 |
 | 2026-09 | 落地 L2 持久化接线(M2):新增 `persist/store.rs` 协调句柄(实现内存引擎 `PersistHook`,WAL-before-visible + 批 `BatchBegin/Commit` + Checkpoint 重置);`flush` 采用 **全量快照**(设计 04 §3.2 的 L2 兜底)写 vsec/msec + write-once MANIFEST,`open` 由「MANIFEST/段/WAL」重建状态并回放 `seqno > watermark`;`close` 先 flush 再释放锁。`FC-PERSIST-INV-001/019/020`、`FC-PERSIST-POST-001/003`、`FC-PERSIST-ERR-001/002/003/004` 置 `Passed`(测试见 `tests/persist_contracts.rs` 与 `src/persist/*.rs` 单测);`FC-MEM-ERR-002` 收紧:`open`/`path` 已落地,新建持久库缺维度改返回 `Config`。WAL `Insert` 负载补 `[u32 dim][f32×dim]` 向量副本(设计 04 §2.3 的记录体不含向量,否则未 flush 记录重启后丢失),已同步 04 §2.3。门面(`memory::Builder`/`Mneme`)作为单一 crate 组合根引用 `persist`(构成根例外,不改变 L0→L6 业务依赖方向) |
 | 2026-09 | 文档对齐(实现与设计一致性):① `VectorStore` 内部 trait 按 03 §8/04 §14 明确为 **L3 随 HNSW 引入**,L1/L2 直接实现同一组公开签名,同步修订 01 §2「接口先于实现」表述;② 04 §11 明确 L2 仅提供 `FileSource`,`MmapSource`/`mmap` 自 L3 引入(依 01 §5 依赖表);③ 04 §10.1 `FsyncHook`/`IoAction` 明确经 `Builder::fsync_hook` 公开注入(测试 seam),不再表述为"仅测试 builder 暴露" |
 | 2026-09 | 启动 L2 持久层实现:① 新增 `crc32fast` 直接依赖(白名单 L2)、`tempfile` dev-dep;② 按 01 §5 依赖表(§5 权威)`memmap2` 自 L3 引入,L2 仅提供 `SegmentSource`+`FileSource`(std),`MmapSource`/`mmap` feature 推迟至 L3,并据此澄清 04 §11;③ 按 03 §8/04 §14 引入内部 `VectorStore` 内部接口(`Target`/`SearchOpt`/`EntryRef`),持久层 `Database` 实现之;④ L2 契约测试文件 `tests/persist_contracts.rs` 登记进 `tests/contract_traceability.rs` 双向追溯门禁,条目自 M1 起由 `待补` 回填真实测试路径 |
@@ -156,15 +157,17 @@
 
 | 编号 | 类型 | 形式化规范 | 对应测试 | 状态 |
 |---|---|---|---|---|
-| FC-PERSIST-INV-001 | INV | **I1**:已确认写入不半写;未确认写入重启后要么完整可见要么不存在 | `tests/persist_contracts.rs::reopen_after_close_recovers_records`、`tests/persist_contracts.rs::reopen_after_drop_recovers_from_wal` | Passed |
+| FC-PERSIST-INV-001 | INV | **I1**:已确认写入不半写;未确认写入重启后要么完整可见要么不存在 | `tests/persist_contracts.rs::reopen_after_close_recovers_records`、`tests/persist_contracts.rs::reopen_after_drop_recovers_from_wal`、`tests/persist_contracts.rs::injected_wal_failure_keeps_confirmed_prefix` | Passed |
 | FC-PERSIST-INV-002 | INV | **I2**:任意 bit 损坏可检出或拒绝启动,绝不静默返回错误数据 | `src/persist/vsec.rs::vsec_detects_header_corruption`、`src/persist/vsec.rs::vsec_detects_payload_corruption`、`src/persist/manifest.rs::manifest_detects_header_corruption`、`src/persist/manifest.rs::manifest_detects_payload_corruption`、`src/persist/wal.rs::wal_bad_crc_stops_replay` | Passed |
 | FC-PERSIST-INV-003 | INV | **I3**:活跃段集合 = 某 MANIFEST 版本所列集合 | 待补 | Planned |
 | FC-PERSIST-INV-004 | INV | **I4**:WAL 总量 ≤ `wal_bytes`;段文件只增不改 | 待补 | Planned |
-| FC-PERSIST-INV-019 | INV | **I19**:`delete`/`update`/`touch`/`relate` 返回 `Ok` 后,崩溃 + WAL 截断仍生效,删除永不复活 | `tests/persist_contracts.rs::delete_survives_flush_and_reopen`、`tests/persist_contracts.rs::crash_after_delete_does_not_resurrect`、`tests/persist_contracts.rs::update_survives_reopen` | Passed |
+| FC-PERSIST-INV-019 | INV | **I19(记录级)**:`delete`/`update` 返回 `Ok` 后,崩溃 + WAL 截断仍生效,删除永不复活(`touch`/`relate` 的 WAL 帧见 FC-PERSIST-POST-005) | `tests/persist_contracts.rs::delete_survives_flush_and_reopen`、`tests/persist_contracts.rs::crash_after_delete_does_not_resurrect`、`tests/persist_contracts.rs::update_survives_reopen` | Passed |
 | FC-PERSIST-INV-020 | INV | **I20**:`path↔NsId`、`next_ns_id`、`next_rowid` 可由 MANIFEST+WAL 重建,ID 永不复用 | `tests/persist_contracts.rs::namespace_and_rowid_survive_reopen` | Passed |
 | FC-PERSIST-POST-001 | POST | **I15**:`insert_batch` 整批原子:可见记录数 ∈ {0, n},无部分批 | `tests/persist_contracts.rs::batch_insert_is_atomic_across_reopen` | Passed |
 | FC-PERSIST-POST-002 | POST | Checkpoint 仅当 `seqno ≤ watermark` 的覆盖条目已物化时才截断 WAL | 待补 | Planned |
 | FC-PERSIST-POST-003 | POST | **I16**:`close()` 返回 `Ok` 后所有已确认写入持久;`Drop` 不保证 | `tests/persist_contracts.rs::reopen_after_close_recovers_records` | Passed |
+| FC-PERSIST-POST-004 | POST | `backup_to` 先 flush 再复制段/MANIFEST/WAL,`current` 最后写;产物可独立 `open`(设计 16 §7) | `tests/persist_contracts.rs::backup_is_independently_openable` | Passed |
+| FC-PERSIST-POST-005 | POST | `touch`/`relate`/`unrelate` 的 WAL 帧持久性(崩溃后回放);当前仅经 flush 快照持久(close/reopen 可保),崩溃窗口内未落 WAL,待后续补齐 | 待补 | Planned |
 | FC-PERSIST-ERR-001 | ERR | 未知 WAL 帧类型 → 停止回放并报错,不静默跳过 | `src/persist/wal.rs::wal_unknown_frame_type_errors` | Passed |
 | FC-PERSIST-ERR-002 | ERR | 更高主版本 → `UnsupportedVersion`(I18) | `src/persist/vsec.rs::vsec_rejects_higher_major`、`src/persist/manifest.rs::manifest_rejects_higher_major` | Passed |
 | FC-PERSIST-ERR-003 | ERR | 只读模式写操作 → `Unsupported { feature: "只读模式写入" }`,绝不静默(设计 04 §13) | `tests/persist_contracts.rs::read_only_rejects_writes` | Passed |

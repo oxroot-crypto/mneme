@@ -43,7 +43,7 @@ mod expand;
 mod lifecycle;
 mod mutate_helpers;
 mod namespace;
-mod ops;
+pub(crate) mod ops;
 mod pred;
 mod pred_eval;
 mod record;

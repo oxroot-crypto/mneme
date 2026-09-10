@@ -326,4 +326,18 @@ impl Builder {
         self.fail_fast_on_corruption = fail_fast;
         self
     }
+
+    /// 注入 I/O 前置钩子(测试崩溃注入;设计 04 §10.1)。
+    ///
+    /// # Arguments
+    ///
+    /// * `hook` - 在每次 write/fsync/rename 前调用的回调;返回 `Err` 即注入故障。
+    ///
+    /// # Returns
+    ///
+    /// 携带钩子的构建器(链式)。
+    pub fn fsync_hook(mut self, hook: std::sync::Arc<dyn crate::persist::hook::FsyncHook>) -> Self {
+        self.fsync_hook = Some(hook);
+        self
+    }
 }

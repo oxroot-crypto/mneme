@@ -20,6 +20,7 @@ use crate::core::options::FsyncPolicy;
 use crate::memory::config::Config;
 use crate::memory::table::{PersistHook, SlotData, WriteOp, WriterState};
 use crate::persist::flush;
+use crate::persist::hook::{FsyncHook, IoAction};
 use crate::persist::manifest::{self, Manifest, NsEntry, SegmentEntry};
 use crate::persist::msec::EntryData;
 use crate::persist::recover::{self, SegmentBytes};
@@ -40,6 +41,7 @@ struct WalWriter {
     policy: FsyncPolicy,
     dimension: u32,
     metric: Metric,
+    hook: Option<Arc<dyn FsyncHook>>,
 }
 
 impl WalWriter {
@@ -55,6 +57,7 @@ impl WalWriter {
         dimension: u32,
         metric: Metric,
         policy: FsyncPolicy,
+        hook: Option<Arc<dyn FsyncHook>>,
     ) -> Result<Self> {
         storage::ensure_dir(&root.join(WAL_DIR))?;
         let path = storage::resolve(root, WAL_FILE)?;
@@ -73,11 +76,19 @@ impl WalWriter {
                 policy,
                 dimension,
                 metric,
+                hook,
             });
         }
         let header = wal::encode_file_header(dimension, metric);
         let mut file = std::fs::File::create(&path)?;
         use std::io::Write as _;
+        if let Some(hook) = &hook {
+            hook.before(IoAction::Write {
+                file: WAL_FILE,
+                offset: 0,
+                len: header.len(),
+            })?;
+        }
         file.write_all(&header)?;
         file.sync_all()?;
         Ok(Self {
@@ -85,6 +96,7 @@ impl WalWriter {
             policy,
             dimension,
             metric,
+            hook,
         })
     }
 
@@ -95,9 +107,20 @@ impl WalWriter {
     fn append(&mut self, seqno: u64, kind: FrameKind, payload: &[u8]) -> Result<u64> {
         use std::io::Write as _;
         let frame = wal::encode_frame(seqno, kind, payload);
+        let offset = self.file.metadata()?.len();
+        if let Some(hook) = &self.hook {
+            hook.before(IoAction::Write {
+                file: WAL_FILE,
+                offset,
+                len: frame.len(),
+            })?;
+        }
         self.file.write_all(&frame)?;
         // `Always`/`Batched` 均在此同步:同步次数不弱于设计承诺(更强持久性无害)。
         if matches!(self.policy, FsyncPolicy::Always | FsyncPolicy::Batched(_)) {
+            if let Some(hook) = &self.hook {
+                hook.before(IoAction::Fsync { file: WAL_FILE })?;
+            }
             self.file.sync_all()?;
         }
         Ok(self.file.metadata()?.len())
@@ -133,6 +156,7 @@ pub(crate) struct Store {
     dimension: u32,
     metric: Metric,
     read_only: bool,
+    hook: Option<Arc<dyn FsyncHook>>,
 }
 
 impl Store {
@@ -152,6 +176,7 @@ impl Store {
         read_only: bool,
         verify_on_open: bool,
         fail_fast_on_corruption: bool,
+        hook: Option<Arc<dyn FsyncHook>>,
     ) -> Result<(Arc<Store>, WriterState, u32, Metric)> {
         storage::ensure_dir(root)?;
         storage::ensure_dir(&root.join(SEGMENTS_DIR))?;
@@ -246,7 +271,13 @@ impl Store {
             recover::replay_wal(&mut state, &bytes, manifest.watermark_seqno)?;
         }
 
-        let wal = WalWriter::open_or_create(root, manifest.dimension, manifest.metric, fsync)?;
+        let wal = WalWriter::open_or_create(
+            root,
+            manifest.dimension,
+            manifest.metric,
+            fsync,
+            hook.clone(),
+        )?;
         let store = Arc::new(Store {
             root: root.to_path_buf(),
             lock: Mutex::new(lock),
@@ -258,6 +289,7 @@ impl Store {
             dimension: manifest.dimension,
             metric: manifest.metric,
             read_only,
+            hook,
         });
         Ok((store, state, manifest.dimension, manifest.metric))
     }
@@ -274,6 +306,75 @@ impl Store {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *guard = None;
+    }
+
+    /// 原子写一个库内文件,前置触发 `FsyncHook`(测试崩溃注入)。
+    fn write_file(&self, rel: &str, bytes: &[u8]) -> Result<()> {
+        if let Some(hook) = &self.hook {
+            hook.before(IoAction::Write {
+                file: rel,
+                offset: 0,
+                len: bytes.len(),
+            })?;
+        }
+        storage::write_atomic(&self.root, rel, bytes)
+    }
+
+    /// 备份到目标目录(设计 16 §7)。
+    ///
+    /// 目标目录必须不存在或为空;先写全部段/MANIFEST/WAL,最后写 `current`,
+    /// 中途失败不会留下可打开的备份。备份可被独立 `open`。
+    ///
+    /// # Errors
+    /// 目标非空、目标等于源、或 I/O 失败时返回结构化错误。
+    pub(crate) fn backup_to(&self, target: &Path) -> Result<crate::memory::ops::BackupReport> {
+        if target == self.root {
+            return Err(MnemeError::Config {
+                reason: "备份目录不能是库目录本身",
+            });
+        }
+        if storage::exists(target)? && !storage::list_dir(target, "")?.is_empty() {
+            return Err(MnemeError::Busy("备份目标目录非空"));
+        }
+        storage::ensure_dir(target)?;
+        storage::ensure_dir(&target.join(SEGMENTS_DIR))?;
+        storage::ensure_dir(&target.join(WAL_DIR))?;
+
+        let (version, manifest) = {
+            let guard = self
+                .manifest
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            (guard.version, guard.manifest.clone())
+        };
+
+        let mut files = 0_usize;
+        let mut bytes = 0_u64;
+        let mut copy = |rel: &str| -> Result<()> {
+            if let Some(content) = storage::read_file_opt(&self.root, rel)? {
+                bytes += content.len() as u64;
+                files += 1;
+                storage::write_atomic(target, rel, &content)?;
+            }
+            Ok(())
+        };
+
+        for segment in &manifest.segments {
+            copy(&format!("{SEGMENTS_DIR}/{}", vsec_name(segment.segment_id)))?;
+            copy(&format!("{SEGMENTS_DIR}/{}", msec_name(segment.segment_id)))?;
+        }
+        copy(&manifest_name(version))?;
+        copy(WAL_FILE)?;
+        // `current` 最后写:中途失败则备份不可打开,不会误认为完整。
+        storage::write_atomic(target, CURRENT_FILE, version.to_string().as_bytes())?;
+        files += 1;
+        bytes += version.to_string().len() as u64;
+
+        Ok(crate::memory::ops::BackupReport {
+            files,
+            bytes,
+            hardlinked: false,
+        })
     }
 
     /// 全量快照 flush:写新段 + 提交 MANIFEST + 重置 WAL(设计 04 §3.2)。
@@ -298,13 +399,11 @@ impl Store {
         };
         let segment_id = manifest_state.next_segment_id;
 
-        storage::write_atomic(
-            &self.root,
+        self.write_file(
             &format!("{SEGMENTS_DIR}/{}", vsec_name(segment_id)),
             &vsec_bytes,
         )?;
-        storage::write_atomic(
-            &self.root,
+        self.write_file(
             &format!("{SEGMENTS_DIR}/{}", msec_name(segment_id)),
             &msec_bytes,
         )?;
@@ -345,7 +444,7 @@ impl Store {
                 entry_level: 0,
             }],
         };
-        commit_manifest(&self.root, &new_manifest)?;
+        commit_manifest(&self.root, &new_manifest, self.hook.as_deref())?;
 
         // 旧段进入 trash 并清理;WAL 重置(所有覆盖条目已随快照物化)。
         let old_segments: Vec<String> = manifest_state
@@ -495,9 +594,24 @@ fn load_manifest(root: &Path) -> Result<Option<(Manifest, u64)>> {
 }
 
 /// 提交 MANIFEST:写 `MANIFEST.<v>` → 写 `current` → 保留最近 `MANIFEST_KEEP` 版。
-fn commit_manifest(root: &Path, manifest: &Manifest) -> Result<()> {
+fn commit_manifest(root: &Path, manifest: &Manifest, hook: Option<&dyn FsyncHook>) -> Result<()> {
     let bytes = manifest::encode(manifest)?;
-    storage::write_atomic(root, &manifest_name(manifest.manifest_version), &bytes)?;
+    let name = manifest_name(manifest.manifest_version);
+    if let Some(hook) = hook {
+        hook.before(IoAction::Write {
+            file: &name,
+            offset: 0,
+            len: bytes.len(),
+        })?;
+    }
+    storage::write_atomic(root, &name, &bytes)?;
+    if let Some(hook) = hook {
+        hook.before(IoAction::Write {
+            file: CURRENT_FILE,
+            offset: 0,
+            len: manifest.manifest_version.to_string().len(),
+        })?;
+    }
     storage::write_atomic(
         root,
         CURRENT_FILE,

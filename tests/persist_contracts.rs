@@ -5,11 +5,15 @@
 //! 本文件的条目双向相等,由 `tests/contract_traceability.rs` 机械校验。
 //!
 //! 覆盖的契约:`FC-PERSIST-INV-001`、`FC-PERSIST-INV-019`、`FC-PERSIST-INV-020`、
-//! `FC-PERSIST-POST-001`、`FC-PERSIST-POST-003`、`FC-PERSIST-ERR-003`、`FC-PERSIST-ERR-004`。
+//! `FC-PERSIST-POST-001`、`FC-PERSIST-POST-003`、`FC-PERSIST-POST-004`、
+//! `FC-PERSIST-ERR-003`、`FC-PERSIST-ERR-004`。
 //!
 //! 片级编解码的损坏检出与版本拒绝见各 `src/persist/*.rs` 单元测试。
 
-use mneme::{Builder, Mneme, Record, UpdatePatch};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use mneme::{Builder, FsyncHook, IoAction, Mneme, Record, UpdatePatch};
 
 /// 在临时目录新建持久库。
 fn build(dir: &std::path::Path, dimension: u32) -> Mneme {
@@ -203,6 +207,80 @@ fn read_only_rejects_writes() {
         db.namespace("demo").insert(Record::new(vec![0.0, 1.0])),
         Err(mneme::MnemeError::Unsupported { .. })
     ));
+}
+
+/// **FC-PERSIST-INV-001(I1)**:注入 WAL 写失败,失败写入整体回滚且不入 WAL;
+/// 崩溃后恢复的可见状态 = 已确认操作前缀。
+#[test]
+fn injected_wal_failure_keeps_confirmed_prefix() {
+    /// 在第 `fail_on` 次 WAL 写(0 基)前返回错误的钩子。
+    struct FailAt {
+        count: AtomicUsize,
+        fail_on: usize,
+    }
+    impl FsyncHook for FailAt {
+        fn before(&self, action: IoAction<'_>) -> std::io::Result<()> {
+            if let IoAction::Write { file, .. } = action
+                && file.starts_with("wal/")
+            {
+                let n = self.count.fetch_add(1, Ordering::SeqCst);
+                if n == self.fail_on {
+                    return Err(std::io::Error::other("injected WAL write failure"));
+                }
+            }
+            Ok(())
+        }
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    // WAL 写序列:头(0)、首插批 [BatchBegin, NsRegister, Insert, BatchCommit](1..4)、
+    // 第二次 insert 的 Insert 帧(5)。令索引 5 失败,首次插入保持已确认。
+    let hook = Arc::new(FailAt {
+        count: AtomicUsize::new(0),
+        fail_on: 5,
+    });
+    {
+        let db = Builder::default()
+            .dimension(2)
+            .path(dir.path())
+            .fsync_hook(hook)
+            .build()
+            .expect("build");
+        let ns = db.namespace("demo");
+        ns.insert(Record::new(vec![1.0, 0.0]).key("a"))
+            .expect("first insert");
+        assert!(ns.insert(Record::new(vec![0.0, 1.0]).key("b")).is_err());
+    }
+
+    let db = Mneme::open(dir.path()).expect("reopen");
+    let ns = db.namespace("demo");
+    assert!(ns.get("a").expect("get a").is_some());
+    assert!(ns.get("b").expect("get b").is_none());
+    db.close().expect("close");
+}
+
+/// **FC-PERSIST-POST-004**:`backup_to` 产出一致快照,可独立 `open`。
+#[test]
+fn backup_is_independently_openable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let backup = tempfile::tempdir().expect("backup dir");
+    {
+        let db = build(dir.path(), 2);
+        let ns = db.namespace("demo");
+        ns.insert(Record::new(vec![1.0, 0.0]).key("a")).expect("a");
+        ns.insert(Record::new(vec![0.0, 1.0]).key("b")).expect("b");
+        assert!(ns.delete("b").expect("delete b"));
+        let report = db.backup_to(backup.path()).expect("backup");
+        assert!(report.files >= 1);
+        assert!(report.bytes > 0);
+        db.close().expect("close");
+    }
+
+    let db = Mneme::open(backup.path()).expect("open backup");
+    let ns = db.namespace("demo");
+    assert!(ns.get("a").expect("get a").is_some());
+    assert!(ns.get("b").expect("get b").is_none());
+    db.close().expect("close");
 }
 
 /// 打开维度与库维度不符 → `DimensionMismatch`,拒绝打开。
