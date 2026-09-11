@@ -214,4 +214,46 @@ mod tests {
         );
         assert!((filtered.selectivity - 6.0 / 1030.0).abs() < 1e-6);
     }
+
+    /// FC-QUERY-POST-005(保留字段被同名 metadata 影子化:不得据 metadata 统计剪块)
+    #[test]
+    fn reserved_metadata_shadowing_never_prunes() {
+        let db = Mneme::in_memory(2).expect("in_memory");
+        let ns = db.namespace("n");
+        for index in 0..1024 {
+            ns.insert(Record::new(vec![1.0, 0.0]).key(format!("k{index}")))
+                .expect("insert");
+        }
+        // 第二条块(槽位 1024)的 metadata 与保留字段同名:不得据此剪掉块 0。
+        ns.insert(
+            Record::new(vec![0.0, 1.0])
+                .key("shadow")
+                .metadata(crate::core::meta::json!({
+                    "key": 5,
+                    "rowid": 9_000,
+                    "access_count": 7,
+                    "last_access": 3,
+                })),
+        )
+        .expect("insert");
+        let view = db.table.view();
+        let ns_id = view
+            .ns_registry
+            .iter()
+            .find_map(|(id, path)| (**path == *"n").then_some(*id))
+            .expect("命名空间已注册");
+        for expr in [
+            Expr::Exists("key".into()),
+            Expr::Exists("rowid".into()),
+            Expr::field("key").ne("nope"),
+            Expr::field("rowid").gt(0_i64),
+            Expr::field("access_count").ge(0_i64),
+            Expr::field("last_access").ge(0_i64),
+            Expr::In("key".into(), vec![Val::Str("k1".into())].into_boxed_slice()),
+        ] {
+            assert_matches_bruteforce(&view, ns_id, &expr);
+        }
+        let plan = compile(&view, ns_id, Some(&Expr::Exists("key".into())), 0);
+        assert_eq!(plan.candidates.len(), 1025, "所有保留 key 都必须保留");
+    }
 }

@@ -11,7 +11,7 @@ use super::{
     Region, Regions, TOMBSTONE_DOC_OFFSET, VERSION_ROW_BYTES, VersionRow,
 };
 
-/// 头部解析结果:行数、8 个数据区与 payload CRC。
+/// 头部解析结果:行数、9 个数据区与 payload CRC。
 struct HeaderLayout {
     row_count: u64,
     regions: Regions,
@@ -73,7 +73,7 @@ fn parse_header(bytes: &[u8]) -> Result<HeaderLayout> {
             reason: "msec: header_crc32 不符".to_string(),
         });
     }
-    // 头部偏移 8..16 为 `row_count`;随后 16..160 为 8 组 offset/len(含 field_dict)。
+    // 头部偏移 8..16 为 `row_count`;随后 16..160 为 9 组 offset/len(含 field_dict)。
     let row_count = cursor.u64()?;
     Ok(HeaderLayout {
         row_count,

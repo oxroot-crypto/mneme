@@ -369,7 +369,7 @@ db.close()?;                // flush + 释放文件锁;Drop 只尽力 flush
 | `AsyncNamespace` | async 门面(feature `async`),共享同一底层句柄 |
 | `Reranker` / `QueryCtx` | 精排回调钩子及其查询上下文 |
 | `Stats` / `SegmentStat` / `NsStat` / `Histogram` / `QuantStat` / `StorageStat` / `HistoryStat` | 运行统计(段/WAL/延迟/每命名空间/量化/合并/存储安全/版本链) |
-| `CheckReport` / `BackupReport` / `RetainReport` / `SnapshotStats`(L5 规划) | 运维报告 |
+| `CheckReport` / `BackupReport` / `RetainReport` / `SnapshotStats`(L5 规划) | 运维报告(前两者 L1 已实现,`SnapshotStats` 待 L5) |
 | `CompactionState` / `CompactionControl` | 后台合并状态与 pause/resume 控制 |
 | `AccessStat` | 单条记录的访问统计(`last_access_ms` / `access_count`) |
 | `MnemeError` | 统一错误(见 [02 §2](02-l0-core.md)) |

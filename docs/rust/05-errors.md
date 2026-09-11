@@ -71,7 +71,7 @@ level.map_or(0, |l| l as usize);      // None 时给默认 0
 ```
 
 见 [`src/index/filtered.rs:100-104`](../../src/index/filtered.rs) 与
-[`src/index/hnsw.rs:243`](../../src/index/hnsw.rs)。`is_none_or` 是 Rust 1.82 稳定的
+[`src/index/hidx.rs:257-259`](../../src/index/hidx.rs)。`is_none_or` 是 Rust 1.82 稳定的
 新方法,名字直译就是"是 `None` 或者满足条件";在"默认放行、有值才检查"的语义下比
 `map_or(true, ...)` 更不容易读反。
 
@@ -111,7 +111,7 @@ for segment in path.split('.') {
 }
 ```
 
-见 [`src/core/meta.rs:42-44`](../../src/core/meta.rs)。任一环返回 `None`,整个函数立即返回 `None`。
+见 [`src/core/meta.rs:44-46`](../../src/core/meta.rs)。任一环返回 `None`,整个函数立即返回 `None`。
 
 L4 又用到几个"判断 / 过滤 / 借用"的组合子:
 
@@ -140,11 +140,11 @@ filter.map_or_else(
 );
 ```
 
-见 [`src/query/iso.rs:80-83`](../../src/query/iso.rs)、
+见 [`src/query/iso.rs:94`](../../src/query/iso.rs)、
 [`src/query/zmap.rs:148-164`](../../src/query/zmap.rs)、
 [`src/query/json.rs:101-104`](../../src/query/json.rs)、
-[`src/query/exec.rs:364-367`](../../src/query/exec.rs) 与
-[`src/query/plan.rs:33-36`](../../src/query/plan.rs)。逐条:
+[`src/query/exec.rs:368-369`](../../src/query/exec.rs) 与
+[`src/query/plan.rs:44-47`](../../src/query/plan.rs)。逐条:
 
 - `then_some`:等价于 `if cond { Some(v) } else { None }`,但 `v` **立即求值**;
   要惰性(只在 `true` 时才算)就用 `bool::then(|| ...)`。
@@ -154,7 +154,7 @@ filter.map_or_else(
   `Option<Vec<T>>` → `Option<&[T]>` 同理。
 - `cloned()`:`Option<&T>` → `Option<T>`(要求 `T: Clone`);`HashMap::get` 返回引用,
   L4 取来源边时用 `via_map.get(&rowid).cloned()` 复制出拥有值(见
-  [`src/query/exec.rs:354`](../../src/query/exec.rs))。
+  [`src/query/exec.rs:357`](../../src/query/exec.rs))。
 - `map_or_else(none_fn, some_fn)`:两个分支都惰性;L4 计划器用它"无过滤→全 1 位图,
   有过滤→下推求值"。默认值构造昂贵时,`map_or`(默认值立即求值)不合适。
 
@@ -186,7 +186,7 @@ mneme 给 `Result` 起了别名,固定错误类型:
 pub type Result<T> = std::result::Result<T, MnemeError>;
 ```
 
-见 [`src/core/error.rs:81`](../../src/core/error.rs)。于是全库函数签名统一写成 `-> Result<T>`,
+见 [`src/core/error.rs:133`](../../src/core/error.rs)。于是全库函数签名统一写成 `-> Result<T>`,
 不需要每次都写 `, MnemeError`。
 
 ### 2.1 `match` 处理
@@ -275,7 +275,7 @@ pub enum MnemeError {
 }
 ```
 
-见 [`src/core/error.rs:13-34`](../../src/core/error.rs)。
+见 [`src/core/error.rs:16-34`](../../src/core/error.rs)。
 
 ### 3.1 `#[error("...")]`:错误消息模板
 
@@ -461,7 +461,7 @@ if let Some(links) = self.nodes.get_mut(node as usize)
 | 测试代码 | 可以 `unwrap`/`expect`/`panic!` |
 
 mneme 的 L0 契约明确:**公开 API 不 panic**(FC-CORE-INV-002,见
-[`tests/core_contracts.rs:136`](../../tests/core_contracts.rs))。甚至浮点的边界也处理成确定值:
+[`tests/core_contracts.rs:151`](../../tests/core_contracts.rs))。甚至浮点的边界也处理成确定值:
 
 ```rust
 // 余弦零向量返回 0,绝不返回 NaN

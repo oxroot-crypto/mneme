@@ -24,7 +24,7 @@ pub struct TopK<T: Ord> {
 }
 ```
 
-见 [`src/core/heap.rs:27-31`](../../src/core/heap.rs)。
+见 [`src/core/heap.rs:45-49`](../../src/core/heap.rs)。
 
 - `T` 是**类型参数**,占位符;用 `TopK<u32>` 时 `T = u32`。
 - 可以实例化成 `TopK<u32>`、`TopK<RowId>`……同一份代码复用。
@@ -88,7 +88,7 @@ impl<T: Ord> TopK<T> {
 `T: Ord` 读作"T 必须实现 `Ord` trait"。为什么需要?因为 `TopK` 在分数相同时要按载荷
 `a_payload < b_payload` 排序,`<` 来自 `Ord`。没有这个约束,编译器不知道 `T` 能否比较大小。
 
-见 [`src/core/heap.rs:33`](../../src/core/heap.rs) 与 [`src/core/heap.rs:193`](../../src/core/heap.rs)。
+见 [`src/core/heap.rs:51`](../../src/core/heap.rs) 与 [`src/core/heap.rs:193`](../../src/core/heap.rs)。
 
 等价写法(更复杂时用 `where`):
 
@@ -274,12 +274,12 @@ decode_field_val(value, Expr::Contains);
 ```
 
 见 [`src/query/json.rs:171-192`](../../src/query/json.rs) 与
-[`src/query/json.rs:274-279`](../../src/query/json.rs)。要点:
+[`src/query/json.rs:278-283`](../../src/query/json.rs)。要点:
 
 - `Expr::Exists` 不是方法调用,而是把**变体构造器**当函数指针值传递:元组变体的构造器
   签名就是它的参数列表。
 - 需要显式类型时写 `Expr::Exists as fn(String) -> Expr` 强转(见
-  [`src/query/parse/mod.rs:243`](../../src/query/parse/mod.rs));
+  [`src/query/parse/mod.rs:249`](../../src/query/parse/mod.rs));
 - 构造器**不能捕获环境**,天然满足 `fn` 指针签名,所以适合当"无状态工厂"传来传去。
 
 ---
@@ -315,7 +315,7 @@ impl std::ops::BitAnd for Expr {
 let expr = Expr::field("importance").gt(0.5_f32) & Expr::field("rank").lt(1028_i64);
 ```
 
-见 [`src/query/plan.rs:139-141`](../../src/query/plan.rs)。要点:
+见 [`src/query/plan.rs:152`](../../src/query/plan.rs)。要点:
 
 - `a & b` 只是 `a.bitand(b)` 的**语法糖**,`|` 同理;重载不改变优先级,也不能凭空造运算符。
 - **关联类型 vs 泛型参数**:`Output` 由 `Self` 唯一决定,所以用关联类型;如果要允许同一个类型

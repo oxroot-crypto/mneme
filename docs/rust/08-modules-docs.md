@@ -196,7 +196,7 @@ f.write_char('(')?;      // 来自 fmt::Write trait
 f.write_str("never")?;   // 同上
 ```
 
-见 [`src/query/display.rs:6-8`](../../src/query/display.rs)。否则编译器只会报
+见 [`src/query/display.rs:9`](../../src/query/display.rs)。否则编译器只会报
 `no method named write_char found for ...`——**错误信息里不会提示你缺 `use`**。
 这条规则对所有 trait 方法都成立:方法定义在 trait 上,不是类型本身(见
 [06 §2](06-generics-traits.md));`std::io::Read`/`Write`、`Iterator` 等同理

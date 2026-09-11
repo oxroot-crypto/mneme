@@ -228,7 +228,8 @@ fn entry_body(slot: &SlotData, ws: &WriterState) -> Option<EntryData> {
     })
 }
 
-/// 统计各命名空间的活行数与文本总长(段内剪枝/BM25 用)。
+/// 统计各命名空间的活行数与文本**字节**总长(msec `ns_stats` 区;查询期不消费,
+/// BM25 的长度口径以倒排 doc 区的词数为准,见 `FC-QUERY-POST-003`)。
 fn build_ns_stats(ws: &WriterState, config: &Config) -> Vec<NsStatRow> {
     let now = config.clock.now_unix_ms();
     let mut stats: HashMap<u32, (u64, u64)> = HashMap::new();

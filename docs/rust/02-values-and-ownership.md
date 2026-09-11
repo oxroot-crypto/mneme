@@ -181,7 +181,7 @@ value.unsigned_abs() <= MAX_EXACT_INT as u64;
 - 为什么用 `unsigned_abs`:对 `i64::MIN` 直接取负会溢出 panic,`unsigned_abs`
   返回 `u64`,先比上限再转 `f64`(见 §2.2 的 2^53)。
 
-见 [`src/query/iso.rs:169-180`](../../src/query/iso.rs)、
+见 [`src/query/iso.rs:183-184`](../../src/query/iso.rs)、
 [`src/query/zmap.rs:27-30`](../../src/query/zmap.rs) 与
 [`src/query/zmap.rs:179-182`](../../src/query/zmap.rs)。
 
@@ -246,8 +246,8 @@ alpha.is_finite();        // 三者都是 false;配合 [0,1] 区间判定拒绝�
   `exact_int` 先检查 `unsigned_abs() <= MAX_EXACT_INT`,超了就返回 `None`,
   由调用方退回"全 1 位图"(无法判断就不剪)。
 
-见 [`src/query/fusion.rs:84-85`](../../src/query/fusion.rs)、
-[`src/query/fusion.rs:195-213`](../../src/query/fusion.rs) 与
+见 [`src/query/fusion.rs:86-87`](../../src/query/fusion.rs)、
+[`src/query/fusion.rs:202-221`](../../src/query/fusion.rs) 与
 [`src/query/zmap.rs:166-182`](../../src/query/zmap.rs)。
 
 ### 2.3 布尔与字符
@@ -279,7 +279,7 @@ c.len_utf8();          // 3:'好' 在 UTF-8 里占 3 个字节
   `self.pos += 1` 会切在字符中间,后续 `&input[pos..]` 直接 panic。
 
 见 [`src/query/parse/mod.rs:84-93`](../../src/query/parse/mod.rs) 与
-[`src/query/parse/mod.rs:292-309`](../../src/query/parse/mod.rs)。
+[`src/query/parse/mod.rs:298-315`](../../src/query/parse/mod.rs)。
 
 ### 2.4 数组与元组
 

@@ -89,6 +89,8 @@ const SRC_CORE_TEXT: &str = include_str!("../src/core/text.rs");
 const SRC_QUERY_ISO: &str = include_str!("../src/query/iso.rs");
 /// L1 内存倒排源码(NS 隔离/词频累计单测被 INV 契约引用)。
 const SRC_ANALYSIS_INV: &str = include_str!("../src/memory/analysis/inv.rs");
+/// L2 flush 段编码源码(字段字典 `key` 去重单测被 POST 契约引用)。
+const SRC_PERSIST_FLUSH: &str = include_str!("../src/persist/flush.rs");
 
 /// 契约测试文件(孤立检查与覆盖声明检查的范围)。
 const CONTRACT_TEST_FILES: [(&str, &str); 8] = [
@@ -103,7 +105,7 @@ const CONTRACT_TEST_FILES: [(&str, &str); 8] = [
 ];
 
 /// 契约引用的测试可能落在的全部文件(路径必须与 `contracts.md` 中书写一致)。
-const SOURCES: [(&str, &str); 39] = [
+const SOURCES: [(&str, &str); 40] = [
     ("tests/core_contracts.rs", CORE_TESTS),
     ("tests/memory_contracts.rs", MEMORY_TESTS),
     ("tests/query_contracts.rs", QUERY_TESTS),
@@ -143,6 +145,7 @@ const SOURCES: [(&str, &str); 39] = [
     ("src/core/text.rs", SRC_CORE_TEXT),
     ("src/query/iso.rs", SRC_QUERY_ISO),
     ("src/memory/analysis/inv.rs", SRC_ANALYSIS_INV),
+    ("src/persist/flush.rs", SRC_PERSIST_FLUSH),
 ];
 
 /// 契约编号的类型段(五维 + CPLX,见 `contracts.md` §0)。
@@ -158,10 +161,18 @@ fn test_fns(source: &str) -> Vec<String> {
             pending = true;
             continue;
         }
-        if pending && let Some(name) = fn_name(trimmed) {
-            names.push(name);
-            pending = false;
+        if !pending {
+            continue;
         }
+        // 跳过 `#[test]` 与声明之间可能出现的注释/其它属性行,
+        // 防止 `// fn foo` 之类注释被误当成测试名(也会让真孤立测试逃逸)。
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("#[") {
+            continue;
+        }
+        if let Some(name) = fn_name(trimmed) {
+            names.push(name);
+        }
+        pending = false;
     }
     names
 }

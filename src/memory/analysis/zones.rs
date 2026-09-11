@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::core::meta::Meta;
+use crate::memory::pred_eval::is_reserved_field;
 use crate::memory::table::SlotData;
 
 /// zone map 的块粒度(物理槽位数;与存储块粒度一致)。
@@ -46,8 +47,8 @@ pub(crate) struct BlockStat {
 #[derive(Clone)]
 struct FieldZones {
     kind: ZoneKind,
-    /// 出现类型冲突(同名 metadata 数字与保留 `Ts` 等):该字段退化为不参与
-    /// 块级剪枝,查询侧 `kind_of` 返回 `None`,绝不按不完整的统计误剪。
+    /// 出现类型冲突(同一字段被两种 `ZoneKind` 观察,实现防御):该字段退化为
+    /// 不参与块级剪枝,查询侧 `kind_of` 返回 `None`,绝不按不完整的统计误剪。
     mixed: bool,
     blocks: Vec<BlockStat>,
 }
@@ -100,9 +101,12 @@ impl ZoneIndex {
 
     /// 递归收集 metadata 中字段路径的存在性与数值区间(数组不参与路径)。
     ///
-    /// 与保留字段同名的 metadata 键会与保留字段共享 zone:类型一致时区间取并集,
-    /// 类型冲突时该字段退化为不参与块级剪枝([`FieldZones::mixed`]),行级求值仍以保留字段为准。
+    /// 与保留字段同名的 metadata 键**一律跳过**:行级求值以保留值为准,同名
+    /// metadata 永远读不到,若把它的统计当剪枝依据会静默漏报(FC-QUERY-POST-005)。
     fn observe_meta(&mut self, value: &Meta, prefix: &str, block: usize) {
+        if is_reserved_field(prefix) {
+            return;
+        }
         match value {
             Meta::Object(map) => {
                 if !prefix.is_empty() {
@@ -338,21 +342,15 @@ mod tests {
         assert_eq!((rank.min, rank.max), (f64::NEG_INFINITY, f64::INFINITY));
     }
 
-    /// 类型冲突(同名 metadata 数字 vs 保留 `Ts`)必须放弃剪枝,不得静默丢弃统计。
+    /// FC-QUERY-POST-005(字段类别冲突必须放弃剪枝,不得静默丢弃统计)
     #[test]
     fn kind_conflict_disables_block_pruning() {
         let mut zones = ZoneIndex::new(16);
-        // 块 0:metadata 数字先注册 `valid_to` 为 `Num`。
-        let mut first = slot(0, 0.5, json!({"valid_to": 1}));
-        first.valid_to = None;
-        zones.observe(0, &first);
-        assert_eq!(zones.kind_of("valid_to"), Some(ZoneKind::Num));
-        // 块 1:保留字段 `valid_to` 是 `Ts`,类型冲突 → 整个字段退出剪枝。
-        let mut second = slot(1, 0.5, json!({}));
-        second.valid_to = Some(5_000);
-        zones.observe(ZONE_BLOCK_ROWS, &second);
+        zones.observe_int("conflict", ZoneKind::Ts, 1_000, 0);
+        assert_eq!(zones.kind_of("conflict"), Some(ZoneKind::Ts));
+        zones.observe_int("conflict", ZoneKind::Num, 7, 0);
         assert_eq!(
-            zones.kind_of("valid_to"),
+            zones.kind_of("conflict"),
             None,
             "类型冲突字段必须退出块级剪枝"
         );
@@ -368,17 +366,22 @@ mod tests {
         assert!(zones.kind_of("b").is_none(), "超上限字段不再注册");
     }
 
+    /// FC-QUERY-POST-005(保留字段同名的 metadata 不进 zone map,行级以保留值为准)
     #[test]
-    fn reserved_timestamp_kind_wins_over_metadata_number() {
+    fn reserved_metadata_is_shadowed_and_not_indexed() {
         let mut zones = ZoneIndex::new(16);
-        zones.observe(0, &slot(0, 0.5, json!({"created_at": 5})));
+        zones.observe(
+            0,
+            &slot(0, 0.5, json!({"created_at": 5, "key": 9, "rowid": 99})),
+        );
         assert_eq!(
             zones.kind_of("created_at"),
-            None,
-            "同名 metadata 数字与保留 Ts 冲突后,字段退出块级剪枝"
+            Some(ZoneKind::Ts),
+            "created_at 的统计只来自保留值"
         );
-        // 已记录的保留字段统计仍在(调试可见),但查询侧不再据此剪枝。
+        assert!(zones.kind_of("key").is_none(), "保留名 metadata 不注册");
+        assert!(zones.kind_of("rowid").is_none(), "保留名 metadata 不注册");
         let stat = zones.block_stat("created_at", 0).expect("created_at");
-        assert!(stat.max >= 1_000.0);
+        assert!(stat.min >= 1_000.0, "不得混入 metadata 的 5");
     }
 }

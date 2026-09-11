@@ -79,7 +79,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 ```
 
-见 [`src/core/simd.rs:33`](../../src/core/simd.rs)。
+见 [`src/core/simd.rs:50`](../../src/core/simd.rs)。
 
 - `&[f32]` 可以接收 `&[f32; 4]`(数组的引用)、`&Vec<f32>`、或 `&v[1..3]`(子切片)。
   **函数只依赖"能当切片用",不关心底层是数组还是 Vec**——这是很好的解耦。
@@ -219,7 +219,7 @@ if bytes.len() < 4 || !bytes[..4].iter().all(u8::is_ascii_digit) { return None; 
   凡是签名能对上就能直接传给迭代器方法(和 §2.3 的 `Vec::as_slice`、[10 §4.6](10-testing.md)
   的 `Cell::get` 是同一个原理)。
 
-见 [`src/query/iso.rs:25-51`](../../src/query/iso.rs) 与 [`src/query/iso.rs:53-58`](../../src/query/iso.rs)。
+见 [`src/query/iso.rs:31-56`](../../src/query/iso.rs) 与 [`src/query/iso.rs:59-63`](../../src/query/iso.rs)。
 
 ---
 
@@ -326,7 +326,7 @@ rest.strip_prefix(keyword)                                      // Option<&str>,
 ```
 
 见 [`src/query/parse/mod.rs:110-121`](../../src/query/parse/mod.rs) 与
-[`src/query/display.rs:130-137`](../../src/query/display.rs)。常用成员:
+[`src/query/display.rs:133-140`](../../src/query/display.rs)。常用成员:
 `starts_with`/`ends_with`/`contains`/`find`/`split`/`trim_start_matches` 等。
 
 > `str::strip_prefix` 返回 `Option<&str>`:匹配时是"去掉前缀后的借用",不匹配是 `None`,
@@ -349,7 +349,7 @@ pub fn get_path<'v>(value: &'v Meta, path: &str) -> Option<&'v Meta> {
 }
 ```
 
-见 [`src/core/meta.rs:37`](../../src/core/meta.rs)。
+见 [`src/core/meta.rs:39`](../../src/core/meta.rs)。
 
 - `'v` 读作"生命周期 v",是一个**泛型参数**,但泛化的是"存活时间"而不是类型。
 - 签名含义:**返回的引用活得和 `value` 的引用一样久**;`path` 的生命周期无关紧要。
@@ -457,7 +457,7 @@ impl<T: Ord> TopK<T> {
 }
 ```
 
-见 [`src/core/heap.rs:107`](../../src/core/heap.rs)。调用方必须先拥有 `let mut top = ...`。
+见 [`src/core/heap.rs:131`](../../src/core/heap.rs)。调用方必须先拥有 `let mut top = ...`。
 
 `Clock` trait 的方法用 `&self` 而非 `&mut self`,因为它只是"读时间",不修改自身:
 
@@ -524,8 +524,8 @@ static NEXT_QUERY_ID: AtomicU64 = AtomicU64::new(1);
 let id = NEXT_QUERY_ID.fetch_add(1, Ordering::Relaxed);
 ```
 
-见 [`src/query/exec.rs:31-32`](../../src/query/exec.rs) 与
-[`src/query/exec.rs:258-262`](../../src/query/exec.rs)。要点:
+见 [`src/query/exec.rs:35`](../../src/query/exec.rs) 与
+[`src/query/exec.rs:262-265`](../../src/query/exec.rs)。要点:
 
 - `static` 是**整个程序唯一**的变量(比 `const` 多一个固定地址);普通 `static mut` 的读写
   是 `unsafe`,而 `AtomicU64` 提供安全的原子读写,`&self` 也能改内部值——这是它版本的

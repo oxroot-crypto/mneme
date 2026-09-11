@@ -228,6 +228,10 @@ fn decode_doc_region(
         let ns_id = NsId::new(doc_cursor.u32()?);
         let raw_slot = doc_cursor.u32()?;
         let doc_len = doc_cursor.u32()?;
+        if doc_len == 0 {
+            // 空文本在编码端不入 doc 区;0 词长会令 BM25 `avgdl=0`,分数出现 NaN。
+            return Err(corrupted("inverted: doc 区 doc_len 为 0"));
+        }
         let slot = remap_slot(raw_slot, remap)?;
         index.insert_doc(ns_id, slot, doc_len);
     }
@@ -393,6 +397,19 @@ mod tests {
         put_u32(&mut bytes, 0);
         assert!(matches!(
             decode_inverted(&bytes, &[]),
+            Err(MnemeError::Corrupted { .. })
+        ));
+
+        // doc 区 `doc_len = 0`:会使 BM25 `avgdl = 0` 产生 NaN 分数,必须拒绝。
+        let mut bytes = Vec::new();
+        put_u32(&mut bytes, 0);
+        put_u64(&mut bytes, 0);
+        put_u32(&mut bytes, 1);
+        put_u32(&mut bytes, 1);
+        put_u32(&mut bytes, 0);
+        put_u32(&mut bytes, 0);
+        assert!(matches!(
+            decode_inverted(&bytes, &[0]),
             Err(MnemeError::Corrupted { .. })
         ));
     }

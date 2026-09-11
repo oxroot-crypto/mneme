@@ -156,4 +156,11 @@ mod tests {
     fn whitespace_only_text_yields_no_tokens() {
         assert!(tokenize("   ", true).is_empty());
     }
+
+    /// FC-CORE-POST-008(纯标点输入不产生词条)
+    #[test]
+    fn punctuation_only_text_yields_no_tokens() {
+        assert!(tokenize("... ,.;!?", true).is_empty());
+        assert!(tokenize("... ,.;!?", false).is_empty());
+    }
 }

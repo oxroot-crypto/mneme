@@ -94,7 +94,7 @@ impl Clock for FakeClock {
 
 - `Clock` 是 L0 定义的 trait(见 [04 §5](04-borrowing-strings-slices.md));测试实现它,
   再用 `.clock(Arc::clone(&clock) as Arc<dyn Clock>)` 注入构建器,业务代码读到的"现在"
-  就由测试说了算(见 [`tests/l4_contracts.rs:539-542`](../../tests/l4_contracts.rs),
+  就由测试说了算(见 [`tests/l4_contracts.rs:615-630`](../../tests/l4_contracts.rs),
   推进时间用 `clock.0.store(...)`,即 `AtomicI64` 的 `&self` 写入)。
 - 内部用 `AtomicI64` 而不是 `Cell`:`&self` 下也能改,且跨线程安全(见
   [04 §5.2](04-borrowing-strings-slices.md))。
@@ -115,7 +115,7 @@ use mneme::{Dimension, Metric, TopK, json};
 use mneme::simd::{dot, dot_scalar};
 ```
 
-见 [`tests/core_contracts.rs:20-24`](../../tests/core_contracts.rs)。
+见 [`tests/core_contracts.rs:21-27`](../../tests/core_contracts.rs)。
 
 - 集成测试验证"用户视角"的 API 是否按契约工作。
 - 单元测试可以访问私有项,集成测试不行——这个区别很有用:它强迫你验证公开契约。
@@ -159,7 +159,7 @@ proptest! {
 }
 ```
 
-见 [`tests/core_contracts.rs:186-202`](../../tests/core_contracts.rs)。(`...` 处源码里还断言了
+见 [`tests/core_contracts.rs:201-217`](../../tests/core_contracts.rs)。(`...` 处源码里还断言了
 最小编码字节数,并对 `u32` 做同样的往返检查。)
 
 - `value in any::<u64>()` 是**策略(strategy)**:告诉 proptest 生成任意 `u64`。
@@ -210,7 +210,7 @@ proptest! {
 }
 ```
 
-见 [`tests/core_contracts.rs:204-220`](../../tests/core_contracts.rs)。这是优化代码最有力的正确性保障。
+见 [`tests/core_contracts.rs:221-244`](../../tests/core_contracts.rs)。这是优化代码最有力的正确性保障。
 
 ### 4.4 参照实现:验证数据结构
 
@@ -233,7 +233,7 @@ fn reference_topk(entries: &[(f32, u32)], k: usize, metric: Metric) -> Vec<u32> 
 }
 ```
 
-见 [`tests/core_contracts.rs:26-40`](../../tests/core_contracts.rs) 与 [`tests/core_contracts.rs:156-184`](../../tests/core_contracts.rs)。
+见 [`tests/core_contracts.rs:29-43`](../../tests/core_contracts.rs) 与 [`tests/core_contracts.rs:171-199`](../../tests/core_contracts.rs)。
 
 ### 4.5 自定义策略:`impl Strategy` 与 `prop_oneof!`
 
@@ -373,7 +373,7 @@ mneme 的集成测试文件头部列出它覆盖的契约编号:
 //! ...
 ```
 
-见 [`tests/core_contracts.rs:3-16`](../../tests/core_contracts.rs),契约定义在
+见 [`tests/core_contracts.rs:3-19`](../../tests/core_contracts.rs),契约定义在
 [`docs/spec/contracts.md`](../spec/contracts.md)。
 
 - 每个测试函数上方注释它对应的 `FC-*` 编号。

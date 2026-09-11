@@ -82,7 +82,7 @@ pub struct SystemClock;      // 没有任何字段
 ```
 
 它只表示"存在这样一个类型",用来挂载行为(实现 `Clock` trait),见
-[`src/core/options/clock.rs:20`](../../src/core/options/clock.rs)。
+[`src/core/options/clock.rs:24`](../../src/core/options/clock.rs)。
 
 ---
 
@@ -200,7 +200,7 @@ pub fn into_sorted_vec(mut self) -> Vec<T> {
 
 `mut self` 不是一种新的接收者,而是"`self`(值接收) + 一个可变的局部绑定"。调用后原 `TopK`
 被**移动**进函数,不能再使用——这正是 `into_*` 命名的语义。见
-[`src/core/heap.rs:166`](../../src/core/heap.rs)。
+[`src/core/heap.rs:201-213`](../../src/core/heap.rs)。
 
 #### 2.2.3 链式方法:`mut self -> Self` 与构建者模式
 
@@ -307,7 +307,7 @@ pub enum Expr {
 本身大小固定(分别为一个指针、一个"指针 + 长度"胖指针),递归因此被截断。要点:
 
 - **构造**:`Expr::Not(Box::new(inner))`、`Expr::And(vec![a, b].into_boxed_slice())`——
-  L4 的解析器与 `Display` 都这么造节点,见 [`src/query/parse/mod.rs:222`](../../src/query/parse/mod.rs);
+  L4 的解析器与 `Display` 都这么造节点,见 [`src/query/parse/mod.rs:228`](../../src/query/parse/mod.rs);
 - **解构**:模式写法和普通枚举一样,`Expr::Not(inner)` 里的 `inner` 绑定到 `&Box<Expr>`,
   用 `*inner` 或直接当 `Expr` 用(自动 deref);`match` 里也照常写 `Expr::Not(_)`;
 - **列表为什么用 `Box<[Expr]>` 而不是 `Vec<Expr>`**:AST 构造完就不再增删,`Box<[T]>`
@@ -367,9 +367,9 @@ pub struct Scoring {                         // 字段含 f32
   所以载荷**不能是 `f32`**(`RowId`、`u32` 可以)。
 - 需要给 `f32` 排序时,用 `f32::total_cmp`(它定义了一个把 `NaN` 也纳入的全序),而不是
   `partial_cmp().unwrap()`(遇 `NaN` 会 panic)。mneme 的 `TopK` 排序不依赖载荷是浮点,而是由
-  `Metric::better` 决定方向,同分再比 `Ord` 载荷。见 [`src/core/heap.rs:180`](../../src/core/heap.rs)。
+  `Metric::better` 决定方向,同分再比 `Ord` 载荷。见 [`src/core/heap.rs:201-213`](../../src/core/heap.rs)。
 
-`derive` 也能用在枚举上,见 [`src/core/options/index.rs:64`](../../src/core/options/index.rs)
+`derive` 也能用在枚举上,见 [`src/core/options/index.rs:66-76`](../../src/core/options/index.rs)
 的 `VectorFormat`。
 
 ### 4.2 手写比较 trait:字段含 `f32` 又要排序时(L3 的 `Cand`)
@@ -465,7 +465,7 @@ pub enum VectorFormat {
 }
 ```
 
-`#[default]` 指定哪个变体是默认值。见 [`src/core/options/index.rs:64-73`](../../src/core/options/index.rs)。
+`#[default]` 指定哪个变体是默认值。见 [`src/core/options/index.rs:67-71`](../../src/core/options/index.rs)。
 
 ### 5.3 惯用法
 
@@ -509,7 +509,7 @@ impl fmt::Display for RowId {
 pub enum MnemeError { ... }
 ```
 
-见 [`src/core/error.rs:13-14`](../../src/core/error.rs)。
+见 [`src/core/error.rs:16-17`](../../src/core/error.rs)。
 
 `#[non_exhaustive]` 表示"这个枚举将来可能增加变体":
 **外部 crate 的代码必须用 `_` 兜底匹配**,不能假设变体已全部列完。

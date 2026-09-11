@@ -276,7 +276,7 @@ cargo run --example hello
 >
 > 同族的 `format!` 不打印,而是直接产出一个 `String`。格式参数还能带**宽度与补零**:
 > `{month:02}` 按两位输出、不足补 0,`{milli:03}` 补到三位——L4 的 ISO 8601
-> 格式化就用它拼出定宽时间戳(见 [`src/query/iso.rs:169-180`](../../src/query/iso.rs))。
+> 格式化就用它拼出定宽时间戳(见 [`src/query/iso.rs:182-193`](../../src/query/iso.rs))。
 
 ---
 

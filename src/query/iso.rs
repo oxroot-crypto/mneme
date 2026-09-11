@@ -98,12 +98,12 @@ fn parse_offset(bytes: &[u8]) -> Option<i64> {
         b'-' => (-1_i64, &bytes[1..]),
         _ => return None,
     };
-    let (hour, rest) = take_digits(rest, 2)?;
+    let (hour, rest) = take_fixed_digits(rest, 2)?;
     let rest = match strip(rest, b':') {
         Some(rest) => rest,
         None => rest,
     };
-    let (minute, rest) = take_digits(rest, 2)?;
+    let (minute, rest) = take_fixed_digits(rest, 2)?;
     if !rest.is_empty() || hour > 23 || minute > 59 {
         return None;
     }
@@ -280,6 +280,32 @@ mod tests {
             parse_iso8601_ms("2024-06-01T00:00:00.5"),
             Some(1_717_200_000_500)
         );
+    }
+
+    /// FC-QUERY-POST-007(小写 `t`/`z`、紧凑 `±hhmm`;时区时分恰好 2 位)
+    #[test]
+    fn accepts_lowercase_and_compact_offset() {
+        assert_eq!(
+            parse_iso8601_ms("2024-06-01t12:00:00z"),
+            parse_iso8601_ms("2024-06-01T12:00:00Z")
+        );
+        assert_eq!(
+            parse_iso8601_ms("2024-06-01T20:00:00+0800"),
+            parse_iso8601_ms("2024-06-01T12:00:00Z")
+        );
+        assert_eq!(parse_iso8601_ms("2024-06-01T00:00:00+5:00"), None);
+        assert_eq!(parse_iso8601_ms("2024-06-01T00:00:00+05:0"), None);
+    }
+
+    /// FC-QUERY-POST-007(全范围采样往返,不只端点)
+    #[test]
+    fn roundtrip_covers_range_samples() {
+        let span = MAX_ROUNDTRIP_MS - MIN_ROUNDTRIP_MS;
+        for index in 0..=100 {
+            let ms = MIN_ROUNDTRIP_MS + span / 100 * index;
+            let text = format_iso8601_ms(ms);
+            assert_eq!(parse_iso8601_ms(&text), Some(ms), "{text}");
+        }
     }
 
     #[test]

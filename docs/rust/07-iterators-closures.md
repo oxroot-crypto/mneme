@@ -64,7 +64,7 @@ a.iter()                       // &f32
  .sum::<f32>()                 // 消费:求和
 ```
 
-这是 mneme 的标量点积实现,见 [`src/core/simd.rs:69-71`](../../src/core/simd.rs):
+这是 mneme 的标量点积实现,见 [`src/core/simd.rs:86-97`](../../src/core/simd.rs):
 
 ```rust
 pub fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
@@ -135,7 +135,7 @@ let min = oriented.iter().copied().fold(f32::INFINITY, f32::min);
 let max = oriented.iter().copied().fold(f32::NEG_INFINITY, f32::max);
 ```
 
-见 [`src/query/fusion.rs:84-85`](../../src/query/fusion.rs)。两个细节:
+见 [`src/query/fusion.rs:86-87`](../../src/query/fusion.rs)。两个细节:
 
 - `f32::min` / `f32::max` 是**方法**,但签名是 `fn(f32, f32) -> f32`,正好吻合 `fold`
   需要的 `FnMut(f32, f32) -> f32`;凡是签名对得上,关联函数/方法都能直接当函数指针传
@@ -180,7 +180,7 @@ self.heap.sort_by(|a, b| {
 });
 ```
 
-见 [`src/core/heap.rs:168-176`](../../src/core/heap.rs)。
+见 [`src/core/heap.rs:203-211`](../../src/core/heap.rs)。
 
 - 闭包参数 `a`、`b` 是 `&Entry<T>`(因为 `sort_by` 传引用)。
 - 返回值是 `std::cmp::Ordering`,三选一:`Less`(a 在前)、`Greater`(b 在前)、`Equal`。
@@ -191,7 +191,7 @@ self.heap.sort_by(|a, b| {
 > `a.score.partial_cmp(&b.score).unwrap()` 的原因:`f32` 的 `partial_cmp` 遇到 `NaN` 返回 `None`,
 > `unwrap()` 会 panic。mneme 绕开浮点比较,改用 `Metric::better` + `Ord` 载荷保证全序:
 > 对任意 `a`、`b`,`is_better(a, b)` 与 `is_better(b, a)` 至多一个为真,相等时再用
-> `a_payload < b_payload` 兜底。见 [`src/core/heap.rs:180-195`](../../src/core/heap.rs)。
+> `a_payload < b_payload` 兜底。见 [`src/core/heap.rs:216-226`](../../src/core/heap.rs)。
 
 ### 4.2 闭包捕获与借用规则
 
@@ -397,7 +397,7 @@ let v: Vec<i32> = [Some(1), None, Some(3)].into_iter().flatten().collect();
 
 数组则经 `IntoIterator` 进入 `for` 循环(即 §2 表中的 `into_iter` 一行,拿到的是元素值)。
 mneme 的测试里也常见 `for (score, id) in [...]` 直接遍历数组,见
-[`src/core/heap.rs:250-259`](../../src/core/heap.rs)。
+[`src/core/heap.rs:287-296`](../../src/core/heap.rs)。
 
 ---
 

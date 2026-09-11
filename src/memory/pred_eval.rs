@@ -169,6 +169,27 @@ enum FieldValue<'a> {
     Meta(&'a Meta),
 }
 
+/// 引擎保留字段名:行级求值优先于同名 metadata(见 [`resolve`])。
+///
+/// zone map 侧必须排除这些名字——它们的行级值来自 `SlotData`,metadata 里的
+/// 同名键永远读不到,把 metadata 统计当剪枝依据会静默漏报(FC-QUERY-POST-005)。
+pub(crate) fn is_reserved_field(name: &str) -> bool {
+    matches!(
+        name,
+        "rowid"
+            | "key"
+            | "created_at"
+            | "expires_at"
+            | "importance"
+            | "confidence"
+            | "valid_from"
+            | "valid_to"
+            | "last_access"
+            | "access_count"
+            | "__ns"
+    )
+}
+
 fn resolve<'a>(field: &str, ctx: &EvalCtx<'a>) -> Option<FieldValue<'a>> {
     let slot = ctx.slot;
     match field {
