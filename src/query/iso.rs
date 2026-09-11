@@ -115,11 +115,11 @@ fn parse_time_of_day(bytes: &[u8]) -> Option<(i64, i64, i64, i64, i64)> {
     let (mut hour, mut minute, mut second, mut milli) = (0, 0, 0, 0);
     let rest = match strip(bytes, b'T') {
         Some(rest) => {
-            let (h, rest) = take_digits(rest, 2)?;
+            let (h, rest) = take_fixed_digits(rest, 2)?;
             let rest = strip(rest, b':')?;
-            let (m, rest) = take_digits(rest, 2)?;
+            let (m, rest) = take_fixed_digits(rest, 2)?;
             let (s, rest) = match strip(rest, b':') {
-                Some(rest) => take_digits(rest, 2)?,
+                Some(rest) => take_fixed_digits(rest, 2)?,
                 None => (0, rest),
             };
             let rest = match strip(rest, b'.') {
@@ -253,6 +253,9 @@ mod tests {
         assert_eq!(parse_iso8601_ms("2024-06-01T23:59:60Z"), None);
         assert_eq!(parse_iso8601_ms("not-a-date"), None);
         assert_eq!(parse_iso8601_ms("2024-06-01T00:00:00+25:00"), None);
+        // 时分秒各须恰好 2 位。
+        assert_eq!(parse_iso8601_ms("2024-06-01T1:00:00Z"), None);
+        assert_eq!(parse_iso8601_ms("2024-06-01T00:0:00Z"), None);
     }
 
     /// FC-QUERY-POST-007(小数秒不足 3 位按位补零;绝不读入后续时区字符)
@@ -302,7 +305,7 @@ mod tests {
     fn roundtrip_covers_range_samples() {
         let span = MAX_ROUNDTRIP_MS - MIN_ROUNDTRIP_MS;
         for index in 0..=100 {
-            let ms = MIN_ROUNDTRIP_MS + span / 100 * index;
+            let ms = MIN_ROUNDTRIP_MS + span * index / 100;
             let text = format_iso8601_ms(ms);
             assert_eq!(parse_iso8601_ms(&text), Some(ms), "{text}");
         }

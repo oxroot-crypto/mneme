@@ -169,25 +169,27 @@ enum FieldValue<'a> {
     Meta(&'a Meta),
 }
 
-/// 引擎保留字段名:行级求值优先于同名 metadata(见 [`resolve`])。
+/// 引擎保留字段名全表(与 [`resolve`] 的保留分支一一对应)。
 ///
-/// zone map 侧必须排除这些名字——它们的行级值来自 `SlotData`,metadata 里的
+/// zone map 侧必须排除这些名字本身:它们的行级值来自 `SlotData`,metadata 里的
 /// 同名键永远读不到,把 metadata 统计当剪枝依据会静默漏报(FC-QUERY-POST-005)。
+pub(crate) const RESERVED_FIELDS: &[&str] = &[
+    "rowid",
+    "key",
+    "created_at",
+    "expires_at",
+    "importance",
+    "confidence",
+    "valid_from",
+    "valid_to",
+    "last_access",
+    "access_count",
+    "__ns",
+];
+
+/// 判断字段名本身是否为引擎保留字段。
 pub(crate) fn is_reserved_field(name: &str) -> bool {
-    matches!(
-        name,
-        "rowid"
-            | "key"
-            | "created_at"
-            | "expires_at"
-            | "importance"
-            | "confidence"
-            | "valid_from"
-            | "valid_to"
-            | "last_access"
-            | "access_count"
-            | "__ns"
-    )
+    RESERVED_FIELDS.contains(&name)
 }
 
 fn resolve<'a>(field: &str, ctx: &EvalCtx<'a>) -> Option<FieldValue<'a>> {
@@ -376,5 +378,30 @@ mod tests {
     fn reserved_fields_shadow_metadata() {
         let (slot, access) = ctx_with(crate::core::meta::json!({"importance": 0.0}));
         assert!(hit(&Expr::field("importance").gt(0.4), &slot, access));
+    }
+
+    /// FC-QUERY-POST-005(保留名清单与 `resolve` 的保留分支保持同步)
+    #[test]
+    fn reserved_names_resolve_to_reserved_values() {
+        let (mut slot, mut access) = ctx_with(crate::core::meta::json!({}));
+        slot.key = Some(crate::core::types::Key::new("k"));
+        slot.expires_at = Some(1);
+        slot.valid_to = Some(2);
+        access.last_access_ms = 3;
+        access.access_count = 4;
+        for name in RESERVED_FIELDS {
+            assert!(is_reserved_field(name));
+            match resolve(
+                name,
+                &EvalCtx {
+                    slot: &slot,
+                    access: Some(access),
+                },
+            ) {
+                Some(FieldValue::Reserved(_)) => {}
+                Some(FieldValue::Meta(_)) => panic!("{name} 落入 metadata 分支"),
+                None => panic!("{name} 未按保留值解析"),
+            }
+        }
     }
 }

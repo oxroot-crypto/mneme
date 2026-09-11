@@ -50,7 +50,7 @@ pub trait Clock: Send + Sync {
 }
 ```
 
-见 [`src/core/options/clock.rs:9-16`](../../src/core/options/clock.rs)。
+见 [`src/core/options/clock.rs:10-19`](../../src/core/options/clock.rs)。
 
 - `Clock` 是 trait 名,里面声明了方法 `now_unix_ms`(只有签名,没有实现)。
 - `: Send + Sync` 是 **supertrait(父 trait)约束**:任何 `Clock` 的实现者还必须满足 `Send + Sync`。

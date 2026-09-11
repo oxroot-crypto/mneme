@@ -467,7 +467,7 @@ pub trait Clock: Send + Sync {
 }
 ```
 
-见 [`src/core/options/clock.rs:9-16`](../../src/core/options/clock.rs)。
+见 [`src/core/options/clock.rs:10-19`](../../src/core/options/clock.rs)。
 
 > **那"用 `&self` 却要改内部状态"怎么办?** 这就是**内部可变性(interior mutability)**:
 > 用 `Cell`/`RefCell`(单线程)或 `Mutex`/`RwLock`/原子类型(多线程)把"可变性"藏进类型内部,

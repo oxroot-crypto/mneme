@@ -256,4 +256,50 @@ mod tests {
         let plan = compile(&view, ns_id, Some(&Expr::Exists("key".into())), 0);
         assert_eq!(plan.candidates.len(), 1025, "所有保留 key 都必须保留");
     }
+
+    /// FC-QUERY-POST-005(保留名对象下的子路径 `key.x` 按 `meta::get_path` 照常观察)
+    #[test]
+    fn dotted_reserved_subpath_never_prunes() {
+        let db = Mneme::in_memory(2).expect("in_memory");
+        let ns = db.namespace("n");
+        for index in 0..1024 {
+            let record = Record::new(vec![1.0, 0.0]).key(format!("k{index}"));
+            // 块 0 内嵌 `{"key": {"x": 5}}`:行级 `key.x == 5` 可命中。
+            let record = if index == 0 {
+                record.metadata(crate::core::meta::json!({"key": {"x": 5}}))
+            } else {
+                record
+            };
+            ns.insert(record).expect("insert");
+        }
+        // 块 1 用字面点分键把 `key.x` 注册进 zone map(数字/字符串两种形态)。
+        ns.insert(
+            Record::new(vec![0.0, 1.0])
+                .key("dotted-num")
+                .metadata(crate::core::meta::json!({"key.x": 9})),
+        )
+        .expect("insert");
+        ns.insert(
+            Record::new(vec![0.0, 1.0])
+                .key("dotted-str")
+                .metadata(crate::core::meta::json!({"key.x": "s"})),
+        )
+        .expect("insert");
+        let view = db.table.view();
+        let ns_id = view
+            .ns_registry
+            .iter()
+            .find_map(|(id, path)| (**path == *"n").then_some(*id))
+            .expect("命名空间已注册");
+        for expr in [
+            Expr::field("key.x").eq(5_i64),
+            Expr::field("key.x").eq(9_i64),
+            Expr::field("key.x").lt(8_i64),
+            Expr::Exists("key.x".into()),
+        ] {
+            assert_matches_bruteforce(&view, ns_id, &expr);
+        }
+        let plan = compile(&view, ns_id, Some(&Expr::field("key.x").eq(5_i64)), 0);
+        assert_eq!(plan.candidates.len(), 1, "嵌套子路径行必须保留");
+    }
 }

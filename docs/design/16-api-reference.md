@@ -597,7 +597,7 @@ pub struct ConsolidateReport {
 | 自动遗忘 | `.retention` | **`None`(关闭)** | `Option<Retention>`;显式传入才开启后台 retain,见 [07 §3.4](07-l5-life.md) |
 | 遗忘扫描周期 | `.retain_interval` | 半衰期/4 | 开启自动遗忘后的触发间隔 |
 | 访问统计落盘 | `.access_flush_interval` | `30s` | 内存访问计数批量写 WAL 的周期,见 [07 §2](07-l5-life.md) |
-| 压缩 | `.compression` | `None` | 文本/元数据压缩,见 [11 §3](11-security-storage.md) |
+| 压缩 | `.compression` | `None` | 文本/元数据压缩,见 [11 §3](11-security-storage.md);**L11 落地**,当前仅记录配置、不生效 |
 | 加密 | `.encryption` | `None` | 静态加密(feature `encrypt`),见 [11 §2](11-security-storage.md);**L11 落地**,当前无此 API |
 | 存储后端 | `.storage` | `FsStorage` | `Arc<dyn Storage>`;WASM/边缘自定义后端,见 [12 §3](12-deployment.md);**L12 落地**,当前无此 API |
 | 只读共享 | `.read_only` | `false` | 多进程只读打开,见 [12 §2](12-deployment.md) |

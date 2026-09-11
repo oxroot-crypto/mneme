@@ -101,15 +101,13 @@ impl ZoneIndex {
 
     /// 递归收集 metadata 中字段路径的存在性与数值区间(数组不参与路径)。
     ///
-    /// 与保留字段同名的 metadata 键**一律跳过**:行级求值以保留值为准,同名
-    /// metadata 永远读不到,若把它的统计当剪枝依据会静默漏报(FC-QUERY-POST-005)。
+    /// 保留名**自身**不注册(行级读 `SlotData` 保留值,同名 metadata 永远读不到),
+    /// 但其对象子路径(如 `key.x`)按 `meta::get_path` 语义照常观察(FC-QUERY-POST-005)。
     fn observe_meta(&mut self, value: &Meta, prefix: &str, block: usize) {
-        if is_reserved_field(prefix) {
-            return;
-        }
+        let reserved = is_reserved_field(prefix);
         match value {
             Meta::Object(map) => {
-                if !prefix.is_empty() {
+                if !prefix.is_empty() && !reserved {
                     self.observe_any(prefix, block);
                 }
                 for (key, child) in map {
@@ -120,18 +118,18 @@ impl ZoneIndex {
                     }
                 }
             }
-            Meta::Number(number) if !prefix.is_empty() => {
+            Meta::Number(number) if !prefix.is_empty() && !reserved => {
                 if let Some(int) = number.as_i64() {
                     self.observe_int(prefix, ZoneKind::Num, int, block);
                 } else if let Some(value) = number.as_f64() {
                     self.observe_value(prefix, ZoneKind::Num, value, block);
                 }
             }
-            Meta::Null if !prefix.is_empty() => {
+            Meta::Null if !prefix.is_empty() && !reserved => {
                 self.observe_null(prefix, block);
             }
             // 字符串/布尔/数组等非数值类型:只记录"存在",不参与区间剪枝。
-            _ if !prefix.is_empty() => self.observe_any(prefix, block),
+            _ if !prefix.is_empty() && !reserved => self.observe_any(prefix, block),
             _ => {}
         }
     }
@@ -383,5 +381,15 @@ mod tests {
         assert!(zones.kind_of("rowid").is_none(), "保留名 metadata 不注册");
         let stat = zones.block_stat("created_at", 0).expect("created_at");
         assert!(stat.min >= 1_000.0, "不得混入 metadata 的 5");
+    }
+
+    /// FC-QUERY-POST-005(保留名对象下的子路径照常观察,如 `key.x`)
+    #[test]
+    fn reserved_object_subpaths_are_still_indexed() {
+        let mut zones = ZoneIndex::new(16);
+        zones.observe(0, &slot(0, 0.5, json!({"key": {"x": 5}})));
+        assert!(zones.kind_of("key").is_none(), "保留名自身仍不注册");
+        let stat = zones.block_stat("key.x", 0).expect("key.x 子路径");
+        assert_eq!((stat.min, stat.max), (5.0, 5.0));
     }
 }

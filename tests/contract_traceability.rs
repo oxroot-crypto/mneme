@@ -91,6 +91,8 @@ const SRC_QUERY_ISO: &str = include_str!("../src/query/iso.rs");
 const SRC_ANALYSIS_INV: &str = include_str!("../src/memory/analysis/inv.rs");
 /// L2 flush 段编码源码(字段字典 `key` 去重单测被 POST 契约引用)。
 const SRC_PERSIST_FLUSH: &str = include_str!("../src/persist/flush.rs");
+/// L1 谓词求值源码(保留字段清单同步单测被 POST 契约引用)。
+const SRC_PRED_EVAL: &str = include_str!("../src/memory/pred_eval.rs");
 
 /// 契约测试文件(孤立检查与覆盖声明检查的范围)。
 const CONTRACT_TEST_FILES: [(&str, &str); 8] = [
@@ -105,7 +107,7 @@ const CONTRACT_TEST_FILES: [(&str, &str); 8] = [
 ];
 
 /// 契约引用的测试可能落在的全部文件(路径必须与 `contracts.md` 中书写一致)。
-const SOURCES: [(&str, &str); 40] = [
+const SOURCES: [(&str, &str); 41] = [
     ("tests/core_contracts.rs", CORE_TESTS),
     ("tests/memory_contracts.rs", MEMORY_TESTS),
     ("tests/query_contracts.rs", QUERY_TESTS),
@@ -146,6 +148,7 @@ const SOURCES: [(&str, &str); 40] = [
     ("src/query/iso.rs", SRC_QUERY_ISO),
     ("src/memory/analysis/inv.rs", SRC_ANALYSIS_INV),
     ("src/persist/flush.rs", SRC_PERSIST_FLUSH),
+    ("src/memory/pred_eval.rs", SRC_PRED_EVAL),
 ];
 
 /// 契约编号的类型段(五维 + CPLX,见 `contracts.md` §0)。
