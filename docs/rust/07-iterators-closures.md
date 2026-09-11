@@ -88,6 +88,7 @@ pub fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
 | `copied()` | 把 `&T` 变成 `T`(`T: Copy`),省去 `|x| *x` |
 | `flat_map(f)` | 每个元素展开成多个 |
 | `peekable()` | 可以偷看下一个元素 |
+| `find_map(f)` | `map` + `find` 合一:闭包返回 `Option`,第一个 `Some` 即为结果 |
 
 消费器(终结适配器):
 
@@ -101,6 +102,26 @@ pub fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
 | `find(f)` / `position(f)` | 找第一个满足的 |
 | `min()` / `max()` | 极值(要求 `Ord`;`f32` 不能直接用,见 [03 §4.1](03-structs-enums-impl.md)) |
 | `min_by_key(f)` / `max_by_key(f)` | 按"键"取极值,如 `max_by_key(\|item\| item.level)` |
+
+`find_map` 是"逐个尝试、第一个成功就停"的组合:L4 用它把命名空间路径解析成 `NsId`,找不到就是
+`None`(调用方退回空结果):
+
+```rust
+view.ns_registry.iter().find_map(|(id, path)| {
+    if **path == *self.ns_path { Some(*id) } else { None }
+})
+```
+
+见 [`src/query/exec.rs:168-176`](../../src/query/exec.rs)。闭包返回 `Option`,所以既能"过滤掉
+不关心的项",又能顺手做转换;`**path` 的双重解引用见 [04 §3.3](04-borrowing-strings-slices.md)。
+
+另外两个不属于迭代器、但总在链尾露脸的 `Vec` 方法:
+
+- `Vec::extend(iter)`:把另一个迭代器(或 `Vec`)的元素追加进来。L4 解析器把第一个子表达式与
+  收集到的其余项合并成一个列表再 `into_boxed_slice`,见
+  [`src/query/parse/mod.rs:191-194`](../../src/query/parse/mod.rs);
+- `Vec::truncate(n)`:只保留前 `n` 个元素(多出的直接丢掉)。L4 执行管线在融合排序后按 `top_k`
+  截断,见 [`src/query/exec.rs:338`](../../src/query/exec.rs)。
 
 ### 3.1 `enumerate` 的例子
 
@@ -131,18 +152,22 @@ let v: Vec<i32> = (0..5).map(|x| x * x).collect();
 通道分数的最小 / 最大值:
 
 ```rust
-let min = oriented.iter().copied().fold(f32::INFINITY, f32::min);
-let max = oriented.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+let min = oriented.iter().copied().fold(f64::INFINITY, f64::min);
+let max = oriented.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 ```
 
-见 [`src/query/fusion.rs:86-87`](../../src/query/fusion.rs)。两个细节:
+见 [`src/query/fusion.rs:86-87`](../../src/query/fusion.rs)。三个细节:
 
-- `f32::min` / `f32::max` 是**方法**,但签名是 `fn(f32, f32) -> f32`,正好吻合 `fold`
-  需要的 `FnMut(f32, f32) -> f32`;凡是签名对得上,关联函数/方法都能直接当函数指针传
+- `f64::min` / `f64::max` 是**方法**,但签名是 `fn(f64, f64) -> f64`,正好吻合 `fold`
+  需要的 `FnMut(f64, f64) -> f64`;凡是签名对得上,关联函数/方法都能直接当函数指针传
   (和 [04 §2.3](04-borrowing-strings-slices.md) 的 `Vec::as_slice`、[10 §4.6](10-testing.md)
-  的 `Cell::get` 一样)。
-- 用 `f32::INFINITY` 当地基:任何有限值都能顶掉它,`fold` 完拿到的就是集合最小值;
+  的 `Cell::get` 一样)。`f32` 有完全同名的版本,规则一致。
+- 用 `f64::INFINITY` 当地基:任何有限值都能顶掉它,`fold` 完拿到的就是集合最小值;
   空集合则原样返回 `+∞`(L4 调用前已判空,不会遇到)。
+- **为什么用 `f64` 而不是 `f32`**:两个通道的分数本身是 `f32`,但归一化要算 `max - min`;
+  极端输入(`±f32::MAX`)的极差会在 `f32` 下溢出成 `inf`,再算 `inf/inf` 就得到 `NaN`。
+  先把中间量升到 `f64` 再降回 `f32`,既不溢出也不丢序(见
+  [`src/query/fusion.rs:76-106`](../../src/query/fusion.rs))。
 
 ---
 
@@ -371,6 +396,11 @@ for (rank, hit) in channel.iter().enumerate() {
 - 想"存在时顺便改一下"用 `and_modify(|v| ...)`;预知规模时 `HashMap::with_capacity(n)`
   预留容量(与 `Vec::with_capacity` 同理,见 §7)。
 - 注意 `HashMap` 迭代顺序不确定;要稳定顺序必须像 L4 一样**显式排序**或按 key 取值。
+- `keys()` 只借出键的视图(要值用 `values()`,要键值对直接 `iter()`);L4 统计 BM25 平均文档长度
+  时 `for slot in docs.keys()`,见 [`src/query/bm25.rs:87-92`](../../src/query/bm25.rs)。
+- `map[&key]` 是对 `HashMap` 实现 `Index` 的语法糖,等价于"`get` + 取不到就 panic";
+  只在**已经证明键存在**时用——L4 的 `docs[slot]` 刚由同一轮 `keys()` 枚举出来,所以安全;
+  拿不准时一律 `get(...).copied()` 配兜底,而不是靠 `[]`。
 
 L4 的分词阶段还把"排序 + 去重"当固定搭配:
 
@@ -426,10 +456,12 @@ mneme 的测试里也常见 `for (score, id) in [...]` 直接遍历数组,见
 ## 9. 本章小结
 
 - `for` + Range 是基本循环;`iter`/`iter_mut`/`into_iter` 决定借用还是消耗。
-- 迭代器适配器(`map`/`filter`/`zip`/`enumerate`/`rev`/`copied`)+ 消费器
-  (`sum`/`collect`/`fold`/`max_by_key`)链式组合,惰性零开销。
-- `fold(init, f)` 是带累加器的归约;`f32::min` 这类方法只要签名对得上,就能当函数指针传给 `fold`。
-- `HashMap::entry(key).or_insert(..)` 一次查找完成"查 / 插 / 改";`sort` + `dedup` 是有序去重。
+- 迭代器适配器(`map`/`filter`/`zip`/`enumerate`/`rev`/`copied`/`find_map`)+ 消费器
+  (`sum`/`collect`/`fold`/`max_by_key`)链式组合,惰性零开销;`Vec::extend`/`Vec::truncate`
+  常用来收尾。
+- `fold(init, f)` 是带累加器的归约;`f64::min`/`f32::min` 这类方法只要签名对得上,就能当函数指针传给 `fold`。
+- `HashMap::entry(key).or_insert(..)` 一次查找完成"查 / 插 / 改";`keys()` 遍历键;
+  `map[&key]` 键不存在会 panic,拿不准时用 `get(..).copied()`;`sort` + `dedup` 是有序去重。
 - 闭包 `|x| ...` 能捕获环境;`move` 强制转移所有权。
 - 接收闭包的函数用 `FnOnce`/`FnMut`/`Fn` 声明调用方式;L1 写事务 `write_tx` 用 `FnOnce` 执行一次、
   失败整体回滚。

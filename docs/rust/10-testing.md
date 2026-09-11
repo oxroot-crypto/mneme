@@ -119,6 +119,10 @@ use mneme::simd::{dot, dot_scalar};
 
 - 集成测试验证"用户视角"的 API 是否按契约工作。
 - 单元测试可以访问私有项,集成测试不行——这个区别很有用:它强迫你验证公开契约。
+- 多个集成测试要共享辅助函数时,把它们放进 `tests/common/mod.rs`,各测试文件用 `mod common;`
+  引入(目录入口 `mod.rs` 不会被单独当成一个测试 crate)。L4 契约测试就复用了其中的建库助手:
+  `mod common; use common::{inserted, mem};`,见
+  [`tests/l4_contracts.rs:27-29`](../../tests/l4_contracts.rs)。
 
 ---
 
@@ -165,6 +169,10 @@ proptest! {
 - `value in any::<u64>()` 是**策略(strategy)**:告诉 proptest 生成任意 `u64`。
 - `prop_assert_eq!` 是 proptest 版断言,失败时会**收缩(shrink)**到最小反例。
 - 区间生成:`prop::collection::vec(-10.0f32..10.0, 0..300)` 生成"长度 0–300、元素在 -10~10 的 Vec"。
+- 字符串/正则策略:直接写正则字面量,proptest 生成匹配它的字符串。L4 的
+  `input in ".{0,200}"` 就是"0–200 个任意字符(含 Unicode)",用来给 DSL 解析器喂任意输入
+  (见 [`tests/l4_contracts.rs:798`](../../tests/l4_contracts.rs));要无长度上限可用
+  `any::<String>()`。
 - 失败时 proptest 会打印反例,你可以据此加一个固定的回归测试。
 
 ### 4.1 失败之后:收缩与回归

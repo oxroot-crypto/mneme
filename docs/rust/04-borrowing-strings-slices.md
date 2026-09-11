@@ -239,6 +239,10 @@ Rust 的字符串是初学者最容易晕的地方。记住两条轴:
 - 字符串字面量 `"hello"` 的类型是 `&'static str`(静态生命周期的借用)。
 - `String` 可以通过 `&s` 或 `s.as_str()` 变成 `&str`。
 - `&str` 通过 `.to_string()` 或 `String::from(...)` 变成 `String`。
+- `String` 是可增长的:`.push(c)` 追加一个 `char`、`.push_str(s)` 追加一段 `&str`。
+  L4 打印浮点常量时用 `push_str(".0")` 补小数点,解码转义序列时用 `push(char)` 逐字符装配
+  (见 [`src/query/display.rs:133-140`](../../src/query/display.rs) 与
+  [`src/query/parse/literal.rs:209-218`](../../src/query/parse/literal.rs))。
 
 ### 3.1 mneme 的 `Key`:为什么用 `Arc<str>`
 
@@ -300,6 +304,33 @@ impl From<String> for Key {
 
 见 [`src/core/types.rs:219-259`](../../src/core/types.rs)。
 
+**`.as_ref()` 借出 `&str`:`AsRef` trait。** 除了 `&*arc`(解引用)和 `Key::as_str()`,
+还可以用 `.as_ref()`——它来自标准库的 **`AsRef`** trait(含义是"把 `&self` 转成另一种引用",
+零成本)。`Arc<str>`、`String` 都实现了 `AsRef<str>`,所以 JSON 编码 `Val::Str` 里的 `Arc<str>`
+时直接写 `value.as_ref()` 就得到 `&str`,见 [`src/query/json.rs:90`](../../src/query/json.rs)。
+注意 `Option<T>` 也有一个同名的**固有方法** `as_ref()`(见 [05 §1.2](05-errors.md)),
+两者同名不同源,按接收者是不是 `Option` 区分。
+
+**`Arc<str>` 能直接和 `str` 比较。** 标准库提供了跨类型 `PartialEq`,所以比较字符串内容时不必
+先转成 `String`、也不依赖 `Arc` 指针地址。L4 查命名空间就利用了这点:
+
+```rust
+fn resolve_ns_id(&self, view: &ReaderView) -> Option<NsId> {
+    view.ns_registry.iter().find_map(|(id, path)| {
+        if **path == *self.ns_path {
+            Some(*id)
+        } else {
+            None
+        }
+    })
+}
+```
+
+见 [`src/query/exec.rs:168-176`](../../src/query/exec.rs)。`ns_registry` 的值类型是 `Arc<str>`,
+迭代给出 `path: &Arc<str>`,所以 `**path` 一路解到 `str`;`self.ns_path: Arc<str>`,`*self.ns_path`
+同样解到 `str`——两边比较的是字符内容。测试里 `**path == *"n"` 的 `*"n"` 也是把字面量 `&str`
+解一层得到 `str`(见 [`src/query/plan.rs:114-117`](../../src/query/plan.rs))。
+
 ### 3.4 原始字符串与"模式" API:L4 解析器的字符串日常
 
 L4 的过滤 DSL 本身含双引号(如 `kind == "preference"`),所以测试与 doctest 里满是
@@ -328,6 +359,9 @@ rest.strip_prefix(keyword)                                      // Option<&str>,
 见 [`src/query/parse/mod.rs:110-121`](../../src/query/parse/mod.rs) 与
 [`src/query/display.rs:133-140`](../../src/query/display.rs)。常用成员:
 `starts_with`/`ends_with`/`contains`/`find`/`split`/`trim_start_matches` 等。
+不带模式的 `trim_start()` / `trim_end()` / `trim()` 则去掉开头 / 结尾 / 两端的全部 Unicode 空白
+(与 `trim_start_matches` 要传模式不同);L4 解析器用它跳过关键字后面的空格,如
+`after.trim_start().starts_with('(')`,见 [`src/query/parse/mod.rs:123-133`](../../src/query/parse/mod.rs)。
 
 > `str::strip_prefix` 返回 `Option<&str>`:匹配时是"去掉前缀后的借用",不匹配是 `None`,
 > 所以常配 `let ... else`(见 [05 §4.6](05-errors.md))做"匹配失败就早退"。L4 解析器
@@ -564,6 +598,8 @@ let id = NEXT_QUERY_ID.fetch_add(1, Ordering::Relaxed);
 - 字节字面量 `b'0'` 是 `u8`;`[u8]::strip_prefix` 返回 `Option<&[u8]>`,常配合 `let...else` 早退。
 - 原始字符串 `r#"..."#` 免转义;`str` 的前缀/子串方法接受字符、闭包、字符数组等"模式"。
 - `String` 拥有且可变,`&str` 借用且不可变,`Arc<str>` 拥有且共享、克隆廉价;mneme 的 `Key` 用 `Arc<str>`。
+- `String` 用 `push`/`push_str` 增长;从 `Arc<str>`/`String` 借 `&str` 可用 `.as_ref()`(`AsRef` trait);
+  `Arc<str>` 与 `str`/`&str` 能直接 `==`,比较的是内容而不是指针。
 - 生命周期标注只描述引用之间的存活关系,多数情况可省略;`'_` 是占位符;
   结构体字段存引用时,结构体自身要带生命周期参数(如 `QueryRef<'a>`)。
 - 方法返回借"字段"的引用时要显式写字段的生命周期(`fn rest(&self) -> &'a str`);

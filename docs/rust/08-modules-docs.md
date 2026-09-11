@@ -202,6 +202,11 @@ f.write_str("never")?;   // 同上
 [06 §2](06-generics-traits.md));`std::io::Read`/`Write`、`Iterator` 等同理
 (`Iterator` 在 prelude 里,所以平时感觉不到)。
 
+`{self, Write}` 里的 `self` 指"这个模块本身"——这一行同时把模块名 `fmt` 与 trait `Write`
+带进作用域(`fmt::Formatter`、`fmt::Result` 因此可用)。`use` 的路径组里都能写 `self`:
+L4 的 plan.rs 用 `use crate::memory::pred::{self, EvalCtx, Expr};` 同时引入模块 `pred`
+(以便调用 `pred::matches`)与两个类型,见 [`src/query/plan.rs:10`](../../src/query/plan.rs)。
+
 ---
 
 ## 5. 文档:rustdoc

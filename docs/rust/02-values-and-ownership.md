@@ -226,8 +226,8 @@ L4 又用到几个浮点常量与精度事实:
 
 ```rust
 // ① 极值哨兵:做 min / max 归约时当"初始累加器"
-let min = values.iter().copied().fold(f32::INFINITY, f32::min);
-let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+let min = values.iter().copied().fold(f64::INFINITY, f64::min);
+let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
 // ② 非有限值的三种形态:NaN、+∞、-∞
 alpha.is_finite();        // 三者都是 false;配合 [0,1] 区间判定拒绝非法参数
@@ -237,8 +237,9 @@ alpha.is_finite();        // 三者都是 false;配合 [0,1] 区间判定拒绝�
 9_007_199_254_740_993_i64 as f64;   // 2^53 + 1,转 f64 后与 2^53 相等(静默舍入)
 ```
 
-- `f32::INFINITY` / `NEG_INFINITY` 是关联常量,分别表示 ±∞;融合做 min-max
-  归一化时用它们当 `fold` 初值(`f32::min(+∞, x) == x`,任何有限值都能顶掉初值)。
+- `f64::INFINITY` / `NEG_INFINITY`(以及 `f32` 的同名版本)是关联常量,分别表示 ±∞;
+  融合做 min-max 归一化时用它们当 `fold` 初值(`f64::min(+∞, x) == x`,任何有限值都能顶掉初值)。
+  这里刻意用 `f64`:两个 `f32` 极端值相减得到的极差会溢出成 `inf`,升位再算才能避免 `inf/inf = NaN`。
 - `f32::EPSILON` 是最小的"使 `1.0 + ε != 1.0`"的正数,测试里用它造"极差极小但不为 0"
   的输入,验证归一化不会把极小差异当成单点。
 - **2^53 精度上限**是 L4 计划器的关键约束:zone map 的区间比较要把整数转成 `f64`,

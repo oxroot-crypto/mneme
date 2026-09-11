@@ -124,23 +124,29 @@ L4(`src/query/`)新引入的 Rust 特性同样已**回填到对应章节**:
 |---|---|
 | 递归枚举与 `Box<Expr>`/`Box<[Expr]>` | [03 §3.4](03-structs-enums-impl.md) |
 | 固有 `Expr::from_str` 与 `#[allow(clippy::…)]` | [03 §2.1.2](03-structs-enums-impl.md) |
+| 字段初始化简写、`match` 守卫、元组变体 `(..)` 模式 | [03 §1.1](03-structs-enums-impl.md)、[03 §3.3](03-structs-enums-impl.md)、[05 §4.4](05-errors.md) |
 | `div_euclid`/`rem_euclid`/`div_ceil`/`unsigned_abs` | [02 §2.1.3](02-values-and-ownership.md) |
 | `char` 的 Unicode 判定与 `len_utf8`、`chars().next()` | [02 §2.3](02-values-and-ownership.md) |
-| `f32::INFINITY`/`NEG_INFINITY`/`EPSILON`、`f64` 精确整数上限 | [02 §2.2](02-values-and-ownership.md) |
+| `f64::INFINITY`/`NEG_INFINITY`(融合中间量)、`f32::EPSILON`、`f64` 精确整数上限 | [02 §2.2](02-values-and-ownership.md) |
 | `[u8]::strip_prefix`、字节字面量 `b'0'`、`is_ascii_digit` | [04 §2.4](04-borrowing-strings-slices.md) |
-| 原始字符串 `r#"..."#`、`str` 模式 API(闭包/字符数组) | [04 §3.4](04-borrowing-strings-slices.md) |
+| 原始字符串 `r#"..."#`、`str` 模式 API(闭包/字符数组)、`trim_start`、`String::push`/`push_str` | [04 §3](04-borrowing-strings-slices.md)、[04 §3.4](04-borrowing-strings-slices.md) |
+| `AsRef`(`.as_ref()` 借出 `&str`)、`Arc<str>` 与 `str` 直接比较 | [04 §3.3](04-borrowing-strings-slices.md) |
 | `impl<'a> Parser<'a>`、`fn rest(&self) -> &'a str` | [04 §4.5](04-borrowing-strings-slices.md) |
 | 原子类型(`AtomicU64` + `fetch_add`) | [04 §5.2](04-borrowing-strings-slices.md) |
-| `then_some`/`is_some_and`/`filter`/`as_deref`/`cloned`/`map_or_else` | [05 §1.2](05-errors.md) |
+| `then_some`/`is_some_and`/`filter`/`as_deref`/`as_ref`/`cloned`/`copied`/`or_else`/`unwrap_or_default`/`map_or_else` | [05 §1.2](05-errors.md) |
+| 默认绑定模式(匹配 `&T` 免写 `&`)、let 链混普通条件 | [05 §4.2](05-errors.md)、[05 §4.7](05-errors.md) |
 | `collect` 收成 `Result<Vec<_>>` | [05 §2.4](05-errors.md) |
-| 枚举变体构造器转函数指针 | [06 §4.2](06-generics-traits.md) |
+| 枚举变体构造器转函数指针、`Option::map` 接构造器 | [06 §4.2](06-generics-traits.md) |
 | 运算符重载(`std::ops::BitAnd`/`BitOr`)与关联类型 | [06 §5](06-generics-traits.md) |
-| `HashMap` entry API、`sort` + `dedup` | [07 §5.2](07-iterators-closures.md) |
-| `fold` 配 `f32::min`/`f32::max` 函数指针求极值 | [07 §3.3](07-iterators-closures.md) |
-| `fmt::Write` 与 `write_char`/`write_str`(trait 须在作用域) | [08 §4](08-modules-docs.md) |
+| `HashMap` entry API、`keys()`/`map[key]` 索引、`sort` + `dedup` | [07 §5.2](07-iterators-closures.md) |
+| `Iterator::find_map`、`Vec::extend`/`truncate` | [07 §3](07-iterators-closures.md) |
+| `fold` 配 `f64::min`/`f64::max` 函数指针求极值 | [07 §3.3](07-iterators-closures.md) |
+| `fmt::Write` 与 `write_char`/`write_str`(trait 须在作用域)、`use` 组里的 `self` | [08 §4](08-modules-docs.md) |
 | `pub(super)` 子模块受限方法 | [08 §3](08-modules-docs.md) |
 | `pub use` 重导出第三方宏(`mneme::json`) | [08 §1](08-modules-docs.md) |
 | 测试替身 `FakeClock`(`AtomicI64`,可注入时钟) | [10 §1.4](10-testing.md) |
+| 集成测试共享助手(`tests/common/mod.rs`) | [10 §2](10-testing.md) |
+| proptest 字符串正则策略(`".{0,200}"`) | [10 §4](10-testing.md) |
 | `format!("{month:02}")` 宽度与补零 | [01 §6](01-toolchain.md) |
 
 > L1 的业务语义(命名空间、写事务、去重、双时态等)、L3 的业务语义(HNSW 构建/查询、

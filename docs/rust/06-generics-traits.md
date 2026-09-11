@@ -280,7 +280,12 @@ decode_field_val(value, Expr::Contains);
   签名就是它的参数列表。
 - 需要显式类型时写 `Expr::Exists as fn(String) -> Expr` 强转(见
   [`src/query/parse/mod.rs:249`](../../src/query/parse/mod.rs));
-- 构造器**不能捕获环境**,天然满足 `fn` 指针签名,所以适合当"无状态工厂"传来传去。
+- 构造器**不能捕获环境**,天然满足 `fn` 指针签名,所以适合当"无状态工厂"传来传去;
+- 同一个构造器也能喂给泛型方法:`Option::map` / `Result::map` 要的正是 `FnOnce(T) -> U`,
+  于是 JSON 解码里直接写 `value.as_bool().map(Val::Bool)`、
+  `value.as_f64().filter(...).map(Val::Num)`,不必包闭包、也不必 `as` 强转
+  (见 [`src/query/json.rs:96-112`](../../src/query/json.rs))。编译器会从 `map` 的泛型参数
+  反推出构造器的具体签名。
 
 ---
 

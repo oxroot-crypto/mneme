@@ -131,7 +131,19 @@ value.as_f64().filter(|value| value.is_finite());
 self.text.as_deref();
 
 // cloned:Option<&T> → Option<T>,复制出拥有值(HashMap::get 返回引用)
-via_map.get(&rowid).cloned();
+via_map.get(&candidate.rowid).cloned();
+
+// as_ref:Option<T> → Option<&T>,只借不搬;要直达 &str 才用 as_deref
+slot_data.text.as_ref();
+
+// copied:Option<&T> → Option<T>(要求 T: Copy);Copy 类型用 copied、其余用 cloned
+view.access.get(&slot.rowid).copied();
+
+// or_else:None 时换一条路(闭包惰性);Result 的同名方法换的是错误路径
+bytes.strip_prefix(&[expected]).or_else(|| bytes.strip_prefix(&[expected.to_ascii_lowercase()]));
+
+// unwrap_or_default:None 时取 T::default()
+self.fusion.unwrap_or_default();
 
 // map_or_else:两个分支都是惰性闭包
 filter.map_or_else(
@@ -152,9 +164,22 @@ filter.map_or_else(
 - `filter`:保留满足谓词的 `Some`,其余变 `None`——JSON 解码用它把非有限 `f64` 直接滤掉。
 - `as_deref`:`Option<String>`(或 `&Option<String>`)→ `Option<&str>`,不移动内部值;
   `Option<Vec<T>>` → `Option<&[T]>` 同理。
+- `as_ref`:`Option<T>` → `Option<&T>`,只借一层;若 `T` 还能继续解引用(如 `String`),
+  `as_deref` 会再走一步给出 `Option<&str>`。L4 物化 `Hit` 时用 `slot_data.text.as_ref().map(...)`
+  借出文本再转拥有值(见 [`src/query/exec.rs:354`](../../src/query/exec.rs))。
 - `cloned()`:`Option<&T>` → `Option<T>`(要求 `T: Clone`);`HashMap::get` 返回引用,
-  L4 取来源边时用 `via_map.get(&rowid).cloned()` 复制出拥有值(见
+  L4 取来源边时用 `via_map.get(&candidate.rowid).cloned()` 复制出拥有值(见
   [`src/query/exec.rs:357`](../../src/query/exec.rs))。
+- `copied()`:`Option<&T>` → `Option<T>`(要求 `T: Copy`),是 `cloned()` 的零成本版本;
+  `RowId`、`u32`、`f32` 这类 `Copy` 类型一律用它——L4 从访问统计表、分数表取值都是
+  `get(...).copied()`(见 [`src/query/plan.rs:59-63`](../../src/query/plan.rs) 与
+  [`src/query/fusion.rs:109-123`](../../src/query/fusion.rs))。
+- `or_else(f)`:只有是 `None` 时才调用闭包 `f`(惰性),返回另一个 `Option`;常用来把
+  "第一种写法失败就试第二种"串起来。L4 兼容时区后缀的大小写就靠它:
+  `.strip_prefix(&[b'Z']).or_else(|| ...to_ascii_lowercase...)`,见
+  [`src/query/iso.rs:58-63`](../../src/query/iso.rs)。`Result::or_else` 同理,只是换的是错误。
+- `unwrap_or_default()`:`None` 时取 `T::default()`(要求 `T: Default`);L4 未显式设置融合策略时
+  取默认的 RRF(见 [`src/query/exec.rs:227`](../../src/query/exec.rs))。
 - `map_or_else(none_fn, some_fn)`:两个分支都惰性;L4 计划器用它"无过滤→全 1 位图,
   有过滤→下推求值"。默认值构造昂贵时,`map_or`(默认值立即求值)不合适。
 
@@ -364,6 +389,24 @@ if let Some(&(_, best)) = candidates.first() {
 规则:模式要对**值的类型**匹配,加 `&` 可以"透过引用看进去"——和 [07 §3.1](07-iterators-closures.md)
 的 `for (index, &byte) in ...` 是同一个原理。
 
+反过来,**被匹配的值本身就是引用时,模式通常不用写 `&`**:默认绑定模式(default binding
+modes,俗称 match ergonomics)会把 `&T` 直接当 `T` 来匹配,绑定出来的是引用。L4 几乎每个
+`match` 都靠它:
+
+```rust
+fn val_to_meta(val: &Val) -> Meta {     // val: &Val
+    match val {
+        Val::Bool(value) => json!({ "bool": value }),   // value: &bool,不是 bool
+        ...
+    }
+}
+```
+
+见 [`src/query/json.rs:85-93`](../../src/query/json.rs)。所以读 `match self`(`self: &Self`)、
+`match expr`(`expr: &Expr`)时,分支里绑定到的字段都是**引用**;要值本身时得解一层 `*`——
+如 `(ZoneKind::Num, Val::Num(value)) if value.is_finite()` 里 `value: &f64` 可直接调方法,
+而 `exact_int(*value)` 要显式解引用,见 [`src/query/zmap.rs:170-182`](../../src/query/zmap.rs)。
+
 ### 4.3 `matches!`:返回布尔值
 
 ```rust
@@ -382,6 +425,17 @@ assert!(matches!(err, MnemeError::Corrupted { .. }));
 ```
 
 `{ .. }` 表示"结构体变体,字段随便"。见 [`src/core/varint.rs:219-222`](../../src/core/varint.rs)。
+
+元组变体则用 `(..)` 忽略全部字段,L4 把四种"无块级摘要可用"的条件合并成一个分支:
+
+```rust
+Expr::Contains(..) | Expr::StartsWith(..) | Expr::EndsWith(..) | Expr::Glob(..) => {
+    full_mask(ctx.blocks)
+}
+```
+
+见 [`src/query/zmap.rs:69-73`](../../src/query/zmap.rs)。`..` 与 `_` 的区别:`_` 只匹配**一个**
+字段(因此必须写够字段数),`..` 匹配**任意多个**剩余字段;`(a, ..)`、`(.., z)` 也都合法。
 
 ### 4.5 `while let`:循环地匹配一个分支
 
@@ -448,6 +502,11 @@ if let Some(links) = self.nodes.get_mut(node as usize)
 - 每层解构出的绑定,在后续条件和块里都可用(`links` 在第二个 `let` 里就能用);
 - 它取代嵌套的 `if let` 金字塔,可读性更好;**只在 `edition = "2024"` 可用**
   (mneme 正是 2024,见 [01 §4.3](01-toolchain.md))。
+- 链里不必全是 `let`,普通布尔条件也能混进来、放前放后都行:L4 写
+  `if is_int && let Ok(int) = text.parse::<i64>()`(只有整数形态才尝试 `i64` 解析,见
+  [`src/query/parse/literal.rs:60-63`](../../src/query/parse/literal.rs));参数校验则是
+  `if let Some(ef) = self.ef && ef > self.config.limits.ef_max as usize`
+  (见 [`src/query/exec.rs:123-131`](../../src/query/exec.rs))。
 
 ---
 
@@ -494,11 +553,14 @@ if denominator < COSINE_EPSILON { 0.0 } else { simd::dot(a, b) / denominator }
 - `?` 在 `Result` 或 `Option` 上短路传播;`unwrap`/`expect` 会 panic,生产代码禁用。
 - `map_or`/`is_none_or`/`ok_or_else` 等组合子把"取值 + 兜底 / 转错误"写成表达式,
   `ok_or_else` 惰性构造错误,优先于 `ok_or`;L4 还常用 `then_some`、`is_some_and`、
-  `filter`、`as_deref`、`cloned`、`map_or_else`(两分支惰性)。
+  `filter`、`as_deref`、`as_ref`、`cloned`、`copied`、`or_else`、`unwrap_or_default`、
+  `map_or_else`(两分支惰性)。
 - `collect::<Result<Vec<_>>>()` 把 `Iterator<Item = Result<T, E>>` 收成一个 `Result`,
   第一个 `Err` 立刻短路。
 - `if let` 只匹配一个分支,`matches!` 返回布尔值;`while let` 反复匹配直到失败,
   `let...else` 匹配失败即早退,`edition 2024` 的 let 链用 `&&` 串起多个条件与 `let`。
+- 匹配引用时默认绑定模式让模式免写 `&`(绑定自动是引用);`match` 分支可带守卫,
+  `(..)`/`{ .. }` 用 `..` 忽略剩余字段。
 - 用 `thiserror` 的 `#[error]` 定义消息、`#[from]` 自动转换、字段携带上下文、`#[source]` 保留根因。
 - mneme 原则:可预期失败返回 `Result`,公开 API 不 panic,绝不静默吞错。
 

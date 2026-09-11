@@ -39,6 +39,19 @@ let p = HnswParams { m: 16, m0: 32, ef_construction: 200, ef_search: 64 };
 
 见 [`src/core/options/index.rs:8-17`](../../src/core/options/index.rs)。
 
+字段名与局部变量同名时,可以省略 `字段名:` 只写变量名,这叫**字段初始化简写(field init shorthand)**:
+
+```rust
+let view = ...;
+let blocks = block_count(view);
+let ctx = MaskCtx { view, blocks };   // 等价于 MaskCtx { view: view, blocks: blocks }
+```
+
+L4 的内部结构几乎都这么构造——`MaskCtx`、`Plan`、`EvalCtx`、`ChannelCtx` 等,见
+[`src/query/zmap.rs:20-23`](../../src/query/zmap.rs) 与
+[`src/query/plan.rs:80-84`](../../src/query/plan.rs)。简写与完整写法可以混用
+(`Plan { candidates, bits, selectivity }` 三个字段全是简写),只影响书写,字段名与语义不变。
+
 只想改几个字段、其余沿用另一份值时,用**结构体更新语法(struct update syntax)** `..`:
 
 ```rust
@@ -285,6 +298,24 @@ match metric {
 - `|` 表示"或",多个模式共用一段代码。
 - `_` 是通配符,但 mneme 规范鼓励显式列出,避免新增变体时被静默吞掉。
 - 更复杂的模式、`if let`、`matches!` 在 [05 章](05-errors.md) 展开。
+
+分支还能带**守卫(guard)**:写成 `模式 if 条件 => ...`,只有模式匹配**且**条件为真才走该分支。
+L4 用它表达"空列表特例":
+
+```rust
+match self {
+    Expr::And(parts) if parts.is_empty() => json!({ "always": true }),
+    Expr::And(parts) => exprs_to_meta(parts),
+    ...
+}
+```
+
+见 [`src/query/json.rs:213-216`](../../src/query/json.rs) 与
+[`src/query/display.rs:76-79`](../../src/query/display.rs)。要点:
+
+- 守卫里的 `parts` 已经由模式绑定,可以直接用;多个模式共用同一守卫写成 `A(x) | B(x) if cond`;
+- 守卫不是模式的一部分,**穷尽性检查只看主模式**——`Expr::And(parts) if ...` 后面仍需要一个不带守卫的
+  `Expr::And(parts)` 分支兜底,否则编译器报 `non-exhaustive patterns`。
 
 ### 3.4 递归枚举:为什么 `Expr` 里套着 `Box`
 
@@ -540,6 +571,8 @@ pub struct UpdatePatch {
 ## 9. 本章小结
 
 - 数据用 `struct`(具名/元组/单元)和 `enum`(变体可带数据)描述;行为用 `impl` 挂载。
+- 结构体字面量支持**字段初始化简写**(`MaskCtx { view, blocks }`);`match` 分支可带**守卫**
+  (`模式 if 条件`),但穷尽性只看主模式,带守卫的分支之后仍要兜底。
 - 递归 `enum`(如 `Expr`)用 `Box<Expr>`/`Box<[Expr]>` 打断无限大小;固有方法不要求 trait
   在作用域,`#[allow(clippy::…)]` 必须就近写明理由。
 - `impl` 里:关联函数不带 `self`,方法带 `self`/`&self`/`&mut self`;还能定义关联常量。
