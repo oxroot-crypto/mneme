@@ -60,6 +60,8 @@ const SRC_CORE_SIMD: &str = include_str!("../src/core/simd.rs");
 const SRC_CORE_HEAP: &str = include_str!("../src/core/heap.rs");
 /// L2 恢复重排映射源码(槽位一致性单测被 ERR 契约引用)。
 const SRC_RECOVER_STATE: &str = include_str!("../src/persist/recover/state.rs");
+/// L2 打开路径源码(载入期重排越界二次校验单测被 ERR 契约引用)。
+const SRC_STORE_OPEN: &str = include_str!("../src/persist/store/open.rs");
 
 /// 契约测试文件(孤立检查与覆盖声明检查的范围)。
 const CONTRACT_TEST_FILES: [(&str, &str); 7] = [
@@ -73,7 +75,7 @@ const CONTRACT_TEST_FILES: [(&str, &str); 7] = [
 ];
 
 /// 契约引用的测试可能落在的全部文件(路径必须与 `contracts.md` 中书写一致)。
-const SOURCES: [(&str, &str); 24] = [
+const SOURCES: [(&str, &str); 25] = [
     ("tests/core_contracts.rs", CORE_TESTS),
     ("tests/memory_contracts.rs", MEMORY_TESTS),
     ("tests/query_contracts.rs", QUERY_TESTS),
@@ -98,6 +100,7 @@ const SOURCES: [(&str, &str); 24] = [
     ("src/core/simd.rs", SRC_CORE_SIMD),
     ("src/core/heap.rs", SRC_CORE_HEAP),
     ("src/persist/recover/state.rs", SRC_RECOVER_STATE),
+    ("src/persist/store/open.rs", SRC_STORE_OPEN),
 ];
 
 /// 契约编号的类型段(五维 + CPLX,见 `contracts.md` §0)。

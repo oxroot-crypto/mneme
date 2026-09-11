@@ -181,7 +181,7 @@ mneme/
 │   ├── core/           # L0:types.rs error.rs metric.rs simd.rs varint.rs meta.rs heap.rs bitset.rs options/
 │   ├── memory/         # L1:engine.rs engine_ops.rs builder/ namespace/ snapshot.rs snapshot_scan.rs search_builder.rs search_exec.rs expand.rs rerank.rs table/ index.rs search.rs pred.rs pred_eval.rs record.rs write_helpers.rs mutate_helpers.rs dedup.rs relation.rs temporal.rs score.rs lifecycle.rs ops.rs config.rs
 │   ├── persist/        # L2:mod.rs codec.rs hook.rs wal/ msec/ recover/ store/ vsec.rs manifest.rs edges.rs flush.rs source.rs storage.rs trash.rs
-│   ├── index/          # L3:hnsw.rs graph.rs filtered.rs rebuild.rs hidx.rs
+│   ├── index/          # L3:hnsw.rs graph.rs filtered.rs rebuild.rs hidx.rs factory.rs
 │   ├── query/          # L4:parse.rs plan.rs zmap.rs bm25.rs fusion.rs result_dedup.rs exec.rs
 │   ├── life/           # L5:ttl.rs retain.rs access.rs namespace.rs compact.rs backup.rs stats.rs
 │   ├── quant/          # L6:scalar_i8.rs f16.rs rescore.rs

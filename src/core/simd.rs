@@ -16,11 +16,11 @@ const SHUFFLE_TAKE_HIGHEST: i32 = 0x1;
 
 #[cfg(test)]
 thread_local! {
-    /// 最近一次 `dot_scalar` 的逐元素乘加次数(操作计数,验证 $O(d)$)。
+    /// 累计的 `dot_scalar` 逐元素乘加次数(操作计数,验证 $O(d)$;测试需自行清零)。
     static MUL_ADDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// 取出最近一次 `dot_scalar` 的乘加计数(仅测试,读后不清零)。
+/// 取出当前累计的 `dot_scalar` 乘加计数(仅测试;计数跨调用累加,测试需自行清零)。
 #[cfg(test)]
 fn take_mul_adds() -> usize {
     MUL_ADDS.with(std::cell::Cell::get)
@@ -84,9 +84,16 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// assert_eq!(dot_scalar(&[1.0, 2.0], &[3.0, 4.0]), 11.0);
 /// ```
 pub fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
-    #[cfg(test)]
-    MUL_ADDS.with(|count| count.set(a.len().min(b.len())));
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| {
+            // 计数在闭包内逐元素累加(与 `heap.rs::COMPARES` 同口径),
+            // 而不是预先写入预期值——否则测试无法证伪"循环被改写/短路"。
+            #[cfg(test)]
+            MUL_ADDS.with(|count| count.set(count.get() + 1));
+            x * y
+        })
+        .sum()
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -235,6 +242,7 @@ mod tests {
         for len in [0_usize, 1, 7, 64, 1_024] {
             let a = vec![1.0_f32; len];
             let b = vec![2.0_f32; len];
+            MUL_ADDS.with(|count| count.set(0));
             let result = dot_scalar(&a, &b);
             assert_eq!(result, 2.0 * len as f32);
             assert_eq!(take_mul_adds(), len, "乘加次数必须恰为 min(len)");

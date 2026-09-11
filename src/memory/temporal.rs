@@ -70,7 +70,7 @@ mod tests {
     use super::*;
     use crate::core::metric::Metric;
     use crate::core::options::HnswParams;
-    use crate::index::HnswIndex;
+    use crate::index::hnsw::HnswIndex;
     use crate::memory::table::WriterState;
 
     /// FC-INDEX-POST-005:`as_of` 重建的历史视图必须保留索引句柄,

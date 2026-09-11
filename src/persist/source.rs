@@ -75,7 +75,8 @@ impl SegmentSource for FileSource {
 /// 基于 `memmap2` 的零拷贝段数据源(feature `mmap`,默认开启)。
 ///
 /// 整段只读映射由内核按页惰性载入,`slice()` 直接返回映射切片;文件不可变,
-/// 故多线程共享安全。平台不支持 mmap 时用 [`FileSource`] 兜底(功能不变)。
+/// 故多线程共享安全。**关闭 feature `mmap`** 时用 [`FileSource`] 兜底(功能不变);
+/// 开启后运行时 mmap 失败按 I/O 错误返回,不做静默降级。
 #[cfg(feature = "mmap")]
 pub(crate) struct MmapSource {
     map: memmap2::Mmap,
@@ -139,7 +140,11 @@ pub(crate) fn read_whole(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     #[cfg(not(feature = "mmap"))]
     {
         let source = FileSource::open(path)?;
-        let len = source.len()? as usize;
+        // 32 位平台上 usize 装不下超过 4 GiB 的长度;显式报错而非静默截断
+        // (与 `MmapSource::read_at` 的偏移转换同口径)。
+        let len = usize::try_from(source.len()?).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "文件长度超出平台字长")
+        })?;
         let mut buf = vec![0_u8; len];
         source.read_at(0, &mut buf)?;
         Ok(buf)

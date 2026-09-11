@@ -102,7 +102,8 @@ pub(crate) fn search(params: &SearchParams<'_>) -> Result<Vec<Scored>> {
     if let Some(index) = params.view.index.as_ref()
         && index.node_count() > params.brute_force_max_rows
     {
-        return ann_search(params, index.as_ref(), &candidates, query_norm, k);
+        let budget = AnnBudget { query_norm, k };
+        return ann_search(params, index.as_ref(), &candidates, budget);
     }
 
     let top = run_scan(params, &candidates, query_norm, k)?;
@@ -132,14 +133,20 @@ fn collect_candidates(params: &SearchParams<'_>) -> Vec<u32> {
     candidates
 }
 
+/// ANN 路径的预算参数:`search` 已算好查询范数与有效 `k`,打包传入避免参数堆叠。
+struct AnnBudget {
+    query_norm: f32,
+    k: usize,
+}
+
 /// ANN 路径:前缀 HNSW + 尾部暴力,归并后再取分。
 fn ann_search(
     params: &SearchParams<'_>,
     index: &dyn VectorIndex,
     candidates: &[u32],
-    query_norm: f32,
-    k: usize,
+    budget: AnnBudget,
 ) -> Result<Vec<Scored>> {
+    let AnnBudget { query_norm, k } = budget;
     let indexed = index.node_count().min(params.view.slots.len());
     let (alive, filter) = prefix_bitmaps(params, indexed, candidates);
     let index_top = index.search(&IndexSearch {
@@ -336,5 +343,79 @@ mod tests {
         assert_eq!(hits.len(), 4);
         let calls = SCORE_CALLS.with(std::cell::Cell::get);
         assert_eq!(calls, 8, "扫描打分次数必须等于候选数(线性,无隐藏全扫)");
+    }
+
+    /// FC-INDEX-POST-009(分派):段行数超过 `brute_force_max_rows` 且视图带索引时,
+    /// 查询必须走索引搜索,不得回退为全量暴力重扫——否则恒暴力退化解无人察觉。
+    #[test]
+    fn search_dispatches_to_index_when_prefix_exceeds_brute_threshold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::memory::Builder::default()
+            .path(dir.path())
+            .dimension(4)
+            .tuning(crate::core::options::Tuning {
+                brute_force_max_rows: 8,
+                ..crate::core::options::Tuning::default()
+            })
+            .build()
+            .expect("build");
+        let ns = db.namespace("n");
+        let batch: Vec<crate::memory::Record> = (0..64)
+            .map(|row| crate::memory::Record::new(vec![row as f32, 1.0, 0.0, 0.0]))
+            .collect();
+        ns.insert_batch(batch).expect("insert_batch");
+        db.flush().expect("flush");
+
+        SCORE_CALLS.with(|calls| calls.set(0));
+        let hits = ns
+            .search()
+            .vector(&[1.0, 0.0, 0.0, 0.0])
+            .top_k(4)
+            .ef(16)
+            .execute()
+            .expect("search");
+        assert_eq!(hits.len(), 4);
+        let calls = SCORE_CALLS.with(std::cell::Cell::get);
+        assert_eq!(
+            calls, 0,
+            "有索引且段行数超过阈值时必须走索引,不得回退暴力重扫前缀"
+        );
+    }
+
+    /// FC-INDEX-POST-009(分派边界):段行数等于 `brute_force_max_rows` 时仍走暴力
+    /// (契约口径为严格「超过」),且索引存在与否不改变该边界判定。
+    #[test]
+    fn search_bruteforces_when_prefix_does_not_exceed_threshold() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::memory::Builder::default()
+            .path(dir.path())
+            .dimension(4)
+            .tuning(crate::core::options::Tuning {
+                brute_force_max_rows: 64,
+                ..crate::core::options::Tuning::default()
+            })
+            .build()
+            .expect("build");
+        let ns = db.namespace("n");
+        let batch: Vec<crate::memory::Record> = (0..64)
+            .map(|row| crate::memory::Record::new(vec![row as f32, 1.0, 0.0, 0.0]))
+            .collect();
+        ns.insert_batch(batch).expect("insert_batch");
+        db.flush().expect("flush");
+
+        SCORE_CALLS.with(|calls| calls.set(0));
+        let hits = ns
+            .search()
+            .vector(&[1.0, 0.0, 0.0, 0.0])
+            .top_k(4)
+            .ef(16)
+            .execute()
+            .expect("search");
+        assert_eq!(hits.len(), 4);
+        let calls = SCORE_CALLS.with(std::cell::Cell::get);
+        assert_eq!(
+            calls, 64,
+            "行数等于阈值(未严格超过)时必须走暴力;若索引存在即走图会在此变红"
+        );
     }
 }

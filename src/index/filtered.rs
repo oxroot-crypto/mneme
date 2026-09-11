@@ -4,7 +4,8 @@
 //! ① 后过滤(`s > post_threshold`)→ 全图遍历 + 放大 `ef`(≤8×)后过滤结果;
 //! ② 放大后过滤(`brute_threshold < s ≤ post_threshold` 且候选数 ≥ `max(ef, 1024)`)
 //!    → 全图遍历(保连通),结果限候选,`ef` 取 4×;
-//! ③ 候选暴力(`s ≤ brute_threshold` 或候选数 < `max(ef, 1024)`)→ 直接对候选暴力。
+//! ③ 候选暴力(**仅当存在过滤位图**:`s ≤ brute_threshold` 或候选数 < `max(ef, 1024)`)
+//!    → 直接对候选暴力;无过滤时候选即 alive、`s = 1`,不入档③。
 //!
 //! 档①②为近似(与候选暴力统计等价,`ef→∞` 收敛);档③恒精确。候选数上界用于避免
 //! 图遍历在候选稀少时返回近空结果(设计 05 §8 档③第二条件)。
@@ -74,7 +75,8 @@ pub(crate) fn search(index: &HnswIndex, params: &IndexSearch<'_>) -> TopK<(RowId
         .map_or(alive_count, |filter| filter.count_ones());
     let selectivity = filter_count as f32 / alive_count as f32;
 
-    // 档③:候选暴力(精确)。选择性极低,或候选数低于 `max(ef, 1024)`。
+    // 档③:候选暴力(精确)。仅当有过滤位图,且选择性极低或候选数低于
+    // `max(ef, 1024)`;无过滤走档①/②全图遍历。
     let brute_cap = params.ef.max(BRUTE_CANDIDATE_CAP);
     if params.filter.is_some()
         && (selectivity <= params.brute_threshold || filter_count < brute_cap)

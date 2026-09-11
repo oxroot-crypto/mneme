@@ -33,6 +33,39 @@ struct BuiltSegment {
     entry_level: u8,
 }
 
+/// 复制 MANIFEST 所列段的 `vsec`/`msec`(及存在的 `hidx`);缺失即失败,绝不产出残档。
+fn copy_manifest_segments(
+    root: &Path,
+    target: &Path,
+    manifest: &Manifest,
+    counts: &mut CopyCounts,
+) -> Result<()> {
+    for segment in &manifest.segments {
+        // 被 MANIFEST 引用的段必须存在;缺失即备份不可信,绝不静默产出残档。
+        copy_required(
+            root,
+            target,
+            &format!("{SEGMENTS_DIR}/{}", vsec_name(segment.segment_id)),
+            counts,
+        )?;
+        copy_required(
+            root,
+            target,
+            &format!("{SEGMENTS_DIR}/{}", msec_name(segment.segment_id)),
+            counts,
+        )?;
+        if segment.hidx_crc != 0 {
+            copy_required(
+                root,
+                target,
+                &format!("{SEGMENTS_DIR}/{}", hidx_name(segment.segment_id)),
+                counts,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 impl Store {
     /// 全量快照 flush:写新段 + 提交 MANIFEST + 重置 WAL(设计 04 §3.2)。
     ///
@@ -114,29 +147,7 @@ impl Store {
         let (version, manifest) = self.versioned_manifest();
 
         let mut counts = CopyCounts::default();
-        for segment in &manifest.segments {
-            // 被 MANIFEST 引用的段必须存在;缺失即备份不可信,绝不静默产出残档。
-            copy_required(
-                &self.root,
-                target,
-                &format!("{SEGMENTS_DIR}/{}", vsec_name(segment.segment_id)),
-                &mut counts,
-            )?;
-            copy_required(
-                &self.root,
-                target,
-                &format!("{SEGMENTS_DIR}/{}", msec_name(segment.segment_id)),
-                &mut counts,
-            )?;
-            if segment.hidx_crc != 0 {
-                copy_required(
-                    &self.root,
-                    target,
-                    &format!("{SEGMENTS_DIR}/{}", hidx_name(segment.segment_id)),
-                    &mut counts,
-                )?;
-            }
-        }
+        copy_manifest_segments(&self.root, target, &manifest, &mut counts)?;
         copy_required(&self.root, target, &manifest_name(version), &mut counts)?;
         // WAL 可以在只读实例中不存在,故为可选。
         copy_optional(&self.root, target, WAL_FILE, &mut counts)?;

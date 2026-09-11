@@ -7,7 +7,7 @@
 > **本章你将学到**:NSW 与小世界 → 层级概率分布推导 → 构建/搜索算法逐步 →
 > 复杂度(构建 O(N·d·ef_c·M_0) 等)→ 8 点手算算例 → 墓碑删除 → 过滤三档策略。
 
-模块:`index/{hnsw.rs, graph.rs, filtered.rs, rebuild.rs, hidx.rs}`
+模块:`index/{hnsw.rs, graph.rs, filtered.rs, rebuild.rs, hidx.rs, factory.rs}`
 (原计划的 `merge.rs` 在 L2 全量快照单图架构下退化为 L0 `TopK::merge`,不单设;
 L5 引入多图 compaction 重建时恢复为独立模块。)
 参考:HNSW 原论文(Malkov & Yashunin, 2016)的思想,实现为纯 Rust 自研、适配墓碑删除与过滤。
@@ -330,7 +330,7 @@ $s = |\text{cand}| / N_{\text{alive}}$ 自适应三档:
 |---|---|---|---|
 | ① 后过滤 | $s > 0.10$ | 正常 HNSW,结果集过滤 | $ef' = \max(ef,k) \cdot \min(8,\ 1/s)$ |
 | ② 放大后过滤 | $0.001 < s \le 0.10$(且候选数 ≥ `max(ef,1024)`) | **全图遍历**(保连通)+ 结果限候选 | $ef' = \max(ef,k) \cdot 4$ |
-| ③ 候选暴力 | $s \le 0.001$ 或候选数 < `max(ef, 1024)` | 直接对候选位图暴力扫描 | — |
+| ③ 候选暴力 | $s \le 0.001$ 或候选数 < `max(ef, 1024)`(仅当存在过滤位图;无过滤时候选即 alive、$s=1$,按 `post_threshold` 走档①/②) | 直接对候选位图暴力扫描 | — |
 
 > **实现注**:原设计档②为"约束遍历(只展开过滤内节点)",但过滤稀疏时图会被候选位图
 > 切断,`ef` 再放大也探不到足够候选,召回近乎归零(已由候选数阈值兜底)。落地改为

@@ -94,6 +94,13 @@ fn close_key(metric: Metric, score: Score) -> f32 {
     }
 }
 
+/// SplitMix64 增量常数(Steele et al., 2014;用于确定性层级骰子,无外部依赖)。
+const SPLITMIX_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+/// SplitMix64 第一次混合乘数。
+const SPLITMIX_MIX1: u64 = 0xBF58_476D_1CE4_E5B9;
+/// SplitMix64 第二次混合乘数。
+const SPLITMIX_MIX2: u64 = 0x94D0_49BB_1331_11EB;
+
 /// 确定性 SplitMix64 伪随机数发生器(无外部依赖)。
 struct Rng(u64);
 
@@ -103,15 +110,16 @@ impl Rng {
     }
 
     fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        self.0 = self.0.wrapping_add(SPLITMIX_GAMMA);
         let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z = (z ^ (z >> 30)).wrapping_mul(SPLITMIX_MIX1);
+        z = (z ^ (z >> 27)).wrapping_mul(SPLITMIX_MIX2);
         z ^ (z >> 31)
     }
 
     /// 均匀分布于 `(0, 1]`。
     fn next_unit(&mut self) -> f32 {
+        // 取高 24 位并加一,落在 `(0, 1]`(避免 `ln(0)`)。
         ((self.next_u64() >> 40) as f32 + 1.0) * (1.0 / (1_u32 << 24) as f32)
     }
 }
@@ -575,7 +583,9 @@ mod tests {
         let calls16 = search_calls(&index, &query, &alive, 16);
         let calls128 = search_calls(&index, &query, &alive, 128);
         assert!(calls16 > 0);
-        assert!(calls128 >= calls16, "距离计算未随 ef 增长");
+        // 距离调用随 ef 单调不减(图连通分量被探尽后会持平,故不强制严格增长);
+        // 关键是远小于 N,证明查询没有退化为全扫。
+        assert!(calls128 >= calls16, "距离计算随 ef 单调不减");
         assert!(
             calls128 < nodes.len() as u64 / 2,
             "ef=128 时距离计算疑似全扫:{calls128}"
@@ -610,19 +620,21 @@ mod tests {
         assert!((1..=8).contains(&large.max_level()), "层高异常");
     }
 
-    /// FC-INDEX-POST-005:查询结果全部落在 alive 位图内。
+    /// FC-INDEX-POST-005:查询结果全部落在 alive 位图内,且候选足够时满额返回、
+    /// 与 alive 内暴力结果集合一致(空返/少返同样被证伪)。
     #[test]
     fn search_results_respect_alive_bitmap() {
         let nodes = make_nodes(64, 8);
         let index = HnswIndex::build(&nodes, HnswParams::default(), Metric::Dot);
         let mut alive = BitSet::default();
-        for node in 0..32u32 {
-            alive.set(node as usize);
+        for node in 0..32usize {
+            alive.set(node);
         }
         let query = make_nodes(1, 8).remove(0).vector;
+        let query_norm = simd::dot(&query, &query);
         let top = index.search(&IndexSearch {
             query: &query,
-            query_norm: simd::dot(&query, &query),
+            query_norm,
             ef: 64,
             k: 16,
             alive: &alive,
@@ -630,8 +642,117 @@ mod tests {
             post_threshold: 0.1,
             brute_threshold: 0.001,
         });
-        for (_, slot) in top.into_sorted_vec() {
-            assert!(slot.get() < 32, "结果越出 alive 位图:{}", slot.get());
-        }
+        let hits = top.into_sorted_vec();
+        assert_eq!(
+            hits.len(),
+            16,
+            "alive 内候选足够时必须满额返回,不得被死节点挤占"
+        );
+        let got: HashSet<u64> = hits.iter().map(|(rowid, _)| rowid.get()).collect();
+        // alive 内暴力 oracle:ef=64 覆盖全图 64 节点,结果须与暴力 top-16 集合相等。
+        let mut scored: Vec<(f32, u64)> = (0..32usize)
+            .map(|node| {
+                let score =
+                    Metric::Dot.score(&query, &nodes[node].vector, query_norm, nodes[node].norm_sq);
+                (score, nodes[node].rowid.get())
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+        let want: HashSet<u64> = scored
+            .into_iter()
+            .take(16)
+            .map(|(_, rowid)| rowid)
+            .collect();
+        assert_eq!(got, want, "alive 位图内结果应与暴力一致");
+    }
+
+    /// FC-INDEX-ERR-001:hidx 节点数与恢复槽位数不一致 → `Corrupted`,绝不静默错配。
+    #[test]
+    fn load_rejects_node_count_mismatch() {
+        let nodes = make_nodes(3, 8);
+        let index = HnswIndex::build(&nodes, HnswParams::default(), Metric::Dot);
+        let bytes = index.serialize().expect("serialize");
+        let slot_of: Vec<SlotId> = (0..3).map(SlotId::new).collect();
+        // 图节点数 > 恢复槽位数。
+        let error = HnswIndex::load(&bytes, &nodes[..2], &slot_of[..2], Metric::Dot)
+            .err()
+            .expect("节点数不一致必须拒绝载入");
+        assert!(matches!(
+            error,
+            crate::core::error::MnemeError::Corrupted { .. }
+        ));
+        // `slot_of` 长度不一致同样拒绝。
+        let error = HnswIndex::load(&bytes, &nodes, &slot_of[..2], Metric::Dot)
+            .err()
+            .expect("槽位数不一致必须拒绝载入");
+        assert!(matches!(
+            error,
+            crate::core::error::MnemeError::Corrupted { .. }
+        ));
+        // 边界对照:完全一致时可载入。
+        assert!(HnswIndex::load(&bytes, &nodes, &slot_of, Metric::Dot).is_ok());
+    }
+
+    /// 构建确定性:同一输入两次构建产生逐字节相同的 hidx(设计 05 §4.4:固定种子串行构建,便于复现)。
+    #[test]
+    fn build_is_deterministic() {
+        let nodes = make_nodes(256, 8);
+        let params = HnswParams {
+            m: 4,
+            m0: 8,
+            ef_construction: 32,
+            ef_search: 16,
+        };
+        let first = HnswIndex::build(&nodes, params, Metric::Dot)
+            .serialize()
+            .expect("serialize");
+        let second = HnswIndex::build(&nodes, params, Metric::Dot)
+            .serialize()
+            .expect("serialize");
+        assert_eq!(first, second, "同一输入必须产生同一图");
+    }
+
+    /// 退化边界:空图与单节点图的构建/编解码往返(FC-INDEX-POST-007 的退化边界)与
+    /// 查询不 panic、不越界。
+    #[test]
+    fn empty_and_single_node_graphs_are_supported() {
+        // 空图:构建、序列化、载入均成立;查询返回空。
+        let empty = HnswIndex::build(&[], HnswParams::default(), Metric::Dot);
+        assert_eq!(empty.node_count(), 0);
+        let bytes = empty.serialize().expect("serialize empty");
+        assert!(HnswIndex::load(&bytes, &[], &[], Metric::Dot).is_ok());
+        let alive = BitSet::default();
+        let top = empty.search(&IndexSearch {
+            query: &[1.0, 0.0],
+            query_norm: 1.0,
+            ef: 8,
+            k: 4,
+            alive: &alive,
+            filter: None,
+            post_threshold: 0.1,
+            brute_threshold: 0.001,
+        });
+        assert!(top.into_sorted_vec().is_empty(), "空图不得返回任何命中");
+
+        // 单节点图:查询能返回该节点。
+        let nodes = make_nodes(1, 8);
+        let single = HnswIndex::build(&nodes, HnswParams::default(), Metric::Dot);
+        let mut alive = BitSet::default();
+        alive.set(0);
+        let query = nodes[0].vector.clone();
+        let hits = single
+            .search(&IndexSearch {
+                query: &query,
+                query_norm: simd::dot(&query, &query),
+                ef: 8,
+                k: 4,
+                alive: &alive,
+                filter: None,
+                post_threshold: 0.1,
+                brute_threshold: 0.001,
+            })
+            .into_sorted_vec();
+        assert_eq!(hits.len(), 1, "单节点图必须返回唯一节点");
+        assert_eq!(hits[0].0.get(), 0);
     }
 }

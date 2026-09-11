@@ -98,6 +98,9 @@ impl Builder {
     /// * 未设置 `dimension`(新建库)→ [`MnemeError::Config`];
     /// * `dedup_threshold` 非 `[0,1]` 内的有限值 → [`MnemeError::Config`]
     ///   (FC-GLOBAL-PRE-004:NaN 会让去重静默失效,越界值超出余弦相似度口径,绝不静默);
+    /// * HNSW 参数域非法(`m < 2`/`m0 < m`/`ef_construction = 0`/`ef_search = 0`)或过滤阈值
+    ///   非法(非有限值、越界、`brute > post`)→ [`MnemeError::Config`];`ef_search` 或度数
+    ///   超上限 → [`MnemeError::LimitExceeded`](FC-INDEX-PRE-001);
     /// * `path` 已存在库且显式维度/度量与其不符 → [`MnemeError::DimensionMismatch`]/
     ///   [`MnemeError::MetricMismatch`];目录被其他实例独占 → [`MnemeError::Busy`]。
     ///

@@ -411,11 +411,12 @@ pub(crate) trait VectorIndex: Send + Sync {
     fn node_count(&self) -> usize;
     fn max_level(&self) -> u8;
     fn entry(&self) -> (SlotId, u8);
-    fn serialize(&self) -> Vec<u8>;
+    fn serialize(&self) -> Result<Vec<u8>>;
     fn search(&self, params: &IndexSearch<'_>) -> TopK<(RowId, SlotId)>;
 }
 pub(crate) trait IndexFactory: Send + Sync {
     fn build(&self, nodes: &[IndexNode], params: HnswParams, metric: Metric) -> Arc<dyn VectorIndex>;
+    fn verify(&self, bytes: &[u8]) -> Result<()>;
     fn load(&self, bytes: &[u8], nodes: &[IndexNode], slot_of: &[SlotId], metric: Metric)
         -> Result<Arc<dyn VectorIndex>>;
 }

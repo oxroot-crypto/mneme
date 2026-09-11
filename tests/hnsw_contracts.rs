@@ -15,6 +15,7 @@ mod common;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use mneme::{Builder, Expr, HnswParams, Metric, Mneme, MnemeError, Record, RowId, Tuning, simd};
 
@@ -22,7 +23,7 @@ use mneme::{Builder, Expr, HnswParams, Metric, Mneme, MnemeError, Record, RowId,
 const RECALL_ROWS: usize = 2_500;
 /// 召回测试维度。
 const RECALL_DIM: usize = 32;
-/// 召回查询数(提高统计置信度:单查询 0/10 无法再蒙混过 0.95 门槛)。
+/// 召回查询数(提高统计置信度:个别查询全 0 时仍可能高于门槛,必须降低偶然通过率)。
 const RECALL_QUERIES: usize = 50;
 /// 档②(放大后过滤)测试行数:候选数 = 20480 / 20 = 1024 = `max(ef, 1024)` 边界。
 const AMPLIFIED_TIER_ROWS: usize = 20_480;
@@ -287,6 +288,29 @@ fn invalid_hnsw_params_and_thresholds_are_rejected() {
             .build()
             .is_ok()
     );
+    // 阈值合法边界:post=brute=1.0 与 post=brute=0.0 均合法。
+    assert!(
+        Builder::default()
+            .dimension(4)
+            .tuning(Tuning {
+                filter_post_threshold: 1.0,
+                filter_brute_threshold: 1.0,
+                ..Tuning::default()
+            })
+            .build()
+            .is_ok()
+    );
+    assert!(
+        Builder::default()
+            .dimension(4)
+            .tuning(Tuning {
+                filter_post_threshold: 0.0,
+                filter_brute_threshold: 0.0,
+                ..Tuning::default()
+            })
+            .build()
+            .is_ok()
+    );
     assert!(
         Builder::default()
             .dimension(4)
@@ -314,10 +338,17 @@ fn ann_merges_prefix_with_unflushed_tail() {
     let batch: Vec<Record> = tail.iter().map(|v| Record::new(v.clone())).collect();
     ns.insert_batch(batch).expect("tail insert");
 
+    let query = tail[0].clone();
     let mut all = vectors.clone();
     all.extend(tail);
 
-    let query = vector(4_242, RECALL_DIM);
+    // 查询直接取一条尾部向量:保证全量 top-10 必含尾部行,否则"实现只返回索引
+    // 前缀、丢弃尾部"的退化也能通过,归并路径失去证伪力。
+    let want_rows = brute_topk(&all, &query, 10);
+    assert!(
+        want_rows.iter().any(|&row| row >= RECALL_ROWS),
+        "测试数据必须让尾部行进入全量 top-10,否则归并无证伪力"
+    );
     let hits = ns
         .search()
         .vector(&query)
@@ -326,7 +357,7 @@ fn ann_merges_prefix_with_unflushed_tail() {
         .execute()
         .expect("search");
     let got: HashSet<usize> = hits.iter().map(|hit| hit.rowid.get() as usize).collect();
-    let want: HashSet<usize> = brute_topk(&all, &query, 10).into_iter().collect();
+    let want: HashSet<usize> = want_rows.into_iter().collect();
     assert_eq!(got, want, "前缀 ANN + 尾部暴力应与全量暴力一致");
 }
 
@@ -759,6 +790,70 @@ fn ann_after_as_of_matches_bruteforce() {
     assert!(!got_now.contains(&7), "当前视图不得返回已删除记录");
 }
 
+/// FC-INDEX-POST-005:ANN 前缀的 alive 位图同时按命名空间与 TTL 过滤——其他
+/// 命名空间与已逻辑过期记录不得入选,本命名空间内结果与「TTL 过滤后」暴力一致。
+#[test]
+fn ann_respects_namespace_and_ttl_visibility() {
+    const T0: i64 = 1_700_100_000_000;
+    const OTHER_ROWS: usize = 100;
+    let vectors: Vec<Vec<f32>> = (0..RECALL_ROWS).map(|row| vector(row as u64, 8)).collect();
+    // 哨兵向量:放大 1000 倍使其点积碾压普通随机向量。若 TTL 或 NS 过滤失效,
+    // 哨兵必进(甚至居首)结果集,断言必然变红——否则测试只是空转。
+    let sentinel: Vec<f32> = vectors[0].iter().map(|x| x * 1_000.0).collect();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clock = Arc::new(TestClock::new(T0));
+    let db = Builder::default()
+        .path(dir.path())
+        .dimension(8)
+        .metric(Metric::Dot)
+        .hnsw(fast_hnsw())
+        .tuning(ann_tuning())
+        .clock(Arc::clone(&clock) as Arc<dyn mneme::Clock>)
+        .build()
+        .expect("build");
+    // 命名空间 a:首行存哨兵且带 1s TTL,其余为普通向量。
+    let ns_a = db.namespace("a");
+    let mut batch: Vec<Record> = vectors.iter().map(|v| Record::new(v.clone())).collect();
+    batch[0] = Record::new(sentinel.clone()).ttl(Duration::from_millis(1_000));
+    ns_a.insert_batch(batch).expect("insert a");
+    // 命名空间 b:首行存同一哨兵(永久),与 a 同段落盘(hidx 前缀覆盖两 NS)。
+    let ns_b = db.namespace("b");
+    let mut other: Vec<Record> = (0..OTHER_ROWS)
+        .map(|row| Record::new(vector(8_000_000 + row as u64, 8)))
+        .collect();
+    other[0] = Record::new(sentinel.clone());
+    ns_b.insert_batch(other).expect("insert b");
+    db.flush().expect("flush");
+
+    // 推进时钟:首行 TTL 到期,alive 位图必须摘除它。
+    clock.set(T0 + 2_000);
+    let hits = ns_a
+        .search()
+        .vector(&sentinel)
+        .top_k(10)
+        .ef(4096)
+        .execute()
+        .expect("search");
+    let got: Vec<usize> = hits.iter().map(|hit| hit.rowid.get() as usize).collect();
+    assert!(
+        !got.contains(&0),
+        "已逻辑过期哨兵不得被 ANN 返回(若 TTL 过滤失效它必然居首)"
+    );
+    assert!(
+        got.iter().all(|&row| row < RECALL_ROWS),
+        "其他命名空间哨兵不得入选(若 NS 过滤失效它必然居首):{got:?}"
+    );
+    // a 内 oracle(排除已过期首行):任何可见性泄漏都会破坏集合相等。
+    let want: HashSet<usize> = brute_topk_filtered(&vectors, &sentinel, 10, |row| row != 0)
+        .into_iter()
+        .collect();
+    assert_eq!(
+        got.into_iter().collect::<HashSet<_>>(),
+        want,
+        "a 命名空间结果应与 TTL 过滤后暴力一致"
+    );
+}
+
 /// FC-INDEX-POST-008:hidx 随 flush 落盘并登记入口,重开从 hidx 载入且检索正确。
 #[test]
 fn reopen_loads_hnsw_from_hidx() {
@@ -771,8 +866,8 @@ fn reopen_loads_hnsw_from_hidx() {
         "重开后应从 hidx 载入完整索引(而非降级暴力)"
     );
     assert!(
-        stats.segments[0].index_levels >= 1,
-        "载入的索引应有上层结构"
+        (1..=8).contains(&stats.segments[0].index_levels),
+        "载入的索引应有上层结构且层级在合理范围"
     );
 
     let ns = db.namespace("t");

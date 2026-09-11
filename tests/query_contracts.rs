@@ -348,6 +348,24 @@ fn scoring_floor_zeroes_below_threshold() {
     assert!(almost(&scores(0.8), &[1.0, 0.0, 0.0]));
     // floor = 0:任何非负相似度都不清零,与不做保底全等。
     assert!(almost(&scores(0.0), &[1.0, boundary, 0.0]));
+    // floor = 0 必须真正"不清零":开 importance 权重使尾部候选总分为正,
+    // 若实现退化为 `<=` 清零,该断言变红(消除上面恒等比较的空转)。
+    let floor_zero = ns
+        .search()
+        .vector(&[1.0, 0.0])
+        .score(Scoring {
+            floor: 0.0,
+            w_importance: 1.0,
+            ..Scoring::default()
+        })
+        .top_k(3)
+        .execute()
+        .expect("search");
+    let tail_score = floor_zero.last().expect("3 hits").score;
+    assert!(
+        tail_score > 0.0,
+        "floor=0 时相似度 0 的候选不得被清零(实现必须用严格小于)"
+    );
 }
 
 /// FC-MEM-PRE-003(综合打分各因子钳制到 [0,1]:访问频次因子超基准后恒为 1.0;
