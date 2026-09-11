@@ -4,6 +4,7 @@
 > **前置**:[05 章](05-errors.md)(`Result`)、[07 章](07-iterators-closures.md)。
 > **对应源码**:各 `src/core/*.rs` 底部的 `mod tests`,以及 [`tests/core_contracts.rs`](../../tests/core_contracts.rs)、
 > [`tests/contract_traceability.rs`](../../tests/contract_traceability.rs)、
+> [`tests/l4_contracts.rs`](../../tests/l4_contracts.rs)、
 > [`src/index/hnsw.rs`](../../src/index/hnsw.rs)、[`src/index/hidx.rs`](../../src/index/hidx.rs)、
 > [`src/index/filtered.rs`](../../src/index/filtered.rs)。
 
@@ -74,6 +75,35 @@ fn expired_session_is_invalid() {
 mneme 的集成测试用 `.expect("下界合法")` 让失败信息更清楚,见
 [`tests/core_contracts.rs:45`](../../tests/core_contracts.rs)。
 
+### 1.4 测试替身:可注入的假时钟
+
+验证 TTL、`as_of` 历史视图这类行为的测试**不能读真实时间**,否则结果不可重现。L4 的契约测试
+把时间做成可手动推进的 `Clock` 实现:
+
+```rust
+struct FakeClock(AtomicI64);
+
+impl Clock for FakeClock {
+    fn now_unix_ms(&self) -> i64 {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+```
+
+见 [`tests/l4_contracts.rs:31-38`](../../tests/l4_contracts.rs)。要点:
+
+- `Clock` 是 L0 定义的 trait(见 [04 §5](04-borrowing-strings-slices.md));测试实现它,
+  再用 `.clock(Arc::clone(&clock) as Arc<dyn Clock>)` 注入构建器,业务代码读到的"现在"
+  就由测试说了算(见 [`tests/l4_contracts.rs:615-630`](../../tests/l4_contracts.rs),
+  推进时间用 `clock.0.store(...)`,即 `AtomicI64` 的 `&self` 写入)。
+- 内部用 `AtomicI64` 而不是 `Cell`:`&self` 下也能改,且跨线程安全(见
+  [04 §5.2](04-borrowing-strings-slices.md))。
+- 这是"外部状态必须通过参数注入"(见 [CONTRIBUTING.md](../../CONTRIBUTING.md))的落地;
+  随机数、环境变量同理,不要直接读全局。
+
+> 仓库里还有一份共享的 `FakeClock(Arc<Mutex<i64>>)`,放在 [`tests/common/mod.rs`](../../tests/common/mod.rs),
+> 供其余契约测试复用;两种写法都行,关键是"测试能控制时间"。
+
 ---
 
 ## 2. 集成测试:`tests/` 目录
@@ -85,10 +115,14 @@ use mneme::{Dimension, Metric, TopK, json};
 use mneme::simd::{dot, dot_scalar};
 ```
 
-见 [`tests/core_contracts.rs:20-24`](../../tests/core_contracts.rs)。
+见 [`tests/core_contracts.rs:21-27`](../../tests/core_contracts.rs)。
 
 - 集成测试验证"用户视角"的 API 是否按契约工作。
 - 单元测试可以访问私有项,集成测试不行——这个区别很有用:它强迫你验证公开契约。
+- 多个集成测试要共享辅助函数时,把它们放进 `tests/common/mod.rs`,各测试文件用 `mod common;`
+  引入(目录入口 `mod.rs` 不会被单独当成一个测试 crate)。L4 契约测试就复用了其中的建库助手:
+  `mod common; use common::{inserted, mem};`,见
+  [`tests/l4_contracts.rs:27-29`](../../tests/l4_contracts.rs)。
 
 ---
 
@@ -129,12 +163,16 @@ proptest! {
 }
 ```
 
-见 [`tests/core_contracts.rs:186-202`](../../tests/core_contracts.rs)。(`...` 处源码里还断言了
+见 [`tests/core_contracts.rs:201-217`](../../tests/core_contracts.rs)。(`...` 处源码里还断言了
 最小编码字节数,并对 `u32` 做同样的往返检查。)
 
 - `value in any::<u64>()` 是**策略(strategy)**:告诉 proptest 生成任意 `u64`。
 - `prop_assert_eq!` 是 proptest 版断言,失败时会**收缩(shrink)**到最小反例。
 - 区间生成:`prop::collection::vec(-10.0f32..10.0, 0..300)` 生成"长度 0–300、元素在 -10~10 的 Vec"。
+- 字符串/正则策略:直接写正则字面量,proptest 生成匹配它的字符串。L4 的
+  `input in ".{0,200}"` 就是"0–200 个任意字符(含 Unicode)",用来给 DSL 解析器喂任意输入
+  (见 [`tests/l4_contracts.rs:798`](../../tests/l4_contracts.rs));要无长度上限可用
+  `any::<String>()`。
 - 失败时 proptest 会打印反例,你可以据此加一个固定的回归测试。
 
 ### 4.1 失败之后:收缩与回归
@@ -180,7 +218,7 @@ proptest! {
 }
 ```
 
-见 [`tests/core_contracts.rs:204-220`](../../tests/core_contracts.rs)。这是优化代码最有力的正确性保障。
+见 [`tests/core_contracts.rs:221-244`](../../tests/core_contracts.rs)。这是优化代码最有力的正确性保障。
 
 ### 4.4 参照实现:验证数据结构
 
@@ -203,7 +241,7 @@ fn reference_topk(entries: &[(f32, u32)], k: usize, metric: Metric) -> Vec<u32> 
 }
 ```
 
-见 [`tests/core_contracts.rs:26-40`](../../tests/core_contracts.rs) 与 [`tests/core_contracts.rs:156-184`](../../tests/core_contracts.rs)。
+见 [`tests/core_contracts.rs:29-43`](../../tests/core_contracts.rs) 与 [`tests/core_contracts.rs:171-199`](../../tests/core_contracts.rs)。
 
 ### 4.5 自定义策略:`impl Strategy` 与 `prop_oneof!`
 
@@ -343,7 +381,7 @@ mneme 的集成测试文件头部列出它覆盖的契约编号:
 //! ...
 ```
 
-见 [`tests/core_contracts.rs:3-16`](../../tests/core_contracts.rs),契约定义在
+见 [`tests/core_contracts.rs:3-19`](../../tests/core_contracts.rs),契约定义在
 [`docs/spec/contracts.md`](../spec/contracts.md)。
 
 - 每个测试函数上方注释它对应的 `FC-*` 编号。
@@ -371,7 +409,8 @@ const MEMORY_TESTS: &str = include_str!("memory_contracts.rs");
 - 测试文件头声明的 `FC-*` 集合与契约覆盖该文件的条目**双向相等**(无多报、无漏报)。
 
 L1 的契约测试按 FC 模块族拆分为 `tests/memory_contracts.rs`、`query_contracts.rs`、
-`model_contracts.rs`、`life_contracts.rs`,统一纳入这道门禁。它随 `cargo test` 一起跑——
+`model_contracts.rs`、`life_contracts.rs`;L2/L3/L4 的 `persist_contracts.rs`、
+`hnsw_contracts.rs`、`l4_contracts.rs` 也一并纳入这道门禁。它随 `cargo test` 一起跑——
 契约漂移会让测试变红,而不是等人工审查发现。
 
 > `include_str!` 是"把别的文件当字符串嵌入当前源码"的编译期宏;配合 `env!("CARGO_PKG_VERSION")`
@@ -415,6 +454,7 @@ cargo test --release                # release 模式跑(测优化后的行为)
 
 - 单元测试放 `#[cfg(test)] mod tests`,用 `#[test]` 和断言宏;遵循 AAA,测试名描述行为。
 - 集成测试放 `tests/`,只能访问公开 API;doctest 让文档示例自动运行。
+- 时间等外部状态用**测试替身**注入(如实现 `Clock` 的 `FakeClock`),测试才能重现。
 - `proptest` 自动生成随机输入验证不变量,失败会收缩到最小反例;常用"参照实现"对照优化实现。
 - 策略可以组合:自定义 `impl Strategy` 函数、`prop_map` 变换、`prop_oneof!` 混合来源;
   "合法样本 + 变异"的 fuzzing 思路能逼解析器走遍校验分支。
@@ -434,11 +474,14 @@ cargo test --release                # release 模式跑(测优化后的行为)
 ## 结语
 
 到这里,你已经掌握了读懂 mneme L0 所需的全部 Rust 基础。L1( [`src/memory/`](../../src/memory) )
-新引入的共享所有权、锁与写事务等特性,以及 L3( [`src/index/`](../../src/index) )
+新引入的共享所有权、锁与写事务等特性,L3( [`src/index/`](../../src/index) )
 新引入的手写 `Ord`、`BinaryHeap`、`TryFrom`/受检运算、字节切片操作、let 链与 `let...else`、
-`thread_local!` 探针、proptest 自定义策略,都已回填到 02/03/04/05/07/10 章的对应小节
+`thread_local!` 探针、proptest 自定义策略,以及 L4( [`src/query/`](../../src/query) )
+新引入的递归枚举与 `Box`、生命周期参数化解析器、`HashMap` entry API、原子类型、
+运算符重载与 `fmt::Write`、可注入假时钟等,都已回填到 01–08 与 10 章的对应小节
 (回填总表见 [README §4](README.md))。建议现在从头再读一遍
 [`src/core/`](../../src/core) 的源码,把每处语法对应回相应章节;有余力再按需读
-[`src/index/`](../../src/index)。之后可以按
+[`src/memory/`](../../src/memory)、[`src/index/`](../../src/index) 与
+[`src/query/`](../../src/query)。之后可以按
 [DESIGN.md](../DESIGN.md) 的分层路线,从 [03 L1 内存引擎](../design/03-l1-memory.md)
 起继续读各层设计文档,并参考 [README 的通用资料](README.md#5-学完之后的下一步通用资料)继续深入 Rust。

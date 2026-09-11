@@ -169,7 +169,9 @@ impl SnapshotNamespace {
         filter: Option<Expr>,
         include_deleted: bool,
     ) -> Result<impl Iterator<Item = Result<RecordRef<'_>>> + '_> {
-        let now = self.table.config.clock.now_unix_ms();
+        // TTL 可见性以快照时刻为准,与 `SnapshotNamespace` 的其它读路径一致
+        // (FC-QUERY-POST-006),绝不混用墙上时钟。
+        let now = self.as_of_ms;
         let mut collected = Vec::new();
         if let Some(ns_id) = self.ns_id() {
             for (rowid, slot) in self.view.latest.iter() {

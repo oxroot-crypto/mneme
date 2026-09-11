@@ -1,9 +1,9 @@
 //! 元数据段(`msec`)编解码(设计 04 §2.2、§5.5)。
 //!
 //! 文件 = 定长头(160 B 字段 + CRC,补齐到 192 B)+ 变长数据区 + 尾部 payload CRC。
-//! 头部用 8 组 `offset/len` 指向各数据区;L2 落地 `doc_region`(记录体)、
-//! `version_table`(版本链)、`key_index`、`ns_stats`、`delta`、`relations`;
-//! `field_dict`/`zone_maps`/`ttl_map`/`blooms`/`inverted` 属 L4,本层写空(`len=0`)。
+//! 头部用 9 组 `offset/len` 指向各数据区;`doc_region`(记录体)、
+//! `version_table`(版本链)、`key_index`、`ns_stats`、`delta`、`relations` 与
+//! L4 的四类轻量索引区(`field_dict`/`zone_maps`/`blooms`/`inverted`)。
 //!
 //! **记录体(entry)**:`[u32 total_len][u64 rowid][u64 seqno][u32 ns_id][u8 flags]`
 //! 之后按 flags 依次出现可选的 key/text、meta、时间与统计字段。墓碑版本无记录体,
@@ -13,6 +13,8 @@
 //!
 //! * `encode` —— 段与记录体编码。
 //! * `decode` —— 段头解析、记录体解码与只读视图 [`MsecView`]。
+//! * `index` —— 字段字典 / zone map / bloom 三类轻量索引区编解码。
+//! * `inverted` —— 倒排区编解码(含槽位重排映射)。
 
 use std::sync::Arc;
 
@@ -22,10 +24,17 @@ use crate::core::types::{Key, NsId, RowId, SeqNo};
 mod decode;
 mod encode;
 mod entry;
+mod index;
+mod inverted;
 
 pub(crate) use decode::{MsecView, parse};
 pub(crate) use encode::{encode, encode_entry};
 pub(crate) use entry::entry_from_prefix;
+pub(crate) use index::{
+    FieldKind, decode_bloom, decode_field_dict, encode_bloom, encode_field_dict, encode_zmap,
+    validate_zmap,
+};
+pub(crate) use inverted::{decode_inverted, encode_inverted};
 
 /// 元数据段魔数。
 pub(crate) const MAGIC: [u8; 4] = *b"MSC1";
@@ -148,6 +157,14 @@ pub(crate) struct MsecInput<'a> {
     pub(crate) delta: &'a [u8],
     /// 预编码的 relations 区(见 [`crate::persist::edges`]);无边时为 `&[]`。
     pub(crate) relations: &'a [u8],
+    /// 字段字典区(L4;无索引字段时为空)。
+    pub(crate) field_dict: &'a [u8],
+    /// zone map 区(L4;无索引字段时为空)。
+    pub(crate) zmap: &'a [u8],
+    /// bloom 区(L4;无 `key` 字段时为空)。
+    pub(crate) bloom: &'a [u8],
+    /// 倒排区(L4;无文本记录时为空)。
+    pub(crate) inverted: &'a [u8],
 }
 
 /// msec 各数据区偏移/长度。
@@ -157,9 +174,10 @@ struct Region {
     len: u64,
 }
 
-/// 头部 8 个数据区的偏移/长度。
+/// 头部 9 个数据区的偏移/长度(field_dict/version/key/inv/ns_stats/zmap/bloom/delta/rel)。
 #[derive(Debug, Clone, Copy, Default)]
 struct Regions {
+    field_dict: Region,
     version: Region,
     key: Region,
     inv: Region,
@@ -229,6 +247,10 @@ mod tests {
             ns_stats: &ns_stats,
             delta: &[],
             relations: &[],
+            field_dict: &[],
+            zmap: &[],
+            bloom: &[],
+            inverted: &[],
         })
         .expect("encode")
     }

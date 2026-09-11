@@ -30,22 +30,43 @@ fn retain_forgets_below_threshold() {
     assert!(!ns.exists("drop").expect("exists"));
 }
 
-/// FC-MEM-ERR-002(延后能力返回结构化错误;`Fusion` 单独设置即拒绝)
+/// FC-MEM-ERR-002(与当前形态不符的能力返回结构化错误,绝不静默:
+/// `Fusion` 需要双通道,单通道设置即拒绝;纯内存库 `backup_to` 仍 `Unsupported`)
 #[test]
 fn deferred_features_return_structured_errors() {
     let db = mem(2);
     let ns = db.namespace("n");
-    assert!(matches!(
-        ns.search().text("x").execute(),
-        Err(mneme::MnemeError::Unsupported { .. })
-    ));
+    ns.insert(Record::new(vec![1.0, 0.0]).key("k").text("hello"))
+        .expect("insert");
+    // L4 起文本通道可用:仅文本查询命中且得分有限。
+    let text_hits = ns.search().text("hello").execute().expect("text channel");
+    assert_eq!(text_hits.len(), 1);
+    assert_eq!(
+        text_hits[0].key.as_ref().map(ToString::to_string),
+        Some("k".to_string())
+    );
+    assert!(text_hits[0].score.is_finite());
+    // 但 Fusion 需要向量与文本两个通道;单通道设置即拒绝,绝不静默忽略。
     assert!(matches!(
         ns.search()
             .vector(&[1.0, 0.0])
             .fusion(mneme::Fusion::default())
             .execute(),
-        Err(mneme::MnemeError::Unsupported { .. })
+        Err(mneme::MnemeError::Config { .. })
     ));
+    // 双通道 + Fusion:融合可用且命中。
+    let fused = ns
+        .search()
+        .vector(&[1.0, 0.0])
+        .text("hello")
+        .fusion(mneme::Fusion::default())
+        .execute()
+        .expect("dual channel");
+    assert_eq!(fused.len(), 1);
+    assert_eq!(
+        fused[0].key.as_ref().map(ToString::to_string),
+        Some("k".to_string())
+    );
     assert!(matches!(
         db.backup_to("./nowhere"),
         Err(mneme::MnemeError::Unsupported { .. })

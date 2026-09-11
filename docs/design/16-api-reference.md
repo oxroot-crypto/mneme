@@ -15,8 +15,9 @@
 签名在 L1 冻结([01 §6](01-overview.md))。`Mneme` 是库句柄,`Namespace` 是逻辑分区,
 二者都通过内部 `Arc` 共享、可自由克隆并跨线程传递(见 §5)。
 
-> **L1 实现状态**:本参考按冻结签名描述目标语义;标注「L1 未落地」的方法在当前
-> 版本返回 `Unsupported{feature}`(FC-MEM-ERR-002),不静默降级,见 §4 错误表。
+> **实现状态**:本参考按冻结签名描述目标语义。L4 起 `text`(BM25)、`Fusion`、
+> `Expr::from_str`/`Display`/JSON 往返与 `filter!` 均已落地;尚未落地的能力以结构化
+> 错误返回、绝不静默降级(FC-MEM-ERR-002),见 §4 错误表。
 
 ### 1.1 构建与打开
 
@@ -49,10 +50,10 @@ impl Builder {
     pub fn retain_interval(self, d: Duration) -> Self;      // 开启自动遗忘时的周期,默认 半衰期/4
     pub fn access_flush_interval(self, d: Duration) -> Self; // 默认 30s
     pub fn compression(self, c: Compression) -> Self;       // 文本/元数据压缩,默认 None(见 11;L11 落地,当前记录不启用)
-    pub fn encryption(self, e: Option<Encryption>) -> Self; // 静态加密,feature `encrypt`(见 11;L11 落地)
-    pub fn storage(self, s: Arc<dyn Storage>) -> Self;      // 存储后端,默认 FsStorage;WASM/边缘自定义(见 12 §3;L12 落地,当前内部 std::fs)
+    pub fn encryption(self, e: Option<Encryption>) -> Self; // 静态加密,feature `encrypt`(见 11;L11 落地,当前无此 API)
+    pub fn storage(self, s: Arc<dyn Storage>) -> Self;      // 存储后端,默认 FsStorage;WASM/边缘自定义(见 12 §3;L12 落地,当前无此 API,内部直接 std::fs)
     pub fn read_only(self, yes: bool) -> Self;              // 只读共享模式(见 12 §2;L2 已实现单进程只读,不创建锁/WAL)
-    pub fn read_only_probe_interval(self, d: Duration) -> Self; // 只读实例探测新 MANIFEST 的周期,默认 1s(L12 多进程只读时落地)
+    pub fn read_only_probe_interval(self, d: Duration) -> Self; // 只读实例探测新 MANIFEST 的周期,默认 1s(见 12 §2;L12 落地,当前无此 API)
     pub fn verify_on_open(self, yes: bool) -> Self;         // 打开时全量校验各段 payload CRC,默认 false(见 04 §4.3)
     pub fn fail_fast_on_corruption(self, yes: bool) -> Self; // 损坏段直接拒绝启动,默认 false = 隔离剔除(见 04 §7)
     pub fn relation_index(self, r: RelationIndex) -> Self;  // 关系反向索引,默认 Outgoing(见 09 §2.3)
@@ -60,6 +61,7 @@ impl Builder {
     pub fn tuning(self, t: Tuning) -> Self;                 // 进阶调参,默认见 §2
     pub fn limits(self, l: Limits) -> Self;                 // 数据限额,见 §8
     pub fn clock(self, c: Arc<dyn Clock>) -> Self;          // 测试注入;默认 SystemClock
+    pub fn fsync_hook(self, hook: Arc<dyn FsyncHook>) -> Self; // 测试崩溃注入,见 04 §10.1
     pub fn observer(self, o: Arc<dyn Observer>) -> Self;    // 可选可观测钩子,默认无(见 12 §4;L12 落地,当前无此 API)
     pub fn build(self) -> Result<Mneme>;
 }
@@ -237,14 +239,14 @@ impl SearchBuilder<'_> {
     pub fn ef(self, ef: usize) -> Self;                     // 仅 L3+ 生效;上限 4096
     pub fn filter(self, e: Expr) -> Self;                   // 预过滤(语义见 03 §2.2)
     pub fn dedup(self, d: ResultDedup) -> Self;             // 结果级去重(见 06 §6)
-    pub fn fusion(self, f: Fusion) -> Self;                 // 双通道融合(见 06 §4);L1 未落地:设置即 `Unsupported`(L4)
+    pub fn fusion(self, f: Fusion) -> Self;                 // 双通道融合(见 06 §4);未同时启用双通道时 execute() 返回 Config
     pub fn score(self, s: Scoring) -> Self;                 // 时序/重要度/访问感知打分(见 10 §2)
     pub fn diversify(self, d: Diversity) -> Self;           // MMR 多样性(见 10 §5)
     pub fn expand(self, e: RelationExpand) -> Self;         // 关系联想扩展(见 10 §3)
     pub fn as_of(self, ts_ms: i64) -> Self;                 // 双时态历史读(见 09 §3)
     pub fn query_id(self, id: QueryId) -> Self;             // 指定本次查询的幂等标识;默认由 execute() 生成(见 10 §4)
     pub fn rerank(self, r: Arc<dyn Reranker>) -> Self;      // 可选精排钩子
-    pub fn execute(&self) -> Result<Vec<Hit>>;              // 至少一个通道非空,否则 Config;查询向量维度不符返回 DimensionMismatch;MMR lambda 非有限值返回 Config
+    pub fn execute(&self) -> Result<Vec<Hit>>;              // 至少一个通道非空,否则 Config;Fusion 未同时启用双通道或 Weighted.alpha 越界/非有限 → Config;查询向量维度不符返回 DimensionMismatch;MMR lambda 非有限值返回 Config
 }
 ```
 
@@ -310,7 +312,7 @@ impl SnapshotHandle {
     pub fn as_of_ms(&self) -> i64;                         // 事务时间上界;普通 snapshot() = 当前,as_of(t) = t
     /// 在钉住的快照上取命名空间视图(键唯一性按命名空间隔离,故读取须先选命名空间)。
     pub fn namespace(&self, path: &str) -> SnapshotNamespace;
-    pub fn stats(&self) -> SnapshotStats;
+    pub fn stats(&self) -> SnapshotStats;                  // L5 规划,当前无此 API
 }
 
 /// 快照上的命名空间只读视图;持有快照视图的 `Arc`,克隆廉价、可跨线程使用。
@@ -355,14 +357,15 @@ impl Retention {
     pub fn protect(self, e: Expr) -> Self;
 }
 
-/// 融合器。`Rrf` 默认 k=60;`Weighted` 的 alpha 默认 0.5(见 06 §4)。
+/// 融合器。`Rrf` 默认 k=60(即 `Fusion::default()`);`Weighted { alpha }` 无 `Default`,
+/// 设计推荐 0.5,须显式构造(未指定时默认融合为 `Rrf { k: 60 }`,见 06 §4)。
 pub enum Fusion { Rrf { k: u32 }, Weighted { alpha: f32 } }
 
 /// 运维报告类型(字段为稳定契约)。
 pub struct RetainReport { pub scanned: usize, pub forgotten: usize, pub sampled_ids: Vec<RowId> }  // 可审计(I23)
 pub struct BackupReport { pub files: usize, pub bytes: u64, pub hardlinked: bool }
 pub struct CheckReport  { pub ok: bool, pub corrupted: Vec<SegmentId>, pub suggestions: Vec<String> }
-pub struct SnapshotStats { pub version: u64, pub segments: usize, pub rows: u64 }
+pub struct SnapshotStats { pub version: u64, pub segments: usize, pub rows: u64 }  // L5 规划,当前无此 API
 ```
 
 #### 运行统计
@@ -459,8 +462,15 @@ impl Expr {
     pub fn field(name: &str) -> FieldBuilder;
     /// DSL 字符串解析,对任意输入不 panic(I7);`filter!` 即其 expect 封装(见 06 §1)。
     pub fn from_str(s: &str) -> Result<Expr>;
-    // Display(打印)与 Meta ↔ Expr 的 JSON 往返见 06 §1。
+    /// 编码为 JSON(单键对象,见 06 §1)。
+    pub fn to_meta(&self) -> Meta;
+    /// 从 JSON 解码;结构非法返回 `FilterParse`。
+    pub fn from_meta(meta: &Meta) -> Result<Expr>;
 }
+// `Display`(打印为可被 `from_str` 读回的文本)亦已实现,见 06 §1。
+
+/// 分词:按空白切词 + CJK bigram + 可选停用词;公开给自建文本索引的宿主(见 06 §3.5)。
+pub fn tokenize(text: &str, stopwords_enabled: bool) -> Vec<String>;
 
 /// 字段组合器(定义见 [03 §5.1](03-l1-memory.md)):`eq/ne/gt/ge/lt/le/is_in` 返回 `Expr`。
 pub struct FieldBuilder { /* field: String */ }
@@ -506,7 +516,7 @@ impl Scoring { pub fn new() -> Self; /* 链式 setter */ }
 pub enum TimeAxis { ValidTime, TransactionTime }
 
 /// 结果多样性(见 [10 §5](10-scoring.md))。
-pub enum Diversity { Off, Mmr { lambda: f32 } }   // lambda∈[0,1],越大越重相关性,默认 0.7;非有限值 execute() 返回 Config
+pub enum Diversity { Off, Mmr { lambda: f32 } }   // lambda∈[0,1],越大越重相关性;设计推荐 0.7,须显式构造(`Diversity::default() == Off`);非有限值 execute() 返回 Config
 
 /// 关系联想扩展(见 [10 §3](10-scoring.md)):hops 默认 1(最大 3),decay 默认 0.5/跳,
 /// max_nodes 默认 4k(封顶扩展延迟)。
@@ -521,7 +531,7 @@ pub struct RelationKind(pub u16);
 impl RelationKind {
     pub const DERIVED_FROM: Self; pub const SUPPORTS: Self;
     pub const CONTRADICTS: Self;  pub const RELATED: Self;
-    pub fn custom(name: &str) -> Result<Self>;   // 名称→稳定编号(注册表见 09 §2;耗尽返回 TooLarge)
+    pub fn custom(name: &str) -> Result<Self>;   // 名称→稳定编号(注册表见 09 §2;耗尽返回 TooLarge;L2 注册表落地前无此 API)
 }
 /// 一条关系边。
 pub struct Edge { pub from: RowId, pub to: RowId, pub kind: RelationKind, pub weight: f32, pub metadata: Meta }
@@ -587,11 +597,11 @@ pub struct ConsolidateReport {
 | 自动遗忘 | `.retention` | **`None`(关闭)** | `Option<Retention>`;显式传入才开启后台 retain,见 [07 §3.4](07-l5-life.md) |
 | 遗忘扫描周期 | `.retain_interval` | 半衰期/4 | 开启自动遗忘后的触发间隔 |
 | 访问统计落盘 | `.access_flush_interval` | `30s` | 内存访问计数批量写 WAL 的周期,见 [07 §2](07-l5-life.md) |
-| 压缩 | `.compression` | `None` | 文本/元数据压缩,见 [11 §3](11-security-storage.md) |
-| 加密 | `.encryption` | `None` | 静态加密(feature `encrypt`),见 [11 §2](11-security-storage.md) |
-| 存储后端 | `.storage` | `FsStorage` | `Arc<dyn Storage>`;WASM/边缘自定义后端,见 [12 §3](12-deployment.md) |
+| 压缩 | `.compression` | `None` | 文本/元数据压缩,见 [11 §3](11-security-storage.md);**L11 落地**,当前仅记录配置、不生效 |
+| 加密 | `.encryption` | `None` | 静态加密(feature `encrypt`),见 [11 §2](11-security-storage.md);**L11 落地**,当前无此 API |
+| 存储后端 | `.storage` | `FsStorage` | `Arc<dyn Storage>`;WASM/边缘自定义后端,见 [12 §3](12-deployment.md);**L12 落地**,当前无此 API |
 | 只读共享 | `.read_only` | `false` | 多进程只读打开,见 [12 §2](12-deployment.md) |
-| 只读探测周期 | `.read_only_probe_interval` | `1s` | 只读实例发现新 MANIFEST 的周期,见 [12 §2.1](12-deployment.md) |
+| 只读探测周期 | `.read_only_probe_interval` | `1s` | 只读实例发现新 MANIFEST 的周期,见 [12 §2.1](12-deployment.md);**L12 落地**,当前无此 API |
 | 关系索引 | `.relation_index` | `Outgoing` | `Outgoing/Both`;`Both` 空间 ×2,见 [09 §2.3](09-memory-model.md) |
 | 并行度 | `.parallelism` | `0`(自动) | 扫描/建索引/合并的线程数;0 = `available_parallelism()` |
 | 可观测 | `.observer` | 无 | 可选事件钩子,见 [12 §4](12-deployment.md);**L12 落地**,当前无此 API |
@@ -630,7 +640,7 @@ pub struct Tuning {
     pub brute_force_max_rows: u32,      // 默认 2048  段行数低于此值恒用暴力(05 §9)
     pub filter_post_threshold: f32,     // 默认 0.10  过滤三档:后过滤/放大后过滤分界(05 §8)
     pub filter_brute_threshold: f32,    // 默认 0.001 过滤三档:放大后过滤/候选暴力分界(05 §8)
-    pub stopwords: bool,                // 默认 true  启用内置停用词表(06 §3.5)
+    pub stopwords: bool,                // 默认 true  启用内置停用词表(06 §3.5;建库即锁定,既存库以 MANIFEST 为准)
 }
 ```
 
@@ -702,8 +712,8 @@ pub struct Tuning {
 | `TooLarge` / `LimitExceeded` / `MetaTooDeep` | ❌ | 数据/参数超限,见 §8 |
 | `NonFinite` | ❌ | 向量分量或 `importance`/`confidence`/边权/`boost` 含 `NaN`/`±Inf`,会污染排序与打分;修正输入 |
 | `Closed` | ❌ | 库已关闭;不要再使用该库的任何克隆句柄 |
-| `Config` | ❌ | 建库/查询配置非法(缺维度、无查询通道、MMR `lambda` 非有限值),策略参数含非有限值(`min_importance`/`access_weight`/`threshold`/`dedup_threshold`)或非法(如 `max_cluster = 0`) |
-| `Unsupported` | ❌ | 该能力延后到后续层,或对当前形态不适用(text/Fusion;**纯内存库 `backup_to`**;只读模式写);`Fusion` 单独设置即拒绝;按版本升级 |
+| `Config` | ❌ | 建库/查询配置非法(缺维度、无查询通道、MMR `lambda` 非有限值、`Fusion` 未同时启用双通道、`Weighted.alpha` 越界或非有限),策略参数含非有限值(`min_importance`/`access_weight`/`threshold`/`dedup_threshold`)或非法(如 `max_cluster = 0`) |
+| `Unsupported` | ❌ | 该能力延后到后续层,或对当前形态不适用(**纯内存库 `backup_to`**;只读模式写);按版本升级 |
 | `Inconsistent` | ❌ | 内部不变量被破坏(应为 bug);上报并附上下文 |
 | `UnsupportedVersion` | ❌ | 库由更新版本的 Mneme 写入;升级库,勿降级读 |
 | `Corrupted` | ❌ | 数据损坏:立即停止写入,跑 `db.check()`,按 §7 恢复 |
@@ -713,7 +723,8 @@ pub struct Tuning {
 `spawn_blocking` 任务被取消/panic 的 `expect`([08 §6](08-l6-quant.md));
 ② `filter!` 宏对写死的非法字面量在展开处 panic——运行时输入请用 `Expr::from_str`
 返回的 `Result`([06 §1.1](06-l4-query.md)、不变量 I7);
-③ 并行扫描候选收集处对槽位下标的 `u32::try_from(..).expect`——`commit_version` 经
+③ 候选收集/槽位映射处对槽位下标的 `u32::try_from(..).expect`(如并行扫描、
+`query::plan::compile`、`WriterState::rebuild_indexes`),`commit_version` 经
 `slot_id_for` 拒绝溢出(FC-MEM-INV-004),该转换可证明不会失败。
 
 ---

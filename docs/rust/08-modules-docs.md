@@ -5,7 +5,8 @@
 > **前置**:[03 章](03-structs-enums-impl.md)。
 > **对应源码**:[`src/lib.rs`](../../src/lib.rs)、[`src/core/mod.rs`](../../src/core/mod.rs)、
 > [`src/core/options/mod.rs`](../../src/core/options/mod.rs)、[`src/core/metric.rs`](../../src/core/metric.rs)、
-> [`src/index/mod.rs`](../../src/index/mod.rs)。
+> [`src/index/mod.rs`](../../src/index/mod.rs)、[`src/query/parse/`](../../src/query/parse)、
+> [`src/query/display.rs`](../../src/query/display.rs)。
 
 Rust 用**模块(module)**组织命名空间,用**可见性(visibility)**控制谁能访问。
 mneme 的模块划分直接对应架构分层,读模块结构就能读出设计。
@@ -41,6 +42,9 @@ pub use crate::core::meta;
 - `pub mod core;` 声明一个公开子模块。
 - `pub use ...` 是**重导出(re-export)**:把深层路径的项提升到 crate 根,
   让用户能写 `use mneme::Metric;` 而不是 `use mneme::core::metric::Metric;`。
+- `pub use` 也能重导出**宏**:`core/meta.rs` 里的 `pub use serde_json::json;` 把第三方
+  `json!` 宏转成本 crate 的 `mneme::json`。L4 的 doctest 因此写 `use mneme::{Expr, json};`,
+  库用户不必直接依赖 serde_json(见 [`src/core/meta.rs:10`](../../src/core/meta.rs))。
 
 ---
 
@@ -56,6 +60,7 @@ mneme 的 `core` 模块用目录:
 ```text
 src/
   lib.rs          # crate 根,声明 pub mod core;
+  query/          # L4 检索层(内部模块)
   core/
     mod.rs        # 声明子模块:error, heap, meta, ...
     types.rs
@@ -65,6 +70,8 @@ src/
     heap.rs
     varint.rs
     meta.rs
+    bitset.rs     # L4 计划器/BM25 共用的候选位图
+    text.rs       # L4 BM25 与倒排共用的分词
     options/
       mod.rs
       clock.rs
@@ -77,15 +84,19 @@ src/
 ```rust
 //! L0 原语层:类型、错误、距离数学与基础算法。
 //! ...
+pub(crate) mod bitset;
 pub mod error;
 pub mod heap;
 pub mod meta;
 pub mod metric;
 pub mod options;
 pub mod simd;
+pub mod text;
 pub mod types;
 pub mod varint;
 ```
+
+> `bitset` 是 `pub(crate)`(见下节):它只服务 crate 内部的索引与计划器,不对外暴露。
 
 见 [`src/core/mod.rs`](../../src/core/mod.rs)。**规范要求 `mod.rs` 只做组织与 `pub use`,不写业务逻辑。**
 
@@ -97,6 +108,18 @@ pub mod varint;
 - `pub` 表示对所有能访问到该模块的地方可见。
 - `pub(crate)` 表示**仅在本 crate 内可见**,不对外暴露。
 - `pub(super)` 仅父模块可见。
+
+L4 的 `parse/literal.rs` 是 `parse` 的子模块,父模块要调用里面的取值解析方法,于是标为
+`pub(super)`——只对父模块开放:
+
+```rust
+impl<'a> Parser<'a> {
+    pub(super) fn parse_value(&mut self) -> Result<Val> { ... }
+}
+```
+
+见 [`src/query/parse/literal.rs:38-39`](../../src/query/parse/literal.rs)。同级模块之间**看不到**
+对方的私有项;要跨兄弟模块共享,只能放宽到 `pub(super)`(父模块)或 `pub(crate)`(全 crate)。
 
 mneme 的 `options/mod.rs` 是很好的例子:
 
@@ -162,6 +185,27 @@ use crate::core::types::{Key, SegmentId};
 | `std::` | 标准库 |
 
 mneme 规范优先 `crate::` 绝对路径,避免 `../../..` 这种脆弱写法。
+
+**一个容易踩的坑:trait 方法要先引入 trait 才能调用。** L4 的 `display.rs` 要往
+`Formatter` 里写字符,必须把 `std::fmt::Write` 带进作用域:
+
+```rust
+use std::fmt::{self, Write};
+
+f.write_char('(')?;      // 来自 fmt::Write trait
+f.write_str("never")?;   // 同上
+```
+
+见 [`src/query/display.rs:9`](../../src/query/display.rs)。否则编译器只会报
+`no method named write_char found for ...`——**错误信息里不会提示你缺 `use`**。
+这条规则对所有 trait 方法都成立:方法定义在 trait 上,不是类型本身(见
+[06 §2](06-generics-traits.md));`std::io::Read`/`Write`、`Iterator` 等同理
+(`Iterator` 在 prelude 里,所以平时感觉不到)。
+
+`{self, Write}` 里的 `self` 指"这个模块本身"——这一行同时把模块名 `fmt` 与 trait `Write`
+带进作用域(`fmt::Formatter`、`fmt::Result` 因此可用)。`use` 的路径组里都能写 `self`:
+L4 的 plan.rs 用 `use crate::memory::pred::{self, EvalCtx, Expr};` 同时引入模块 `pred`
+(以便调用 `pred::matches`)与两个类型,见 [`src/query/plan.rs:10`](../../src/query/plan.rs)。
 
 ---
 
@@ -288,6 +332,7 @@ Rust 的文档注释会被 `cargo doc` 渲染成 HTML,也是 doctest 的来源�
 - `src/lib.rs` 是 crate 根,声明模块、重导出公共 API、写 crate 级属性。
 - 模块用 `mod` 声明,可拆成文件/目录;`mod.rs` 只做组织与 `pub use`。
 - 默认私有;`pub` / `pub(crate)` / `pub(super)` 逐级放开;重导出同样能带可见性(`pub(crate) use`)。
+- trait 方法要先 `use` 对应 trait 才能调用,如 `std::fmt::Write` 的 `write_char`/`write_str`。
 - `pub use` 重导出让用户只依赖稳定路径,文件结构可自由重构。
 - `//!` 模块文档 + `///` 条目文档 + doctest 让文档可渲染、可测试、不过期;
   `#![deny(missing_docs)]` 强制公开项 100% 有文档。
