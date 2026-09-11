@@ -123,10 +123,14 @@ impl SearchBuilder<'_> {
             query,
             metric: self.config.metric,
             top_k: self.top_k,
+            ef: self.ef.unwrap_or(self.config.hnsw.ef_search as usize),
             filter: self.filter.as_ref(),
             now_ms: now,
             block: self.config.tuning.parallel_block,
             parallelism: self.config.parallelism,
+            brute_force_max_rows: self.config.tuning.brute_force_max_rows as usize,
+            filter_post_threshold: self.config.tuning.filter_post_threshold,
+            filter_brute_threshold: self.config.tuning.filter_brute_threshold,
         })
     }
 

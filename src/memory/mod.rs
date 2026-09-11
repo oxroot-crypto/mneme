@@ -18,7 +18,7 @@
 //! * `rerank` —— 融合器 `Fusion` 与精排钩子 `Reranker`。
 //! * `expand` —— 关系联想扩展与结果级去重。
 //! * `table` —— 内存表、写状态与不可变读视图。
-//! * `bitset` —— 标记不可见物理版本的可增长位图。
+//! * `index` —— 向量索引抽象(暴力 → HNSW 的替换缝;HNSW 实现见 crate::index)。
 //! * `search` —— 过滤先行的暴力扫描与并行归并。
 //! * `pred` / `pred_eval` —— 过滤 AST 与三值求值。
 //! * `dedup` —— 写入期两级去重。
@@ -31,7 +31,6 @@
 //! * `ops` —— 运维报告与运行统计类型。
 //! * `config` —— 建库配置。
 
-mod bitset;
 mod builder;
 // `config`/`dedup`/`relation`/`search`/`table` 供 L2 `persist` 读取内存表结构
 // (flush/recover 需要),故以 `pub(crate)` 暴露给同 crate 的兄弟模块。
@@ -40,6 +39,7 @@ pub(crate) mod dedup;
 mod engine;
 mod engine_ops;
 mod expand;
+pub(crate) mod index;
 mod lifecycle;
 mod mutate_helpers;
 mod namespace;

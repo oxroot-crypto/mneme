@@ -38,9 +38,9 @@ pub struct Tuning {
     pub bloom_fpp: f32,
     /// 段行数低于此值恒用暴力扫描,默认 2048。
     pub brute_force_max_rows: u32,
-    /// 过滤三档:后过滤 / 约束遍历分界,默认 0.10。
+    /// 过滤三档:后过滤 / 放大后过滤分界,默认 0.10。
     pub filter_post_threshold: f32,
-    /// 过滤三档:约束遍历 / 候选暴力分界,默认 0.001。
+    /// 过滤三档:放大后过滤 / 候选暴力分界,默认 0.001。
     pub filter_brute_threshold: f32,
     /// 是否启用内置停用词表,默认 `true`。
     pub stopwords: bool,

@@ -45,7 +45,7 @@ impl PersistHook for Store {
         Ok(())
     }
 
-    fn maybe_flush(&self, ws: &WriterState, config: &Config) -> Result<()> {
+    fn maybe_flush(&self, ws: &mut WriterState, config: &Config) -> Result<()> {
         if self.read_only {
             return Ok(());
         }

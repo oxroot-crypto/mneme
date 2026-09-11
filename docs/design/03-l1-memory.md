@@ -6,13 +6,15 @@
 > **本章你将学到**:API 语义细则 → 内存表结构 → 暴力扫描 → 过滤 AST → 去重预检。
 
 模块:`memory/{engine.rs, engine_ops.rs, builder.rs, namespace/, snapshot.rs, snapshot_scan.rs,
-search_builder.rs, search_exec.rs, expand.rs, rerank.rs, table/(mod,handle,state,view,write_op).rs, bitset.rs, search.rs, pred.rs,
+search_builder.rs, search_exec.rs, expand.rs, rerank.rs, table/(mod,handle,state,view,write_op).rs, index.rs, search.rs, pred.rs,
 pred_eval.rs, record.rs, write_helpers.rs, mutate_helpers.rs, dedup.rs, relation.rs,
 temporal.rs, score.rs, lifecycle.rs, ops.rs, config.rs}`——`engine.rs` 承载库句柄 `Mneme`
 (统计/fsck/落盘门面在 `engine_ops.rs`),`namespace/` 承载 `Namespace` 的写/读/访问/
 生命周期/关系方法(过滤遍历与计数在 `namespace/scan.rs`),`snapshot.rs`/`snapshot_scan.rs`
 承载快照只读视图;`search_builder.rs`、`search_exec.rs` 与 `expand.rs` 承载 `SearchBuilder`
-执行流程及联想扩展/结果去重;本章 §2 的语义即其行为规约,其余小节逐个展开数据结构与算法。
+执行流程及联想扩展/结果去重;`index.rs` 是 L3 索引替换缝(内部 trait,公开 API 不变);
+原 `bitset.rs` 已上移 L0 `core/bitset.rs`(构建期/查询期共用位图);本章 §2 的语义即其
+行为规约,其余小节逐个展开数据结构与算法。
 
 ---
 
@@ -242,6 +244,7 @@ F  = { Reclaimed }
 | 元数据过滤求值 | $O(N \cdot \|E\|)$,$\|E\|$ = AST 节点数 | $O(N/8)$ 位图 |
 | 向量打分 | $O(N_c \cdot d)$,$N_c$ = 候选数(无过滤则 $N$) | $O(C_{\text{block}} \cdot k)$ |
 | 归并 | $O(C_{\text{block}} \cdot k \log k)$ | $O(C_{\text{block}} \cdot k)$ |
+| 快照 `snapshot` | $O(1)$(clone `Arc` 视图,不复制记录体) | $O(1)$ |
 
 **带宽视角**(并行扩展性的物理上限):每查询读 $4 d$ 字节/行,
 1M×1536 维 ≈ 6 GB;双通道内存 ~50 GB/s → **纯暴力下限约 120ms**。
@@ -396,31 +399,34 @@ snapshot / as_of / backup_to / stats / check / compact_control` 的签名。
 **向下(L0)**:只使用 [02 §9](02-l0-core.md) 契约内的类型与函数。
 
 **向 L3 交接的内部接口**(L3 引入 HNSW 时落地,以便内存层无痛升级为索引层;
-L1/L2 阶段直接在引擎内实现本节签名,不引入该内部 trait,公开 API 始终不变):
+L1/L2 阶段直接在引擎内实现公开签名,公开 API 始终不变):
+
+设计最初的"全量 `VectorStore` trait(`insert/update/delete/get/search/relate`…)"在
+落地时收敛为**只替换向量检索**的窄接口:`L1/L2` 继续直接实现全部公开 API,仅把
+"暴力扫描"这一处抽成可替换的向量索引:
 
 ```rust
-// SearchOpt: 检索参数打包(top_k / ef / filter / dedup / fusion / score / diversify / expand / as_of / query_id / rerank);
-// Target:    定位目标,`enum Target { Key(Key), RowId(RowId) }`(无 key 记录只能按 RowId);
-// EntryRef:  段内记录只读视图(公开 `RecordRef` 的内部形态,额外带 SlotId/seqno)。
-pub trait VectorStore: Send + Sync {
-    fn insert_batch(&self, batch: &[Record]) -> Result<Vec<InsertOutcome>>;
-    fn update(&self, target: Target, patch: UpdatePatch) -> Result<UpdateOutcome>;
-    fn delete(&self, keys: &[Key]) -> Result<usize>;
-    fn get_many(&self, targets: &[Target]) -> Result<Vec<Option<EntryRef>>>;
-    fn search(&self, opt: &SearchOpt) -> Result<Vec<Hit>>;
-    fn relate(&self, edge: Edge) -> Result<()>;
-    fn neighbors(&self, from: RowId, kinds: &[RelationKind]) -> Result<Vec<Edge>>;
-    fn predecessors(&self, to: RowId, kinds: &[RelationKind]) -> Result<Vec<Edge>>;
-    fn scan_alive(&self) -> impl Iterator<Item = (RowId, &EntryRef)>;
+// memory::index(内部):公开 API 不变,只替换检索实现。
+pub(crate) trait VectorIndex: Send + Sync {
+    fn node_count(&self) -> usize;
+    fn max_level(&self) -> u8;
+    fn entry(&self) -> (SlotId, u8);
+    fn serialize(&self) -> Result<Vec<u8>>;
+    fn search(&self, params: &IndexSearch<'_>) -> TopK<(RowId, SlotId)>;
+}
+pub(crate) trait IndexFactory: Send + Sync {
+    fn build(&self, nodes: &[IndexNode], params: HnswParams, metric: Metric) -> Arc<dyn VectorIndex>;
+    fn verify(&self, bytes: &[u8]) -> Result<()>;
+    fn load(&self, bytes: &[u8], nodes: &[IndexNode], slot_of: &[SlotId], metric: Metric)
+        -> Result<Arc<dyn VectorIndex>>;
 }
 ```
 
-L3 以该 trait 承载 "暴力扫描 → HNSW" 的检索实现替换——公开 API 始终不变。
-L1 全内存引擎与 L2 持久引擎都是同一组公开签名的直接实现(见本仓 `src/memory/`、
-`src/persist/`),因此该 trait 在 L3 落地前不存在实现分歧。**注**:含 `impl Iterator`
-返回位置(RPITIT)的 trait 不是 object-safe,内部按泛型/单态使用(不构造
-`dyn VectorStore`);若需要动态替换,把 `scan_alive` 改为返回
-`Box<dyn Iterator<...> + '_>`。
+`L1` 的 `ReaderView` 随快照携带 `Option<Arc<dyn VectorIndex>>`(与段/表快照原子一致),
+`search` 在读视图无索引或行数低于 `brute_force_max_rows` 时走暴力,否则**索引前缀走
+ANN + 未落盘尾部暴力 + `TopK` 归并**。工厂由组合根(`Builder`)注入,`HNSW` 实现见
+`crate::index`(设计 [05](05-l3-hnsw.md));`persist` 只经该接口安装/校验索引,不认识
+`crate::index` 具体类型,层方向保持 L3 → L1。该接口对象安全(无 RPITIT),可存于 `Arc<dyn>`。
 
 ## 本章小结
 
@@ -428,7 +434,7 @@ L1 全内存引擎与 L2 持久引擎都是同一组公开签名的直接实现(
 - 写入/读取/生命周期/落盘四组 API 的语义细则,是后续所有层的**行为规约**。
 - 内存表 = `RowId` 版本链 + `delta` 覆盖层 + `(NsId, key)` 索引;读路径无锁扫描。
 - 暴力扫描**过滤先行** + 分块并行;过滤 AST 采用三值语义;两级去重(FNV-1a + top-1)。
-- **本章不变量**:I15(批量原子)、I16(优雅关闭)、I24(更新原子可见);内部 `VectorStore` trait 衔接 L2。
+- **本章不变量**:I15(批量原子)、I16(优雅关闭)、I24(更新原子可见);内部 `memory::index::{VectorIndex, IndexFactory}` 接口衔接 L3。
 
 ## 下一章
 

@@ -61,7 +61,7 @@ impl Mneme {
         let now = self.config.clock.now_unix_ms();
         let (per_namespace, live_rows) = aggregate_namespaces(&view, now);
         let relations = view.out_edges.values().map(Vec::len).sum::<usize>() as u64;
-        let store = self.collect_store_stats();
+        let store = self.collect_store_stats(&view);
         Ok(Stats {
             segments: store.segments,
             wal_bytes: store.wal_bytes,
@@ -94,10 +94,10 @@ impl Mneme {
     }
 
     /// 收集持久后端的段/WAL/trash 统计;纯内存库返回零值。
-    fn collect_store_stats(&self) -> StoreStats {
+    fn collect_store_stats(&self, view: &ReaderView) -> StoreStats {
         match &self.store {
             Some(store) => StoreStats {
-                segments: store.segment_stats(),
+                segments: store.segment_stats(view.index.as_deref()),
                 wal_bytes: store.wal_bytes(),
                 trash_bytes: store.trash_bytes(),
                 total_segments: store.total_segments(),
@@ -182,11 +182,12 @@ impl Mneme {
         }
         drop(view);
         if let Some(store) = &self.store {
-            let ws = self.table.write();
+            let mut ws = self.table.write();
             if ws.closed {
                 return Err(MnemeError::Closed);
             }
-            store.flush(&ws, &self.config)?;
+            store.flush(&mut ws, &self.config)?;
+            self.table.publish(&ws);
         }
         Ok(())
     }

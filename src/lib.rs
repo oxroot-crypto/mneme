@@ -1,15 +1,18 @@
 //! Mneme:面向 AI Agent 超长期记忆层的嵌入型向量存储引擎。
 //!
 //! 本 crate 采用 L0–L6 渐进式分层;当前实现为 **L0 原语层**([`core`])、
-//! **L1 内存引擎**([`memory`])与 **L2 持久层**(`persist`)。L1 提供全内存的
-//! 完整公开 API(易失);L2 以 `Builder::path` 或 [`Mneme::open`] 打开本地目录库,
-//! 提供 WAL、段文件、MANIFEST 与崩溃恢复,公开签名不变。
+//! **L1 内存引擎**([`memory`])、**L2 持久层**(`persist`)与 **L3 索引层**(`index`)。
+//! L1 提供全内存的完整公开 API(易失);L2 以 `Builder::path` 或 [`Mneme::open`]
+//! 打开本地目录库,提供 WAL、段文件、MANIFEST 与崩溃恢复;L3 引入自研 HNSW:
+//! `flush` 随段写 `hidx` 图文件,查询在索引前缀上走 ANN、未落盘尾部仍暴力扫描,
+//! 公开签名不变。
 //!
 //! # 模块
 //!
-//! * [`core`] —— 标识类型、错误、距离度量、SIMD 点积、TopK 堆、varint、元数据与配置类型。
+//! * [`core`] —— 标识类型、错误、距离度量、SIMD 点积、TopK 堆、位图、varint、元数据与配置类型。
 //! * [`memory`] —— 内存表、暴力检索、过滤 AST、去重与记忆生命周期,并承载公开门面。
 //! * `persist`(内部)—— L2 持久层:WAL、段文件、MANIFEST、恢复与全量快照 flush。
+//! * `index`(内部)—— L3 索引层:自研 HNSW、过滤三档、hidx 编解码与 mmap 段读取。
 //!
 //! # 示例
 //!
@@ -34,6 +37,7 @@
 pub mod core;
 pub mod memory;
 
+mod index;
 mod persist;
 
 pub use crate::core::error::{MnemeError, Result};

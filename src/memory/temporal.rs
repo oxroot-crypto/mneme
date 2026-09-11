@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::core::bitset::BitSet;
 use crate::core::types::SeqNo;
-use crate::memory::bitset::BitSet;
 use crate::memory::table::ReaderView;
 
 /// 按事务时间上界 `tx_ms` 重建一份读视图。
@@ -59,7 +59,37 @@ pub(crate) fn snapshot_at(view: &ReaderView, tx_ms: i64) -> ReaderView {
         in_edges: Arc::clone(&view.in_edges),
         access: Arc::clone(&view.access),
         ns_registry: Arc::clone(&view.ns_registry),
+        index: view.index.clone(),
         seqno,
         closed: view.closed,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::metric::Metric;
+    use crate::core::options::HnswParams;
+    use crate::index::hnsw::HnswIndex;
+    use crate::memory::table::WriterState;
+
+    /// FC-INDEX-POST-005:`as_of` 重建的历史视图必须保留索引句柄,
+    /// 否则会静默退化为全量暴力(性能回退不可见)。
+    #[test]
+    fn snapshot_at_preserves_index_handle() {
+        let mut ws = WriterState::new();
+        ws.index = Some(Arc::new(HnswIndex::build(
+            &[],
+            HnswParams::default(),
+            Metric::Dot,
+        )));
+        let view = ws.snapshot();
+        assert!(view.index.is_some(), "构造的视图应携带索引");
+
+        let snapshot = snapshot_at(&view, i64::MAX);
+        assert!(
+            snapshot.index.is_some(),
+            "as_of 历史视图必须保留索引句柄(不得静默降级为暴力)"
+        );
     }
 }

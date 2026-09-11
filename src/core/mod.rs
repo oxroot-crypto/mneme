@@ -1,7 +1,8 @@
 //! L0 原语层:类型、错误、距离数学与基础算法。
 //!
 //! 本层是整库的"地基":**没有任何 I/O、没有全局状态、没有锁**,只有类型与纯函数。
-//! 唯一允许出现 `unsafe` 的位置是 [`simd`] 的 arch 内联,且每处均附 `// SAFETY:` 证明。
+//! 全库仅两处允许 `unsafe`:本层 [`simd`] 的 arch 内联与 L2 `persist::source` 的
+//! `MmapSource`(mmap 固有 unsafe),每处均附 `// SAFETY:` 证明。
 //!
 //! # 模块
 //!
@@ -12,8 +13,10 @@
 //! * [`heap`] —— `TopK` 有界堆(支持并行归并)。
 //! * [`varint`] —— 变长整数编解码。
 //! * [`meta`] —— 元数据(JSON)隔离区。
+//! * `bitset` —— 可增长位图(不可见版本标记 / 索引层候选位图)。
 //! * [`options`] —— 全局配置与选项类型。
 
+pub(crate) mod bitset;
 pub mod error;
 pub mod heap;
 pub mod meta;

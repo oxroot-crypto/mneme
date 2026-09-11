@@ -9,11 +9,15 @@ use std::sync::{Arc, Mutex};
 use crate::core::error::{MnemeError, Result};
 use crate::core::metric::Metric;
 use crate::core::options::FsyncPolicy;
+use crate::core::types::SlotId;
+use crate::memory::index::{IndexFactory, IndexNode, VectorIndex};
 use crate::memory::table::WriterState;
 use crate::persist::hook::FsyncHook;
 use crate::persist::manifest::Manifest;
 use crate::persist::recover;
-use crate::persist::storage::{self, FileLock, SEGMENTS_DIR, WAL_DIR, msec_name, vsec_name};
+use crate::persist::storage::{
+    self, FileLock, SEGMENTS_DIR, WAL_DIR, hidx_name, msec_name, vsec_name,
+};
 use crate::persist::trash;
 use crate::persist::wal;
 
@@ -40,6 +44,8 @@ pub(crate) struct OpenOptions {
     pub(crate) fail_fast_on_corruption: bool,
     /// 崩溃注入钩子。
     pub(crate) hook: Option<Arc<dyn FsyncHook>>,
+    /// 索引工厂(L3);`None` = 不载入 hidx(恒暴力)。
+    pub(crate) index_factory: Option<Arc<dyn IndexFactory>>,
 }
 
 impl Store {
@@ -92,6 +98,7 @@ impl Store {
             metric: manifest.metric,
             read_only: options.read_only,
             hook: options.hook,
+            index_factory: options.index_factory,
         });
         Ok((store, state, manifest.dimension, manifest.metric))
     }
@@ -261,19 +268,36 @@ fn load_write_state(
     options: &OpenOptions,
 ) -> Result<WriterState> {
     let mut state = recover::empty_state(manifest);
-    let segments = manifest_io::read_segment_bytes(root, manifest)?;
-    let skipped = recover::load_segments(
+    let segments =
+        manifest_io::read_segment_bytes(root, manifest, options.fail_fast_on_corruption)?;
+    let recovered = recover::load_segments(
         &mut state,
         &segments,
         options.verify_on_open,
         options.fail_fast_on_corruption,
     )?;
-    if !options.read_only && !skipped.is_empty() {
-        let names: Vec<String> = skipped
-            .iter()
-            .flat_map(|id| [vsec_name(*id), msec_name(*id)])
-            .collect();
-        trash::move_to_trash(root, &names)?;
+    move_skipped_segments_to_trash(root, &recovered.skipped, options.read_only)?;
+    // 载入 hidx 并安装到写状态(索引是优化:损坏时降级暴力,`check()` 报告)。
+    if let Some(factory) = options.index_factory.as_ref()
+        && let Some(remap) = recovered.remap.as_ref()
+        && let Some(hidx) = segments.first().and_then(|segment| segment.hidx.as_ref())
+    {
+        match load_index(
+            factory,
+            hidx,
+            SlotRemap {
+                state: &state,
+                remap,
+            },
+            manifest.metric,
+        ) {
+            Ok(index) => state.index = Some(index),
+            Err(error) if options.fail_fast_on_corruption => return Err(error),
+            // reason: 索引是查询加速器而非数据来源;hidx 损坏时降级为暴力扫描仍然正确,
+            // `db.check()` 会校验 hidx 字节并报告损坏;节点数不匹配的降级可由
+            // `stats().segments[*].index_nodes == 0` 观测,绝不静默丢数据。
+            Err(_) => {}
+        }
     }
     // 回放 WAL(仅 seqno > watermark),并在可写打开时截断撕裂尾部。
     if let Some(bytes) = storage::read_file_opt(root, WAL_FILE)? {
@@ -284,4 +308,136 @@ fn load_write_state(
         }
     }
     Ok(state)
+}
+
+/// 把被隔离的损坏段三件套移入 `trash/`(只读打开不动文件系统)。
+fn move_skipped_segments_to_trash(root: &Path, skipped: &[u32], read_only: bool) -> Result<()> {
+    if read_only || skipped.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<String> = skipped
+        .iter()
+        .flat_map(|id| [vsec_name(*id), msec_name(*id), hidx_name(*id)])
+        .collect();
+    trash::move_to_trash(root, &names)
+}
+
+/// [`load_index`] 的槽位来源:恢复后的写状态与"段内槽位 → 全局槽位"重排映射。
+struct SlotRemap<'a> {
+    /// 恢复后的写状态(hidx 节点按段内顺序取 `rowid`/向量)。
+    state: &'a WriterState,
+    /// 段内节点 id → 全局槽位。
+    remap: &'a [u32],
+}
+
+/// 由 hidx 字节与恢复出的槽位构建索引。
+///
+/// # Errors
+/// hidx 解析失败(损坏/版本过高)或重排映射越界时返回结构化错误。
+fn load_index(
+    factory: &Arc<dyn IndexFactory>,
+    hidx: &[u8],
+    slots: SlotRemap<'_>,
+    metric: Metric,
+) -> Result<Arc<dyn VectorIndex>> {
+    let mut nodes = Vec::with_capacity(slots.remap.len());
+    let mut slot_of = Vec::with_capacity(slots.remap.len());
+    for &global in slots.remap {
+        let slot = slots
+            .state
+            .slots
+            .get(global as usize)
+            .ok_or_else(|| MnemeError::Corrupted {
+                segment: None,
+                reason: "hidx: 重排映射指向不存在的槽位".to_string(),
+            })?;
+        nodes.push(IndexNode {
+            rowid: slot.rowid,
+            vector: Arc::clone(&slot.vector),
+            norm_sq: slot.norm_sq,
+        });
+        slot_of.push(SlotId::new(global));
+    }
+    factory.load(hidx, &nodes, &slot_of, metric)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::heap::TopK;
+    use crate::core::options::HnswParams;
+    use crate::core::types::RowId;
+
+    /// 桩索引:测试只验证 `load_index` 的重排校验,本桩不会被真正调用。
+    struct StubIndex;
+
+    impl VectorIndex for StubIndex {
+        fn node_count(&self) -> usize {
+            0
+        }
+
+        fn max_level(&self) -> u8 {
+            0
+        }
+
+        fn entry(&self) -> (SlotId, u8) {
+            (SlotId::new(0), 0)
+        }
+
+        fn serialize(&self) -> Result<Vec<u8>> {
+            Ok(Vec::new())
+        }
+
+        fn search(&self, _params: &crate::memory::index::IndexSearch<'_>) -> TopK<(RowId, SlotId)> {
+            TopK::new(0, Metric::Dot)
+        }
+    }
+
+    /// 桩工厂:不接触 `crate::index` 具体实现,保持 L2 不依赖 L3。
+    struct StubFactory;
+
+    impl IndexFactory for StubFactory {
+        fn build(
+            &self,
+            _nodes: &[IndexNode],
+            _params: HnswParams,
+            _metric: Metric,
+        ) -> Arc<dyn VectorIndex> {
+            Arc::new(StubIndex)
+        }
+
+        fn verify(&self, _bytes: &[u8]) -> Result<()> {
+            Ok(())
+        }
+
+        fn load(
+            &self,
+            _bytes: &[u8],
+            _nodes: &[IndexNode],
+            _slot_of: &[SlotId],
+            _metric: Metric,
+        ) -> Result<Arc<dyn VectorIndex>> {
+            Ok(Arc::new(StubIndex))
+        }
+    }
+
+    /// FC-PERSIST-ERR-009:载入期二次校验——重排映射指向不存在的槽位 → `Corrupted`,
+    /// 绝不静默映射到槽位 0(空状态上 `remap = [0]` 即越界)。
+    #[test]
+    fn load_index_rejects_remap_past_state_slots() {
+        let state = WriterState::new();
+        let factory: Arc<dyn IndexFactory> = Arc::new(StubFactory);
+        let error = load_index(
+            &factory,
+            &[],
+            SlotRemap {
+                state: &state,
+                remap: &[0],
+            },
+            Metric::Dot,
+        )
+        .err()
+        .expect("重排映射越界必须拒绝载入");
+        assert!(matches!(error, MnemeError::Corrupted { .. }));
+    }
 }

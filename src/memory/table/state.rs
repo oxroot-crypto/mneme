@@ -3,11 +3,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+use crate::core::bitset::BitSet;
 use crate::core::error::{MnemeError, Result};
 use crate::core::meta::Meta;
 use crate::core::options::RelationKind;
 use crate::core::types::{Key, NsId, RowId, SeqNo, SlotId};
-use crate::memory::bitset::BitSet;
+use crate::memory::index::VectorIndex;
 use crate::memory::relation::Edge;
 
 use super::view::ReaderView;
@@ -86,6 +87,8 @@ pub(crate) struct WriterState {
     pub(crate) next_ns_id: u32,
     pub(crate) ns_registry: Arc<HashMap<NsId, Arc<str>>>,
     pub(crate) ns_by_path: Arc<HashMap<Arc<str>, NsId>>,
+    /// 当前已构建的向量索引(覆盖槽位前缀;`None` = 恒暴力扫描)。
+    pub(crate) index: Option<Arc<dyn VectorIndex>>,
     // 反馈幂等键(I27);L1 常驻内存,L5 随访问统计一并落盘。经 `Arc` COW,
     // 使批量写入快照(`WriterState::clone`)与回滚不深拷贝该集合。
     pub(crate) feedback_seen: Arc<HashSet<(RowId, u64)>>,
@@ -112,6 +115,7 @@ impl WriterState {
             next_ns_id: 1,
             ns_registry: Arc::new(HashMap::new()),
             ns_by_path: Arc::new(HashMap::new()),
+            index: None,
             feedback_seen: Arc::new(HashSet::new()),
             pending: Vec::new(),
             closed: false,
@@ -288,6 +292,7 @@ impl WriterState {
             in_edges: Arc::clone(&self.in_edges),
             access: Arc::clone(&self.access),
             ns_registry: Arc::clone(&self.ns_registry),
+            index: self.index.clone(),
             seqno: self.seqno,
             closed: self.closed,
         }

@@ -12,7 +12,8 @@
 //! `FC-PERSIST-STA-001`、`FC-PERSIST-STA-002`、`FC-PERSIST-STA-003`、
 //! `FC-PERSIST-ERR-002`、`FC-PERSIST-ERR-003`、`FC-PERSIST-ERR-004`、
 //! `FC-PERSIST-ERR-005`、`FC-PERSIST-ERR-006`、`FC-PERSIST-ERR-007`、`FC-PERSIST-CPLX-001`、`FC-PERSIST-CPLX-007`、
-//! `FC-PERSIST-CPLX-008`、`FC-PERSIST-CPLX-009`、`FC-PERSIST-CPLX-010`。
+//! `FC-PERSIST-CPLX-008`、`FC-PERSIST-CPLX-009`、`FC-PERSIST-CPLX-010`、`FC-INDEX-ERR-002`、
+//! `FC-LIFE-INV-011`(备份独立打开 + 校验)、`FC-LIFE-CPLX-005`(backup/check 哨兵)。
 //!
 //! 片级编解码的损坏检出与版本拒绝见各 `src/persist/*.rs` 单元测试。
 
@@ -542,6 +543,13 @@ fn backup_is_independently_openable() {
     let ns = db.namespace("demo");
     assert!(ns.get("a").expect("get a").is_some());
     assert!(ns.get("b").expect("get b").is_none());
+    // 备份必须包含 hidx 且可独立载入(FC-PERSIST-POST-004 + L3 索引)。
+    assert!(
+        db.stats().expect("stats").segments[0].index_nodes > 0,
+        "备份应包含并可载入 hidx"
+    );
+    // FC-LIFE-INV-011:备份目录不仅可独立 open,还必须通过 check。
+    assert!(db.check().expect("check").ok, "备份目录 check 必须通过");
     db.close().expect("close");
 }
 
@@ -1057,4 +1065,81 @@ fn read_only_open_does_not_mutate() {
         Err(mneme::MnemeError::Config { .. })
     ));
     assert!(!missing.exists(), "只读打开不得创建目录");
+}
+
+/// **FC-INDEX-ERR-002(L3)**:MANIFEST 引用的 hidx 缺失时,fail-fast 打开直接拒绝;
+/// 可写非 fail-fast 打开降级为暴力(`stats.index_nodes == 0`)且 `check()` 报告损坏。
+#[test]
+fn missing_hidx_degrades_or_rejects() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let db = build(dir.path(), 2);
+        db.namespace("demo")
+            .insert(Record::new(vec![1.0, 0.0]).key("a"))
+            .expect("a");
+        db.close().expect("close");
+    }
+    let hidx = dir.path().join("segments").join("seg_000000.hidx");
+    assert!(hidx.exists(), "flush 应写出 hidx");
+    std::fs::remove_file(&hidx).expect("remove hidx");
+
+    // fail-fast:拒绝打开(此时 MANIFEST 仍引用缺失的 hidx)。
+    assert!(matches!(
+        Builder::default()
+            .fail_fast_on_corruption(true)
+            .path(dir.path())
+            .build(),
+        Err(mneme::MnemeError::Corrupted { .. })
+    ));
+
+    // 非 fail-fast:降级暴力,库可读,check 报告损坏。
+    let db = Builder::default()
+        .path(dir.path())
+        .build()
+        .expect("degrade open");
+    let stats = db.stats().expect("stats");
+    assert_eq!(stats.segments[0].index_nodes, 0, "缺 hidx 应降级暴力");
+    assert!(
+        db.namespace("demo").get("a").expect("get").is_some(),
+        "降级后库必须仍可读"
+    );
+    assert!(!db.check().expect("check").ok, "缺 hidx 应被 check 报告");
+}
+
+/// **FC-INDEX-ERR-002(L3)**:hidx 内容被翻转(CRC 不符)时行为与缺失一致。
+#[test]
+fn corrupt_hidx_degrades_or_rejects() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let db = build(dir.path(), 2);
+        db.namespace("demo")
+            .insert(Record::new(vec![1.0, 0.0]).key("a"))
+            .expect("a");
+        db.close().expect("close");
+    }
+    let hidx = dir.path().join("segments").join("seg_000000.hidx");
+    assert!(hidx.exists(), "flush 应写出 hidx");
+    let mut bytes = std::fs::read(&hidx).expect("read hidx");
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0x01;
+    std::fs::write(&hidx, &bytes).expect("write hidx");
+
+    assert!(matches!(
+        Builder::default()
+            .fail_fast_on_corruption(true)
+            .path(dir.path())
+            .build(),
+        Err(mneme::MnemeError::Corrupted { .. })
+    ));
+
+    let db = Builder::default()
+        .path(dir.path())
+        .build()
+        .expect("degrade open");
+    assert_eq!(db.stats().expect("stats").segments[0].index_nodes, 0);
+    assert!(
+        db.namespace("demo").get("a").expect("get").is_some(),
+        "降级后库必须仍可读"
+    );
+    assert!(!db.check().expect("check").ok, "坏 hidx 应被 check 报告");
 }

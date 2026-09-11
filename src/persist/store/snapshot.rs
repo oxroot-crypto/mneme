@@ -13,7 +13,7 @@ use crate::memory::table::WriterState;
 use crate::persist::flush;
 use crate::persist::manifest::{Manifest, NsEntry, SegmentEntry};
 use crate::persist::storage::{
-    self, CURRENT_FILE, SEGMENTS_DIR, WAL_DIR, manifest_name, msec_name, vsec_name,
+    self, CURRENT_FILE, SEGMENTS_DIR, WAL_DIR, hidx_name, manifest_name, msec_name, vsec_name,
 };
 use crate::persist::trash;
 use crate::persist::{FORMAT_VERSION, crc32};
@@ -22,33 +22,82 @@ use super::Store;
 use super::manifest_io;
 use super::wal_writer::WAL_FILE;
 
-/// 一次 flush 物化出的新段(段号、时间戳与两文件字节)。
+/// 一次 flush 物化出的新段(段号、时间戳与三文件字节 + 入口)。
 struct BuiltSegment {
     id: u32,
     created_unix_ms: i64,
     vsec: Vec<u8>,
     msec: Vec<u8>,
+    hidx: Option<Vec<u8>>,
+    entry_slot: u32,
+    entry_level: u8,
+}
+
+/// 复制 MANIFEST 所列段的 `vsec`/`msec`(及存在的 `hidx`);缺失即失败,绝不产出残档。
+fn copy_manifest_segments(
+    root: &Path,
+    target: &Path,
+    manifest: &Manifest,
+    counts: &mut CopyCounts,
+) -> Result<()> {
+    for segment in &manifest.segments {
+        // 被 MANIFEST 引用的段必须存在;缺失即备份不可信,绝不静默产出残档。
+        copy_required(
+            root,
+            target,
+            &format!("{SEGMENTS_DIR}/{}", vsec_name(segment.segment_id)),
+            counts,
+        )?;
+        copy_required(
+            root,
+            target,
+            &format!("{SEGMENTS_DIR}/{}", msec_name(segment.segment_id)),
+            counts,
+        )?;
+        if segment.hidx_crc != 0 {
+            copy_required(
+                root,
+                target,
+                &format!("{SEGMENTS_DIR}/{}", hidx_name(segment.segment_id)),
+                counts,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 impl Store {
     /// 全量快照 flush:写新段 + 提交 MANIFEST + 重置 WAL(设计 04 §3.2)。
     ///
+    /// 同时构建 HNSW 图写入 `hidx` 并把索引安装到写状态(`ws.index`),使后续
+    /// 查询走 ANN;未落盘尾部仍由调用方暴力扫描。
+    ///
     /// # Errors
     /// 只读模式返回 [`MnemeError::Unsupported`];I/O 失败返回 [`MnemeError::Io`]。
-    pub(crate) fn flush(&self, ws: &WriterState, config: &Config) -> Result<()> {
+    pub(crate) fn flush(&self, ws: &mut WriterState, config: &Config) -> Result<()> {
         if self.read_only {
             return Err(MnemeError::Unsupported {
                 feature: "只读模式写入",
             });
         }
         let created_unix_ms = config.clock.now_unix_ms();
-        let (vsec, msec) = flush::build_segment(ws, config, created_unix_ms)?;
+        let flush::EncodedSegment {
+            vsec,
+            msec,
+            hidx,
+            index,
+            entry_slot,
+            entry_level,
+        } = flush::build_segment(ws, config, created_unix_ms)?;
         let previous = self.manifest_snapshot();
         let segment = BuiltSegment {
             id: previous.next_segment_id,
             created_unix_ms,
             vsec,
             msec,
+            hidx,
+            entry_slot,
+            entry_level,
         };
 
         self.write_file(
@@ -59,6 +108,9 @@ impl Store {
             &format!("{SEGMENTS_DIR}/{}", msec_name(segment.id)),
             &segment.msec,
         )?;
+        if let Some(hidx) = &segment.hidx {
+            self.write_file(&format!("{SEGMENTS_DIR}/{}", hidx_name(segment.id)), hidx)?;
+        }
 
         let new_manifest = self.next_manifest(&previous, ws, &segment);
         manifest_io::commit_manifest(&self.root, &new_manifest, self.hook.as_deref())?;
@@ -66,6 +118,8 @@ impl Store {
         // 旧段进入 trash 并清理;WAL 重置(所有覆盖条目已随快照物化)。
         trash::move_to_trash(&self.root, &old_segment_names(&previous))?;
         trash::purge(&self.root)?;
+        // 索引在 MANIFEST 提交后安装到写状态,由调用方发布为读视图。
+        ws.index = index;
         self.publish(&new_manifest)?;
         Ok(())
     }
@@ -93,21 +147,7 @@ impl Store {
         let (version, manifest) = self.versioned_manifest();
 
         let mut counts = CopyCounts::default();
-        for segment in &manifest.segments {
-            // 被 MANIFEST 引用的段必须存在;缺失即备份不可信,绝不静默产出残档。
-            copy_required(
-                &self.root,
-                target,
-                &format!("{SEGMENTS_DIR}/{}", vsec_name(segment.segment_id)),
-                &mut counts,
-            )?;
-            copy_required(
-                &self.root,
-                target,
-                &format!("{SEGMENTS_DIR}/{}", msec_name(segment.segment_id)),
-                &mut counts,
-            )?;
-        }
+        copy_manifest_segments(&self.root, target, &manifest, &mut counts)?;
         copy_required(&self.root, target, &manifest_name(version), &mut counts)?;
         // WAL 可以在只读实例中不存在,故为可选。
         copy_optional(&self.root, target, WAL_FILE, &mut counts)?;
@@ -161,9 +201,9 @@ impl Store {
                 created_ms: segment.created_unix_ms,
                 vsec_crc: crc32(&segment.vsec),
                 msec_crc: crc32(&segment.msec),
-                hidx_crc: 0,
-                entry_slot: 0,
-                entry_level: 0,
+                hidx_crc: segment.hidx.as_deref().map_or(0, crc32),
+                entry_slot: segment.entry_slot,
+                entry_level: segment.entry_level,
             }],
         }
     }
@@ -220,7 +260,13 @@ fn old_segment_names(previous: &Manifest) -> Vec<String> {
     previous
         .segments
         .iter()
-        .flat_map(|segment| [vsec_name(segment.segment_id), msec_name(segment.segment_id)])
+        .flat_map(|segment| {
+            [
+                vsec_name(segment.segment_id),
+                msec_name(segment.segment_id),
+                hidx_name(segment.segment_id),
+            ]
+        })
         .collect()
 }
 

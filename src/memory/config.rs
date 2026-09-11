@@ -12,6 +12,7 @@ use crate::core::options::{
     RelationIndex, Tuning, VectorFormat,
 };
 use crate::memory::dedup::Dedup;
+use crate::memory::index::IndexFactory;
 use crate::memory::lifecycle::Retention;
 
 /// 建库配置;由 [`Builder`](crate::memory::Builder) 构造,建库后不可变。
@@ -28,6 +29,8 @@ pub(crate) struct Config {
     pub(crate) dedup_threshold: f32,
     pub(crate) quantization: VectorFormat,
     pub(crate) hnsw: HnswParams,
+    /// 向量索引工厂(L3);`None` = 纯暴力(L1 语义)。
+    pub(crate) index_factory: Option<Arc<dyn IndexFactory>>,
     pub(crate) compaction: CompactionPolicy,
     pub(crate) retention: Option<Retention>,
     pub(crate) retain_interval: Option<Duration>,

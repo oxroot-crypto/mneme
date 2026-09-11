@@ -3,8 +3,9 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::core::bitset::BitSet;
 use crate::core::types::{Key, NsId, RowId, SeqNo, SlotId};
-use crate::memory::bitset::BitSet;
+use crate::memory::index::VectorIndex;
 use crate::memory::relation::Edge;
 
 use super::AccessStat;
@@ -21,6 +22,8 @@ pub(crate) struct ReaderView {
     pub(crate) in_edges: Arc<HashMap<RowId, Vec<Edge>>>,
     pub(crate) access: Arc<HashMap<RowId, AccessStat>>,
     pub(crate) ns_registry: Arc<HashMap<NsId, Arc<str>>>,
+    /// 覆盖槽位前缀的向量索引(与视图一同快照,保证快照一致)。
+    pub(crate) index: Option<Arc<dyn VectorIndex>>,
     pub(crate) seqno: SeqNo,
     /// 库是否已关闭(关闭后读写返回 `Closed`)。
     pub(crate) closed: bool,
