@@ -3,7 +3,9 @@
 > **本章目标**:会写单元测试、集成测试、doctest,理解 `proptest` 属性测试与 mneme 的契约追溯方式。
 > **前置**:[05 章](05-errors.md)(`Result`)、[07 章](07-iterators-closures.md)。
 > **对应源码**:各 `src/core/*.rs` 底部的 `mod tests`,以及 [`tests/core_contracts.rs`](../../tests/core_contracts.rs)、
-> [`tests/contract_traceability.rs`](../../tests/contract_traceability.rs)。
+> [`tests/contract_traceability.rs`](../../tests/contract_traceability.rs)、
+> [`src/index/hnsw.rs`](../../src/index/hnsw.rs)、[`src/index/hidx.rs`](../../src/index/hidx.rs)、
+> [`src/index/filtered.rs`](../../src/index/filtered.rs)。
 
 mneme 把测试当作**形式化约束的证明**:每个公开行为都要有测试,每个测试要能追溯到一条契约
 (`FC-*`)。本项目的开发流程是"先写契约 → 再写测试 → 再写实现"(FSVDD,见
@@ -203,6 +205,131 @@ fn reference_topk(entries: &[(f32, u32)], k: usize, metric: Metric) -> Vec<u32> 
 
 见 [`tests/core_contracts.rs:26-40`](../../tests/core_contracts.rs) 与 [`tests/core_contracts.rs:156-184`](../../tests/core_contracts.rs)。
 
+### 4.5 自定义策略:`impl Strategy` 与 `prop_oneof!`
+
+上面的策略都是现成的(`any::<u64>()`、`prop::collection::vec(...)`)。L3 的 hidx 测试需要
+"合法的二进制文件"和"在合法文件上翻一个字节的变异体"作为输入,于是把策略写成了**函数**:
+
+```rust
+/// 合法 hidx 编码(随机层级、合法邻居、入口取最高层节点),作为变异基底。
+fn valid_hidx_strategy() -> impl Strategy<Value = Vec<u8>> {
+    proptest::collection::vec(0u8..=2, 1..=8).prop_map(|levels| {
+        let mut graph = Graph::new();
+        ...
+        encode(&graph, GRAPH_PARAMS).expect("合法图必须可编码")
+    })
+}
+
+/// 在合法编码上翻一个字节并重算对应 CRC。
+fn mutated_valid_hidx_strategy() -> impl Strategy<Value = Vec<u8>> {
+    (valid_hidx_strategy(), any::<usize>(), any::<u8>()).prop_map(|(mut bytes, pos, value)| {
+        let index = pos % bytes.len();
+        bytes[index] = value;
+        ...
+        bytes
+    })
+}
+```
+
+见 [`src/index/hidx.rs:727-767`](../../src/index/hidx.rs)。三个新工具:
+
+- **`impl Strategy<Value = T>`**:策略也是值,可以写成函数返回。`impl Trait` 返回类型让调用者
+  不必关心具体策略类型(见 [06 §2.3](06-generics-traits.md));
+- **`prop_map`**:把生成器的输出映射成另一个值——这里是"随机层级序列 → 建图 → 编码成字节",
+  相当于迭代器的 `map`,描述的是"怎么造输入";
+- **元组的 `Strategy`**:`(a, b, c)` 本身也是一个策略,依次生成三个值再合并——`mutated_...`
+  用它同时取"合法文件 + 位置 + 新字节"。
+
+再到使用处,用 `prop_oneof!` 把多来源策略混在一条测试里:
+
+```rust
+proptest! {
+    #[test]
+    fn hidx_decode_never_panics_on_arbitrary_bytes(
+        bytes in prop_oneof![
+            proptest::collection::vec(any::<u8>(), 0..4096),   // ① 任意字节
+            valid_hidx_strategy(),                             // ② 合法文件
+            mutated_valid_hidx_strategy(),                     // ③ 合法文件变体
+        ]
+    ) {
+        let Ok(decoded) = decode(&bytes) else {
+            return Ok(());
+        };
+        // 解码成功 → 必须能重编码并往返一致
+        ...
+    }
+}
+```
+
+见 [`src/index/hidx.rs:769-801`](../../src/index/hidx.rs)。要点:
+
+- `prop_oneof![a, b, c]` 每次从几个策略中随机挑一个执行,适合"混合来源"的输入;
+- `return Ok(())` 在 `proptest!` 宏里表示"本用例通过"——测试体返回
+  `Result<(), TestCaseError>`,所以 `let...else`(见 [05 §4.6](05-errors.md))失败时直接
+  判该用例通过:任意字节被**拒绝**也是合法结局,"不 panic + 接受即往返"才是要验证的属性;
+- 纯随机字节几乎不可能穿过魔数与 CRC 校验,所以必须补"合法样本"与"变异样本"两类策略,
+  才能逼着解析器走到布局、入口、邻居等每个语义校验分支。
+
+> 这种"合法样本 + 在其上做变异"的策略就是 **fuzzing 思路**:变异体专门冲撞解析器的
+> 校验边界。对应 [CONTRIBUTING.md](../../CONTRIBUTING.md) 的证伪原则——故意破坏一条约束,
+> 必须有测试变红。hidx 的变异策略还会**重算 CRC**,否则变异体会先被 CRC 拦下,
+> 根本到不了真正要测的语义校验。
+
+### 4.6 操作计数探针:用 `thread_local!` 验证复杂度
+
+mneme 的契约不只约束结果,还约束**代价**(`FC-*-CPLX-*`)。"构建距离计算随节点数近似线性"
+怎么测?L3 在距离函数里埋了一个**线程局部计数器**:
+
+```rust
+// 单测操作计数:统计距离计算次数(线程局部,避免测试间干扰)。
+#[cfg(test)]
+thread_local! {
+    static DIST_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn bump_dist_calls() {
+    DIST_CALLS.with(|calls| calls.set(calls.get() + 1));
+}
+```
+
+见 [`src/index/hnsw.rs:36-45`](../../src/index/hnsw.rs)。逐个概念:
+
+- **`thread_local!`**:声明"每个线程各有一份"的静态变量。测试默认并行、各跑各的线程,
+  全局计数器会互相污染;线程局部正好把每个测试隔开;
+- **`Cell<u64>`**:最简单的**内部可变性**容器(见 [04 §5](04-borrowing-strings-slices.md)):
+  没有 `&mut` 也能改,`get()` 复制出值、`set()` 覆盖。单线程够用、没有原子开销;
+- **`const { Cell::new(0) }`**:`const` 块在编译期求值,给线程局部变量提供常量初始化
+  (`Cell::new` 是 `const fn`,所以合法),比惰性初始化更快、语义更简单;
+- `DIST_CALLS.with(|calls| ...)`:访问当前线程的那份变量。`.with` 是必须的——它保证
+  你拿到的是本线程的值,而不是某个跨线程共享的静态量。
+
+测试再用计数验证**增长率**:
+
+```rust
+let c200 = build_calls(200);
+let c500 = build_calls(500);
+let c1200 = build_calls(1200);
+let r1 = c500 as f64 / c200 as f64;
+let r2 = c1200 as f64 / c500 as f64;
+assert!(r1 < 4.0, "200→500 增长过快(疑似二次):{r1}");
+assert!(r2 < 4.0, "500→1200 增长过快(疑似二次):{r2}");
+```
+
+见 [`src/index/hnsw.rs:534-549`](../../src/index/hnsw.rs)。要点:
+
+- 断言的是**规模之间的比值**,不是绝对次数——常数随实现微调而变,但"线性时 2.5 倍节点
+  对应约 2.5 倍操作数,二次时约 6.25 倍"这个结构性质稳定;
+- 这是"复杂度上界测试"的落地方式:不看秒表(受机器负载影响大),而是数**基本操作**;
+- 探针代码全部在 `#[cfg(test)]` 下,发布产物里一行不剩。测试里先重置计数
+  (`DIST_CALLS.with(|calls| calls.set(0))`)再执行,读取时把 `Cell::get` 当函数指针传给
+  `with`(`DIST_CALLS.with(std::cell::Cell::get)`),见
+  [`src/index/hnsw.rs:496-500`](../../src/index/hnsw.rs)。
+
+> 同类探针在 `filtered.rs` 里记录"最近一次搜索命中的档位与 `ef`",用于把档位分派公式
+> 逐值钉死;`thread_local!` 保证并行测试互不干扰(见
+> [`src/index/filtered.rs:37-63`](../../src/index/filtered.rs))。
+
 ---
 
 ## 5. 契约追溯:测试不是"测了个寂寞"
@@ -289,6 +416,10 @@ cargo test --release                # release 模式跑(测优化后的行为)
 - 单元测试放 `#[cfg(test)] mod tests`,用 `#[test]` 和断言宏;遵循 AAA,测试名描述行为。
 - 集成测试放 `tests/`,只能访问公开 API;doctest 让文档示例自动运行。
 - `proptest` 自动生成随机输入验证不变量,失败会收缩到最小反例;常用"参照实现"对照优化实现。
+- 策略可以组合:自定义 `impl Strategy` 函数、`prop_map` 变换、`prop_oneof!` 混合来源;
+  "合法样本 + 变异"的 fuzzing 思路能逼解析器走遍校验分支。
+- 复杂度也是可测的:测试专属的 `thread_local!` + `Cell` 探针统计基本操作次数,
+  断言规模之间的增长率而非绝对耗时。
 - mneme 用 `FC-*` 契约编号把约束、实现、测试串成 1:1 追溯矩阵(FSVDD),并由
   `tests/contract_traceability.rs` 机械校验(含 `include_str!` 元测试)。
 - `cargo test` 一次跑齐单测、集成、doctest。
@@ -303,7 +434,11 @@ cargo test --release                # release 模式跑(测优化后的行为)
 ## 结语
 
 到这里,你已经掌握了读懂 mneme L0 所需的全部 Rust 基础。L1( [`src/memory/`](../../src/memory) )
-新引入的共享所有权、锁与写事务等特性已回填到 02/03/04/06/07 章对应小节。建议现在从头再读一遍
-[`src/core/`](../../src/core) 的源码,把每处语法对应回相应章节。之后可以按
+新引入的共享所有权、锁与写事务等特性,以及 L3( [`src/index/`](../../src/index) )
+新引入的手写 `Ord`、`BinaryHeap`、`TryFrom`/受检运算、字节切片操作、let 链与 `let...else`、
+`thread_local!` 探针、proptest 自定义策略,都已回填到 02/03/04/05/07/10 章的对应小节
+(回填总表见 [README §4](README.md))。建议现在从头再读一遍
+[`src/core/`](../../src/core) 的源码,把每处语法对应回相应章节;有余力再按需读
+[`src/index/`](../../src/index)。之后可以按
 [DESIGN.md](../DESIGN.md) 的分层路线,从 [03 L1 内存引擎](../design/03-l1-memory.md)
 起继续读各层设计文档,并参考 [README 的通用资料](README.md#5-学完之后的下一步通用资料)继续深入 Rust。

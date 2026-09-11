@@ -4,7 +4,8 @@
 > 以及 `//!` 模块文档、`///` 条目文档和 doctest 怎么写。
 > **前置**:[03 章](03-structs-enums-impl.md)。
 > **对应源码**:[`src/lib.rs`](../../src/lib.rs)、[`src/core/mod.rs`](../../src/core/mod.rs)、
-> [`src/core/options/mod.rs`](../../src/core/options/mod.rs)、[`src/core/metric.rs`](../../src/core/metric.rs)。
+> [`src/core/options/mod.rs`](../../src/core/options/mod.rs)、[`src/core/metric.rs`](../../src/core/metric.rs)、
+> [`src/index/mod.rs`](../../src/index/mod.rs)。
 
 Rust 用**模块(module)**组织命名空间,用**可见性(visibility)**控制谁能访问。
 mneme 的模块划分直接对应架构分层,读模块结构就能读出设计。
@@ -117,6 +118,18 @@ pub use dimension::Dimension;
 > **注意**:`#![deny(missing_docs)]` 只要求**公开**项有文档;私有项和 `pub(crate)` 项不强制
 > (但 mneme 规范仍要求都写)。把内部类型设为 `pub(crate)` 而不是 `pub`,也能避免把实现细节
 > 写进公开 API 文档。
+
+重导出也能带可见性修饰。L3 的 `index/mod.rs` 把索引工厂定为 `pub(crate)`,只给组合根使用:
+
+```rust
+mod factory;
+
+pub(crate) use factory::default_factory;
+```
+
+见 [`src/index/mod.rs:26-28`](../../src/index/mod.rs)。`pub(crate) use` 是"仅在本 crate 内重导出":
+门面(`memory::Builder`)能用,下游用户看不到——这正是 [AGENTS.md](../../AGENTS.md) 里
+"门面可注入 `IndexFactory`"的可见性边界。
 
 ---
 
@@ -274,7 +287,7 @@ Rust 的文档注释会被 `cargo doc` 渲染成 HTML,也是 doctest 的来源�
 
 - `src/lib.rs` 是 crate 根,声明模块、重导出公共 API、写 crate 级属性。
 - 模块用 `mod` 声明,可拆成文件/目录;`mod.rs` 只做组织与 `pub use`。
-- 默认私有;`pub` / `pub(crate)` / `pub(super)` 逐级放开。
+- 默认私有;`pub` / `pub(crate)` / `pub(super)` 逐级放开;重导出同样能带可见性(`pub(crate) use`)。
 - `pub use` 重导出让用户只依赖稳定路径,文件结构可自由重构。
 - `//!` 模块文档 + `///` 条目文档 + doctest 让文档可渲染、可测试、不过期;
   `#![deny(missing_docs)]` 强制公开项 100% 有文档。

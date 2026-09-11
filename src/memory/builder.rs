@@ -98,6 +98,9 @@ impl Builder {
     /// * 未设置 `dimension`(新建库)→ [`MnemeError::Config`];
     /// * `dedup_threshold` 非 `[0,1]` 内的有限值 → [`MnemeError::Config`]
     ///   (FC-GLOBAL-PRE-004:NaN 会让去重静默失效,越界值超出余弦相似度口径,绝不静默);
+    /// * HNSW 参数域非法(`m < 2`/`m0 < m`/`ef_construction = 0`/`ef_search = 0`)或过滤阈值
+    ///   非法(非有限值、越界、`brute > post`)→ [`MnemeError::Config`];`ef_search` 或度数
+    ///   超上限 → [`MnemeError::LimitExceeded`](FC-INDEX-PRE-001);
     /// * `path` 已存在库且显式维度/度量与其不符 → [`MnemeError::DimensionMismatch`]/
     ///   [`MnemeError::MetricMismatch`];目录被其他实例独占 → [`MnemeError::Busy`]。
     ///
@@ -121,12 +124,65 @@ impl Builder {
         })
     }
 
-    /// 校验跨字段配置约束(FC-GLOBAL-PRE-004)。
+    /// 校验跨字段配置约束(FC-GLOBAL-PRE-004、FC-INDEX-PRE-001)。
     fn validate(&self) -> Result<()> {
         // NaN 的 `contains` 恒为 false,一个区间判断即可同时覆盖非有限值与越界。
         if !(0.0..=1.0).contains(&self.dedup_threshold) {
             return Err(MnemeError::Config {
                 reason: "dedup_threshold 必须是 [0,1] 内的有限值",
+            });
+        }
+        self.validate_hnsw()?;
+        self.validate_tuning()?;
+        Ok(())
+    }
+
+    /// 校验 HNSW 参数:`m ≥ 2`、`m0 ≥ m`、`ef_construction ≥ 1`、`ef_search ∈ [1, ef_max]`、
+    /// 度数不超硬上限(FC-INDEX-PRE-001;越限会使自产 hidx 无法读回,或让默认查询宽度
+    /// 绕过查询期上限)。
+    fn validate_hnsw(&self) -> Result<()> {
+        let params = self.hnsw;
+        if params.m < 2 || params.m0 < params.m {
+            return Err(MnemeError::Config {
+                reason: "HNSW m 必须 ≥ 2 且 m0 ≥ m",
+            });
+        }
+        if params.ef_construction < 1 {
+            return Err(MnemeError::Config {
+                reason: "HNSW ef_construction 必须 ≥ 1",
+            });
+        }
+        if params.ef_search < 1 {
+            return Err(MnemeError::Config {
+                reason: "HNSW ef_search 必须 ≥ 1",
+            });
+        }
+        let ef_max = self.limits.ef_max as usize;
+        if params.ef_search as usize > ef_max {
+            return Err(MnemeError::LimitExceeded {
+                field: "ef_search",
+                limit: ef_max,
+                got: params.ef_search as usize,
+            });
+        }
+        let max = crate::memory::index::MAX_INDEX_DEGREE as usize;
+        if params.m as usize > max || params.m0 as usize > max {
+            return Err(MnemeError::LimitExceeded {
+                field: "hnsw 度数(m/m0)",
+                limit: max,
+                got: params.m.max(params.m0) as usize,
+            });
+        }
+        Ok(())
+    }
+
+    /// 校验过滤三档阈值:有限且 `0 ≤ brute ≤ post ≤ 1`(FC-INDEX-PRE-001)。
+    fn validate_tuning(&self) -> Result<()> {
+        let post = self.tuning.filter_post_threshold;
+        let brute = self.tuning.filter_brute_threshold;
+        if !(0.0..=1.0).contains(&post) || !(0.0..=1.0).contains(&brute) || brute > post {
+            return Err(MnemeError::Config {
+                reason: "过滤三档阈值必须是 [0,1] 内有限值且 brute ≤ post",
             });
         }
         Ok(())
@@ -150,6 +206,7 @@ impl Builder {
                         verify_on_open: self.verify_on_open,
                         fail_fast_on_corruption: self.fail_fast_on_corruption,
                         hook: self.fsync_hook.clone(),
+                        index_factory: Some(crate::index::default_factory()),
                     },
                 )?;
                 Ok((Some(store), Some(state), Dimension::new(dimension)?, metric))
@@ -174,6 +231,7 @@ impl Builder {
             dedup_threshold: self.dedup_threshold,
             quantization: self.quantization,
             hnsw: self.hnsw,
+            index_factory: Some(crate::index::default_factory()),
             compaction: self.compaction,
             retention: self.retention,
             retain_interval: self.retain_interval,

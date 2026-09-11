@@ -4,10 +4,13 @@
 > 写代码的人。你不需要任何 Rust 基础,也不需要 AI 或数据库背景。
 >
 > **本套文档想解决什么**:让你能**独立读懂 `mneme` 的源码**。本套以 L0 原语层
-> `src/core/` 为教材,并把 L1 内存引擎 `src/memory/` 新引入的 Rust 知识
-> (`Arc` 共享所有权、写时复制、`Mutex`/`RwLock` 守卫、`move` 闭包写事务、
-> `dyn` 策略与函数指针、构建者模式)**回填到各章对应小节**(见 §4 对照表);
-> L1 的业务语义与分文件阅读路线见 [设计 03 L1 内存引擎](../design/03-l1-memory.md)。
+> `src/core/` 为教材,并把 L1 内存引擎 `src/memory/` 与 L3 索引层 `src/index/`
+> 新引入的 Rust 知识(`Arc` 共享所有权、写时复制、`Mutex`/`RwLock` 守卫、
+> `move` 闭包写事务、`dyn` 策略与函数指针、构建者模式,以及手写 `Ord` 与
+> `BinaryHeap`、`TryFrom`/受检运算、字节切片操作、`let` 链与 `let...else`、
+> `thread_local!` 测试探针、`proptest` 自定义策略)**回填到各章对应小节**
+> (见 §4 对照表);L1 与 L3 的业务语义与分文件阅读路线见
+> [设计 03 L1 内存引擎](../design/03-l1-memory.md) 与 [设计 05 L3 HNSW](../design/05-l3-hnsw.md)。
 > 所有语法点都锚定在 mneme 的真实代码上,不讲"为了教语法而教语法"的空例子。
 >
 > **预计阅读**:6–10 小时(边读边敲会更快掌握)。建议**开着源码对照阅读**。
@@ -33,7 +36,7 @@ Rust 的通用教材很多(见 §5),但它们有两个问题:
 
 - **顺序读**:01 → 10。每章只依赖前面章节,不跳步。
 - **边读边跑**:每章末尾有「动手练习」,在 `examples/` 下新建一个文件敲一遍(或用临时 crate)。
-  **不要直接改 `src/core/` 与 `src/memory/`**:库里的公开项受 `#![deny(missing_docs)]` 约束,乱加还会污染源码。
+  **不要直接改 `src/core/`、`src/memory/` 与 `src/index/`**:库里的公开项受 `#![deny(missing_docs)]` 约束,乱加还会污染源码。
   光看不敲,Rust 的所有权和借用是学不会的。
 - **对照源码**:遇到 `文件:行号` 就跳过去看完整上下文。
 - **不要背语法**:Rust 编译器报错信息极其友好,学会"看报错 → 改代码"比背规则更重要。
@@ -48,15 +51,15 @@ Rust 的通用教材很多(见 §5),但它们有两个问题:
 | 章 | 标题 | 一句话 | 读完后你能看懂 mneme 里的…… |
 |---|---|---|---|
 | [01](01-toolchain.md) | 工具链与 Cargo | `cargo` 怎么构建、测试、出文档 | `Cargo.toml`、edition、MSRV、`cargo test/doc` |
-| [02](02-values-and-ownership.md) | 值、类型与所有权 | Rust 最独特、也最容易卡住的部分 | `u32`/`f32`、`mut`、移动/复制/克隆、newtype、`Arc`/写时复制 |
-| [03](03-structs-enums-impl.md) | 结构体、枚举与 impl | 用类型描述数据、用 `impl` 挂行为 | `RowId`、`Metric`、`MnemeError`、`#[derive]`、`Builder` 链 |
-| [04](04-borrowing-strings-slices.md) | 引用、借用、生命周期与字符串 | `&`、`&mut`、`&str`/`String`/`Arc<str>` | `dot(a, b)`、`Key`、`get_path` 的 `'v`、锁守卫 |
-| [05](05-errors.md) | 错误处理 | `Option`/`Result`/`?`/`thiserror` | `MnemeError`、`Result<T>`、varint 的畸形输入 |
+| [02](02-values-and-ownership.md) | 值、类型与所有权 | Rust 最独特、也最容易卡住的部分 | `u32`/`f32`、`mut`、移动/复制/克隆、newtype、`Arc`/写时复制、`TryFrom`/受检运算 |
+| [03](03-structs-enums-impl.md) | 结构体、枚举与 impl | 用类型描述数据、用 `impl` 挂行为 | `RowId`、`Metric`、`MnemeError`、`#[derive]`、`Builder` 链、手写 `Ord`(`Cand`) |
+| [04](04-borrowing-strings-slices.md) | 引用、借用、生命周期与字符串 | `&`、`&mut`、`&str`/`String`/`Arc<str>` | `dot(a, b)`、`Key`、`get_path` 的 `'v`、锁守卫、hidx 的字节切片读写 |
+| [05](05-errors.md) | 错误处理 | `Option`/`Result`/`?`/`thiserror` | `MnemeError`、`Result<T>`、varint 的畸形输入、`let...else` 与 let 链 |
 | [06](06-generics-traits.md) | 泛型与 trait | 一套代码适配多种类型 | `TopK<T: Ord>`、`Clock`、`From`/`Display`、`dyn` 策略 |
-| [07](07-iterators-closures.md) | 迭代器与闭包 | 用链式调用替代手写循环 | `dot_scalar`、`TopK::into_sorted_vec`、`write_tx` 闭包 |
+| [07](07-iterators-closures.md) | 迭代器与闭包 | 用链式调用替代手写循环 | `dot_scalar`、`TopK::into_sorted_vec`、`write_tx` 闭包、`BinaryHeap` 图搜索 |
 | [08](08-modules-docs.md) | 模块、可见性与文档 | 代码怎么分文件、怎么暴露 | `lib.rs`、`core/mod.rs`、`//!` 与 `///` |
 | [09](09-cfg-unsafe-simd.md) | 条件编译、unsafe 与 SIMD | 跨平台与手写向量指令 | `simd.rs` 的 `#[cfg(target_arch)]`、`unsafe` |
-| [10](10-testing.md) | 测试与属性测试 | `#[test]`、doctest、`proptest` | `tests/core_contracts.rs`、契约测试 |
+| [10](10-testing.md) | 测试与属性测试 | `#[test]`、doctest、`proptest` | `tests/core_contracts.rs`、契约测试、proptest 自定义策略、复杂度探针 |
 
 > 章节编号是稳定标识,不严格等于阅读次序;但**首次学习请按编号顺序**。
 
@@ -93,8 +96,28 @@ L1(`src/memory/`)新引入的 Rust 特性已**回填到对应章节**,不在上�
 | `move` 闭包、`FnOnce` 与 `write_tx` 写事务 | [07 §4.3](07-iterators-closures.md) |
 | `include_str!` 契约追溯门禁(元测试) | [10 §5.1](10-testing.md) |
 
-> L1 的业务语义(命名空间、写事务、去重、双时态等)不属于语言教学,见
-> [设计 03 L1 内存引擎](../design/03-l1-memory.md)。
+L3(`src/index/`)新引入的 Rust 特性同样已**回填到对应章节**:
+
+| L3 新特性 | 落在哪一节 |
+|---|---|
+| `TryFrom`、`checked_*`/`saturating_*` 受检运算 | [02 §2.1.2](02-values-and-ownership.md) |
+| 浮点 `is_finite`/`clamp`/`MIN_POSITIVE` 防 NaN | [02 §2.2](02-values-and-ownership.md) |
+| `Arc<[f32]>` 与 `Vec::into_boxed_slice` | [02 §3.7](02-values-and-ownership.md) |
+| 结构体更新语法(`..GRAPH_PARAMS`) | [03 §1.1](03-structs-enums-impl.md) |
+| 手写 `PartialEq`/`Eq`/`PartialOrd`/`Ord`、`f32::total_cmp` | [03 §4.2](03-structs-enums-impl.md) |
+| `to_le_bytes`/`from_le_bytes`、`copy_from_slice`/`extend_from_slice`、字节串 `b"..."` | [04 §2.3](04-borrowing-strings-slices.md) |
+| 借用结构体与生命周期参数(`QueryRef<'a>`) | [04 §4.4](04-borrowing-strings-slices.md) |
+| `is_none_or`/`ok_or_else`/`.err()` 组合子 | [05 §1.2](05-errors.md) |
+| 引用解构模式、`while let`、`let...else`、let 链 | [05 §4](05-errors.md) |
+| `BinaryHeap`/`std::cmp::Reverse`、`HashSet` 访问去重 | [07 §5](07-iterators-closures.md) |
+| `pub(crate) use` 受限重导出 | [08 §3](08-modules-docs.md) |
+| `proptest` 自定义 `Strategy`/`prop_oneof!`/变异策略 | [10 §4.5](10-testing.md) |
+| `thread_local!`+`Cell` 操作计数探针(复杂度验证) | [10 §4.6](10-testing.md) |
+
+> L1 的业务语义(命名空间、写事务、去重、双时态等)与 L3 的业务语义(HNSW 构建/查询、
+> 过滤三档、hidx 字节布局)不属于语言教学,分别见
+> [设计 03 L1 内存引擎](../design/03-l1-memory.md) 与
+> [设计 05 L3 HNSW](../design/05-l3-hnsw.md)。
 
 ---
 

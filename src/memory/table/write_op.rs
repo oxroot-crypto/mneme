@@ -92,7 +92,7 @@ pub(crate) trait PersistHook: Send + Sync {
     /// 落盘 I/O 失败时返回对应错误。
     fn maybe_flush(
         &self,
-        _ws: &WriterState,
+        _ws: &mut WriterState,
         _config: &crate::memory::config::Config,
     ) -> Result<()> {
         Ok(())

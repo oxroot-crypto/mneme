@@ -52,6 +52,11 @@ pub(crate) fn msec_name(segment_id: u32) -> String {
     format!("seg_{segment_id:06}.msec")
 }
 
+/// 段 HNSW 图文件名(L3 起)。
+pub(crate) fn hidx_name(segment_id: u32) -> String {
+    format!("seg_{segment_id:06}.hidx")
+}
+
 /// 把相对路径拼到根目录下,拒绝绝对路径与 `..` 目录穿越。
 ///
 /// # Errors

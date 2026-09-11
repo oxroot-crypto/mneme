@@ -5,7 +5,7 @@
 //! * FC-MEM-CPLX-001..003/005(暴力扫描、过滤求值、并行归并、iter 过滤/排序)
 //! * FC-MEM-PRE-003/004、FC-MEM-POST-005、FC-MEM-INV-003
 //! * FC-INDEX-POST-003、FC-QUERY-ERR-002、FC-QUERY-POST-001
-//! * FC-SCORE-INV-027、FC-SCORE-POST-001、FC-GLOBAL-PRE-001/004
+//! * FC-SCORE-INV-027、FC-SCORE-POST-001、FC-SCORE-POST-002、FC-GLOBAL-PRE-001/004
 
 use std::sync::Arc;
 
@@ -310,6 +310,62 @@ fn default_scoring_matches_similarity_order() {
         .map(|hit| hit.rowid.get())
         .collect();
     assert_eq!(plain, scored);
+}
+
+/// FC-SCORE-POST-002:归一化相似度低于 `floor` 时综合分清零;等于 `floor` 为保留边界。
+#[test]
+fn scoring_floor_zeroes_below_threshold() {
+    let ns = mem(2).namespace("n");
+    // 查询 [1,0];三条候选的归一化相似度分别为 1.0 / 1/√2 / 0.0(min = 0,span = 1)。
+    for (index, vector) in [vec![1.0, 0.0], vec![0.5, 0.5], vec![0.0, 1.0]]
+        .iter()
+        .enumerate()
+    {
+        ns.insert(Record::new(vector.clone()).key(format!("k{index}")))
+            .expect("insert");
+    }
+    let scores = |floor: f32| -> Vec<f32> {
+        ns.search()
+            .vector(&[1.0, 0.0])
+            .score(Scoring {
+                floor,
+                ..Scoring::default()
+            })
+            .top_k(3)
+            .execute()
+            .expect("search")
+            .iter()
+            .map(|hit| hit.score)
+            .collect()
+    };
+    let almost = |got: &[f32], want: &[f32]| {
+        got.len() == want.len() && got.iter().zip(want).all(|(a, b)| (a - b).abs() < 1e-6)
+    };
+    let boundary = std::f32::consts::FRAC_1_SQRT_2;
+    // floor = 1/√2:ŝ = 1/√2(等于边界)保留,ŝ = 0.0 清零。
+    assert!(almost(&scores(boundary), &[1.0, boundary, 0.0]));
+    // floor = 0.8(高于 1/√2):ŝ = 1/√2 被清零,只剩首条非零(证伪"恒不清零")。
+    assert!(almost(&scores(0.8), &[1.0, 0.0, 0.0]));
+    // floor = 0:任何非负相似度都不清零,与不做保底全等。
+    assert!(almost(&scores(0.0), &[1.0, boundary, 0.0]));
+    // floor = 0 必须真正"不清零":开 importance 权重使尾部候选总分为正,
+    // 若实现退化为 `<=` 清零,该断言变红(消除上面恒等比较的空转)。
+    let floor_zero = ns
+        .search()
+        .vector(&[1.0, 0.0])
+        .score(Scoring {
+            floor: 0.0,
+            w_importance: 1.0,
+            ..Scoring::default()
+        })
+        .top_k(3)
+        .execute()
+        .expect("search");
+    let tail_score = floor_zero.last().expect("3 hits").score;
+    assert!(
+        tail_score > 0.0,
+        "floor=0 时相似度 0 的候选不得被清零(实现必须用严格小于)"
+    );
 }
 
 /// FC-MEM-PRE-003(综合打分各因子钳制到 [0,1]:访问频次因子超基准后恒为 1.0;

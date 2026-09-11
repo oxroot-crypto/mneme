@@ -3,9 +3,9 @@
 > **Mneme**(μνήμη,古希腊语"记忆";记忆女神 Mnemosyne 的同源词)是一个纯 Rust 编写的**嵌入型向量存储引擎**,
 > 专为 **AI Agent 的超长期记忆层**设计:进程内运行、无需服务端、数据经年累月增长而不失控。
 
-**状态**:开发中(尚未发布到 crates.io)。**L0 原语层(`src/core/`)、L1 内存引擎(`src/memory/`)
-与 L2 持久层(`src/persist/`)**已实现并通过形式化契约验收,后续按 L3→L6 逐层推进,
-每层完成时都是一个可独立交付的完整产品。
+**状态**:开发中(尚未发布到 crates.io)。**L0 原语层(`src/core/`)、L1 内存引擎(`src/memory/`)、
+L2 持久层(`src/persist/`)与 L3 索引层(`src/index/`)**已实现并通过形式化契约验收,后续按 L4→L6
+逐层推进,每层完成时都是一个可独立交付的完整产品。
 设计与验收标准见 [docs/DESIGN.md](docs/DESIGN.md)。
 
 ---
@@ -34,7 +34,7 @@ LLM 每次对话结束就"忘光"上下文之外的一切。要让 Agent 长期�
 | 量化 | i8 / f16 量化副本 + 两阶段重打分,查询带宽 i8 ÷4 / f16 ÷2(f32 原向量保留供精排,故磁盘不缩减) |
 | **存储安全**(可选) | AES-256-GCM 静态加密、文本/元数据压缩 |
 | **部署形态** | 多进程只读共享;`Storage` 抽象支持 WASM/边缘适配;可观测事件钩子 |
-| 依赖极简 | 当前非 feature 强依赖白名单 4 个小 crate(均为直接依赖,`serde_json` 另带入 itoa/ryu/memchr 等极少数传递依赖);规划中默认开 `mmap` 时共 5 个(**L3**);复杂算法全部自研;加密/压缩均为可选 feature |
+| 依赖极简 | 当前非 feature 强依赖白名单 4 个小 crate(均为直接依赖,`serde_json` 另带入 itoa/ryu/memchr 等极少数传递依赖);默认开 `mmap` 时额外引入 1 个(`memmap2`,可经 feature 关闭);复杂算法全部自研;加密/压缩均为可选 feature |
 
 ## 安装
 
@@ -88,18 +88,15 @@ fn main() -> mneme::Result<()> {
 
 ## Feature 开关
 
-> **尚未定义**:`Cargo.toml` 目前**没有 `[features]` 段**;下表是规划中的 feature 与所属层,
-> 均未在当前版本生效(`mmap` 的 `memmap2` 随 **L3** 引入,[01 §5](docs/design/01-overview.md))。
-
 | feature | 默认 | 说明 |
 |---|---|---|
-| `mmap` | ✅ 开(规划) | 段文件 mmap 零拷贝读(**L3**);关闭后走 `Read + Seek` 兜底 |
-| `async` | ❌ 关 | 提供 `insert().await` 等 async 门面(`spawn_blocking` 薄包装) |
-| `quant-f16` | ❌ 关 | f16 量化副本;关闭时只有 f32 / i8 |
-| `encrypt` | ❌ 关 | AES-256-GCM 静态加密 |
-| `compress` | ❌ 关 | 文本/元数据压缩(内置 LZ4 风格 codec) |
-| `compress-zstd` | ❌ 关 | 可选更强压缩(引入 `zstd`) |
-| `wasm` | ❌ 关 | 关闭 mmap/线程并行,WASM 目标 |
+| `mmap` | ✅ 开 | 段文件 mmap 零拷贝读(**L3 已实现**);关闭后走 `Read + Seek` 兜底 |
+| `async` | ❌ 关 | 提供 `insert().await` 等 async 门面(`spawn_blocking` 薄包装);待 L6 |
+| `quant-f16` | ❌ 关 | f16 量化副本;关闭时只有 f32 / i8;待 L6 |
+| `encrypt` | ❌ 关 | AES-256-GCM 静态加密;待 L11 |
+| `compress` | ❌ 关 | 文本/元数据压缩(内置 LZ4 风格 codec);待 L11 |
+| `compress-zstd` | ❌ 关 | 可选更强压缩(引入 `zstd`);待 L11 |
+| `wasm` | ❌ 关 | 关闭 mmap/线程并行,WASM 目标;待 L12 |
 
 ## 文档
 
@@ -135,8 +132,9 @@ mdbook build               # 输出到 book/
 
 ## 开发与测试
 
-> 当前已实现 L0 原语层、L1 内存引擎与 L2 持久层,下列命令即可运行;`cargo test --features async`
-> (async 门面等价性)等 feature 相关命令待对应层(含 `[features]` 定义)落地后加入。
+> 当前已实现 L0 原语层、L1 内存引擎、L2 持久层与 L3 索引层,下列命令即可运行;`cargo test
+> --features async`(async 门面等价性)等 feature 相关命令待对应层落地后加入。`cargo bench`
+> 已在 L3 引入(见 `benches/hnsw.rs`)。
 
 ```bash
 cargo fmt --all -- --check

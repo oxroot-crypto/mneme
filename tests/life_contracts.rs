@@ -2,7 +2,7 @@
 //!
 //! 覆盖 `docs/spec/contracts.md` 的以下条目:
 //!
-//! * FC-LIFE-INV-023、FC-LIFE-POST-001/002
+//! * FC-LIFE-INV-023、FC-LIFE-POST-001/002、FC-LIFE-CPLX-002(retain 扫描复杂度,§9.2.6)
 //! * FC-MEM-ERR-001/002、FC-MEM-STA-001、FC-MEM-POST-008
 //! * FC-GLOBAL-ERR-001/002、FC-GLOBAL-PRE-004
 //!   (冒烟:任何公开 API 路径不 panic;错误分类变体语义互不混淆;策略参数非法 → Config)
