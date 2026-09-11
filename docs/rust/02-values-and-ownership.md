@@ -4,7 +4,9 @@
 > **前置**:读过 [01 章](01-toolchain.md),会 `cargo build`。
 > **对应源码**:[`src/core/types.rs`](../../src/core/types.rs)、[`src/core/varint.rs`](../../src/core/varint.rs)、
 > [`src/core/metric.rs`](../../src/core/metric.rs)、[`src/memory/table/state.rs`](../../src/memory/table/state.rs)、
-> [`src/index/hidx.rs`](../../src/index/hidx.rs)、[`src/index/filtered.rs`](../../src/index/filtered.rs)。
+> [`src/index/hidx.rs`](../../src/index/hidx.rs)、[`src/index/filtered.rs`](../../src/index/filtered.rs)、
+> [`src/query/iso.rs`](../../src/query/iso.rs)、[`src/query/zmap.rs`](../../src/query/zmap.rs)、
+> [`src/query/fusion.rs`](../../src/query/fusion.rs)、[`src/query/parse/mod.rs`](../../src/query/parse/mod.rs)。
 
 这是全书**最关键**的一章。所有权是 Rust 区别于其他语言的核心,也是初学者最容易卡住的地方。
 读完本章你能理解 mneme 里为什么大量使用 `u32`/`u64`/`f32`、为什么 `newtype` 里直接包一个整数。
@@ -155,6 +157,34 @@ let expected_node_table = header
   `ef` 放大就用了 `base.saturating_mul(AMPLIFIED_TIER_FACTOR)`,见
   [`src/index/filtered.rs:148-154`](../../src/index/filtered.rs)。
 
+#### 2.1.3 L4 用到的几个整数方法
+
+```rust
+// ① 欧几里得除法:向负无穷取整,余数永远非负
+let ms = -1_i64;
+ms / 86_400_000;            // 0:截断除法,向 0 取整
+ms.div_euclid(86_400_000);  // -1:floor 除法
+ms.rem_euclid(86_400_000);  // 86_399_999:非负余数
+
+// ② 向上取整的除法:块数 = ceil(元素数 / 每块行数)
+view.slots.len().div_ceil(ZONE_BLOCK_ROWS);
+
+// ③ 无符号绝对值:对 i64::MIN 取负会溢出,unsigned_abs 不会
+value.unsigned_abs() <= MAX_EXACT_INT as u64;
+```
+
+- 为什么需要 `div_euclid`:ISO 8601 格式化要把 Unix 毫秒拆成"天数 + 当日余量"。
+  1970 年之前的时间戳是负数,`/` 向 0 取整会把 `-1 ms` 算成第 0 天,时间直接错一天;
+  `div_euclid`/`rem_euclid` 才是日历需要的 floor 语义。
+- 为什么用 `div_ceil`:`a.div_ceil(b)` 就是「`(a + b - 1) / b`」,但不会在 `a == 0`
+  或大数相加时出幺蛾子;数 zone map 的块数正好是「向上取整」。
+- 为什么用 `unsigned_abs`:对 `i64::MIN` 直接取负会溢出 panic,`unsigned_abs`
+  返回 `u64`,先比上限再转 `f64`(见 §2.2 的 2^53)。
+
+见 [`src/query/iso.rs:169-180`](../../src/query/iso.rs)、
+[`src/query/zmap.rs:27-30`](../../src/query/zmap.rs) 与
+[`src/query/zmap.rs:179-182`](../../src/query/zmap.rs)。
+
 ### 2.2 浮点
 
 - `f32`(单精度,约 7 位有效数字)、`f64`(双精度)。
@@ -192,6 +222,34 @@ f32::MIN_POSITIVE;         // 最小的正规格化浮点数,常用来替代 0 �
 > `clamp` 要求 `min <= max` 且两者非 `NaN`,否则 panic;值本身是 `NaN` 时返回 `NaN`,
 > 所以**先 `is_finite` 校验、再 `clamp`** 是安全顺序。
 
+L4 又用到几个浮点常量与精度事实:
+
+```rust
+// ① 极值哨兵:做 min / max 归约时当"初始累加器"
+let min = values.iter().copied().fold(f32::INFINITY, f32::min);
+let max = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+
+// ② 非有限值的三种形态:NaN、+∞、-∞
+alpha.is_finite();        // 三者都是 false;配合 [0,1] 区间判定拒绝非法参数
+
+// ③ f64 只能精确表示 |整数| ≤ 2^53(约 9.0e15)
+9_007_199_254_740_992_i64 as f64;   // 2^53,精确
+9_007_199_254_740_993_i64 as f64;   // 2^53 + 1,转 f64 后与 2^53 相等(静默舍入)
+```
+
+- `f32::INFINITY` / `NEG_INFINITY` 是关联常量,分别表示 ±∞;融合做 min-max
+  归一化时用它们当 `fold` 初值(`f32::min(+∞, x) == x`,任何有限值都能顶掉初值)。
+- `f32::EPSILON` 是最小的"使 `1.0 + ε != 1.0`"的正数,测试里用它造"极差极小但不为 0"
+  的输入,验证归一化不会把极小差异当成单点。
+- **2^53 精度上限**是 L4 计划器的关键约束:zone map 的区间比较要把整数转成 `f64`,
+  超过 2^53 的 `i64` 转完会失真,可能被误判"不可能命中"而错误剪枝。所以
+  `exact_int` 先检查 `unsigned_abs() <= MAX_EXACT_INT`,超了就返回 `None`,
+  由调用方退回"全 1 位图"(无法判断就不剪)。
+
+见 [`src/query/fusion.rs:84-85`](../../src/query/fusion.rs)、
+[`src/query/fusion.rs:195-213`](../../src/query/fusion.rs) 与
+[`src/query/zmap.rs:166-182`](../../src/query/zmap.rs)。
+
 ### 2.3 布尔与字符
 
 ```rust
@@ -200,7 +258,28 @@ let ch: char = '好';      // 单个 Unicode 标量值,占 4 字节
 ```
 
 - 布尔变量按规范用 `is_` / `has_` / `can_` / `should_` 前缀。
-- `char` 是**一个 Unicode 字符**,不是字节;`"好"` 是字符串字面量(`&str`,见 [04 章](04-borrowing-strings-slices.md))。
+- `char` 是**一个 Unicode 标量值**,不是字节;`char` 在内存里固定占 4 字节,
+  但同一个字符在 UTF-8 字符串里只占 1–4 字节(`len_utf8()`);`"好"` 是字符串字面量
+  (`&str`,见 [04 章](04-borrowing-strings-slices.md))。
+
+`char` 还自带一组 Unicode 判定方法,L4 的 DSL 解析器用它划分"标识符 / 空白 / 数字":
+
+```rust
+let c: char = '好';
+c.is_alphabetic();     // true:是字母(汉字也算,比"是不是 ASCII 字母"宽松)
+c.is_alphanumeric();   // true:字母或数字
+c.is_whitespace();     // 空格、制表符、换行……各类 Unicode 空白
+c.len_utf8();          // 3:'好' 在 UTF-8 里占 3 个字节
+```
+
+- 解析器按**字节位置**推进(便于报"第 N 字节"错误),但读取时用 `chars().next()`
+  拿下一个字符,再用 `len_utf8()` 换算回字节数;ASCII 数字与符号则直接看
+  `as_bytes()` 里的 `u8`。
+- 别把 `char` 当 `u8`:一个汉字 3 字节、一个 emoji 常是 4 字节,
+  `self.pos += 1` 会切在字符中间,后续 `&input[pos..]` 直接 panic。
+
+见 [`src/query/parse/mod.rs:84-93`](../../src/query/parse/mod.rs) 与
+[`src/query/parse/mod.rs:292-309`](../../src/query/parse/mod.rs)。
 
 ### 2.4 数组与元组
 
@@ -407,6 +486,9 @@ pub struct SlotId(u32);
 - `let` 默认不可变,要改加 `mut`;常量用 `const` + 全大写下划线。
 - 整数按位宽/符号分很多种,Rust **不做隐式转换**;`as` 会静默截断,不允许丢数据时用
   `TryFrom`/`checked_*`/`saturating_*`;浮点比较用误差阈值,`is_finite`/`clamp` 防 NaN 与失控。
+- L4 用的整数方法:`div_euclid`/`rem_euclid`(负数 floor 除法)、`div_ceil`(向上取整)、
+  `unsigned_abs`;`f64` 只精确到 2^53,整数转浮点比较前必须先检查范围。
+- `char` 不是 `u8`:用 `chars().next()` 拿字符、`len_utf8()` 换算字节数,别在 UTF-8 中间切刀。
 - 数组定长、元组可异构;需要可增长列表用 `Vec`。
 - **所有权**:每个值一个所有者,离开作用域自动释放;赋值对堆类型是**移动**,对 `Copy` 类型是复制;
   想复制堆数据用 `.clone()`。
@@ -419,6 +501,8 @@ pub struct SlotId(u32);
 1. 在 `examples/hello.rs` 里声明 `let x: u32 = 5;`,试着传给一个需要 `u64` 的函数,读报错并修正。
 2. 写 `let s1 = String::from("a"); let s2 = s1;`,再打印 `s1`,观察移动报错;改成 `s1.clone()` 后通过。
 3. 给 `examples/hello.rs` 加一个 `const MAX_ROWS: u32 = 1_000_000;` 并用 `println!` 打印。
+4. 对 `-1_i64` 分别计算 `/ 86_400_000`、`div_euclid(86_400_000)`、`rem_euclid(86_400_000)`,
+   解释三者为什么不同。
 
 ## 下一章
 

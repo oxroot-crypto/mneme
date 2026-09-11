@@ -4,7 +4,8 @@
 > **前置**:[04 章](04-borrowing-strings-slices.md)(引用)、[06 章](06-generics-traits.md)(trait)。
 > **对应源码**:[`src/core/simd.rs`](../../src/core/simd.rs)、[`src/core/heap.rs`](../../src/core/heap.rs)、
 > [`src/core/varint.rs`](../../src/core/varint.rs)、[`src/memory/namespace/access.rs`](../../src/memory/namespace/access.rs)、
-> [`src/index/hnsw.rs`](../../src/index/hnsw.rs)、[`src/index/filtered.rs`](../../src/index/filtered.rs)。
+> [`src/index/hnsw.rs`](../../src/index/hnsw.rs)、[`src/index/filtered.rs`](../../src/index/filtered.rs)、
+> [`src/query/bm25.rs`](../../src/query/bm25.rs)、[`src/query/fusion.rs`](../../src/query/fusion.rs)。
 
 Rust 的迭代器是**惰性(lazy)**的:你写一串转换,只有到"消费"时(如 `sum`、`collect`、`for`)
 才真正执行。它既表达力强,又能被编译器优化到和手写循环一样快。
@@ -123,6 +124,25 @@ let v: Vec<i32> = (0..5).map(|x| x * x).collect();
 ```
 
 `collect` 能收集成多种容器,所以常需要标注目标类型,或靠上下文推断。
+
+### 3.3 `fold` 与函数指针:求极值
+
+`fold(初值, f)` 从初值出发,对每个元素执行 `acc = f(acc, x)`。L4 的融合归一化要取
+通道分数的最小 / 最大值:
+
+```rust
+let min = oriented.iter().copied().fold(f32::INFINITY, f32::min);
+let max = oriented.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+```
+
+见 [`src/query/fusion.rs:84-85`](../../src/query/fusion.rs)。两个细节:
+
+- `f32::min` / `f32::max` 是**方法**,但签名是 `fn(f32, f32) -> f32`,正好吻合 `fold`
+  需要的 `FnMut(f32, f32) -> f32`;凡是签名对得上,关联函数/方法都能直接当函数指针传
+  (和 [04 §2.3](04-borrowing-strings-slices.md) 的 `Vec::as_slice`、[10 §4.6](10-testing.md)
+  的 `Cell::get` 一样)。
+- 用 `f32::INFINITY` 当地基:任何有限值都能顶掉它,`fold` 完拿到的就是集合最小值;
+  空集合则原样返回 `+∞`(L4 调用前已判空,不会遇到)。
 
 ---
 
@@ -330,6 +350,40 @@ if !visited.insert(neighbor) {
 > 邻接去重 `slot.contains(&other)` 就是这么用的(节点度数 ≤ 32,见
 > [`src/index/graph.rs:79-86`](../../src/index/graph.rs))。
 
+### 5.2 `HashMap` 的 entry API 与"排序去重"
+
+L4 的融合要把两个通道的分数按 `RowId` 累加:同一个文档可能已经出现过,也可能第一次出现。
+"先查再插"要查两次,`entry` API 一次搞定:
+
+```rust
+let mut fused: HashMap<RowId, (SlotId, f32)> = HashMap::new();
+for (rank, hit) in channel.iter().enumerate() {
+    let add = 1.0 / (k as f32 + (rank + 1) as f32);
+    fused.entry(hit.rowid).or_insert((hit.slot, 0.0)).1 += add;
+}
+```
+
+见 [`src/query/fusion.rs:45-53`](../../src/query/fusion.rs)。要点:
+
+- `entry(key)` 返回 `Entry` 枚举("已在 / 不在"两种),**查找只发生一次**;
+- `or_insert(init)` 在不存在时插入 `init` 并返回 `&mut V`,`.1 += add` 直接在槽位上累加。
+  若 `init` 构造成本高,用惰性的 `or_insert_with(|| ...)`;
+- 想"存在时顺便改一下"用 `and_modify(|v| ...)`;预知规模时 `HashMap::with_capacity(n)`
+  预留容量(与 `Vec::with_capacity` 同理,见 §7)。
+- 注意 `HashMap` 迭代顺序不确定;要稳定顺序必须像 L4 一样**显式排序**或按 key 取值。
+
+L4 的分词阶段还把"排序 + 去重"当固定搭配:
+
+```rust
+let mut terms = tokenize(query, stopwords);
+terms.sort();
+terms.dedup();
+```
+
+见 [`src/query/bm25.rs:62-68`](../../src/query/bm25.rs)。`Vec::dedup` 只删**相邻**重复,
+所以必须先 `sort`——不排序时它几乎什么也不删。这两步合起来是"有序去重";`HashSet` 去重
+更快但会丢顺序(见 §5.1)。
+
 ---
 
 ## 6. `Option` 与数组:都是"可迭代"的(常见组合)
@@ -374,6 +428,8 @@ mneme 的测试里也常见 `for (score, id) in [...]` 直接遍历数组,见
 - `for` + Range 是基本循环;`iter`/`iter_mut`/`into_iter` 决定借用还是消耗。
 - 迭代器适配器(`map`/`filter`/`zip`/`enumerate`/`rev`/`copied`)+ 消费器
   (`sum`/`collect`/`fold`/`max_by_key`)链式组合,惰性零开销。
+- `fold(init, f)` 是带累加器的归约;`f32::min` 这类方法只要签名对得上,就能当函数指针传给 `fold`。
+- `HashMap::entry(key).or_insert(..)` 一次查找完成"查 / 插 / 改";`sort` + `dedup` 是有序去重。
 - 闭包 `|x| ...` 能捕获环境;`move` 强制转移所有权。
 - 接收闭包的函数用 `FnOnce`/`FnMut`/`Fn` 声明调用方式;L1 写事务 `write_tx` 用 `FnOnce` 执行一次、
   失败整体回滚。
@@ -389,6 +445,9 @@ mneme 的测试里也常见 `for (score, id) in [...]` 直接遍历数组,见
 3. 用 `sort_by` 把 `vec![(2, "b"), (1, "a")]` 按第一个元素升序排序。
 4. 用 `BinaryHeap<Reverse<u32>>` 实现"流式取最大的 3 个":不断 `push`,堆里超过 3 个就弹出
    堆顶(当前最小值),最后把堆里的元素取出反转,就是从大到小的前三。
+5. 用 `HashMap` 的 entry API 统计 `vec!["a", "b", "a"]` 里每个词出现的次数。
+6. 用 `fold(f32::NEG_INFINITY, f32::max)` 求一个 `Vec<f32>` 的最大值,并解释为什么不能直接写
+   `iter().copied().max()`(提示:见 [03 §4.1](03-structs-enums-impl.md))。
 
 ## 下一章
 

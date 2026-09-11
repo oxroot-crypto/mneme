@@ -56,8 +56,9 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 | `debug_assertions` | debug 构建 |
 | `not(...)` / `any(...)` / `all(...)` | 逻辑组合 |
 
-> `feature = "..."` 只在 `Cargo.toml` 声明了对应 feature 时才有意义;mneme 当前 L0 尚未声明
-> feature(见 [01 章](01-toolchain.md)),这里仅作语法示例。
+> `feature = "..."` 只在 `Cargo.toml` 声明了对应 feature 时才有意义。mneme 目前声明了
+> `mmap`(默认开启,见 [01 §4.2](01-toolchain.md));`async`/`quant-f16` 等尚未定义,
+> 上表仅作语法示例。
 
 ### 1.1 `cfg!` 宏:运行期用的布尔值
 

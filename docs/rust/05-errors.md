@@ -5,7 +5,9 @@
 > **前置**:[03 章](03-structs-enums-impl.md)(枚举与 `impl`)。
 > **对应源码**:[`src/core/error.rs`](../../src/core/error.rs)、[`src/core/varint.rs`](../../src/core/varint.rs)、
 > [`src/core/options/dimension.rs`](../../src/core/options/dimension.rs)、[`src/core/meta.rs`](../../src/core/meta.rs)、
-> [`src/index/hidx.rs`](../../src/index/hidx.rs)、[`src/index/graph.rs`](../../src/index/graph.rs)。
+> [`src/index/hidx.rs`](../../src/index/hidx.rs)、[`src/index/graph.rs`](../../src/index/graph.rs)、
+> [`src/query/json.rs`](../../src/query/json.rs)、[`src/query/iso.rs`](../../src/query/iso.rs)、
+> [`src/query/zmap.rs`](../../src/query/zmap.rs)、[`src/query/plan.rs`](../../src/query/plan.rs)。
 
 Rust 没有异常(exception)和 `try/catch`。它把"可能失败"编码进**类型**:
 
@@ -111,6 +113,51 @@ for segment in path.split('.') {
 
 见 [`src/core/meta.rs:42-44`](../../src/core/meta.rs)。任一环返回 `None`,整个函数立即返回 `None`。
 
+L4 又用到几个"判断 / 过滤 / 借用"的组合子:
+
+```rust
+// bool → Option:条件成立给 Some(v),否则 None(注意 v 会立即求值)
+rest.is_empty().then_some(0);
+
+// is_some_and:Some 且谓词为真(与 is_none_or 正好互补)
+ctx.view.zones
+    .block_stat(field, block)
+    .is_some_and(|stat| stat.has_null);
+
+// filter:Some 且满足谓词才保留,否则变 None
+value.as_f64().filter(|value| value.is_finite());
+
+// as_deref:Option<String> → Option<&str>,借用式读取、不移动
+self.text.as_deref();
+
+// cloned:Option<&T> → Option<T>,复制出拥有值(HashMap::get 返回引用)
+via_map.get(&rowid).cloned();
+
+// map_or_else:两个分支都是惰性闭包
+filter.map_or_else(
+    || zmap::full_mask(zmap::block_count(view)),
+    |expr| zmap::block_mask(expr, view),
+);
+```
+
+见 [`src/query/iso.rs:80-83`](../../src/query/iso.rs)、
+[`src/query/zmap.rs:148-164`](../../src/query/zmap.rs)、
+[`src/query/json.rs:101-104`](../../src/query/json.rs)、
+[`src/query/exec.rs:364-367`](../../src/query/exec.rs) 与
+[`src/query/plan.rs:33-36`](../../src/query/plan.rs)。逐条:
+
+- `then_some`:等价于 `if cond { Some(v) } else { None }`,但 `v` **立即求值**;
+  要惰性(只在 `true` 时才算)就用 `bool::then(|| ...)`。
+- `is_some_and`:表达"有值且满足条件"。上文 `zmap` 用它判断"该块存在此字段的摘要且摘要含 null"。
+- `filter`:保留满足谓词的 `Some`,其余变 `None`——JSON 解码用它把非有限 `f64` 直接滤掉。
+- `as_deref`:`Option<String>`(或 `&Option<String>`)→ `Option<&str>`,不移动内部值;
+  `Option<Vec<T>>` → `Option<&[T]>` 同理。
+- `cloned()`:`Option<&T>` → `Option<T>`(要求 `T: Clone`);`HashMap::get` 返回引用,
+  L4 取来源边时用 `via_map.get(&rowid).cloned()` 复制出拥有值(见
+  [`src/query/exec.rs:354`](../../src/query/exec.rs))。
+- `map_or_else(none_fn, some_fn)`:两个分支都惰性;L4 计划器用它"无过滤→全 1 位图,
+  有过滤→下推求值"。默认值构造昂贵时,`map_or`(默认值立即求值)不合适。
+
 ### 1.3 `unwrap()` / `expect()`:危险动作
 
 ```rust
@@ -188,6 +235,23 @@ if shift == 63 && low > U64_LAST_GROUP_MAX {
 ### 2.3 `?` 也能用在 `Option` 上
 
 在返回 `Option` 的函数里,`?` 遇到 `None` 就返回 `None`(见 §1.2 的 `get_path`)。
+
+### 2.4 把 `Result` 的迭代器收成 `Result<Vec<_>>`
+
+L4 的 JSON 解码要批量转换数组元素,失败就整体失败:
+
+```rust
+let vals: Result<Vec<Val>> = items.iter().map(val_from_meta).collect();
+```
+
+见 [`src/query/json.rs:166-167`](../../src/query/json.rs)。当 `collect` 的目标类型是
+`Result<Vec<T>, E>` 时,迭代器元素必须是 `Result<T, E>`:`Ok` 逐个收集,一旦遇到
+`Err` 就**立即返回该 `Err`**、丢弃已收集的部分。这是"批量 `?`"的惯用写法,
+比手写循环 + `?` 短得多。反过来也行:`Vec<Option<T>>` 可收成 `Option<Vec<T>>`。
+
+> `collect` 能变出什么,完全由**标注的目标类型**决定(见
+> [07 §3.2](07-iterators-closures.md)):同一串迭代器可以收成 `Vec`、`HashMap`、
+> `Result`、`Option`……编译器靠类型标注来选。
 
 ---
 
@@ -429,7 +493,10 @@ if denominator < COSINE_EPSILON { 0.0 } else { simd::dot(a, b) / denominator }
 - `Option<T>` 表示"有/无",`Result<T, E>` 表示"成功/失败",都由编译器强制处理。
 - `?` 在 `Result` 或 `Option` 上短路传播;`unwrap`/`expect` 会 panic,生产代码禁用。
 - `map_or`/`is_none_or`/`ok_or_else` 等组合子把"取值 + 兜底 / 转错误"写成表达式,
-  `ok_or_else` 惰性构造错误,优先于 `ok_or`。
+  `ok_or_else` 惰性构造错误,优先于 `ok_or`;L4 还常用 `then_some`、`is_some_and`、
+  `filter`、`as_deref`、`cloned`、`map_or_else`(两分支惰性)。
+- `collect::<Result<Vec<_>>>()` 把 `Iterator<Item = Result<T, E>>` 收成一个 `Result`,
+  第一个 `Err` 立刻短路。
 - `if let` 只匹配一个分支,`matches!` 返回布尔值;`while let` 反复匹配直到失败,
   `let...else` 匹配失败即早退,`edition 2024` 的 let 链用 `&&` 串起多个条件与 `let`。
 - 用 `thiserror` 的 `#[error]` 定义消息、`#[from]` 自动转换、字段携带上下文、`#[source]` 保留根因。
@@ -441,6 +508,8 @@ if denominator < COSINE_EPSILON { 0.0 } else { simd::dot(a, b) / denominator }
    用 `?` 在另一个函数里串联两次除法。
 2. 给 [03 章练习](03-structs-enums-impl.md)的 `Shape::area` 改成返回 `Result<f32, String>`,半径/边长必须为正。
 3. 用 `matches!` 判断一个 `Option<u32>` 是否为 `Some`。
+4. 写 `(0..5).map(|n| if n == 3 { Err(n) } else { Ok(n) }).collect::<Result<Vec<_>, _>>()`,
+   观察结果,并解释前三个 `Ok` 去了哪里。
 
 ## 下一章
 
