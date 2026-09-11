@@ -248,6 +248,7 @@ mod tests {
     use crate::core::meta::json;
     use crate::core::types::{Key, NsId, RowId, SeqNo};
     use crate::memory::table::SlotData;
+    use proptest::prelude::*;
 
     fn slot_data(index: usize, meta: crate::core::meta::Meta) -> SlotData {
         SlotData {
@@ -336,5 +337,49 @@ mod tests {
         dict.push(9);
         put_bytes_u32(&mut dict, b"x");
         assert!(decode_field_dict(&dict).is_err());
+
+        // 字段字典尾部残留:合法条目后多 1 字节必须拒绝。
+        let mut dict = encode_field_dict(&[(Arc::from("x"), FieldKind::Num)]);
+        assert!(decode_field_dict(&dict).is_ok());
+        dict.push(0);
+        assert!(decode_field_dict(&dict).is_err());
+
+        // zone map 尾部残留:合法区字节后多 1 字节必须拒绝。
+        let fields = vec![(Arc::from("created_at"), FieldKind::Ts)];
+        let defs = decode_field_dict(&encode_field_dict(&fields)).expect("defs");
+        let mut zmap = encode_zmap(&ZoneIndex::new(16), &fields, 1);
+        assert!(validate_zmap(&zmap, &defs, 1).is_ok());
+        zmap.push(0);
+        assert!(validate_zmap(&zmap, &defs, 1).is_err());
+
+        // bloom:零位长 / 非 64 倍数 / 哈希位置数越界([1,64] 之外)必须拒绝。
+        let bloom_bytes = |bit_len: u32, k: u32| {
+            let mut bytes = Vec::new();
+            put_u32(&mut bytes, 1);
+            put_u16(&mut bytes, 0);
+            put_u32(&mut bytes, bit_len);
+            put_u32(&mut bytes, k);
+            for _ in 0..bit_len.div_ceil(64) {
+                put_u64(&mut bytes, 0);
+            }
+            bytes
+        };
+        assert!(decode_bloom(&bloom_bytes(0, 7)).is_err());
+        assert!(decode_bloom(&bloom_bytes(65, 7)).is_err());
+        assert!(decode_bloom(&bloom_bytes(64, 0)).is_err());
+        assert!(decode_bloom(&bloom_bytes(64, 65)).is_err());
+        // 合法下界对照:bit_len=64、k=64 必须可解码。
+        assert!(decode_bloom(&bloom_bytes(64, 64)).is_ok());
+    }
+
+    /// FC-PERSIST-ERR-010(任意字节不 panic)
+    #[test]
+    fn decode_regions_never_panics_on_arbitrary_bytes() {
+        proptest!(|(bytes in prop::collection::vec(any::<u8>(), 0..256))| {
+            // 只证不 panic:返回 Ok/Err 均允许,不对结构合法性作断言。
+            let _ = decode_field_dict(&bytes);
+            let _ = decode_bloom(&bytes);
+            let _ = validate_zmap(&bytes, &[], 0);
+        });
     }
 }

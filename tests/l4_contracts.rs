@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
-use mneme::{Clock, Expr, Fusion, Mneme, Record, Tuning};
+use mneme::{Clock, Expr, Fusion, Mneme, Record, Tuning, UpdatePatch};
 use proptest::prelude::*;
 
 mod common;
@@ -220,15 +220,16 @@ fn hybrid_fusion_and_validation() {
             "alpha = {alpha} 必须拒绝"
         );
     }
-    assert!(
+    // 合法闭区间 [0,1] 的内点与两端点都必须可执行(0.0 纯文本通道、1.0 纯向量通道)。
+    for alpha in [0.0_f32, 0.5, 1.0] {
         ns.search()
             .vector(&query)
             .text("beta")
-            .fusion(Fusion::Weighted { alpha: 0.5 })
+            .fusion(Fusion::Weighted { alpha })
             .top_k(2)
             .execute()
-            .is_ok()
-    );
+            .unwrap_or_else(|error| panic!("alpha = {alpha} 是合法边界: {error}"));
+    }
 }
 
 /// FC-INDEX-INV-006(过滤先行:候选集内融合,绝不"先融合截断再过滤")
@@ -404,6 +405,62 @@ fn text_index_survives_reopen() {
     );
 }
 
+/// FC-PERSIST-POST-008(非恒等重排:update 产生新物理版本,重开前后 BM25 逐位一致)
+#[test]
+fn reopen_after_update_remaps_text_index() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Mneme::builder()
+        .path(dir.path())
+        .dimension(2)
+        .build()
+        .expect("build");
+    let ns = db.namespace("n");
+    ns.insert(Record::new(vec![1.0, 0.0]).key("k0").text("alpha memory"))
+        .expect("insert");
+    ns.insert(
+        Record::new(vec![0.0, 1.0])
+            .key("k1")
+            .text("alpha alpha memory"),
+    )
+    .expect("insert");
+    ns.insert(
+        Record::new(vec![0.5, 0.5])
+            .key("k2")
+            .text("alpha beta gamma memory"),
+    )
+    .expect("insert");
+    // update 生成第 4 个物理槽位(seqno 最大),但按 `(rowid, seqno)` 排序后新版本
+    // 紧跟同 rowid 的旧版本:段内槽位 0/1/2/3 → 全局槽位 0/2/3/1,映射非恒等。
+    ns.update(
+        "k0",
+        UpdatePatch::new().text(Some("alpha alpha alpha memory".to_string())),
+    )
+    .expect("update");
+    let before = ranked(
+        &ns.search()
+            .text("alpha")
+            .top_k(10)
+            .execute()
+            .expect("search"),
+    );
+    assert_eq!(before.len(), 3, "每个 RowId 只回最新版本一次");
+    db.close().expect("close");
+
+    let db = Mneme::open(dir.path()).expect("open");
+    let after = ranked(
+        &db.namespace("n")
+            .search()
+            .text("alpha")
+            .top_k(10)
+            .execute()
+            .expect("search"),
+    );
+    assert_eq!(
+        before, after,
+        "非恒等重排前后 BM25 rowid 顺序与分数逐位一致"
+    );
+}
+
 /// FC-PERSIST-POST-008 / FC-INDEX-INV-021(段 + 增量共用同一全局 BM25 统计)
 #[test]
 fn flushed_and_tail_records_share_bm25_statistics() {
@@ -481,8 +538,9 @@ fn plan_filter_matches_pointwise_count() {
 #[test]
 fn planner_never_prunes_possible_blocks() {
     let ns = mem(2).namespace("n");
-    // 前 2047 行数字 rank 占满块 0/1;大整数在块 1;字符串 rank 独占块 2。
-    // 旧实现会因 f64 精度/非数值不观察而剪掉这些块,导致漏报。
+    // 前 2047 行数字 rank 占满块 0/1;大整数(2^53+1)在块 1;2^53 本身、
+    // -2^53、字符串 rank 与污染 key 落在块 2。旧实现会因 f64 精度/非数值
+    // 不观察而剪掉这些块,导致漏报。
     for index in 0..2047 {
         ns.insert(
             Record::new(vec![1.0, 0.0])
@@ -495,6 +553,19 @@ fn planner_never_prunes_possible_blocks() {
         Record::new(vec![1.0, 0.0])
             .key("big")
             .metadata(mneme::json!({"rank": 9_007_199_254_740_993_i64})),
+    )
+    .expect("insert");
+    // 2^53 本身可由 `f64` 精确表示(内侧边界);-2^53 为负向精确边界。
+    ns.insert(
+        Record::new(vec![1.0, 0.0])
+            .key("inside")
+            .metadata(mneme::json!({"rank": 9_007_199_254_740_992_i64})),
+    )
+    .expect("insert");
+    ns.insert(
+        Record::new(vec![1.0, 0.0])
+            .key("neg")
+            .metadata(mneme::json!({"rank": -9_007_199_254_740_992_i64})),
     )
     .expect("insert");
     ns.insert(
@@ -514,10 +585,15 @@ fn planner_never_prunes_possible_blocks() {
     let cases = [
         // 行级 i64 精确比较命中大整数(块级曾因 f64 舍入误剪)。
         (Expr::field("rank").gt(9_007_199_254_740_992_i64), 1_usize),
+        // 内侧边界 2^53 精确可表示:含等号的比较必须保留大整数块。
+        (Expr::field("rank").ge(9_007_199_254_740_992_i64), 2_usize),
+        // 负向精确边界 -2^53 命中,紧邻越界点 -2^53-1 不得命中。
+        (Expr::field("rank").le(-9_007_199_254_740_992_i64), 1_usize),
+        (Expr::field("rank").lt(-9_007_199_254_740_992_i64), 0_usize),
         // 字符串 rank 所在块必须保留(曾因只统计数值而误剪)。
-        (Expr::Exists("rank".into()), 2049),
+        (Expr::Exists("rank".into()), 2051),
         // `key` 被 metadata 数字污染后,字符串比较仍走全量位图。
-        (Expr::field("key").ne("nope"), 2050),
+        (Expr::field("key").ne("nope"), 2052),
     ];
     for (filter, expected) in cases {
         let count = ns.count(Some(filter.clone())).expect("count");
@@ -691,6 +767,17 @@ fn builder_rejects_invalid_bloom_fpp() {
             "bloom_fpp = {fpp} 必须拒绝"
         );
     }
+    // 有效侧紧邻端点 `1.0` 的内点与极小值必须可构建。
+    for fpp in [1e-6_f32, 0.999_999] {
+        Mneme::builder()
+            .dimension(2)
+            .tuning(Tuning {
+                bloom_fpp: fpp,
+                ..Tuning::default()
+            })
+            .build()
+            .unwrap_or_else(|error| panic!("bloom_fpp = {fpp} 是合法内点: {error}"));
+    }
     // field_dict_max = 0 无法容纳 `key` 字段(自产 bloom 缺失),必须拒绝。
     let tuning = Tuning {
         field_dict_max: 0,
@@ -712,7 +799,7 @@ proptest! {
         match Expr::from_str(&input) {
             Ok(expr) => {
                 let printed = expr.to_string();
-                let _ = Expr::from_meta(&expr.to_meta());
+                prop_assert!(Expr::from_meta(&expr.to_meta()).is_ok(), "JSON 必须可解码");
                 prop_assert!(Expr::from_str(&printed).is_ok(), "打印结果必须可重解析");
             }
             Err(mneme::MnemeError::FilterParse(_)) => {}

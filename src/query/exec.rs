@@ -29,6 +29,9 @@ use super::bm25::{self, Bm25Query};
 use super::{fusion, plan};
 
 /// 全局查询标识分配器(`execute()` 缺省生成 `QueryId`)。
+///
+/// `Ordering::Relaxed` 足够:只要求同一计数器不重号,不承担跨线程可见性顺序;
+/// `u64` 回绕需 2^64 次查询,按实际规模视为不可达。
 static NEXT_QUERY_ID: AtomicU64 = AtomicU64::new(1);
 
 /// 单通道执行的公共上下文(视图/命名空间/时刻/条数/共享候选)。

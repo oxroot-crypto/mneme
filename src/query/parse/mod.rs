@@ -142,11 +142,17 @@ impl<'a> Parser<'a> {
             return false;
         }
         let trimmed = after.trim_start();
+        // `and`/`or` 也要看后续字符:`always andy == 1` 中的 `andy` 不是边界。
+        let keyword_boundary = |word: &str| {
+            trimmed
+                .strip_prefix(word)
+                .is_some_and(|rest| !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_'))
+        };
         let boundary = trimmed.is_empty()
             || trimmed.starts_with(')')
             || trimmed.starts_with(',')
-            || trimmed.starts_with("and")
-            || trimmed.starts_with("or")
+            || keyword_boundary("and")
+            || keyword_boundary("or")
             || trimmed.starts_with("&&")
             || trimmed.starts_with("||");
         if boundary {
@@ -361,6 +367,8 @@ impl<'a> Parser<'a> {
         let mut vals: Vec<Val> = Vec::new();
         loop {
             let val = self.parse_value()?;
+            // 线性查重:`Val` 含 `f64`,无 `Hash`/`Ord`;`in` 列表规模受解析
+            // 预算 $O(L)$ 限制(现阶段用例千级以内),$O(n^2)$ 可接受。
             if !vals.contains(&val) {
                 vals.push(val);
             }

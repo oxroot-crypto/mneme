@@ -72,17 +72,19 @@ fn weighted(
 
 /// 结果集内 min-max 归一化;`flip` 时先取负把"越小越优"翻成"越大越优"。
 ///
-/// 通道只有一个结果(极差为 0)时归一值取 1,避免除零。
+/// 通道只有一个结果(极差为 0)时归一值取 1,避免除零。极值差异在 `f32`
+/// 下可能溢出成 `±inf`(继而 `inf/inf = NaN`),故中间量用 `f64`;仍非有限的
+/// 归一值(上游传入 `NaN` 分数)归 0,保证融合分参与排序时确定可比。
 fn normalize(hits: &[Scored], flip: bool) -> HashMap<RowId, (SlotId, f32)> {
     if hits.is_empty() {
         return HashMap::new();
     }
-    let oriented: Vec<f32> = hits
+    let oriented: Vec<f64> = hits
         .iter()
-        .map(|hit| if flip { -hit.score } else { hit.score })
+        .map(|hit| f64::from(if flip { -hit.score } else { hit.score }))
         .collect();
-    let min = oriented.iter().copied().fold(f32::INFINITY, f32::min);
-    let max = oriented.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let min = oriented.iter().copied().fold(f64::INFINITY, f64::min);
+    let max = oriented.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     let span = max - min;
     hits.iter()
         .zip(oriented)
@@ -92,6 +94,11 @@ fn normalize(hits: &[Scored], flip: bool) -> HashMap<RowId, (SlotId, f32)> {
                 1.0
             } else {
                 (value - min) / span
+            };
+            let normalized = if normalized.is_finite() {
+                normalized as f32
+            } else {
+                0.0
             };
             (hit.rowid, (hit.slot, normalized))
         })
@@ -222,5 +229,27 @@ mod tests {
         // 两个文档各只在一个通道出现,且都是一等,RRF 分相同 → 按 RowId 升序。
         assert_eq!(fused[0].rowid, RowId::new(3));
         assert_eq!(fused[1].rowid, RowId::new(9));
+    }
+
+    /// FC-QUERY-POST-004(极端极差不产生 NaN;归一值仍有限且保序)
+    #[test]
+    fn weighted_extreme_span_stays_finite() {
+        let vector = vec![hit(0, 0, f32::MAX), hit(1, 1, -f32::MAX)];
+        let fused = weighted(
+            vector,
+            Vec::new(),
+            1.0,
+            FusionParams {
+                top_k: 2,
+                vector_is_distance: false,
+            },
+        );
+        assert_eq!(fused.len(), 2);
+        assert!(
+            fused.iter().all(|hit| hit.score.is_finite()),
+            "不得出现 NaN"
+        );
+        assert_eq!(fused[0].rowid, RowId::new(0), "最大分归一为 1 居首");
+        assert_eq!(fused[1].score, 0.0, "最小分归一为 0");
     }
 }

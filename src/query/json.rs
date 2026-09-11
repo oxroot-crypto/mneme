@@ -254,6 +254,10 @@ impl Expr {
     /// 结构不符(多键/空对象/字段类型错误/未知运算符)时返回
     /// [`MnemeError::FilterParse`]。
     ///
+    /// 递归深度由 `meta` 自身的嵌套深度决定:JSON 输入经 `serde_json` 解析
+    /// 默认带 128 层深度限制;直接构造超深 `Meta` 的宿主须自行保证深度有界
+    /// (DSL 文本入口 [`Expr::from_str`] 有独立的 `MAX_DEPTH` 防护)。
+    ///
     /// # Examples
     /// ```
     /// use mneme::{Expr, json};

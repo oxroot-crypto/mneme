@@ -50,10 +50,10 @@ impl Builder {
     pub fn retain_interval(self, d: Duration) -> Self;      // 开启自动遗忘时的周期,默认 半衰期/4
     pub fn access_flush_interval(self, d: Duration) -> Self; // 默认 30s
     pub fn compression(self, c: Compression) -> Self;       // 文本/元数据压缩,默认 None(见 11;L11 落地,当前记录不启用)
-    pub fn encryption(self, e: Option<Encryption>) -> Self; // 静态加密,feature `encrypt`(见 11;L11 落地)
-    pub fn storage(self, s: Arc<dyn Storage>) -> Self;      // 存储后端,默认 FsStorage;WASM/边缘自定义(见 12 §3;L12 落地,当前内部 std::fs)
+    pub fn encryption(self, e: Option<Encryption>) -> Self; // 静态加密,feature `encrypt`(见 11;L11 落地,当前无此 API)
+    pub fn storage(self, s: Arc<dyn Storage>) -> Self;      // 存储后端,默认 FsStorage;WASM/边缘自定义(见 12 §3;L12 落地,当前无此 API,内部直接 std::fs)
     pub fn read_only(self, yes: bool) -> Self;              // 只读共享模式(见 12 §2;L2 已实现单进程只读,不创建锁/WAL)
-    pub fn read_only_probe_interval(self, d: Duration) -> Self; // 只读实例探测新 MANIFEST 的周期,默认 1s(L12 多进程只读时落地)
+    pub fn read_only_probe_interval(self, d: Duration) -> Self; // 只读实例探测新 MANIFEST 的周期,默认 1s(见 12 §2;L12 落地,当前无此 API)
     pub fn verify_on_open(self, yes: bool) -> Self;         // 打开时全量校验各段 payload CRC,默认 false(见 04 §4.3)
     pub fn fail_fast_on_corruption(self, yes: bool) -> Self; // 损坏段直接拒绝启动,默认 false = 隔离剔除(见 04 §7)
     pub fn relation_index(self, r: RelationIndex) -> Self;  // 关系反向索引,默认 Outgoing(见 09 §2.3)
@@ -61,6 +61,7 @@ impl Builder {
     pub fn tuning(self, t: Tuning) -> Self;                 // 进阶调参,默认见 §2
     pub fn limits(self, l: Limits) -> Self;                 // 数据限额,见 §8
     pub fn clock(self, c: Arc<dyn Clock>) -> Self;          // 测试注入;默认 SystemClock
+    pub fn fsync_hook(self, hook: Arc<dyn FsyncHook>) -> Self; // 测试崩溃注入,见 04 §10.1
     pub fn observer(self, o: Arc<dyn Observer>) -> Self;    // 可选可观测钩子,默认无(见 12 §4;L12 落地,当前无此 API)
     pub fn build(self) -> Result<Mneme>;
 }
@@ -311,7 +312,7 @@ impl SnapshotHandle {
     pub fn as_of_ms(&self) -> i64;                         // 事务时间上界;普通 snapshot() = 当前,as_of(t) = t
     /// 在钉住的快照上取命名空间视图(键唯一性按命名空间隔离,故读取须先选命名空间)。
     pub fn namespace(&self, path: &str) -> SnapshotNamespace;
-    pub fn stats(&self) -> SnapshotStats;
+    pub fn stats(&self) -> SnapshotStats;                  // L5 规划,当前无此 API
 }
 
 /// 快照上的命名空间只读视图;持有快照视图的 `Arc`,克隆廉价、可跨线程使用。
@@ -356,14 +357,15 @@ impl Retention {
     pub fn protect(self, e: Expr) -> Self;
 }
 
-/// 融合器。`Rrf` 默认 k=60;`Weighted` 的 alpha 默认 0.5(见 06 §4)。
+/// 融合器。`Rrf` 默认 k=60(即 `Fusion::default()`);`Weighted { alpha }` 无 `Default`,
+/// 设计推荐 0.5,须显式构造(未指定时默认融合为 `Rrf { k: 60 }`,见 06 §4)。
 pub enum Fusion { Rrf { k: u32 }, Weighted { alpha: f32 } }
 
 /// 运维报告类型(字段为稳定契约)。
 pub struct RetainReport { pub scanned: usize, pub forgotten: usize, pub sampled_ids: Vec<RowId> }  // 可审计(I23)
 pub struct BackupReport { pub files: usize, pub bytes: u64, pub hardlinked: bool }
 pub struct CheckReport  { pub ok: bool, pub corrupted: Vec<SegmentId>, pub suggestions: Vec<String> }
-pub struct SnapshotStats { pub version: u64, pub segments: usize, pub rows: u64 }
+pub struct SnapshotStats { pub version: u64, pub segments: usize, pub rows: u64 }  // L5 规划,当前无此 API
 ```
 
 #### 运行统计
@@ -514,7 +516,7 @@ impl Scoring { pub fn new() -> Self; /* 链式 setter */ }
 pub enum TimeAxis { ValidTime, TransactionTime }
 
 /// 结果多样性(见 [10 §5](10-scoring.md))。
-pub enum Diversity { Off, Mmr { lambda: f32 } }   // lambda∈[0,1],越大越重相关性,默认 0.7;非有限值 execute() 返回 Config
+pub enum Diversity { Off, Mmr { lambda: f32 } }   // lambda∈[0,1],越大越重相关性;设计推荐 0.7,须显式构造(`Diversity::default() == Off`);非有限值 execute() 返回 Config
 
 /// 关系联想扩展(见 [10 §3](10-scoring.md)):hops 默认 1(最大 3),decay 默认 0.5/跳,
 /// max_nodes 默认 4k(封顶扩展延迟)。
@@ -529,7 +531,7 @@ pub struct RelationKind(pub u16);
 impl RelationKind {
     pub const DERIVED_FROM: Self; pub const SUPPORTS: Self;
     pub const CONTRADICTS: Self;  pub const RELATED: Self;
-    pub fn custom(name: &str) -> Result<Self>;   // 名称→稳定编号(注册表见 09 §2;耗尽返回 TooLarge)
+    pub fn custom(name: &str) -> Result<Self>;   // 名称→稳定编号(注册表见 09 §2;耗尽返回 TooLarge;L2 注册表落地前无此 API)
 }
 /// 一条关系边。
 pub struct Edge { pub from: RowId, pub to: RowId, pub kind: RelationKind, pub weight: f32, pub metadata: Meta }
@@ -596,10 +598,10 @@ pub struct ConsolidateReport {
 | 遗忘扫描周期 | `.retain_interval` | 半衰期/4 | 开启自动遗忘后的触发间隔 |
 | 访问统计落盘 | `.access_flush_interval` | `30s` | 内存访问计数批量写 WAL 的周期,见 [07 §2](07-l5-life.md) |
 | 压缩 | `.compression` | `None` | 文本/元数据压缩,见 [11 §3](11-security-storage.md) |
-| 加密 | `.encryption` | `None` | 静态加密(feature `encrypt`),见 [11 §2](11-security-storage.md) |
-| 存储后端 | `.storage` | `FsStorage` | `Arc<dyn Storage>`;WASM/边缘自定义后端,见 [12 §3](12-deployment.md) |
+| 加密 | `.encryption` | `None` | 静态加密(feature `encrypt`),见 [11 §2](11-security-storage.md);**L11 落地**,当前无此 API |
+| 存储后端 | `.storage` | `FsStorage` | `Arc<dyn Storage>`;WASM/边缘自定义后端,见 [12 §3](12-deployment.md);**L12 落地**,当前无此 API |
 | 只读共享 | `.read_only` | `false` | 多进程只读打开,见 [12 §2](12-deployment.md) |
-| 只读探测周期 | `.read_only_probe_interval` | `1s` | 只读实例发现新 MANIFEST 的周期,见 [12 §2.1](12-deployment.md) |
+| 只读探测周期 | `.read_only_probe_interval` | `1s` | 只读实例发现新 MANIFEST 的周期,见 [12 §2.1](12-deployment.md);**L12 落地**,当前无此 API |
 | 关系索引 | `.relation_index` | `Outgoing` | `Outgoing/Both`;`Both` 空间 ×2,见 [09 §2.3](09-memory-model.md) |
 | 并行度 | `.parallelism` | `0`(自动) | 扫描/建索引/合并的线程数;0 = `available_parallelism()` |
 | 可观测 | `.observer` | 无 | 可选事件钩子,见 [12 §4](12-deployment.md);**L12 落地**,当前无此 API |
@@ -721,7 +723,8 @@ pub struct Tuning {
 `spawn_blocking` 任务被取消/panic 的 `expect`([08 §6](08-l6-quant.md));
 ② `filter!` 宏对写死的非法字面量在展开处 panic——运行时输入请用 `Expr::from_str`
 返回的 `Result`([06 §1.1](06-l4-query.md)、不变量 I7);
-③ 并行扫描候选收集处对槽位下标的 `u32::try_from(..).expect`——`commit_version` 经
+③ 候选收集/槽位映射处对槽位下标的 `u32::try_from(..).expect`(如并行扫描、
+`query::plan::compile`、`WriterState::rebuild_indexes`),`commit_version` 经
 `slot_id_for` 拒绝溢出(FC-MEM-INV-004),该转换可证明不会失败。
 
 ---

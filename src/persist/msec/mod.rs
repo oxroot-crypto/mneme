@@ -174,7 +174,7 @@ struct Region {
     len: u64,
 }
 
-/// 头部 8 个数据区的偏移/长度。
+/// 头部 9 个数据区的偏移/长度(field_dict/version/key/inv/ns_stats/zmap/bloom/delta/rel)。
 #[derive(Debug, Clone, Copy, Default)]
 struct Regions {
     field_dict: Region,

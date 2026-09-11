@@ -98,6 +98,9 @@ fn main() -> mneme::Result<()> {
 | `compress-zstd` | ❌ 关 | 可选更强压缩(引入 `zstd`);待 L11 |
 | `wasm` | ❌ 关 | 关闭 mmap/线程并行,WASM 目标;待 L12 |
 
+> 除 `mmap` 外,其余 feature 尚未在 `Cargo.toml` 定义,系 L6/L11/L12 目标;
+> 启用会因 feature 未定义报错。
+
 ## 文档
 
 | 文档 | 内容 |

@@ -300,6 +300,7 @@ fn remap_slot(slot: u32, remap: &[u32]) -> Result<SlotId> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     /// FC-PERSIST-POST-008(倒排往返:经重排映射还原为全局槽位)
     #[test]
@@ -366,5 +367,45 @@ mod tests {
         varint::encode_u32(0, &mut postings);
         varint::encode_u32(u32::MAX, &mut postings);
         assert!(decode_postings(&postings, 2, &[7]).is_err());
+
+        // 区尾残留:合法编码后多 1 字节必须拒绝。
+        let mut index = InvertedIndex::default();
+        index.insert_text(SlotId::new(0), NsId::new(1), "alpha", false);
+        let mut bytes = encode_inverted(&index).expect("encode");
+        assert!(decode_inverted(&bytes, &[0]).is_ok());
+        bytes.push(0);
+        assert!(matches!(
+            decode_inverted(&bytes, &[0]),
+            Err(MnemeError::Corrupted { .. })
+        ));
+
+        // 词条重复:同 `(ns_id, term)` 出现两次必须拒绝。
+        let mut bytes = Vec::new();
+        put_u32(&mut bytes, 2);
+        for _ in 0..2 {
+            put_u32(&mut bytes, 1);
+            put_bytes_u32(&mut bytes, b"t");
+            put_u32(&mut bytes, 0);
+            put_u64(&mut bytes, 0);
+            put_u32(&mut bytes, 0);
+        }
+        put_u64(&mut bytes, 0);
+        put_u32(&mut bytes, 0);
+        assert!(matches!(
+            decode_inverted(&bytes, &[]),
+            Err(MnemeError::Corrupted { .. })
+        ));
+    }
+
+    /// FC-PERSIST-ERR-010(任意字节 + 任意 remap 不 panic)
+    #[test]
+    fn decode_inverted_never_panics_on_arbitrary_bytes() {
+        proptest!(|(
+            bytes in prop::collection::vec(any::<u8>(), 0..256),
+            remap in prop::collection::vec(any::<u32>(), 0..16),
+        )| {
+            // 只证不 panic:decode 成败与结构合法性均不作断言。
+            let _ = decode_inverted(&bytes, &remap);
+        });
     }
 }

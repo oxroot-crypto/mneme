@@ -158,6 +158,8 @@ fn rank_scores(params: &Bm25Query<'_>, scores: &HashMap<SlotId, f32>) -> Vec<Sco
         .map(|(rowid, slot)| Scored {
             slot,
             rowid,
+            // `slot` 是上一步由 `scores` 自身的键 push 进 TopK 的,查询必然命中;
+            // `unwrap_or` 只为无 panic 的全函数形态,不构成静默兜底路径。
             score: scores.get(&slot).copied().unwrap_or(0.0),
         })
         .collect()
@@ -166,10 +168,12 @@ fn rank_scores(params: &Bm25Query<'_>, scores: &HashMap<SlotId, f32>) -> Vec<Sco
 /// 槽位在当前视图与命名空间下是否可见(未墓碑、未过期、非遮蔽版本)。
 fn is_visible(params: &Bm25Query<'_>, slot: SlotId) -> bool {
     let index = slot.get() as usize;
-    let Some(data) = params.view.slots.get(index) else {
+    let Some(slot_data) = params.view.slots.get(index) else {
         return false;
     };
-    !params.view.dead.get(index) && data.ns_id == params.ns_id && data.is_live(params.now_ms)
+    !params.view.dead.get(index)
+        && slot_data.ns_id == params.ns_id
+        && slot_data.is_live(params.now_ms)
 }
 
 /// 槽位是否在过滤先行候选集合内。

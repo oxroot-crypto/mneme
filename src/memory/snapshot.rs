@@ -144,6 +144,7 @@ impl SnapshotNamespace {
     ///
     /// # Returns
     /// 命中时返回记录只读视图;命名空间未注册或 key 不存在返回 `None`。
+    /// 可见性(墓碑/逻辑过期)以**快照时刻 `as_of_ms`** 判定(FC-QUERY-POST-006)。
     ///
     /// # Errors
     /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
@@ -171,6 +172,7 @@ impl SnapshotNamespace {
     ///
     /// # Returns
     /// 命中活记录时返回只读视图;`RowId` 不存在、已墓碑或已逻辑过期返回 `None`。
+    /// 过期以**快照时刻 `as_of_ms`** 判定,与墙上时钟无关。
     ///
     /// # Errors
     /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
@@ -203,7 +205,8 @@ impl SnapshotNamespace {
     /// * `keys` - 记录键列表;未命中的位置以 `None` 占位。
     ///
     /// # Returns
-    /// 与 `keys` 等长、顺序一致的命中视图列表。
+    /// 与 `keys` 等长、顺序一致的命中视图列表。可见性以快照时刻判定
+    /// (同 [`get`](Self::get),FC-QUERY-POST-006)。
     ///
     /// # Errors
     /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
@@ -234,7 +237,8 @@ impl SnapshotNamespace {
     /// * `id` - 目标 `RowId`;仅活记录可见。
     ///
     /// # Returns
-    /// 命中活记录时返回向量拷贝;不可见时返回 `None`。
+    /// 命中活记录时返回向量拷贝;不可见时返回 `None`。可见性以快照时刻判定
+    /// (同 [`get`](Self::get),FC-QUERY-POST-006)。
     ///
     /// # Errors
     /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
@@ -292,7 +296,8 @@ impl SnapshotNamespace {
     /// * `filter` - 三值过滤表达式;`None` 表示不过滤。
     ///
     /// # Returns
-    /// 命中过滤条件的活记录数;命名空间未注册返回 `0`。
+    /// 命中过滤条件的活记录数;命名空间未注册返回 `0`。逻辑过期以**快照时刻
+    /// `as_of_ms`** 判定(FC-QUERY-POST-006)。
     ///
     /// # Errors
     /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。

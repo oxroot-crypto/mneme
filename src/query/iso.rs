@@ -1,10 +1,13 @@
 //! ISO 8601 与 Unix 毫秒互转(零依赖;设计 06 §1 的 `ts"..."` 字面量)。
 //!
 //! 支持 `YYYY-MM-DD[Thh:mm[:ss[.fff]]][Z|±hh:mm|±hhmm]`;缺省时区按 UTC。
+//! 秒域 0–59(不支持闰秒 60,直接拒绝);小数秒最多读 9 位、截断到毫秒。
 //! 仅用于过滤 DSL 的时间戳字面量,不追求 ISO 8601 全部边缘语法。
 
 /// 一天的毫秒数。
 const DAY_MS: i64 = 86_400_000;
+/// 一天的秒数。
+const DAY_SECS: i64 = 86_400;
 /// 一小时的毫秒数。
 const HOUR_MS: i64 = 3_600_000;
 /// 一小时的秒数。
@@ -13,6 +16,8 @@ const HOUR_SECS: i64 = 3_600;
 const MINUTE_SECS: i64 = 60;
 /// 一分钟的毫秒数。
 const MINUTE_MS: i64 = 60_000;
+/// 一秒的毫秒数。
+const SECOND_MS: i64 = 1_000;
 
 /// [`format_iso8601_ms`] 可被 [`parse_iso8601_ms`] 原样读回的最小 Unix 毫秒
 /// (`0000-01-01T00:00:00.000Z`);解析器只接受 4 位年份,超出即无法往返。
@@ -57,7 +62,10 @@ fn strip(bytes: &[u8], expected: u8) -> Option<&[u8]> {
         .or_else(|| bytes.strip_prefix(&[expected.to_ascii_lowercase()]))
 }
 
-/// 解析可选的小数秒,返回毫秒(截断到 3 位,不足补零)与剩余字节。
+/// 解析可选的小数秒,返回毫秒(最多读 9 位;截断到 3 位,不足按十分位/百分位补零)。
+///
+/// 只读取**已确认是数字**的前 `cursor` 个字节;不足 3 位时绝不能越过 `cursor`
+/// 去读时区等后续字符(`.5Z` 必须得 500ms,而不是把 `Z` 当数字)。
 fn parse_fraction(bytes: &[u8]) -> Option<(i64, &[u8])> {
     let mut cursor = 0;
     while cursor < bytes.len() && cursor < 9 && bytes[cursor].is_ascii_digit() {
@@ -66,9 +74,13 @@ fn parse_fraction(bytes: &[u8]) -> Option<(i64, &[u8])> {
     if cursor == 0 {
         return None;
     }
+    let digits = &bytes[..cursor.min(3)];
     let mut milli = 0_i64;
-    for index in 0..3 {
-        milli = milli * 10 + i64::from(bytes.get(index).map_or(0, |byte| byte - b'0'));
+    for &byte in digits {
+        milli = milli * 10 + i64::from(byte - b'0');
+    }
+    for _ in digits.len()..3 {
+        milli *= 10;
     }
     Some((milli, &bytes[cursor..]))
 }
@@ -125,7 +137,8 @@ fn parse_time_of_day(bytes: &[u8]) -> Option<(i64, i64, i64, i64, i64)> {
         }
         None => bytes,
     };
-    if hour > 23 || minute > 59 || second > 60 {
+    if hour > 23 || minute > 59 || second > 59 {
+        // 闰秒(60)不支持:线性秒数会把它静默平移,不如直接拒绝。
         return None;
     }
     let offset = parse_offset(rest)?;
@@ -155,8 +168,8 @@ pub(crate) fn parse_iso8601_ms(input: &str) -> Option<i64> {
     if civil_from_days(days) != (year, month as u32, day as u32) {
         return None;
     }
-    let seconds = days * 86_400 + hour * HOUR_SECS + minute * MINUTE_SECS + second;
-    Some(seconds * 1_000 + milli - offset)
+    let seconds = days * DAY_SECS + hour * HOUR_SECS + minute * MINUTE_SECS + second;
+    Some(seconds * SECOND_MS + milli - offset)
 }
 
 /// 把 Unix 毫秒格式化为 UTC 的 `YYYY-MM-DDTHH:MM:SS.mmmZ`。
@@ -172,9 +185,9 @@ pub(crate) fn format_iso8601_ms(ms: i64) -> String {
     let (year, month, day) = civil_from_days(days);
     let (hour, minute, second, milli) = (
         rem / HOUR_MS,
-        rem / MINUTE_MS % 60,
-        rem / 1_000 % 60,
-        rem % 1_000,
+        rem / MINUTE_MS % MINUTE_SECS,
+        rem / SECOND_MS % MINUTE_SECS,
+        rem % SECOND_MS,
     );
     format!("{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}.{milli:03}Z")
 }
@@ -237,8 +250,36 @@ mod tests {
         assert_eq!(parse_iso8601_ms("2023-02-29T00:00:00Z"), None);
         assert_eq!(parse_iso8601_ms("2024-13-01T00:00:00Z"), None);
         assert_eq!(parse_iso8601_ms("2024-06-01T24:00:00Z"), None);
+        assert_eq!(parse_iso8601_ms("2024-06-01T23:59:60Z"), None);
         assert_eq!(parse_iso8601_ms("not-a-date"), None);
         assert_eq!(parse_iso8601_ms("2024-06-01T00:00:00+25:00"), None);
+    }
+
+    /// FC-QUERY-POST-007(小数秒不足 3 位按位补零;绝不读入后续时区字符)
+    #[test]
+    fn fractional_seconds_pad_to_millis() {
+        assert_eq!(
+            parse_iso8601_ms("2024-06-01T00:00:00.5Z"),
+            Some(1_717_200_000_500)
+        );
+        assert_eq!(
+            parse_iso8601_ms("2024-06-01T00:00:00.12Z"),
+            Some(1_717_200_000_120)
+        );
+        // 带负时区偏移的 1 位小数秒:修复前 debug 构建在此触发减法溢出 panic。
+        assert_eq!(
+            parse_iso8601_ms("2024-06-01T00:00:00.1-05:00"),
+            parse_iso8601_ms("2024-06-01T05:00:00.100Z")
+        );
+        // 超过 3 位截断;无时区后缀(EOF)同样补零。
+        assert_eq!(
+            parse_iso8601_ms("2024-06-01T00:00:00.123456Z"),
+            Some(1_717_200_000_123)
+        );
+        assert_eq!(
+            parse_iso8601_ms("2024-06-01T00:00:00.5"),
+            Some(1_717_200_000_500)
+        );
     }
 
     #[test]

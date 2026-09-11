@@ -12,7 +12,10 @@
 > 与本章设计的工程口径差异:① 内存引擎只维护一份全局倒排(见 [04 §5.4](04-l2-persist.md)
 > 落地注);② 三值语义下 `Not` 不做块级取反(位图取反会把 `Unknown` 误判为命中),
 > 交行级残差求值;③ 计划编译仍含 $O(N)$ 的逐行可见性判定(待段句柄重构消除,
-> 契约 `FC-QUERY-CPLX-002`);④ `ttl_map` 与段内反向表随 L5 落地。验收:`tests/l4_contracts.rs`。
+> 契约 `FC-QUERY-CPLX-002`);④ `ttl_map` 与段内反向表随 L5 落地;⑤ 计划按**每查询一份**
+> 编译(内存引擎对全量槽位视图),而非设计中的每段一份;⑥ 残余谓词的**选择性重排**尚未
+> 落地,当前按原 AST 三值求值;⑦ §5 图示的双通道并行属设计目标,当前两通道**串行**
+> 执行,向量通道内部按块并行,融合只依赖各自 top-k,语义等价。验收:`tests/l4_contracts.rs`。
 
 模块:`query/{parse/{mod,literal}.rs, display.rs, json.rs, iso.rs, plan.rs, zmap.rs, bm25.rs, fusion.rs, exec.rs}`
 
@@ -70,21 +73,23 @@ duration = number ( "s" | "m" | "h" | "d" | "w" ) ;
 
 ## 2. 查询计划器:`plan.rs` + `zmap.rs`
 
-**目标**:把 AST 编译成"每段一份的执行方案",让数据越少被碰越好。
+**目标**:把 AST 编译成"每查询一份的执行方案"(内存引擎对全量槽位视图编译),让数据越少被碰越好。
 
 ```text
-compile(expr, segment) → Plan {
-    block_mask:  每 1024 行块的"可能匹配"位图     ← zone map 求值
-    eq_blooms:   等值条件的 bloom 预筛             ← bloom 求值
-    residual:    Expr(行级残留谓词,已做选择性重排)
-    selectivity: s = popcount(候选位图) / 段活行数   → 传给 HNSW 选档(05 §8)
+compile(view, ns_id, filter, now_ms) → Plan {
+    candidates:  过滤后候选槽位(Vec<u32>,行级残余谓词已求值)
+    bits:        候选槽位位图(BM25 通道共享)
+    selectivity: s = 候选数 / 命名空间活行数   → 传给 HNSW 选档(05 §8)
 }
+// 块级"可能匹配"位图与 key bloom 预筛是 compile 的内部步骤(zone map/bloom 下推);
+// 残余谓词未做选择性重排,按原 AST 三值求值。
 ```
 
 - **块剪枝**:对每个合取子条件求块级 min/max(见 [04 §5.2](04-l2-persist.md) 算例);
-  `And` = 位图按位与,`Or` = 按位或,`Not` = 取反(注意与全活位图求交,墓碑除外);
-- **条件重排**:合取链按"预估选择性"升序排列(等值 + 高选择字段优先),
-  短路求值让最便宜的条件先淘汰;
+  `And` = 位图按位与,`Or` = 按位或;`Not` 与无块级摘要可用的条件(子串/前缀/后缀/通配)
+  一律保持全 1——三值语义下块级取反会把 `Unknown` 误判为命中,故不下推,交行级残差求值;
+- **条件重排**:合取链按"预估选择性"升序排列(等值 + 高选择字段优先)、短路求值的做法
+  属**设计目标,尚未落地**:当前残余谓词按原 AST 三值求值;块级下推已把大多数不相关块剪掉;
 - **残留谓词**:块位图只证明"块内**可能**有匹配",行级仍需精确求值——
   plan 只减少工作量,不改变语义(与逐行求值结果全等,属性测试保证)。
 
@@ -188,6 +193,9 @@ doc 区:    [u32 doc_count] + [u32 ns_id][u32 slot][u32 doc_len] × count   (归
 
 $$T = O\!\left(2\sum_{t \in Q} df_t\right)\ \text{postings accesses (count pass + score pass)}, \qquad S = O(\text{postings})\ \text{(static)}$$
 
+单次查询另物化命中文档分数映射 $O(\min(N_{ns}, \sum df_t))$,TopK 另计 $O(k)$
+(与契约 `FC-QUERY-CPLX-003` 的校正口径一致)。
+
 查询只碰"含查询词"的文档——这是 BM25 快的根本;无查询词的文档零成本。
 命名空间隔离通过记录体携带的 `ns_id` 判定(记录体带 NsId,[04 §2.2](04-l2-persist.md)):
 同一遍扫描同时完成过滤与 $df_t$ 计数,复杂度不变(额外每 posting 一次 `ns_id` 比较)。
@@ -236,7 +244,7 @@ $$\text{score}(d) = \alpha \cdot \widehat{s_v}(d) + (1-\alpha)\cdot \widehat{s_b
 - 归一化在**本次查询的结果集内**做(不是全库),否则量纲仍不可比;
 - **向量通道方向**:欧氏原始分为距离平方(越小越优),须先取负得到 $s^{*}$ 再归一,否则排序反转;
 - 若某通道只有一个结果(`s^{*}_{\max} = s^{*}_{\min}`),该通道归一值取 1,避免除零;
-- `Weighted { alpha }`(`alpha ∈ [0,1]`,默认 0.5)供"我就是要向量为主"的场景;融合器整体默认 `Rrf{k:60}`;
+- `Weighted { alpha }`(`alpha ∈ [0,1]`,设计推荐 0.5,须显式构造)供"我就是要向量为主"的场景;融合器整体默认 `Rrf{k:60}`;
 - 复杂度 $O(k)$;缺点:对结果集外的高分文档视而不见(两通道 top-k 之外不参与),
   与 RRF 相同——融合都发生在两通道各自 top-k(默认各取 $2k$ 再融合取 $k$,
   减少截断遗憾)。

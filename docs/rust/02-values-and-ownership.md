@@ -102,7 +102,7 @@ let unsigned: u32 = neg as u32;   // 4294967295:补码按位重新解释
 
 **整数溢出**:debug 构建下溢出会 panic;release 构建下会**回绕(wrapping)**。
 所以涉及可能溢出的运算要小心,或使用 `checked_add` / `saturating_add` 等方法。
-mneme 的 varint 解码显式检查溢出,见 [`src/core/varint.rs:99`](../../src/core/varint.rs)。
+mneme 的 varint 解码显式检查溢出,见 [`src/core/varint.rs:103`](../../src/core/varint.rs)。
 
 #### 2.1.2 不丢数据的转换:`TryFrom` 与受检运算
 
@@ -301,7 +301,7 @@ let (value, consumed) = pair;        // 解构(destructuring)
 let value2 = pair.0;                 // 或用 .0 / .1 访问
 ```
 
-mneme 的 `decode_u64` 返回 `Result<(u64, usize)>`,见 [`src/core/varint.rs:93`](../../src/core/varint.rs)。
+mneme 的 `decode_u64` 返回 `Result<(u64, usize)>`,见 [`src/core/varint.rs:97`](../../src/core/varint.rs)。
 
 > 需要"可增长的同类型列表"用 `Vec<T>`,在 [07 章](07-iterators-closures.md) 讲。
 

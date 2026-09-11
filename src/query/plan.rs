@@ -12,6 +12,17 @@ use crate::memory::table::ReaderView;
 
 use super::zmap;
 
+// 单测操作计数:统计残余谓词的行级求值次数(线程局部,避免测试间干扰)。
+#[cfg(test)]
+thread_local! {
+    static ROW_EVALS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn bump_row_evals() {
+    ROW_EVALS.with(|evals| evals.set(evals.get() + 1));
+}
+
 /// 一次查询的执行计划。
 pub(crate) struct Plan {
     /// 过滤后候选槽位(行级残余谓词已求值)。
@@ -50,6 +61,8 @@ pub(crate) fn compile(view: &ReaderView, ns_id: NsId, filter: Option<&Expr>, now
                 slot,
                 access: view.access.get(&slot.rowid).copied(),
             };
+            #[cfg(test)]
+            bump_row_evals();
             if !pred::matches(expr, &ctx) {
                 continue;
             }
@@ -164,6 +177,25 @@ mod tests {
         let count = assert_matches_bruteforce(&view, ns_id, &Expr::field("key").eq("no-such-key"));
         assert_eq!(count, 0, "bloom 否定必须直接得到空候选");
         assert_matches_bruteforce(&view, ns_id, &Expr::field("key").eq("k1028"));
+    }
+
+    /// FC-QUERY-POST-005(bloom 否定必须避免行级求值,证伪"预筛未被走到")
+    #[test]
+    fn key_bloom_skips_row_evaluation() {
+        let (db, ns_id) = setup();
+        let view = db.table.view();
+        ROW_EVALS.with(|evals| evals.set(0));
+        let count = assert_matches_bruteforce(&view, ns_id, &Expr::field("key").eq("no-such-key"));
+        assert_eq!(count, 0);
+        assert_eq!(
+            ROW_EVALS.with(std::cell::Cell::get),
+            0,
+            "bloom 否定应整块剪除候选,不触发任何行级求值"
+        );
+        // 对照:命中存在的 key 时仍有行级求值,防止探针自身失效造成假绿。
+        ROW_EVALS.with(|evals| evals.set(0));
+        assert_matches_bruteforce(&view, ns_id, &Expr::field("key").eq("k1028"));
+        assert!(ROW_EVALS.with(std::cell::Cell::get) > 0);
     }
 
     /// FC-QUERY-POST-005(选择性 = 候选 / 活行)

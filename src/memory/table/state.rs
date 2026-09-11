@@ -131,6 +131,8 @@ impl WriterState {
             ns_registry: Arc::new(HashMap::new()),
             ns_by_path: Arc::new(HashMap::new()),
             index: None,
+            // 加速结构的兜底初值:生产入口(Builder/open)都会用配置覆写;
+            // 16 / 0.01 与 `Tuning::default()` 保持同口径,仅供 `Default` 构造。
             inv: Arc::new(InvertedIndex::default()),
             zones: Arc::new(ZoneIndex::new(16)),
             key_bloom: Arc::new(BloomSet::new(BLOOM_INITIAL_CAPACITY, 0.01)),
@@ -292,17 +294,17 @@ impl WriterState {
     ///
     /// 墓碑不参与(zone 只统计实际字段值);被遮蔽的旧版本保留在索引中,
     /// 由查询期按视图可见性过滤,`as_of` 历史视图因此仍可检索旧版本文本。
-    fn index_observe(&mut self, slot: SlotId, data: &SlotData) {
-        if let Some(text) = &data.text {
+    fn index_observe(&mut self, slot: SlotId, slot_data: &SlotData) {
+        if let Some(text) = &slot_data.text {
             Arc::make_mut(&mut self.inv).insert_text(
                 slot,
-                data.ns_id,
+                slot_data.ns_id,
                 text,
                 self.stopwords_enabled,
             );
         }
-        Arc::make_mut(&mut self.zones).observe(slot.get() as usize, data);
-        if let Some(key) = &data.key {
+        Arc::make_mut(&mut self.zones).observe(slot.get() as usize, slot_data);
+        if let Some(key) = &slot_data.key {
             Arc::make_mut(&mut self.key_bloom).insert(key.as_str());
         }
     }
@@ -315,14 +317,14 @@ impl WriterState {
         self.zones = Arc::new(ZoneIndex::new(self.index_fields_max));
         self.key_bloom = Arc::new(BloomSet::new(BLOOM_INITIAL_CAPACITY, self.bloom_fpp));
         for index in 0..self.slots.len() {
-            let data = Arc::clone(&self.slots[index]);
-            if data.deleted {
+            let slot_data = Arc::clone(&self.slots[index]);
+            if slot_data.deleted {
                 continue;
             }
             // 槽位下标 ≤ u32::MAX(FC-MEM-INV-004),转换可证明不会失败。
             let slot =
                 SlotId::new(u32::try_from(index).expect("槽位下标必可转入 u32(FC-MEM-INV-004)"));
-            self.index_observe(slot, &data);
+            self.index_observe(slot, &slot_data);
         }
     }
 
