@@ -5,8 +5,9 @@
 > **前置**:[02 章](02-values-and-ownership.md)。
 > **对应源码**:[`src/core/types.rs`](../../src/core/types.rs)、[`src/core/metric.rs`](../../src/core/metric.rs)、
 > [`src/core/error.rs`](../../src/core/error.rs)、[`src/core/options/`](../../src/core/options)、
-> [`src/memory/builder.rs`](../../src/memory/builder.rs)、[`src/index/hnsw.rs`](../../src/index/hnsw.rs)、
-> [`src/index/hidx.rs`](../../src/index/hidx.rs)。
+> [`src/memory/builder.rs`](../../src/memory/builder.rs)、[`src/memory/pred.rs`](../../src/memory/pred.rs)、
+> [`src/index/hnsw.rs`](../../src/index/hnsw.rs)、[`src/index/hidx.rs`](../../src/index/hidx.rs)、
+> [`src/query/parse/mod.rs`](../../src/query/parse/mod.rs)。
 
 Rust 没有"类(class)",而是把数据和行为分开:
 
@@ -37,6 +38,19 @@ let p = HnswParams { m: 16, m0: 32, ef_construction: 200, ef_search: 64 };
 ```
 
 见 [`src/core/options/index.rs:8-17`](../../src/core/options/index.rs)。
+
+字段名与局部变量同名时,可以省略 `字段名:` 只写变量名,这叫**字段初始化简写(field init shorthand)**:
+
+```rust
+let view = ...;
+let blocks = block_count(view);
+let ctx = MaskCtx { view, blocks };   // 等价于 MaskCtx { view: view, blocks: blocks }
+```
+
+L4 的内部结构几乎都这么构造——`MaskCtx`、`Plan`、`EvalCtx`、`ChannelCtx` 等,见
+[`src/query/zmap.rs:20-23`](../../src/query/zmap.rs) 与
+[`src/query/plan.rs:80-84`](../../src/query/plan.rs)。简写与完整写法可以混用
+(`Plan { candidates, bits, selectivity }` 三个字段全是简写),只影响书写,字段名与语义不变。
 
 只想改几个字段、其余沿用另一份值时,用**结构体更新语法(struct update syntax)** `..`:
 
@@ -81,7 +95,7 @@ pub struct SystemClock;      // 没有任何字段
 ```
 
 它只表示"存在这样一个类型",用来挂载行为(实现 `Clock` trait),见
-[`src/core/options/clock.rs:20`](../../src/core/options/clock.rs)。
+[`src/core/options/clock.rs:24`](../../src/core/options/clock.rs)。
 
 ---
 
@@ -117,6 +131,34 @@ pub const fn needs_norm(&self) -> bool { !matches!(self, Metric::Dot) }
 的 `Dimension::new` 保持普通 `fn`(编译期求值收益不大),而纯取值的 `RowId::get` 可以是 `const`。
 见 [`src/core/types.rs:28`](../../src/core/types.rs) 与
 [`src/core/options/dimension.rs:40`](../../src/core/options/dimension.rs)。
+
+#### 2.1.2 固有方法还是 trait 方法:`Expr::from_str` 与 `#[allow(clippy::…)]`
+
+L4 给 `Expr` 加了 DSL 解析入口,但**没有**实现标准库的 `FromStr` trait,而是写固有方法:
+
+```rust
+impl Expr {
+    /// 解析过滤 DSL 字符串。
+    ///
+    /// # Errors
+    /// 语法错误返回 [`MnemeError::FilterParse`],消息携带出错字节位置。
+    // 固有方法而非 `FromStr` 实现:宿主 `Expr::from_str(..)` 无需 import trait。
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(input: &str) -> Result<Expr> { ... }
+}
+```
+
+见 [`src/query/parse/mod.rs:19-48`](../../src/query/parse/mod.rs)。要点:
+
+- **固有方法(inherent method)** 直接挂在类型上,`Expr::from_str(..)` 调用时不需要任何 `use`;
+  而 **trait 方法**要求 trait 在作用域里才能调用(见 [08 §4](08-modules-docs.md))。
+  `FromStr` 是标准库的"从字符串解析"trait,`"42".parse::<i64>()` 走的就是它(见 [06 §3](06-generics-traits.md))。
+- clippy 的 `should_implement_trait` lint 会提示"这个 `from_str` 长得像 `FromStr`"。
+  mneme 选择保留固有方法,于是用 `#[allow(clippy::should_implement_trait)]` **只关这一条 lint**,
+  并在上一行注释写清原因。规范要求:任何 `#[allow(clippy::…)]` 都必须带理由,
+  禁止全局 `#![allow(warnings)]`(见 [01 §5](01-toolchain.md))。
+- 如果你的类型确实希望被 `str::parse` 通用地调用,就实现 `FromStr`;是否实现是 API 设计取舍,
+  不是语法限制。
 
 ### 2.2 方法(method)
 
@@ -171,7 +213,7 @@ pub fn into_sorted_vec(mut self) -> Vec<T> {
 
 `mut self` 不是一种新的接收者,而是"`self`(值接收) + 一个可变的局部绑定"。调用后原 `TopK`
 被**移动**进函数,不能再使用——这正是 `into_*` 命名的语义。见
-[`src/core/heap.rs:166`](../../src/core/heap.rs)。
+[`src/core/heap.rs:201-213`](../../src/core/heap.rs)。
 
 #### 2.2.3 链式方法:`mut self -> Self` 与构建者模式
 
@@ -257,6 +299,57 @@ match metric {
 - `_` 是通配符,但 mneme 规范鼓励显式列出,避免新增变体时被静默吞掉。
 - 更复杂的模式、`if let`、`matches!` 在 [05 章](05-errors.md) 展开。
 
+分支还能带**守卫(guard)**:写成 `模式 if 条件 => ...`,只有模式匹配**且**条件为真才走该分支。
+L4 用它表达"空列表特例":
+
+```rust
+match self {
+    Expr::And(parts) if parts.is_empty() => json!({ "always": true }),
+    Expr::And(parts) => exprs_to_meta(parts),
+    ...
+}
+```
+
+见 [`src/query/json.rs:213-216`](../../src/query/json.rs) 与
+[`src/query/display.rs:76-79`](../../src/query/display.rs)。要点:
+
+- 守卫里的 `parts` 已经由模式绑定,可以直接用;多个模式共用同一守卫写成 `A(x) | B(x) if cond`;
+- 守卫不是模式的一部分,**穷尽性检查只看主模式**——`Expr::And(parts) if ...` 后面仍需要一个不带守卫的
+  `Expr::And(parts)` 分支兜底,否则编译器报 `non-exhaustive patterns`。
+
+### 3.4 递归枚举:为什么 `Expr` 里套着 `Box`
+
+过滤 AST 需要"表达式里包含表达式",所以 `Expr` 是**递归枚举**:
+
+```rust
+pub enum Expr {
+    Cmp { op: CmpOp, field: String, val: Val },
+    ...
+    And(Box<[Expr]>),   // 逻辑与:变长子节点列表
+    Or(Box<[Expr]>),
+    Not(Box<Expr>),     // 逻辑非:单个子节点
+    ...
+}
+```
+
+见 [`src/memory/pred.rs:92-128`](../../src/memory/pred.rs)。如果直接写 `Not(Expr)` /
+`And(Vec<Expr>)`,类型大小会**无限大**(`Expr` 里含 `Expr`……循环下去),编译器报
+`recursive type has infinite size`。`Box<T>` / `Box<[T]>` 是"堆上单个值"的所有权指针,
+本身大小固定(分别为一个指针、一个"指针 + 长度"胖指针),递归因此被截断。要点:
+
+- **构造**:`Expr::Not(Box::new(inner))`、`Expr::And(vec![a, b].into_boxed_slice())`——
+  L4 的解析器与 `Display` 都这么造节点,见 [`src/query/parse/mod.rs:228`](../../src/query/parse/mod.rs);
+- **解构**:模式写法和普通枚举一样,`Expr::Not(inner)` 里的 `inner` 绑定到 `&Box<Expr>`,
+  用 `*inner` 或直接当 `Expr` 用(自动 deref);`match` 里也照常写 `Expr::Not(_)`;
+- **列表为什么用 `Box<[Expr]>` 而不是 `Vec<Expr>`**:AST 构造完就不再增删,`Box<[T]>`
+  少了 `capacity` 字段、语义上就是"定长",配合 `Vec::into_boxed_slice()` 转换——
+  和 [02 §3.7](02-values-and-ownership.md) 的 `Arc<[f32]>` 是同一手法;
+- **什么时候需要 `Box`**:递归类型(树、AST、链表)、trait 对象(见 [06 §4](06-generics-traits.md)),
+  以及任何"要在类型里放一个自身、又不想让它无限嵌套"的场景。
+
+> `Box` 在 prelude 里,无需 `use`;`Box::new(x)` 把 `x` 移到堆上,所有者离开作用域时
+> 连同堆内存一起自动释放(所有权规则,见 [02 §3](02-values-and-ownership.md))。
+
 ---
 
 ## 4. `#[derive(...)]`:自动生成样板
@@ -305,9 +398,9 @@ pub struct Scoring {                         // 字段含 f32
   所以载荷**不能是 `f32`**(`RowId`、`u32` 可以)。
 - 需要给 `f32` 排序时,用 `f32::total_cmp`(它定义了一个把 `NaN` 也纳入的全序),而不是
   `partial_cmp().unwrap()`(遇 `NaN` 会 panic)。mneme 的 `TopK` 排序不依赖载荷是浮点,而是由
-  `Metric::better` 决定方向,同分再比 `Ord` 载荷。见 [`src/core/heap.rs:180`](../../src/core/heap.rs)。
+  `Metric::better` 决定方向,同分再比 `Ord` 载荷。见 [`src/core/heap.rs:201-213`](../../src/core/heap.rs)。
 
-`derive` 也能用在枚举上,见 [`src/core/options/index.rs:64`](../../src/core/options/index.rs)
+`derive` 也能用在枚举上,见 [`src/core/options/index.rs:66-76`](../../src/core/options/index.rs)
 的 `VectorFormat`。
 
 ### 4.2 手写比较 trait:字段含 `f32` 又要排序时(L3 的 `Cand`)
@@ -403,7 +496,7 @@ pub enum VectorFormat {
 }
 ```
 
-`#[default]` 指定哪个变体是默认值。见 [`src/core/options/index.rs:64-73`](../../src/core/options/index.rs)。
+`#[default]` 指定哪个变体是默认值。见 [`src/core/options/index.rs:67-71`](../../src/core/options/index.rs)。
 
 ### 5.3 惯用法
 
@@ -447,7 +540,7 @@ impl fmt::Display for RowId {
 pub enum MnemeError { ... }
 ```
 
-见 [`src/core/error.rs:13-14`](../../src/core/error.rs)。
+见 [`src/core/error.rs:16-17`](../../src/core/error.rs)。
 
 `#[non_exhaustive]` 表示"这个枚举将来可能增加变体":
 **外部 crate 的代码必须用 `_` 兜底匹配**,不能假设变体已全部列完。
@@ -478,6 +571,10 @@ pub struct UpdatePatch {
 ## 9. 本章小结
 
 - 数据用 `struct`(具名/元组/单元)和 `enum`(变体可带数据)描述;行为用 `impl` 挂载。
+- 结构体字面量支持**字段初始化简写**(`MaskCtx { view, blocks }`);`match` 分支可带**守卫**
+  (`模式 if 条件`),但穷尽性只看主模式,带守卫的分支之后仍要兜底。
+- 递归 `enum`(如 `Expr`)用 `Box<Expr>`/`Box<[Expr]>` 打断无限大小;固有方法不要求 trait
+  在作用域,`#[allow(clippy::…)]` 必须就近写明理由。
 - `impl` 里:关联函数不带 `self`,方法带 `self`/`&self`/`&mut self`;还能定义关联常量。
 - `#[derive(...)]` 自动生成 `Debug`/`Clone`/`Copy`/比较/`Default` 等;`Default` 也可手写或给枚举变体加 `#[default]`;
   构造时可用结构体更新语法 `..base` 只覆盖部分字段。
@@ -493,6 +590,8 @@ pub struct UpdatePatch {
 3. 给 `Point` 实现 `Display`,输出形如 `(1.0, 2.0)`。
 4. 去掉 `Point` 的 `PartialEq` 派生,手写 `PartialEq`/`Eq`/`PartialOrd`/`Ord`:先比 `x` 再比 `y`(用
    `f32::total_cmp` 与 `.then(...)`),并建立一个 `Point { x: 1.0, ..p }` 的副本验证比较结果。
+5. 定义递归枚举 `enum Tree { Leaf(i32), Node(Box<Tree>, Box<Tree>) }`,写一个 `sum(&self) -> i32`,
+   再算 `Node(Leaf(1), Node(Leaf(2), Leaf(3)))` 的和(体会 `Box` 为什么必须有)。
 
 ## 下一章
 

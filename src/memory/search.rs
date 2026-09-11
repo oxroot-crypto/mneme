@@ -70,6 +70,21 @@ pub(crate) struct SearchParams<'a> {
     pub(crate) filter_post_threshold: f32,
     /// 过滤三档:放大后过滤 / 候选暴力分界。
     pub(crate) filter_brute_threshold: f32,
+    /// 预计算的候选槽位(过滤先行,与 BM25 通道共享);
+    /// `None` = 本函数内自行收集。
+    pub(crate) candidates: Option<&'a [u32]>,
+}
+
+/// 过滤先行的候选收集输入(与 BM25 通道共享同一份候选)。
+pub(crate) struct CandidateQuery<'a> {
+    /// 不可变读视图。
+    pub(crate) view: &'a ReaderView,
+    /// 目标命名空间。
+    pub(crate) ns_id: NsId,
+    /// 预过滤表达式。
+    pub(crate) filter: Option<&'a Expr>,
+    /// 当前时刻(Unix 毫秒)。
+    pub(crate) now_ms: i64,
 }
 
 /// 分块扫描的输入(顺序与并行共用)。
@@ -92,7 +107,19 @@ pub(crate) fn search(params: &SearchParams<'_>) -> Result<Vec<Scored>> {
         0.0
     };
 
-    let candidates = collect_candidates(params);
+    let candidates_owned;
+    let candidates: &[u32] = match params.candidates {
+        Some(list) => list,
+        None => {
+            candidates_owned = collect_candidates(&CandidateQuery {
+                view: params.view,
+                ns_id: params.ns_id,
+                filter: params.filter,
+                now_ms: params.now_ms,
+            });
+            &candidates_owned
+        }
+    };
     let k = params.top_k.min(candidates.len());
     if k == 0 {
         return Ok(Vec::new());
@@ -103,24 +130,24 @@ pub(crate) fn search(params: &SearchParams<'_>) -> Result<Vec<Scored>> {
         && index.node_count() > params.brute_force_max_rows
     {
         let budget = AnnBudget { query_norm, k };
-        return ann_search(params, index.as_ref(), &candidates, budget);
+        return ann_search(params, index.as_ref(), candidates, budget);
     }
 
-    let top = run_scan(params, &candidates, query_norm, k)?;
+    let top = run_scan(params, candidates, query_norm, k)?;
     Ok(rescore(params, top, query_norm))
 }
 
 /// 过滤先行:只求值元数据,得到候选槽位(不读向量)。
-fn collect_candidates(params: &SearchParams<'_>) -> Vec<u32> {
+pub(crate) fn collect_candidates(query: &CandidateQuery<'_>) -> Vec<u32> {
     let mut candidates: Vec<u32> = Vec::new();
-    for (idx, slot) in params.view.slots.iter().enumerate() {
-        if params.view.dead.get(idx) || slot.ns_id != params.ns_id || !slot.is_live(params.now_ms) {
+    for (idx, slot) in query.view.slots.iter().enumerate() {
+        if query.view.dead.get(idx) || slot.ns_id != query.ns_id || !slot.is_live(query.now_ms) {
             continue;
         }
-        if let Some(expr) = params.filter {
+        if let Some(expr) = query.filter {
             let ctx = EvalCtx {
                 slot,
-                access: params.view.access.get(&slot.rowid).copied(),
+                access: query.view.access.get(&slot.rowid).copied(),
             };
             if !pred::matches(expr, &ctx) {
                 continue;
@@ -188,7 +215,10 @@ fn prefix_bitmaps(
             alive.set(idx);
         }
     }
-    let filter = params.filter.map(|_| {
+    // 仅当存在用户过滤(`filter`)时构造索引前缀过滤位图:exec 无过滤时
+    // 传全 1 候选且 `filter = None`,不得把"全 1 候选"误当过滤(否则会触发
+    // 契约 FC-INDEX-POST-001 的档③「候选暴力」路径)。
+    let filter = params.filter.is_some().then(|| {
         let mut bits = BitSet::default();
         for &idx in candidates {
             if (idx as usize) < indexed {

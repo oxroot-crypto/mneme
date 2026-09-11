@@ -94,6 +94,10 @@ impl Default for Builder {
 impl Builder {
     /// 构建库句柄。
     ///
+    /// # 既存库配置
+    /// 打开既有库时,`Tuning::stopwords` 以 MANIFEST 记录值为准(建库即锁定),
+    /// 调用方冲突配置被忽略,避免索引分词与查询分词不一致(FC-PERSIST-POST-009)。
+    ///
     /// # Errors
     /// * 未设置 `dimension`(新建库)→ [`MnemeError::Config`];
     /// * `dedup_threshold` 非 `[0,1]` 内的有限值 → [`MnemeError::Config`]
@@ -110,9 +114,14 @@ impl Builder {
     /// let db = Builder::default().dimension(2).build().unwrap();
     /// assert!(db.list_namespaces().unwrap().is_empty());
     /// ```
-    pub fn build(self) -> Result<Mneme> {
+    pub fn build(mut self) -> Result<Mneme> {
         self.validate()?;
         let (store, recovered, dimension, metric) = self.open_backend()?;
+        // 既存库的分词口径以 MANIFEST 为准(建库即锁定):调用方冲突配置
+        // 只影响本次查询会造成索引/查询分词不一致,静默漏召回。
+        if let Some(state) = &recovered {
+            self.tuning.stopwords = state.stopwords_enabled;
+        }
         let config = Arc::new(self.into_config(dimension, metric));
         let hook = store.as_ref();
         let table = build_table(hook, recovered, &config);
@@ -176,13 +185,26 @@ impl Builder {
         Ok(())
     }
 
-    /// 校验过滤三档阈值:有限且 `0 ≤ brute ≤ post ≤ 1`(FC-INDEX-PRE-001)。
+    /// 校验过滤三档阈值与 bloom/字段上限:有限且 `0 ≤ brute ≤ post ≤ 1`;
+    /// `bloom_fpp ∈ (0,1)`(否则会生产 `k > 64`、自读不回的段);
+    /// `field_dict_max ≥ 1`(至少容纳 key 字符串字段)(FC-INDEX-PRE-001)。
     fn validate_tuning(&self) -> Result<()> {
         let post = self.tuning.filter_post_threshold;
         let brute = self.tuning.filter_brute_threshold;
         if !(0.0..=1.0).contains(&post) || !(0.0..=1.0).contains(&brute) || brute > post {
             return Err(MnemeError::Config {
                 reason: "过滤三档阈值必须是 [0,1] 内有限值且 brute ≤ post",
+            });
+        }
+        let fpp = self.tuning.bloom_fpp;
+        if !fpp.is_finite() || fpp <= 0.0 || fpp >= 1.0 {
+            return Err(MnemeError::Config {
+                reason: "bloom_fpp 必须是 (0,1) 内的有限值",
+            });
+        }
+        if self.tuning.field_dict_max < 1 {
+            return Err(MnemeError::Config {
+                reason: "field_dict_max 至少为 1(需容纳 key 字段)",
             });
         }
         Ok(())
@@ -207,6 +229,7 @@ impl Builder {
                         fail_fast_on_corruption: self.fail_fast_on_corruption,
                         hook: self.fsync_hook.clone(),
                         index_factory: Some(crate::index::default_factory()),
+                        tuning: self.tuning.clone(),
                     },
                 )?;
                 Ok((Some(store), Some(state), Dimension::new(dimension)?, metric))

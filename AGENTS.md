@@ -2,8 +2,9 @@
 
 Mneme:纯 Rust 的嵌入式向量存储引擎(面向 AI Agent 超长期记忆)。单 crate,edition 2024,
 MSRV 1.93。**当前实现了 L0 原语层 `src/core/`、L1 内存引擎 `src/memory/`、L2 持久层
-`src/persist/` 与 L3 索引层 `src/index/`**(WAL、段文件、MANIFEST、崩溃恢复、全量快照 flush、
-自研 HNSW、过滤三档、hidx 图持久化、mmap 段读取);L4–L6 目前仅有设计文档,
+`src/persist/`、L3 索引层 `src/index/` 与 L4 检索层 `src/query/`**(WAL、段文件、MANIFEST、
+崩溃恢复、全量快照 flush、自研 HNSW、过滤三档、hidx 图持久化、mmap 段读取、过滤 DSL、
+zone map/bloom 计划器、BM25、RRF/加权融合、msec 轻量索引四区落盘);L5–L6 目前仅有设计文档,
 `src/` 下没有对应代码。L2 依赖 `crc32fast`;L3 经 feature `mmap`(默认开)引入 `memmap2`,
 `criterion` 为 dev-dependency。
 
@@ -58,7 +59,7 @@ cargo doc --no-deps        # 公开项须 100% 文档覆盖
 
 - 契约测试:`tests/core_contracts.rs`(L0)、`tests/memory_contracts.rs`、
   `tests/query_contracts.rs`、`tests/model_contracts.rs`、`tests/life_contracts.rs`(L1)、
-  `tests/persist_contracts.rs`(L2)、`tests/hnsw_contracts.rs`(L3);
+  `tests/persist_contracts.rs`(L2)、`tests/hnsw_contracts.rs`(L3)、`tests/l4_contracts.rs`(L4);
   追溯门禁 `tests/contract_traceability.rs`;属性测试用 `proptest`(dev-dependency)。
 - 测试即文档:文件头列不变量编号,断言处引用 `FC-*`,与 `contracts.md` 双向可追溯(门禁强制:无悬空引用、无孤立测试)。
 

@@ -63,6 +63,7 @@ impl SnapshotHandle {
             table: Arc::clone(&self.table),
             view: Arc::clone(&self.view),
             ns_path: Arc::from(path),
+            as_of_ms: self.as_of_ms,
         }
     }
 }
@@ -73,12 +74,15 @@ pub struct SnapshotNamespace {
     pub(crate) table: Arc<Table>,
     pub(crate) view: Arc<ReaderView>,
     pub(crate) ns_path: Arc<str>,
+    /// 快照时刻:检索的 TTL 可见性判定以它为准(设计 07 §25)。
+    pub(crate) as_of_ms: i64,
 }
 
 impl std::fmt::Debug for SnapshotNamespace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SnapshotNamespace")
             .field("ns_path", &self.ns_path)
+            .field("as_of_ms", &self.as_of_ms)
             .finish_non_exhaustive()
     }
 }
@@ -126,7 +130,7 @@ impl SnapshotNamespace {
             scoring: None,
             diversify: Diversity::Off,
             expand: None,
-            as_of: None,
+            as_of: Some(self.as_of_ms),
             query_id: None,
             rerank: None,
             _marker: PhantomData,
@@ -140,6 +144,7 @@ impl SnapshotNamespace {
     ///
     /// # Returns
     /// 命中时返回记录只读视图;命名空间未注册或 key 不存在返回 `None`。
+    /// 可见性(墓碑/逻辑过期)以**快照时刻 `as_of_ms`** 判定(FC-QUERY-POST-006)。
     ///
     /// # Errors
     /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
@@ -154,7 +159,7 @@ impl SnapshotNamespace {
     /// assert!(snap.get("a").unwrap().is_some());
     /// ```
     pub fn get(&self, key: &str) -> Result<Option<RecordRef<'_>>> {
-        let now = self.table.config.clock.now_unix_ms();
+        let now = self.as_of_ms;
         Ok(self
             .ns_id()
             .and_then(|ns_id| point_get(&self.view, ns_id, &Key::new(key), now)))
@@ -167,6 +172,7 @@ impl SnapshotNamespace {
     ///
     /// # Returns
     /// 命中活记录时返回只读视图;`RowId` 不存在、已墓碑或已逻辑过期返回 `None`。
+    /// 过期以**快照时刻 `as_of_ms`** 判定,与墙上时钟无关。
     ///
     /// # Errors
     /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
@@ -184,7 +190,7 @@ impl SnapshotNamespace {
     /// assert!(snap.get_by_rowid(rowid).unwrap().is_some());
     /// ```
     pub fn get_by_rowid(&self, id: RowId) -> Result<Option<RecordRef<'_>>> {
-        let now = self.table.config.clock.now_unix_ms();
+        let now = self.as_of_ms;
         Ok(self
             .view
             .live_slot(id)
@@ -199,7 +205,8 @@ impl SnapshotNamespace {
     /// * `keys` - 记录键列表;未命中的位置以 `None` 占位。
     ///
     /// # Returns
-    /// 与 `keys` 等长、顺序一致的命中视图列表。
+    /// 与 `keys` 等长、顺序一致的命中视图列表。可见性以快照时刻判定
+    /// (同 [`get`](Self::get),FC-QUERY-POST-006)。
     ///
     /// # Errors
     /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
@@ -216,7 +223,7 @@ impl SnapshotNamespace {
     /// assert!(refs[1].is_none());
     /// ```
     pub fn get_many(&self, keys: &[&str]) -> Result<Vec<Option<RecordRef<'_>>>> {
-        let now = self.table.config.clock.now_unix_ms();
+        let now = self.as_of_ms;
         let ns_id = self.ns_id();
         Ok(keys
             .iter()
@@ -230,7 +237,8 @@ impl SnapshotNamespace {
     /// * `id` - 目标 `RowId`;仅活记录可见。
     ///
     /// # Returns
-    /// 命中活记录时返回向量拷贝;不可见时返回 `None`。
+    /// 命中活记录时返回向量拷贝;不可见时返回 `None`。可见性以快照时刻判定
+    /// (同 [`get`](Self::get),FC-QUERY-POST-006)。
     ///
     /// # Errors
     /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
@@ -248,7 +256,7 @@ impl SnapshotNamespace {
     /// assert_eq!(snap.get_vector(rowid).unwrap().unwrap(), vec![1.0, 0.0]);
     /// ```
     pub fn get_vector(&self, id: RowId) -> Result<Option<Vec<f32>>> {
-        let now = self.table.config.clock.now_unix_ms();
+        let now = self.as_of_ms;
         Ok(self
             .view
             .live_slot(id)
@@ -288,7 +296,8 @@ impl SnapshotNamespace {
     /// * `filter` - 三值过滤表达式;`None` 表示不过滤。
     ///
     /// # Returns
-    /// 命中过滤条件的活记录数;命名空间未注册返回 `0`。
+    /// 命中过滤条件的活记录数;命名空间未注册返回 `0`。逻辑过期以**快照时刻
+    /// `as_of_ms`** 判定(FC-QUERY-POST-006)。
     ///
     /// # Errors
     /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
@@ -307,7 +316,7 @@ impl SnapshotNamespace {
         let Some(ns_id) = self.ns_id() else {
             return Ok(0);
         };
-        let now = self.table.config.clock.now_unix_ms();
+        let now = self.as_of_ms;
         let mut count = 0;
         for (idx, slot) in self.view.slots.iter().enumerate() {
             if self.view.dead.get(idx) || slot.ns_id != ns_id || !slot.is_live(now) {

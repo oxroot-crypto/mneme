@@ -5,12 +5,23 @@
 > **前置阅读**:[03 §5](03-l1-memory.md)(过滤 AST)、[04 §5](04-l2-persist.md)(zone map/bloom)、[05 §8](05-l3-hnsw.md)(过滤三档)。
 > **本章你将学到**:DSL 文法与解析器 → 查询计划器 → BM25 公式逐项拆解(含手算)→
 > RRF/加权融合 → 执行管线 → 去重服务。
+>
+> **落地状态(2026-09)**:本章已落地于 `src/query/`(解析/展示/JSON 往返、计划器、
+> BM25、融合、执行管线)与 `src/memory/analysis/`(内存倒排 / zone map / bloom),
+> msec 四区随 `flush` 落盘、`open` 经重排映射重建(设计 04 §5,契约 `FC-PERSIST-POST-008`)。
+> 与本章设计的工程口径差异:① 内存引擎只维护一份全局倒排(见 [04 §5.4](04-l2-persist.md)
+> 落地注);② 三值语义下 `Not` 不做块级取反(位图取反会把 `Unknown` 误判为命中),
+> 交行级残差求值;③ 计划编译仍含 $O(N)$ 的逐行可见性判定(待段句柄重构消除,
+> 契约 `FC-QUERY-CPLX-002`);④ `ttl_map` 与段内反向表随 L5 落地;⑤ 计划按**每查询一份**
+> 编译(内存引擎对全量槽位视图),而非设计中的每段一份;⑥ 残余谓词的**选择性重排**尚未
+> 落地,当前按原 AST 三值求值;⑦ §5 图示的双通道并行属设计目标,当前两通道**串行**
+> 执行,向量通道内部按块并行,融合只依赖各自 top-k,语义等价。验收:`tests/l4_contracts.rs`。
 
-模块:`query/{parse.rs, plan.rs, zmap.rs, bm25.rs, fusion.rs, result_dedup.rs, exec.rs}`
+模块:`query/{parse/{mod,literal}.rs, display.rs, json.rs, iso.rs, plan.rs, zmap.rs, bm25.rs, fusion.rs, exec.rs}`
 
 ---
 
-## 1. 过滤 DSL:`parse.rs`
+## 1. 过滤 DSL:`parse/{mod,literal}.rs`
 
 ### 1.1 文法(EBNF)
 
@@ -36,7 +47,7 @@ duration_expr = "now" ( "-" | "+" ) duration ;   (* now - 7d *)
 duration = number ( "s" | "m" | "h" | "d" | "w" ) ;
 ```
 
-- **解析器**:递归下降,约 300 行手写;优先级 `not > and > or`;
+- **解析器**:递归下降,语法与运算符分派(`parse/mod.rs`)+ 字面量解析(`parse/literal.rs`);优先级 `not > and > or`;
 - **路径**:`path` 为 `a.b.c` 形式的点路径(嵌套元数据字段);
 - **运算符别名**:`&&` / `||` / `!` 作为 `and` / `or` / `not` 的等价写法被接受
   (01 §6 的 `filter!` 示例即用 `&&`);
@@ -62,21 +73,23 @@ duration = number ( "s" | "m" | "h" | "d" | "w" ) ;
 
 ## 2. 查询计划器:`plan.rs` + `zmap.rs`
 
-**目标**:把 AST 编译成"每段一份的执行方案",让数据越少被碰越好。
+**目标**:把 AST 编译成"每查询一份的执行方案"(内存引擎对全量槽位视图编译),让数据越少被碰越好。
 
 ```text
-compile(expr, segment) → Plan {
-    block_mask:  每 1024 行块的"可能匹配"位图     ← zone map 求值
-    eq_blooms:   等值条件的 bloom 预筛             ← bloom 求值
-    residual:    Expr(行级残留谓词,已做选择性重排)
-    selectivity: s = popcount(候选位图) / 段活行数   → 传给 HNSW 选档(05 §8)
+compile(view, ns_id, filter, now_ms) → Plan {
+    candidates:  过滤后候选槽位(Vec<u32>,行级残余谓词已求值)
+    bits:        候选槽位位图(BM25 通道共享)
+    selectivity: s = 候选数 / 命名空间活行数   → 传给 HNSW 选档(05 §8)
 }
+// 块级"可能匹配"位图与 key bloom 预筛是 compile 的内部步骤(zone map/bloom 下推);
+// 残余谓词未做选择性重排,按原 AST 三值求值。
 ```
 
 - **块剪枝**:对每个合取子条件求块级 min/max(见 [04 §5.2](04-l2-persist.md) 算例);
-  `And` = 位图按位与,`Or` = 按位或,`Not` = 取反(注意与全活位图求交,墓碑除外);
-- **条件重排**:合取链按"预估选择性"升序排列(等值 + 高选择字段优先),
-  短路求值让最便宜的条件先淘汰;
+  `And` = 位图按位与,`Or` = 按位或;`Not` 与无块级摘要可用的条件(子串/前缀/后缀/通配)
+  一律保持全 1——三值语义下块级取反会把 `Unknown` 误判为命中,故不下推,交行级残差求值;
+- **条件重排**:合取链按"预估选择性"升序排列(等值 + 高选择字段优先)、短路求值的做法
+  属**设计目标,尚未落地**:当前残余谓词按原 AST 三值求值;块级下推已把大多数不相关块剪掉;
 - **残留谓词**:块位图只证明"块内**可能**有匹配",行级仍需精确求值——
   plan 只减少工作量,不改变语义(与逐行求值结果全等,属性测试保证)。
 
@@ -166,15 +179,22 @@ IDF = ln((1000 - 100 + 0.5)/(100 + 0.5) + 1) = ln(8.96 + 1) = ln 9.96 ≈ 2.299
 
 ```text
 term_dict: [term → (df, postings_offset, postings_len)]   (段内排序,二分查找)
-postings:  [slot_delta varint][tf varint] × df           (SlotId 升序,差分编码)
-doc_len:   f32 × count                                     (|D|,归一用)
+postings:  [slot_delta varint][tf varint] × df           (SlotId 严格升序,差分编码)
+doc 区:    [u32 doc_count] + [u32 ns_id][u32 slot][u32 doc_len] × count   (归一用)
 ```
+
+> 落盘在词表与 postings 区之间写入 `[u64 postings_total_len]` 显式长度,doc 区起点
+> 不靠"各词条声明区间的最大值"推断;重复词条与重复槽位在解码/编码时显式拒绝
+> (见 `src/persist/msec/inverted.rs`)。
 
 - **差分 + varint**:SlotId 升序时相邻差多为小整数,varint 平均 1–2 字节
   ([02 §6](02-l0-core.md));整条 postings 空间 ≈ $df \times 3$ 字节量级(经验值);
 - **打分复杂度**:对查询的每个词走一遍 postings:
 
 $$T = O\!\left(2\sum_{t \in Q} df_t\right)\ \text{postings accesses (count pass + score pass)}, \qquad S = O(\text{postings})\ \text{(static)}$$
+
+单次查询另物化命中文档分数映射 $O(\min(N_{ns}, \sum df_t))$,TopK 另计 $O(k)$
+(与契约 `FC-QUERY-CPLX-003` 的校正口径一致)。
 
 查询只碰"含查询词"的文档——这是 BM25 快的根本;无查询词的文档零成本。
 命名空间隔离通过记录体携带的 `ns_id` 判定(记录体带 NsId,[04 §2.2](04-l2-persist.md)):
@@ -190,7 +210,7 @@ $$T = O\!\left(2\sum_{t \in Q} df_t\right)\ \text{postings accesses (count pass 
 规则:按 Unicode 空白切词 → 小写化 → 去首尾标点;**CJK 连续段做 bigram**
 ("记忆库" → "记忆","忆库")——bigram 是无词典分词的保底方案,精度对
 关键词通道足够;拉丁词按词切。停用词表为内置常量,经 `Tuning::stopwords` 开关(默认开,
-见 [16 §2](16-api-reference.md))。未来替换 jieba 级分词器只动 `bm25::tokenize` 一个函数。
+见 [16 §2](16-api-reference.md))。未来替换 jieba 级分词器只动 `core::text::tokenize` 一个函数。
 
 ---
 
@@ -224,7 +244,7 @@ $$\text{score}(d) = \alpha \cdot \widehat{s_v}(d) + (1-\alpha)\cdot \widehat{s_b
 - 归一化在**本次查询的结果集内**做(不是全库),否则量纲仍不可比;
 - **向量通道方向**:欧氏原始分为距离平方(越小越优),须先取负得到 $s^{*}$ 再归一,否则排序反转;
 - 若某通道只有一个结果(`s^{*}_{\max} = s^{*}_{\min}`),该通道归一值取 1,避免除零;
-- `Weighted { alpha }`(`alpha ∈ [0,1]`,默认 0.5)供"我就是要向量为主"的场景;融合器整体默认 `Rrf{k:60}`;
+- `Weighted { alpha }`(`alpha ∈ [0,1]`,设计推荐 0.5,须显式构造)供"我就是要向量为主"的场景;融合器整体默认 `Rrf{k:60}`;
 - 复杂度 $O(k)$;缺点:对结果集外的高分文档视而不见(两通道 top-k 之外不参与),
   与 RRF 相同——融合都发生在两通道各自 top-k(默认各取 $2k$ 再融合取 $k$,
   减少截断遗憾)。
@@ -290,7 +310,7 @@ C              0.85 / 1           缺席 / —           1/61        = 0.01639
 
 ---
 
-## 6. 去重服务:`result_dedup.rs`
+## 6. 结果级去重(实现于 L1 `memory::expand`)
 
 写入期去重(`Dedup`,见 [03 §6](03-l1-memory.md))与**结果级去重**是两个独立旋钮;
 后者只作用于本次 `execute()` 返回的命中列表:

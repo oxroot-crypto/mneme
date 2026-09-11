@@ -109,13 +109,13 @@ agent_memory/
                       当前可见版本 = 该 RowId 链尾未被墓碑遮蔽者
        key_index:  按 (NsId, key) 排序的 [(NsId u32, key len+bytes, RowId u64, SlotId u32, seqno u64, doc_offset u64)]
                    → get(key) O(log n) 定位本段最新版本(跨段再按 seqno 合并,§5.5)
-       field_dict:  [(u16 field_id, len, name bytes)...]  上限 16 个索引字段(默认,见 §5.1)
-       zone_maps:   每 1024 行一块 × 每个索引字段: (min, max, has_null)
-       (数值/时间字段用 f64/i64 存储;created_at 恒定索引)
+       field_dict:  [(u16 field_id, u8 kind, len, name bytes)...]  上限 16 个索引字段(默认,见 §5.1)
+       zone_maps:   每 1024 行一块 × 每个数值/时间索引字段: (f64 min, f64 max, u8 flags)
+                    (flags = has_value | has_null;±∞ 表示"区间未知",放弃该块剪枝)
        ttl_map:     每 1024 行一块一个 min(expires_at)(无 TTL 行记 +∞)→ TTL 整块剪枝(§5.2);
                     紧接 zone_maps 之后存放,计入 zmap_len
-       blooms:      每个高基数字符串字段(含 key)一个 bloom(参数见 §5.3)
-       inverted:    倒排索引 = term_dict + postings + doc_len
+       blooms:      当前为 `key` 字段一个 bloom(参数见 §5.3)
+       inverted:    倒排索引 = term_dict + [u64 postings_total_len] + postings + doc 区
                     (编码与打分见 [06 §3.4](06-l4-query.md);无文本记录时为空)
        ns_stats:    每命名空间一行 (NsId u32, doc_count u64, total_doc_len u64)
                     → 段内块级剪枝用(§5.6);BM25 的 N/avgdl 需跨段全局聚合
@@ -126,12 +126,11 @@ agent_memory/
        payload_crc32                 u32
 ```
 
-> **L2 落地状态**:定长头实际为 **192 B**(偏移 `0..160` 为字段区、`header_crc32` 在
-> 偏移 **160**、`164..192` 为对齐填充)。数据区中 `field_dict`、`inv`(倒排)、`zmap`
-> (zone map / ttl_map)、`bloom` 四类区在 L2 **写为 `len=0` 空占位**,构建与查询期下推求值属
-> **L4**(§5.1–§5.4 描述 L4 目标);`delta` 区恒为空(`delta: &[]`,保留给 L5,§2.2a);
-> `relations` 区只写**正向表**(§2.2b)。L2 段内实际写入内容的是 `doc_region`、
-> `version_table`、`key_index`、`ns_stats` 与正向 `relations`。
+> **落地状态**:定长头实际为 **192 B**(偏移 `0..160` 为字段区、`header_crc32` 在
+> 偏移 **160**、`164..192` 为对齐填充)。L2 落地 `doc_region`、`version_table`、
+> `key_index`、`ns_stats` 与正向 `relations`;**L4 起** `field_dict`、`zmap`
+> (zone map;`ttl_map` 随 L5 落地)、`bloom` 与 `inverted`(倒排)四区也实际写入
+> (布局与构建见 §5.1–§5.4);`delta` 区恒为空(`delta: &[]`,保留给 L5,§2.2a)。
 
 **记录体(entry)格式**(doc_region 内,长度前缀):
 
@@ -291,7 +290,8 @@ Checkpoint = [u64 watermark_seqno]
 8      header_crc32                      u32     覆盖除自身外的全部头部字段
 12     dimension                         u32     建库维度(空库也可回读;打开时校验)
 16     metric                            u8      0=Cosine 1=Dot 2=Euclidean
-17     reserved                          5
+17     stopwords                         u8      0=未记录(旧版,按默认开) 1=关 2=开(建库即锁定)
+18..22 reserved                          4
 22     next_rel_kind                     u16     自定义关系类型编号分配水位(永不复用)
 24     manifest_version                  u64
 32     watermark_seqno                   u64
@@ -528,9 +528,11 @@ $O(n)$ 时间(查表法每字节 1 次表查 + XOR,8KB 表)、$O(1)$ 空间;`crc
 
 ## 5. msec 内的轻量索引
 
-> **L2 落地状态**:本节 §5.1–§5.4 的 `field_dict`、zone map/ttl_map、bloom、倒排在 L2
-> **写为 `len=0` 空占位**,其构建与查询期下推求值属 **L4**;`key_index`(§5.5)与 `ns_stats`
-> (§5.6)在 L2 已实际写入。字节布局与偏移见 §2.2。
+> **落地状态**:`key_index`(§5.5)与 `ns_stats`(§5.6)自 L2 起写入;`field_dict`、
+> zone map、bloom 与倒排自 **L4** 起实际写入——构建在 `flush` 期由写状态的加速结构
+> 编码,查询期由 L4 计划器下推与 BM25 打分消费,`open` 校验区结构并从磁盘倒排经
+> "段内槽位 → 全局槽位"重排映射直接重建(`ttl_map` 随 L5 TTL 剪枝落地)。
+> 字节布局与偏移见 §2.2,四区编码见 `src/persist/msec/index.rs`。
 
 ### 5.1 字段字典
 
@@ -550,7 +552,7 @@ $O(n)$ 时间(查表法每字节 1 次表查 + XOR,8KB 表)、$O(1)$ 空间;`crc
 - `op 为 <`:块不可能有匹配,当 `min ≥ v`;必全匹配,当 `max < v`;
 - `op 为 ≤`:块不可能有匹配,当 `min > v`;必全匹配,当 `max ≤ v`;
 - `op 为 ==`:`v ∉ [min, max]` → 整块剪枝;`min = max = v` 时必全匹配。
-- 代价:每块每字段 16 字节(两个 8 字节 min/max)+ 1 bit has_null;
+- 代价:每块每字段 17 字节(两个 8 字节 min/max + 1 字节 flags:`has_value`/`has_null` 两位;`has_any`(字段是否出现,供 `exists` 剪枝)仅存内存);
 - 复杂度:全块扫描 $O(\lceil N/1024 \rceil)$ 次**内存连续**判断——1M 行 = 977 次
   判断,亚微秒级;被剪块内的行完全不读。
 - **TTL 剪枝**:除字段 zone map 外,每块另存一个 `min(expires_at)`(§2.2 的 `ttl_map`)。
@@ -586,7 +588,8 @@ $$\frac{m}{n} = \frac{\log_2 (1/p)}{\ln 2} \approx 1.44 \, \log_2(1/p) \ \text{b
 **【工程】** 哈希用**双哈希法**(Kirsch–Mitzenmacher):只需两个 64 位哈希 $h_1, h_2$
 (取自 crc32 组合),第 i 个位置 $h_i(x) = h_1(x) + i \cdot h_2(x) \bmod m$——
 k 次哈希的成本变成 2 次哈希 + k 次乘加。误报的后果只是"多评估几行",**安全性无害**。
-Mneme 在 msec 每段每字符串字段放一个 bloom(fpp 1%,默认),供等值过滤下推使用;
+Mneme 在 msec 当前为 `key` 字段放一个 bloom(fpp 1%,默认;元素数 ≤ 初始容量 65536 时
+满足目标误判率,超出后只升误报率、绝不漏报),供等值过滤下推使用;
 范围过滤走 zone map,两者互补。
 
 ### 5.4 倒排索引(为 BM25 供数据)
@@ -600,6 +603,12 @@ Mneme 在 msec 每段每字符串字段放一个 bloom(fpp 1%,默认),供等值�
 3. **未落段记录**:可变表在内存中维护一份**增量倒排**(词 → 未落段 RowId 列表,插入/更新时增量维护,
    flush 后并入新段倒排并清空);BM25 查询把它当作"内存段"与各段倒排一起参与两遍统计与打分
    ([06 §3.2](06-l4-query.md)),因此新写入的 `text` 无需 `flush` 即可被检索。
+
+> **L4 落地口径**:内存引擎只维护**一份**与全局槽位对齐的倒排——写路径在
+> `commit_version` 时增量插入,随 `ReaderView` 以 `Arc` 快照共享,`flush` 时整体编码进
+> 新段 `inverted` 区;恢复时从磁盘倒排经重排映射重建。"段倒排 + 可变表增量"两套结构在
+> 当前全量快照(始终单活跃段)下与之语义等价,故实现取统一结构。墓碑与被遮蔽版本
+> 不从索引删除,由查询期按视图可见性过滤——`as_of` 历史视图因此仍可检索旧版本文本。
 
 ### 5.5 key 索引(为 `get(key)` 与去重供路)
 
@@ -664,6 +673,10 @@ key 同时进入该字符串字段的 bloom(§5.3),不存在的 key 先被 bloom
 - 只有查询命名空间完全相同的统计才可复用;**不变量 I21(BM25 统计一致性)**:IDF 的 N/avgdl/df
   按查询命名空间在**全部活跃段**全局聚合、只计活行,与段数无关,且不同命名空间的统计互不影响;
 - 若未来引入"全局词表"(跨段合并的 term 统计缓存),可把两遍降为一遍,但语义以本规则为准。
+
+> **L4 落地口径**:内存实现只有一份跨"段 + 未落盘记录"的全局倒排,第一遍遍历查询命名空间
+> 的文档长度表统计 N/avgdl(只计当前视图可见行),第二遍按查询词 postings 打分;与"逐段
+> 聚合再合并"结果一致,验收见 `tests/l4_contracts.rs`(I21)。
 
 ---
 

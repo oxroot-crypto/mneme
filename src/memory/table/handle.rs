@@ -3,6 +3,7 @@
 use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::core::error::Result;
+use crate::memory::analysis::{BloomSet, ZoneIndex};
 use crate::memory::config::Config;
 
 use super::PersistHook;
@@ -26,7 +27,16 @@ impl Table {
 
     /// 以给定配置与持久钩子新建空表。
     pub(crate) fn new_with(config: Arc<Config>, persist: Option<Arc<dyn PersistHook>>) -> Self {
-        let writer = WriterState::new();
+        let mut writer = WriterState::new();
+        // 检索加速结构的容量/开关由建库配置决定(空状态上重建无数据损失)。
+        writer.stopwords_enabled = config.tuning.stopwords;
+        writer.index_fields_max = config.tuning.field_dict_max as usize;
+        writer.bloom_fpp = config.tuning.bloom_fpp;
+        writer.zones = Arc::new(ZoneIndex::new(config.tuning.field_dict_max as usize));
+        writer.key_bloom = Arc::new(BloomSet::new(
+            crate::memory::analysis::BLOOM_INITIAL_CAPACITY,
+            config.tuning.bloom_fpp,
+        ));
         let view = Arc::new(writer.snapshot());
         Self {
             writer: Mutex::new(writer),

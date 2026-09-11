@@ -67,14 +67,14 @@ cargo 1.95.0
   (见第 [10](10-testing.md) 章)。
 - 模块的语法(怎么分文件、怎么 `pub`)在 [08 章](08-modules-docs.md) 讲。
 
-**依赖的方向**:`tests/core_contracts.rs` → `mneme` 库 → `serde` 等外部 crate。
+**依赖的方向**:`tests/core_contracts.rs` → `mneme` 库 → `serde`/`crc32fast` 等外部 crate。
 下层不知道上层存在。
 
 ---
 
 ## 4. 逐段读懂 `Cargo.toml`
 
-mneme 的 `Cargo.toml` 很短,但几乎每一行都值得解释。下面按实际内容分段。
+mneme 的 `Cargo.toml` 不长,但几乎每一行都值得解释。下面按实际内容分段。
 
 ### 4.1 `[package]`:我是谁
 
@@ -98,29 +98,61 @@ categories = ["database"]
   `0.x` 表示尚未稳定,`0.1.0 → 0.2.0` 允许破坏性变更。
 - `description` / `keywords` / `categories` 是发布到 crates.io 时的元数据。
 
-### 4.2 `[dependencies]`:依赖
+### 4.2 `[features]` 与依赖
+
+先看编译开关,再看依赖。`[features]` 定义**可选的编译分支**:
+
+```toml
+[features]
+# L3 起:默认开启 mmap;关闭后段文件走 FileSource 兜底。
+default = ["mmap"]
+# 打开本 feature 时才引入可选依赖 memmap2。
+mmap = ["dep:memmap2"]
+```
+
+- `default = ["mmap"]` 表示不额外指定时也启用 `mmap`;`cargo build --no-default-features`
+  则关掉它。代码里用 `#[cfg(feature = "mmap")]` 选择分支(见 [09 章](09-cfg-unsafe-simd.md))。
+- `mmap = ["dep:memmap2"]` 里的 `dep:` 前缀表示"只引入这个**可选依赖**,不额外造一个同名
+  feature"。依赖在 `Cargo.toml` 里写 `optional = true` 才会变成可选。
+
+再看依赖清单:
 
 ```toml
 [dependencies]
-# 元数据与后续 DSL 序列化的基础;L0 阶段仅经 serde_json 使用,直接声明以对齐依赖白名单
-# (docs/design/01-overview.md §5),避免 L4 引入时再改依赖清单。
+# 元数据与 DSL 序列化的基础;直接声明以对齐依赖白名单( docs/design/01-overview.md §5 )。
 serde = "1"
 serde_json = "1"
 thiserror = "2"
+# L2 持久层的 CRC-32 校验。
+crc32fast = "1"
+# L3 索引层的 mmap 零拷贝读;可选,由 feature `mmap` 控制。
+memmap2 = { version = "0.9", optional = true }
 
 [dev-dependencies]
 proptest = "1"
+tempfile = "3"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "hnsw"
+harness = false
 ```
 
 | 段 | 作用 | 何时编译 |
 |---|---|---|
 | `[dependencies]` | 运行库本身需要的 crate | `cargo build` 与 `cargo test` 都编 |
 | `[dev-dependencies]` | 仅测试/示例/基准需要的 crate | 只有 `cargo test` 等才编 |
+| `[features]` | 编译开关,决定引入哪些可选依赖/代码 | 由命令行或上游依赖选择 |
 
 - 版本写法 `"1"` 是 **caret 语义**:等价于 `"^1"`,表示"任何 `1.x.y`",但**不允许 `2.0.0`**。
-  mneme 规范禁止 `"*"` 这种无界版本。
+  mneme 规范禁止 `"*"` 这种无界版本;`"0.9"` 同理表示 `>=0.9.0, <0.10.0`。
+- `optional = true` 的依赖必须被某个 feature 用 `dep:` 引入,否则永远不会参与编译。
+- `criterion` 用了 `default-features = false`:关掉它自带的绘图等默认功能,只保留
+  `cargo_bench_support`(让 `cargo bench` 认识它)。下方 `[[bench]]` 声明基准目标
+  `benches/hnsw.rs`,并关掉 libtest 的默认 `harness`——基准由 criterion 自己驱动。
 - 新增依赖前必须论证(见 [CONTRIBUTING.md](../../CONTRIBUTING.md)):体积、编译时间、
-  维护活跃度、能否零依赖自研。mneme 的复杂算法(HNSW、BM25、量化)全部自研。
+  维护活跃度、能否零依赖自研。mneme 的复杂算法(HNSW、BM25、量化)全部自研,
+  依赖白名单上限 4 个(不含 feature 引入的 `memmap2`)。
 - `thiserror` 是**过程宏(proc-macro)** crate,用来给错误枚举自动生成样板代码,见 [05 章](05-errors.md)。
 
 ### 4.3 edition 与 MSRV:两个"版本"
@@ -241,6 +273,10 @@ cargo run --example hello
 
 > `println!` 带感叹号说明它是一个**宏(macro)**,不是普通函数。`{n}` 是内联格式参数,
 > 把变量 `n` 格式化后插进字符串。第 [02 章](02-values-and-ownership.md) 会再见到它。
+>
+> 同族的 `format!` 不打印,而是直接产出一个 `String`。格式参数还能带**宽度与补零**:
+> `{month:02}` 按两位输出、不足补 0,`{milli:03}` 补到三位——L4 的 ISO 8601
+> 格式化就用它拼出定宽时间戳(见 [`src/query/iso.rs:182-193`](../../src/query/iso.rs))。
 
 ---
 

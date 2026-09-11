@@ -49,7 +49,7 @@ impl RelationKind {
     pub const SUPPORTS: Self;              // =1 支持
     pub const CONTRADICTS: Self;           // =2 矛盾
     pub const RELATED: Self;               // =3 弱相关
-    pub fn custom(name: &str) -> Result<Self>;  // 名称→稳定编号(≥16;已注册则返回既有编号)
+    pub fn custom(name: &str) -> Result<Self>;  // 名称→稳定编号(≥16;已注册则返回既有编号;L2 注册表落地前无此 API)
 }
 pub struct Edge { pub from: RowId, pub to: RowId, pub kind: RelationKind, pub weight: f32, pub metadata: Meta }
 

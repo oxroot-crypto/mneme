@@ -36,14 +36,14 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 ```
 
-见 [`src/core/simd.rs:35-47`](../../src/core/simd.rs)。
+见 [`src/core/simd.rs:50-65`](../../src/core/simd.rs)。
 
 > **`#[cfg]` 不只用在函数/模块上**,也能用在 `struct` 字段、`match` 分支,以及函数体里的
 > **语句/块表达式**上。上面 `dot` 就是后者:三个互斥的块各自带 `#[cfg]`,编译后只留下一个。
 > 注意块本身仍要写成 `{ ... }`,属性写在块前面。注意:上例为教学而把
 `simd.rs` 不同位置的片段拼在一起——`dot` 内部三段 `#[cfg]` 分发(含
-`not(any(...))` 兜底)才是 35–47 行的连续原文;`fn dot_x86` 在 73 行附近,
-`mod neon` 在 155 行附近。
+`not(any(...))` 兜底)才是 50–65 行的连续原文;`fn dot_x86` 在 100 行附近,
+`mod neon` 在 182 行附近。
 
 常用条件:
 
@@ -56,8 +56,9 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 | `debug_assertions` | debug 构建 |
 | `not(...)` / `any(...)` / `all(...)` | 逻辑组合 |
 
-> `feature = "..."` 只在 `Cargo.toml` 声明了对应 feature 时才有意义;mneme 当前 L0 尚未声明
-> feature(见 [01 章](01-toolchain.md)),这里仅作语法示例。
+> `feature = "..."` 只在 `Cargo.toml` 声明了对应 feature 时才有意义。mneme 目前声明了
+> `mmap`(默认开启,见 [01 §4.2](01-toolchain.md));`async`/`quant-f16` 等尚未定义,
+> 上表仅作语法示例。
 
 ### 1.1 `cfg!` 宏:运行期用的布尔值
 
@@ -79,7 +80,7 @@ if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
 }
 ```
 
-见 [`src/core/simd.rs:73-82`](../../src/core/simd.rs)。
+见 [`src/core/simd.rs:100-108`](../../src/core/simd.rs)。
 
 - `is_x86_feature_detected!` 是标准库宏,在**运行时**查询 CPU 是否支持某指令集。
 - 这样同一个二进制能跑在支持 AVX2 的新 CPU(快)和不支持的旧 CPU(回退 SSE2)上。
@@ -110,7 +111,7 @@ pub unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
 }
 ```
 
-见 [`src/core/simd.rs:97-123`](../../src/core/simd.rs)。
+见 [`src/core/simd.rs:123-128`](../../src/core/simd.rs)。
 
 - `unsafe fn` 表示"调用此函数需要满足某些前提"。
 - `unsafe { ... }` 块表示"这里我做了不安全操作,并为此负责"。
@@ -126,7 +127,7 @@ mneme 规范要求**每个 `unsafe` 块必须有 `// SAFETY:` 注释**,逐条说
 let mut sum = unsafe { ... };
 ```
 
-见 [`src/core/simd.rs:101`](../../src/core/simd.rs)。
+见 [`src/core/simd.rs:127-128`](../../src/core/simd.rs)。
 
 调用处也要证明:
 
@@ -135,7 +136,7 @@ let mut sum = unsafe { ... };
 unsafe { x86::dot_avx2(a, b) }
 ```
 
-见 [`src/core/simd.rs:76`](../../src/core/simd.rs)。
+见 [`src/core/simd.rs:102-103`](../../src/core/simd.rs)。
 
 > 没有 `// SAFETY:` 的 `unsafe` 一律视为违规。这不是形式主义:它把"为什么这段代码是安全的"
 > 写进代码,让后来者能审计。
@@ -149,7 +150,7 @@ unsafe { x86::dot_avx2(a, b) }
 pub unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 { ... }
 ```
 
-见 [`src/core/simd.rs:97`](../../src/core/simd.rs)。
+见 [`src/core/simd.rs:123-124`](../../src/core/simd.rs)。
 
 - 它让编译器为这个函数生成使用 AVX2/FMA 指令的代码。
 - 因为目标 CPU 不一定支持,函数被标记为 `unsafe`,调用者必须先检测(§1.2)。
@@ -164,7 +165,7 @@ SIMD 内联函数需要指针:
 let va = _mm256_loadu_ps(a.as_ptr().add(i));
 ```
 
-见 [`src/core/simd.rs:105`](../../src/core/simd.rs)。
+见 [`src/core/simd.rs:131`](../../src/core/simd.rs)。
 
 - `a.as_ptr()` 得到 `*const f32` 裸指针。
 - `.add(i)` 指针算术,向后移动 `i` 个元素(不是字节)。
@@ -206,7 +207,7 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 ```
 
-见 [`src/core/simd.rs:33-48`](../../src/core/simd.rs)。
+见 [`src/core/simd.rs:50-65`](../../src/core/simd.rs)。
 
 - `debug_assert_eq!` 只在 debug 构建生效;release 下不检查(性能考虑)。
 - 于是 SIMD 内核自己用 `n = a.len().min(b.len())` 收敛到较短长度,保证不越界。
