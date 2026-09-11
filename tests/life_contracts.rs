@@ -38,8 +38,14 @@ fn deferred_features_return_structured_errors() {
     let ns = db.namespace("n");
     ns.insert(Record::new(vec![1.0, 0.0]).key("k").text("hello"))
         .expect("insert");
-    // L4 起文本通道可用:仅文本查询成功。
-    assert!(ns.search().text("hello").execute().is_ok());
+    // L4 起文本通道可用:仅文本查询命中且得分有限。
+    let text_hits = ns.search().text("hello").execute().expect("text channel");
+    assert_eq!(text_hits.len(), 1);
+    assert_eq!(
+        text_hits[0].key.as_ref().map(ToString::to_string),
+        Some("k".to_string())
+    );
+    assert!(text_hits[0].score.is_finite());
     // 但 Fusion 需要向量与文本两个通道;单通道设置即拒绝,绝不静默忽略。
     assert!(matches!(
         ns.search()
@@ -48,14 +54,18 @@ fn deferred_features_return_structured_errors() {
             .execute(),
         Err(mneme::MnemeError::Config { .. })
     ));
-    // 双通道 + Fusion:融合可用。
-    assert!(
-        ns.search()
-            .vector(&[1.0, 0.0])
-            .text("hello")
-            .fusion(mneme::Fusion::default())
-            .execute()
-            .is_ok()
+    // 双通道 + Fusion:融合可用且命中。
+    let fused = ns
+        .search()
+        .vector(&[1.0, 0.0])
+        .text("hello")
+        .fusion(mneme::Fusion::default())
+        .execute()
+        .expect("dual channel");
+    assert_eq!(fused.len(), 1);
+    assert_eq!(
+        fused[0].key.as_ref().map(ToString::to_string),
+        Some("k".to_string())
     );
     assert!(matches!(
         db.backup_to("./nowhere"),

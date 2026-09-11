@@ -215,7 +215,10 @@ fn prefix_bitmaps(
             alive.set(idx);
         }
     }
-    let filter = params.filter.map(|_| {
+    // 仅当存在用户过滤(`filter`)时构造索引前缀过滤位图:exec 无过滤时
+    // 传全 1 候选且 `filter = None`,不得把"全 1 候选"误当过滤(否则会触发
+    // 契约 FC-INDEX-POST-001 的档③「候选暴力」路径)。
+    let filter = params.filter.is_some().then(|| {
         let mut bits = BitSet::default();
         for &idx in candidates {
             if (idx as usize) < indexed {

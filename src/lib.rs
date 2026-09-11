@@ -69,6 +69,9 @@ pub use crate::persist::hook::{FsyncHook, IoAction};
 /// 等价于 `Expr::from_str(...).expect(...)`;处理运行时输入请用
 /// [`Expr::from_str`](crate::Expr::from_str)(返回 `Result`,不 panic,I7)。
 ///
+/// # Panics
+/// 字面量不是合法过滤 DSL 时 panic(消息含字节位置);仅适用于写死的常量。
+///
 /// # Examples
 /// ```
 /// use mneme::{Expr, Mneme, Record, filter};

@@ -69,13 +69,18 @@ fn write_inner(f: &mut fmt::Formatter<'_>, expr: &Expr) -> fmt::Result {
     match expr {
         Expr::Always => f.write_str("always"),
         Expr::Never => f.write_str("never"),
+        // 空逻辑项按求值结果规约(空 and 恒真、空 or 恒假),保证打印可读回。
+        Expr::And(parts) if parts.is_empty() => f.write_str("always"),
         Expr::And(parts) => write_joined(f, parts, " and ", 2),
+        Expr::Or(parts) if parts.is_empty() => f.write_str("never"),
         Expr::Or(parts) => write_joined(f, parts, " or ", 1),
         Expr::Not(inner) => {
             f.write_str("not ")?;
             write_expr(f, inner, 3)
         }
         Expr::Cmp { op, field, val } => write!(f, "{field} {op} {val}"),
+        // 空 `in` 恒不命中,打印为 `never`(与解析器至少要求一个取值一致)。
+        Expr::In(_, vals) if vals.is_empty() => f.write_str("never"),
         Expr::In(field, vals) => {
             write!(f, "{field} in (")?;
             for (index, val) in vals.iter().enumerate() {
@@ -144,6 +149,7 @@ impl fmt::Display for Expr {
 
 #[cfg(test)]
 mod tests {
+    use crate::memory::pred::Expr;
     use crate::query::parse::parse_at;
 
     /// FC-QUERY-POST-002(打印 → 解析往返等价)
@@ -167,6 +173,34 @@ mod tests {
                 panic!("{text} -> {printed}: {error}");
             });
             assert_eq!(expr, reparsed, "往返不一致: {text} -> {printed}");
+        }
+    }
+
+    /// FC-QUERY-POST-002(空逻辑项/空 `in` 打印为等价的真值常量,仍可读回)
+    #[test]
+    fn empty_lists_print_as_truth_constants() {
+        let cases = [
+            (
+                Expr::And(Vec::new().into_boxed_slice()),
+                "always",
+                Expr::Always,
+            ),
+            (
+                Expr::Or(Vec::new().into_boxed_slice()),
+                "never",
+                Expr::Never,
+            ),
+            (
+                Expr::In("x".into(), Vec::new().into_boxed_slice()),
+                "never",
+                Expr::Never,
+            ),
+        ];
+        for (expr, expected, decoded) in cases {
+            let printed = expr.to_string();
+            assert_eq!(printed, expected);
+            let reparsed = parse_at(&printed, 0).expect("parse");
+            assert_eq!(reparsed, decoded, "空列表规约后必须可读回");
         }
     }
 }

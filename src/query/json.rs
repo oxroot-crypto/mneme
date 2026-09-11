@@ -21,6 +21,8 @@ use crate::core::error::{MnemeError, Result};
 use crate::core::meta::{Meta, json};
 use crate::memory::pred::{CmpOp, Expr, Val};
 
+use super::iso;
+
 /// 构造"JSON 结构非法"的过滤错误。
 fn invalid(reason: impl std::fmt::Display) -> MnemeError {
     MnemeError::FilterParse(format!("过滤表达式 JSON 非法:{reason}"))
@@ -96,9 +98,16 @@ fn val_from_meta(meta: &Meta) -> Result<Val> {
     match key {
         "bool" => value.as_bool().map(Val::Bool),
         "int" => value.as_i64().map(Val::Int),
-        "num" => value.as_f64().map(Val::Num),
+        "num" => value
+            .as_f64()
+            .filter(|value| value.is_finite())
+            .map(Val::Num),
         "str" => value.as_str().map(|text| Val::Str(Arc::from(text))),
-        "ts" => value.as_i64().map(Val::Ts),
+        // 时间戳必须落在 `Display` 可往返的范围内,否则读回会失真。
+        "ts" => value
+            .as_i64()
+            .filter(|ms| (iso::MIN_ROUNDTRIP_MS..=iso::MAX_ROUNDTRIP_MS).contains(ms))
+            .map(Val::Ts),
         _ => None,
     }
     .ok_or_else(|| invalid(format!("Val 编码 `{key}` 与取值类型不符")))
@@ -109,12 +118,77 @@ fn exprs_to_meta(parts: &[Expr]) -> Vec<Meta> {
     parts.iter().map(Expr::to_meta).collect()
 }
 
-/// 解码 JSON 数组为 `Expr` 列表。
+/// 解码 JSON 数组为 `Expr` 列表;空数组被显式拒绝(与 `Display` 的 `always`/`never`
+/// 规约一致,避免同一表达式两种表示)。
 fn exprs_from_meta(meta: &Meta) -> Result<Vec<Expr>> {
     let Some(items) = meta.as_array() else {
         return Err(invalid("逻辑运算子项必须是数组"));
     };
+    if items.is_empty() {
+        return Err(invalid("逻辑运算子项不能为空数组"));
+    }
     items.iter().map(Expr::from_meta).collect()
+}
+
+/// 解码 `always` / `never` 真值常量。
+fn decode_truth(key: &str, value: &Meta) -> Result<Expr> {
+    if value.as_bool() != Some(true) {
+        return Err(invalid(format!("`{key}` 的值必须是 true")));
+    }
+    Ok(if key == "always" {
+        Expr::Always
+    } else {
+        Expr::Never
+    })
+}
+
+/// 解码 `cmp` 节点。
+fn decode_cmp(value: &Meta) -> Result<Expr> {
+    let op = op_from_name(field_str(value, "op")?)?;
+    let name = field_str(value, "field")?;
+    let val = val_from_meta(field(value, "val")?)?;
+    Ok(Expr::Cmp {
+        op,
+        field: name.to_string(),
+        val,
+    })
+}
+
+/// 解码 `in` 节点;`vals` 不得为空数组。
+fn decode_in(value: &Meta) -> Result<Expr> {
+    let name = field_str(value, "field")?;
+    let Some(items) = field(value, "vals")?.as_array() else {
+        return Err(invalid("`vals` 必须是数组"));
+    };
+    if items.is_empty() {
+        return Err(invalid("`vals` 不能为空数组"));
+    }
+    let vals: Result<Vec<Val>> = items.iter().map(val_from_meta).collect();
+    Ok(Expr::In(name.to_string(), vals?.into_boxed_slice()))
+}
+
+/// 解码 `{field, val}` 形态的节点(`contains`)。
+fn decode_field_val(value: &Meta, build: fn(String, Val) -> Expr) -> Result<Expr> {
+    Ok(build(
+        field_str(value, "field")?.to_string(),
+        val_from_meta(field(value, "val")?)?,
+    ))
+}
+
+/// 解码 `{field, val:字符串}` 形态的节点(`starts_with` / `ends_with` / `glob`)。
+fn decode_field_str(value: &Meta, build: fn(String, Arc<str>) -> Expr) -> Result<Expr> {
+    Ok(build(
+        field_str(value, "field")?.to_string(),
+        Arc::from(field_str(value, "val")?),
+    ))
+}
+
+/// 解码 `exists` / `is_null` 的路径参数。
+fn decode_path(name: &str, value: &Meta, build: fn(String) -> Expr) -> Result<Expr> {
+    let path = value
+        .as_str()
+        .ok_or_else(|| invalid(format!("`{name}` 的值必须是字符串")))?;
+    Ok(build(path.to_string()))
 }
 
 impl Expr {
@@ -135,12 +209,16 @@ impl Expr {
         match self {
             Expr::Always => json!({ "always": true }),
             Expr::Never => json!({ "never": true }),
+            // 空逻辑项/空 `in` 按求值结果规约,保证任意构造的 AST 都能往返。
+            Expr::And(parts) if parts.is_empty() => json!({ "always": true }),
             Expr::And(parts) => json!({ "and": exprs_to_meta(parts) }),
+            Expr::Or(parts) if parts.is_empty() => json!({ "never": true }),
             Expr::Or(parts) => json!({ "or": exprs_to_meta(parts) }),
             Expr::Not(inner) => json!({ "not": inner.to_meta() }),
             Expr::Cmp { op, field, val } => json!({
                 "cmp": { "op": op_name(*op), "field": field, "val": val_to_meta(val) }
             }),
+            Expr::In(_, vals) if vals.is_empty() => json!({ "never": true }),
             Expr::In(field, vals) => json!({
                 "in": {
                     "field": field,
@@ -187,65 +265,18 @@ impl Expr {
     pub fn from_meta(meta: &Meta) -> Result<Expr> {
         let (key, value) = single_entry(meta, "Expr")?;
         match key {
-            "always" => value
-                .as_bool()
-                .filter(|flag| *flag)
-                .map(|_| Expr::Always)
-                .ok_or_else(|| invalid("`always` 的值必须是 true")),
-            "never" => value
-                .as_bool()
-                .filter(|flag| *flag)
-                .map(|_| Expr::Never)
-                .ok_or_else(|| invalid("`never` 的值必须是 true")),
+            "always" | "never" => decode_truth(key, value),
             "and" => Ok(Expr::And(exprs_from_meta(value)?.into_boxed_slice())),
             "or" => Ok(Expr::Or(exprs_from_meta(value)?.into_boxed_slice())),
             "not" => Ok(Expr::Not(Box::new(Expr::from_meta(value)?))),
-            "cmp" => {
-                let op = op_from_name(field_str(value, "op")?)?;
-                let name = field_str(value, "field")?;
-                let val = val_from_meta(field(value, "val")?)?;
-                Ok(Expr::Cmp {
-                    op,
-                    field: name.to_string(),
-                    val,
-                })
-            }
-            "in" => {
-                let name = field_str(value, "field")?;
-                let Some(items) = field(value, "vals")?.as_array() else {
-                    return Err(invalid("`vals` 必须是数组"));
-                };
-                let vals: Result<Vec<Val>> = items.iter().map(val_from_meta).collect();
-                Ok(Expr::In(name.to_string(), vals?.into_boxed_slice()))
-            }
-            "contains" => Ok(Expr::Contains(
-                field_str(value, "field")?.to_string(),
-                val_from_meta(field(value, "val")?)?,
-            )),
-            "starts_with" => Ok(Expr::StartsWith(
-                field_str(value, "field")?.to_string(),
-                Arc::from(field_str(value, "val")?),
-            )),
-            "ends_with" => Ok(Expr::EndsWith(
-                field_str(value, "field")?.to_string(),
-                Arc::from(field_str(value, "val")?),
-            )),
-            "glob" => Ok(Expr::Glob(
-                field_str(value, "field")?.to_string(),
-                Arc::from(field_str(value, "val")?),
-            )),
-            "exists" => Ok(Expr::Exists(
-                value
-                    .as_str()
-                    .ok_or_else(|| invalid("`exists` 的值必须是字符串"))?
-                    .to_string(),
-            )),
-            "is_null" => Ok(Expr::IsNull(
-                value
-                    .as_str()
-                    .ok_or_else(|| invalid("`is_null` 的值必须是字符串"))?
-                    .to_string(),
-            )),
+            "cmp" => decode_cmp(value),
+            "in" => decode_in(value),
+            "contains" => decode_field_val(value, Expr::Contains),
+            "starts_with" => decode_field_str(value, Expr::StartsWith),
+            "ends_with" => decode_field_str(value, Expr::EndsWith),
+            "glob" => decode_field_str(value, Expr::Glob),
+            "exists" => decode_path("exists", value, Expr::Exists),
+            "is_null" => decode_path("is_null", value, Expr::IsNull),
             _ => Err(invalid(format!("未知 Expr 键 `{key}`"))),
         }
     }
@@ -289,11 +320,31 @@ mod tests {
             json!({"exists": 1}),
             json!({"always": false}),
             json!({"str": "x"}),
+            json!({"and": []}),
+            json!({"or": []}),
+            json!({"in": {"field": "x", "vals": []}}),
+            json!({"cmp": {"op": "eq", "field": "x", "val": {"ts": i64::MAX}}}),
         ] {
             assert!(
                 matches!(Expr::from_meta(&meta), Err(MnemeError::FilterParse(_))),
                 "{meta} 应拒绝"
             );
+        }
+    }
+
+    /// FC-QUERY-POST-002(程序构造的空逻辑项/空 `in` 编码为真值常量,仍可解码)
+    #[test]
+    fn json_encodes_empty_lists_as_truth_constants() {
+        for (expr, expected) in [
+            (Expr::And(Vec::new().into_boxed_slice()), Expr::Always),
+            (Expr::Or(Vec::new().into_boxed_slice()), Expr::Never),
+            (
+                Expr::In("x".into(), Vec::new().into_boxed_slice()),
+                Expr::Never,
+            ),
+        ] {
+            let decoded = Expr::from_meta(&expr.to_meta()).expect("decode");
+            assert_eq!(decoded, expected);
         }
     }
 }

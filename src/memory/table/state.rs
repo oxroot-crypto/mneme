@@ -97,13 +97,13 @@ pub(crate) struct WriterState {
     /// `key` 字段的布隆预筛(设计 04 §5.3)。
     pub(crate) key_bloom: Arc<BloomSet>,
     /// 索引与查询共用的分词停用词开关(`Tuning::stopwords`)。
-    pub(crate) stopwords: bool,
+    pub(crate) stopwords_enabled: bool,
     /// 可索引字段上限(`Tuning::field_dict_max`;重建 zone map 用)。
     pub(crate) index_fields_max: usize,
     /// bloom 目标误判率(`Tuning::bloom_fpp`;重建 bloom 用)。
     pub(crate) bloom_fpp: f32,
     /// 恢复期暂停索引增量维护(段载入完成后由磁盘索引或全量重建接管)。
-    pub(crate) indexing_paused: bool,
+    pub(crate) is_indexing_paused: bool,
     // 反馈幂等键(I27);L1 常驻内存,L5 随访问统计一并落盘。经 `Arc` COW,
     // 使批量写入快照(`WriterState::clone`)与回滚不深拷贝该集合。
     pub(crate) feedback_seen: Arc<HashSet<(RowId, u64)>>,
@@ -134,10 +134,10 @@ impl WriterState {
             inv: Arc::new(InvertedIndex::default()),
             zones: Arc::new(ZoneIndex::new(16)),
             key_bloom: Arc::new(BloomSet::new(BLOOM_INITIAL_CAPACITY, 0.01)),
-            stopwords: true,
+            stopwords_enabled: true,
             index_fields_max: 16,
             bloom_fpp: 0.01,
-            indexing_paused: false,
+            is_indexing_paused: false,
             feedback_seen: Arc::new(HashSet::new()),
             pending: Vec::new(),
             closed: false,
@@ -272,7 +272,7 @@ impl WriterState {
         let arc = Arc::new(slot_data);
         Arc::make_mut(&mut self.slots).push(Arc::clone(&arc));
         self.link_version(rowid, slot);
-        if !deleted && !self.indexing_paused {
+        if !deleted && !self.is_indexing_paused {
             self.index_observe(slot, &arc);
         }
         // 记录待持久化操作:墓碑落 `DeleteRow`,其余落完整新版本 `Insert`。
@@ -294,7 +294,12 @@ impl WriterState {
     /// 由查询期按视图可见性过滤,`as_of` 历史视图因此仍可检索旧版本文本。
     fn index_observe(&mut self, slot: SlotId, data: &SlotData) {
         if let Some(text) = &data.text {
-            Arc::make_mut(&mut self.inv).insert_text(slot, data.ns_id, text, self.stopwords);
+            Arc::make_mut(&mut self.inv).insert_text(
+                slot,
+                data.ns_id,
+                text,
+                self.stopwords_enabled,
+            );
         }
         Arc::make_mut(&mut self.zones).observe(slot.get() as usize, data);
         if let Some(key) = &data.key {

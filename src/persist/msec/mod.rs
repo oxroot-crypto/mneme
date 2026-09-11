@@ -1,7 +1,7 @@
 //! 元数据段(`msec`)编解码(设计 04 §2.2、§5.5)。
 //!
 //! 文件 = 定长头(160 B 字段 + CRC,补齐到 192 B)+ 变长数据区 + 尾部 payload CRC。
-//! 头部用 8 组 `offset/len` 指向各数据区;`doc_region`(记录体)、
+//! 头部用 9 组 `offset/len` 指向各数据区;`doc_region`(记录体)、
 //! `version_table`(版本链)、`key_index`、`ns_stats`、`delta`、`relations` 与
 //! L4 的四类轻量索引区(`field_dict`/`zone_maps`/`blooms`/`inverted`)。
 //!
@@ -13,7 +13,8 @@
 //!
 //! * `encode` —— 段与记录体编码。
 //! * `decode` —— 段头解析、记录体解码与只读视图 [`MsecView`]。
-//! * `index` —— 四类轻量索引区(字段字典 / zone map / bloom / 倒排)编解码。
+//! * `index` —— 字段字典 / zone map / bloom 三类轻量索引区编解码。
+//! * `inverted` —— 倒排区编解码(含槽位重排映射)。
 
 use std::sync::Arc;
 
@@ -24,14 +25,16 @@ mod decode;
 mod encode;
 mod entry;
 mod index;
+mod inverted;
 
 pub(crate) use decode::{MsecView, parse};
 pub(crate) use encode::{encode, encode_entry};
 pub(crate) use entry::entry_from_prefix;
 pub(crate) use index::{
-    FieldKind, decode_bloom, decode_field_dict, decode_inverted, encode_bloom, encode_field_dict,
-    encode_inverted, encode_zmap, validate_zmap,
+    FieldKind, decode_bloom, decode_field_dict, encode_bloom, encode_field_dict, encode_zmap,
+    validate_zmap,
 };
+pub(crate) use inverted::{decode_inverted, encode_inverted};
 
 /// 元数据段魔数。
 pub(crate) const MAGIC: [u8; 4] = *b"MSC1";

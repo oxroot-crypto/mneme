@@ -13,24 +13,31 @@ use crate::core::types::{RowId, SlotId};
 use crate::memory::Fusion;
 use crate::memory::search::Scored;
 
+/// 融合的公共参数(收拢 `top_k` 与向量通道方向,避免参数过多)。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct FusionParams {
+    /// 融合后返回条数。
+    pub(crate) top_k: usize,
+    /// 向量通道分数是否为距离(`Euclidean`;聚合前需翻转方向)。
+    pub(crate) vector_is_distance: bool,
+}
+
 /// 融合两个通道的命中,返回按融合分降序(同分 `RowId` 升序)的 top-k。
 ///
 /// # Arguments
 /// * `vector` - 向量通道命中(已按其优度排序;Euclidean 为距离平方、越小越优)。
 /// * `text` - BM25 通道命中(已按分数降序)。
 /// * `fusion` - 融合策略。
-/// * `top_k` - 融合后返回条数。
-/// * `vector_is_distance` - 向量通道分数是否为距离(`Euclidean`)。
+/// * `params` - 融合公共参数(`top_k` 与向量通道方向)。
 pub(crate) fn fuse(
     vector: Vec<Scored>,
     text: Vec<Scored>,
     fusion: Fusion,
-    top_k: usize,
-    vector_is_distance: bool,
+    params: FusionParams,
 ) -> Vec<Scored> {
     match fusion {
-        Fusion::Rrf { k } => rrf(vector, text, k, top_k),
-        Fusion::Weighted { alpha } => weighted(vector, text, alpha, top_k, vector_is_distance),
+        Fusion::Rrf { k } => rrf(vector, text, k, params.top_k),
+        Fusion::Weighted { alpha } => weighted(vector, text, alpha, params),
     }
 }
 
@@ -51,17 +58,16 @@ fn weighted(
     vector: Vec<Scored>,
     text: Vec<Scored>,
     alpha: f32,
-    top_k: usize,
-    vector_is_distance: bool,
+    params: FusionParams,
 ) -> Vec<Scored> {
     let mut fused: HashMap<RowId, (SlotId, f32)> = HashMap::new();
-    for (rowid, (slot, value)) in normalize(&vector, vector_is_distance) {
+    for (rowid, (slot, value)) in normalize(&vector, params.vector_is_distance) {
         fused.entry(rowid).or_insert((slot, 0.0)).1 += alpha * value;
     }
     for (rowid, (slot, value)) in normalize(&text, false) {
         fused.entry(rowid).or_insert((slot, 0.0)).1 += (1.0 - alpha) * value;
     }
-    rank_top(fused, top_k)
+    rank_top(fused, params.top_k)
 }
 
 /// 结果集内 min-max 归一化;`flip` 时先取负把"越小越优"翻成"越大越优"。
@@ -81,7 +87,8 @@ fn normalize(hits: &[Scored], flip: bool) -> HashMap<RowId, (SlotId, f32)> {
     hits.iter()
         .zip(oriented)
         .map(|(hit, value)| {
-            let normalized = if span <= f32::EPSILON {
+            // 仅真正的零极差(单点)取 1;极小极差仍按公式缩放,保住分数差异。
+            let normalized = if span == 0.0 {
                 1.0
             } else {
                 (value - min) / span
@@ -140,14 +147,24 @@ mod tests {
         // 向量通道为距离:0.1 最近、0.9 最远;文本通道给出相反顺序。
         let vector = vec![hit(0, 0, 0.1), hit(1, 1, 0.9)];
         let text = vec![hit(1, 1, 2.0), hit(0, 0, 1.0)];
-        let fused = weighted(vector, text, 0.5, 2, true);
+        let fused = weighted(
+            vector,
+            text,
+            0.5,
+            FusionParams {
+                top_k: 2,
+                vector_is_distance: true,
+            },
+        );
         assert_eq!(fused[0].rowid, RowId::new(0), "距离近者向量归一值应为 1");
         let plain = weighted(
             vec![hit(0, 0, 0.1), hit(1, 1, 0.9)],
             vec![hit(1, 1, 2.0), hit(0, 0, 1.0)],
             0.5,
-            2,
-            false,
+            FusionParams {
+                top_k: 2,
+                vector_is_distance: false,
+            },
         );
         assert_eq!(plain[0].rowid, RowId::new(1), "同样输入不翻转时结论相反");
     }
@@ -157,7 +174,15 @@ mod tests {
     fn weighted_single_result_channel_normalizes_to_one() {
         let vector = vec![hit(0, 0, 0.3)];
         let text = vec![hit(1, 1, 5.0), hit(2, 2, 1.0)];
-        let fused = weighted(vector, text, 0.5, 3, false);
+        let fused = weighted(
+            vector,
+            text,
+            0.5,
+            FusionParams {
+                top_k: 3,
+                vector_is_distance: false,
+            },
+        );
         let by_id: HashMap<u64, f32> = fused
             .iter()
             .map(|hit| (hit.rowid.get(), hit.score))
@@ -165,6 +190,27 @@ mod tests {
         assert_eq!(by_id[&0], 0.5, "单点向量通道归一为 1,权重 0.5");
         assert_eq!(by_id[&1], 0.5, "文本最高分归一为 1,权重 0.5");
         assert_eq!(by_id[&2], 0.0, "文本最低分归一为 0");
+    }
+
+    /// FC-QUERY-POST-004(极小极差仍按 min-max 公式,不当作单点)
+    #[test]
+    fn weighted_tiny_span_still_scales() {
+        let vector = vec![hit(0, 0, 1.0), hit(1, 1, 1.0 + f32::EPSILON)];
+        let fused = weighted(
+            vector,
+            Vec::new(),
+            1.0,
+            FusionParams {
+                top_k: 2,
+                vector_is_distance: false,
+            },
+        );
+        let by_id: HashMap<u64, f32> = fused
+            .iter()
+            .map(|hit| (hit.rowid.get(), hit.score))
+            .collect();
+        assert_eq!(by_id[&0], 0.0);
+        assert_eq!(by_id[&1], 1.0);
     }
 
     /// FC-QUERY-POST-004(同分按 RowId 升序)

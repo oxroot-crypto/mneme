@@ -109,13 +109,13 @@ agent_memory/
                       当前可见版本 = 该 RowId 链尾未被墓碑遮蔽者
        key_index:  按 (NsId, key) 排序的 [(NsId u32, key len+bytes, RowId u64, SlotId u32, seqno u64, doc_offset u64)]
                    → get(key) O(log n) 定位本段最新版本(跨段再按 seqno 合并,§5.5)
-       field_dict:  [(u16 field_id, len, name bytes)...]  上限 16 个索引字段(默认,见 §5.1)
-       zone_maps:   每 1024 行一块 × 每个索引字段: (min, max, has_null)
-       (数值/时间字段用 f64/i64 存储;created_at 恒定索引)
+       field_dict:  [(u16 field_id, u8 kind, len, name bytes)...]  上限 16 个索引字段(默认,见 §5.1)
+       zone_maps:   每 1024 行一块 × 每个数值/时间索引字段: (f64 min, f64 max, u8 flags)
+                    (flags = has_value | has_null;±∞ 表示"区间未知",放弃该块剪枝)
        ttl_map:     每 1024 行一块一个 min(expires_at)(无 TTL 行记 +∞)→ TTL 整块剪枝(§5.2);
                     紧接 zone_maps 之后存放,计入 zmap_len
-       blooms:      每个高基数字符串字段(含 key)一个 bloom(参数见 §5.3)
-       inverted:    倒排索引 = term_dict + postings + doc_len
+       blooms:      当前为 `key` 字段一个 bloom(参数见 §5.3)
+       inverted:    倒排索引 = term_dict + [u64 postings_total_len] + postings + doc 区
                     (编码与打分见 [06 §3.4](06-l4-query.md);无文本记录时为空)
        ns_stats:    每命名空间一行 (NsId u32, doc_count u64, total_doc_len u64)
                     → 段内块级剪枝用(§5.6);BM25 的 N/avgdl 需跨段全局聚合
@@ -290,7 +290,8 @@ Checkpoint = [u64 watermark_seqno]
 8      header_crc32                      u32     覆盖除自身外的全部头部字段
 12     dimension                         u32     建库维度(空库也可回读;打开时校验)
 16     metric                            u8      0=Cosine 1=Dot 2=Euclidean
-17     reserved                          5
+17     stopwords                         u8      0=未记录(旧版,按默认开) 1=关 2=开(建库即锁定)
+18..22 reserved                          4
 22     next_rel_kind                     u16     自定义关系类型编号分配水位(永不复用)
 24     manifest_version                  u64
 32     watermark_seqno                   u64
@@ -551,7 +552,7 @@ $O(n)$ 时间(查表法每字节 1 次表查 + XOR,8KB 表)、$O(1)$ 空间;`crc
 - `op 为 <`:块不可能有匹配,当 `min ≥ v`;必全匹配,当 `max < v`;
 - `op 为 ≤`:块不可能有匹配,当 `min > v`;必全匹配,当 `max ≤ v`;
 - `op 为 ==`:`v ∉ [min, max]` → 整块剪枝;`min = max = v` 时必全匹配。
-- 代价:每块每字段 16 字节(两个 8 字节 min/max)+ 1 bit has_null;
+- 代价:每块每字段 17 字节(两个 8 字节 min/max + 1 字节 flags:`has_value`/`has_null` 两位;`has_any`(字段是否出现,供 `exists` 剪枝)仅存内存);
 - 复杂度:全块扫描 $O(\lceil N/1024 \rceil)$ 次**内存连续**判断——1M 行 = 977 次
   判断,亚微秒级;被剪块内的行完全不读。
 - **TTL 剪枝**:除字段 zone map 外,每块另存一个 `min(expires_at)`(§2.2 的 `ttl_map`)。
@@ -587,7 +588,8 @@ $$\frac{m}{n} = \frac{\log_2 (1/p)}{\ln 2} \approx 1.44 \, \log_2(1/p) \ \text{b
 **【工程】** 哈希用**双哈希法**(Kirsch–Mitzenmacher):只需两个 64 位哈希 $h_1, h_2$
 (取自 crc32 组合),第 i 个位置 $h_i(x) = h_1(x) + i \cdot h_2(x) \bmod m$——
 k 次哈希的成本变成 2 次哈希 + k 次乘加。误报的后果只是"多评估几行",**安全性无害**。
-Mneme 在 msec 每段每字符串字段放一个 bloom(fpp 1%,默认),供等值过滤下推使用;
+Mneme 在 msec 当前为 `key` 字段放一个 bloom(fpp 1%,默认;元素数 ≤ 初始容量 65536 时
+满足目标误判率,超出后只升误报率、绝不漏报),供等值过滤下推使用;
 范围过滤走 zone map,两者互补。
 
 ### 5.4 倒排索引(为 BM25 供数据)

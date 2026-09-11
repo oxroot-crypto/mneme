@@ -184,6 +184,7 @@ impl Store {
         Manifest {
             dimension: self.dimension,
             metric: self.metric,
+            stopwords: previous.stopwords,
             next_rel_kind: previous.next_rel_kind,
             manifest_version: previous.manifest_version + 1,
             watermark_seqno: ws.seqno.get(),

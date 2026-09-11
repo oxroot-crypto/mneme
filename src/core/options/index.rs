@@ -43,6 +43,9 @@ pub struct Tuning {
     /// 过滤三档:放大后过滤 / 候选暴力分界,默认 0.001。
     pub filter_brute_threshold: f32,
     /// 是否启用内置停用词表,默认 `true`。
+    ///
+    /// **建库即锁定**:打开既有库时以 MANIFEST 记录值为准,本字段仅对新建库生效;
+    /// 冲突值会被忽略,以保证索引分词与查询分词同口径(FC-PERSIST-POST-009)。
     pub stopwords: bool,
 }
 

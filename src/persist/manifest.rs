@@ -5,7 +5,7 @@
 //!
 //! ```text
 //! 0   magic "MNF1" | 4 u16 ver | 6 u16 header_len | 8 u32 header_crc32
-//! 12  u32 dimension | 16 u8 metric | 17 reserved[5] | 22 u16 next_rel_kind
+//! 12  u32 dimension | 16 u8 metric | 17 u8 stopwords | 18 reserved[4] | 22 u16 next_rel_kind
 //! 24  u64 manifest_version | 32 u64 watermark_seqno | 40 u64 next_rowid
 //! 48  u32 next_segment_id | 52 u32 next_ns_id | 56 u32 active_count
 //! 60  u32 ns_count | 64 u32 rel_kind_count | 68..72 pad
@@ -29,6 +29,13 @@ pub(crate) const MAGIC: [u8; 4] = *b"MNF1";
 pub(crate) const HEADER_LEN: u16 = 72;
 /// 单个段条目的定长字节数(见 [`parse_segments`] 字段顺序)。
 const SEGMENT_ENTRY_BYTES: usize = 55;
+
+/// `header[17]` 的 stopwords 三态:旧版未记录(按默认 `true`)。
+const STOPWORDS_UNRECORDED: u8 = 0;
+/// `header[17]` 的 stopwords 三态:显式关闭。
+const STOPWORDS_DISABLED: u8 = 1;
+/// `header[17]` 的 stopwords 三态:显式开启。
+const STOPWORDS_ENABLED: u8 = 2;
 
 /// 命名空间注册项(`path ↔ NsId`)。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +89,8 @@ pub(crate) struct Manifest {
     pub(crate) dimension: u32,
     /// 距离度量(建库即锁定)。
     pub(crate) metric: Metric,
+    /// 文本分词是否启用停用词(建库即锁定;查询与索引必须同口径)。
+    pub(crate) stopwords: bool,
     /// 自定义关系类型编号分配水位(永不复用)。
     pub(crate) next_rel_kind: u16,
     /// MANIFEST 版本号。
@@ -136,6 +145,11 @@ pub(crate) fn encode(manifest: &Manifest) -> Result<Vec<u8>> {
     header[6..8].copy_from_slice(&HEADER_LEN.to_le_bytes());
     header[12..16].copy_from_slice(&manifest.dimension.to_le_bytes());
     header[16] = metric_to_u8(manifest.metric);
+    header[17] = if manifest.stopwords {
+        STOPWORDS_ENABLED
+    } else {
+        STOPWORDS_DISABLED
+    };
     header[22..24].copy_from_slice(&manifest.next_rel_kind.to_le_bytes());
     header[24..32].copy_from_slice(&manifest.manifest_version.to_le_bytes());
     header[32..40].copy_from_slice(&manifest.watermark_seqno.to_le_bytes());
@@ -202,6 +216,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Manifest> {
     Ok(Manifest {
         dimension: header.dimension,
         metric: header.metric,
+        stopwords: header.stopwords,
         next_rel_kind: header.next_rel_kind,
         manifest_version: header.manifest_version,
         watermark_seqno: header.watermark_seqno,
@@ -218,6 +233,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Manifest> {
 struct ManifestHeader {
     dimension: u32,
     metric: Metric,
+    stopwords: bool,
     next_rel_kind: u16,
     manifest_version: u64,
     watermark_seqno: u64,
@@ -258,9 +274,20 @@ fn parse_header(bytes: &[u8]) -> Result<ManifestHeader> {
             reason: "manifest: header_crc32 不符".to_string(),
         });
     }
+    let stopwords = match bytes[17] {
+        STOPWORDS_ENABLED | STOPWORDS_UNRECORDED => true,
+        STOPWORDS_DISABLED => false,
+        _ => {
+            return Err(MnemeError::Corrupted {
+                segment: None,
+                reason: "manifest: stopwords 标志非法".to_string(),
+            });
+        }
+    };
     Ok(ManifestHeader {
         dimension: u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
         metric: metric_from_u8(bytes[16])?,
+        stopwords,
         next_rel_kind: u16::from_le_bytes([bytes[22], bytes[23]]),
         manifest_version: read_u64(bytes, 24),
         watermark_seqno: read_u64(bytes, 32),
@@ -346,6 +373,7 @@ mod tests {
         Manifest {
             dimension: 768,
             metric: Metric::Cosine,
+            stopwords: true,
             next_rel_kind: 20,
             manifest_version: 42,
             watermark_seqno: 105,
@@ -382,6 +410,32 @@ mod tests {
         let manifest = sample();
         let bytes = encode(&manifest).expect("encode");
         assert_eq!(parse(&bytes).expect("parse"), manifest);
+    }
+
+    /// FC-PERSIST-POST-009(stopwords 三态:显式开/关往返;旧版 0 按默认开;非法值拒绝)
+    #[test]
+    fn stopwords_tristate_roundtrip() {
+        for stopwords in [true, false] {
+            let mut manifest = sample();
+            manifest.stopwords = stopwords;
+            let bytes = encode(&manifest).expect("encode");
+            let decoded = parse(&bytes).expect("parse");
+            assert_eq!(decoded.stopwords, stopwords);
+        }
+
+        // 旧版未记录(0)→ 默认 true。
+        let mut bytes = encode(&sample()).expect("encode");
+        bytes[17] = 0;
+        let crc = header_crc(&bytes[..HEADER_LEN as usize]);
+        bytes[8..12].copy_from_slice(&crc.to_le_bytes());
+        assert!(parse(&bytes).expect("legacy parse").stopwords);
+
+        // 未知值 → Corrupted。
+        let mut bytes = encode(&sample()).expect("encode");
+        bytes[17] = 9;
+        let crc = header_crc(&bytes[..HEADER_LEN as usize]);
+        bytes[8..12].copy_from_slice(&crc.to_le_bytes());
+        assert!(matches!(parse(&bytes), Err(MnemeError::Corrupted { .. })));
     }
 
     /// 头部 CRC 损坏被检出。

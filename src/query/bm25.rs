@@ -52,7 +52,7 @@ pub(crate) fn search(params: &Bm25Query<'_>) -> Vec<Scored> {
     if query_terms.is_empty() {
         return Vec::new();
     }
-    let Some(stats) = collect_stats(params, docs) else {
+    let Some(stats) = collect_stats(params, docs, &query_terms) else {
         return Vec::new();
     };
     let scores = score_postings(params, &query_terms, docs, &stats);
@@ -78,7 +78,11 @@ struct Bm25Stats {
 }
 
 /// 第一遍:统计 `N`/`avgdl`(只计可见行)与查询词 `df`。
-fn collect_stats(params: &Bm25Query<'_>, docs: &HashMap<SlotId, u32>) -> Option<Bm25Stats> {
+fn collect_stats(
+    params: &Bm25Query<'_>,
+    docs: &HashMap<SlotId, u32>,
+    query_terms: &[String],
+) -> Option<Bm25Stats> {
     let mut n = 0_u64;
     let mut total_dl = 0_u64;
     for slot in docs.keys() {
@@ -92,18 +96,18 @@ fn collect_stats(params: &Bm25Query<'_>, docs: &HashMap<SlotId, u32>) -> Option<
     }
     let avgdl = total_dl as f32 / n as f32;
     let mut df = HashMap::new();
-    for term in query_terms(params.query, params.stopwords) {
+    for term in query_terms {
         let count = params
             .view
             .inv
-            .postings_of(params.ns_id, &term)
+            .postings_of(params.ns_id, term)
             .map_or(0, |postings| {
                 postings
                     .iter()
                     .filter(|posting| is_visible(params, posting.slot))
                     .count() as u64
             });
-        df.insert(term, count);
+        df.insert(term.clone(), count);
     }
     Some(Bm25Stats { n, avgdl, df })
 }

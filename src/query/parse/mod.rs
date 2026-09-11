@@ -4,14 +4,14 @@
 //! 以及 `always` / `never` 真值常量(供 `Display` 往返闭合)。对任意输入返回
 //! 结构化 [`MnemeError::FilterParse`](crate::MnemeError::FilterParse) 且带位置,
 //! 绝不 panic(I7)。
-
-use std::sync::Arc;
+//!
+//! 值字面量(数字/字符串/时间)的解析见 [`literal`](self::literal)。
 
 use crate::core::error::{MnemeError, Result};
 use crate::core::options::{Clock, SystemClock};
 use crate::memory::pred::{CmpOp, Expr, Val};
 
-use super::iso;
+mod literal;
 
 /// 表达式最大嵌套深度(防畸形输入导致递归栈溢出)。
 const MAX_DEPTH: usize = 128;
@@ -374,183 +374,6 @@ impl<'a> Parser<'a> {
         }
         Ok(Expr::In(field, vals.into_boxed_slice()))
     }
-
-    /// 只接受字符串字面量的取值位置(`startswith` / `endswith` / `~`)。
-    fn parse_string_value(&mut self) -> Result<Arc<str>> {
-        match self.parse_value()? {
-            Val::Str(text) => Ok(text),
-            _ => Err(self.error("此位置只接受字符串字面量")),
-        }
-    }
-
-    /// `value = string | number | "true" | "false" | timestamp | duration_expr`。
-    fn parse_value(&mut self) -> Result<Val> {
-        self.skip_ws();
-        let Some(first) = self.rest().chars().next() else {
-            return Err(self.error("期望取值"));
-        };
-        if first == '"' {
-            let text = self.parse_quoted()?;
-            return Ok(Val::Str(Arc::from(text)));
-        }
-        if first == 't' && self.eat_keyword("true") {
-            return Ok(Val::Bool(true));
-        }
-        if first == 'f' && self.eat_keyword("false") {
-            return Ok(Val::Bool(false));
-        }
-        if self.at_timestamp() {
-            return self.parse_timestamp();
-        }
-        if self.at_keyword("now") {
-            return self.parse_now();
-        }
-        let (text, is_int) = self.parse_number_text()?;
-        if is_int && let Ok(int) = text.parse::<i64>() {
-            return Ok(Val::Int(int));
-        }
-        let value = text.parse::<f64>().map_err(|_| self.error("非法数字"))?;
-        Ok(Val::Num(value))
-    }
-
-    /// 当前位置是否匹配关键字(后随字符不是标识符续字符)。
-    fn at_keyword(&self, keyword: &str) -> bool {
-        let Some(after) = self.rest().strip_prefix(keyword) else {
-            return false;
-        };
-        !after.starts_with(|c: char| c.is_alphanumeric() || c == '_')
-    }
-
-    /// `value` 位置是否是以 `ts"` 开头的时间戳字面量。
-    fn at_timestamp(&self) -> bool {
-        let rest = self.rest();
-        let Some(after) = rest.strip_prefix("ts") else {
-            return false;
-        };
-        after.trim_start().starts_with('"')
-    }
-
-    /// `ts"2024-06-01T00:00:00Z"` → `Val::Ts(Unix 毫秒)`。
-    fn parse_timestamp(&mut self) -> Result<Val> {
-        self.pos += "ts".len();
-        let text = self.parse_quoted()?;
-        let ms =
-            iso::parse_iso8601_ms(&text).ok_or_else(|| self.error("ts 字面量不是合法 ISO 8601"))?;
-        Ok(Val::Ts(ms))
-    }
-
-    /// `now ( - | + ) duration`,查询时刻求值为绝对毫秒。
-    fn parse_now(&mut self) -> Result<Val> {
-        self.pos += "now".len();
-        self.skip_ws();
-        let sign = if self.eat_symbol("-") {
-            -1.0
-        } else if self.eat_symbol("+") {
-            1.0
-        } else {
-            return Err(self.error("now 后须为 '-' 或 '+' 与时间量(如 now - 7d)"));
-        };
-        self.skip_ws();
-        let (text, _) = self.parse_number_text()?;
-        let amount = text.parse::<f64>().map_err(|_| self.error("非法数字"))?;
-        let unit = self
-            .rest()
-            .chars()
-            .next()
-            .ok_or_else(|| self.error("时间量缺单位(s/m/h/d/w)"))?;
-        let unit_ms = match unit {
-            's' => 1_000.0,
-            'm' => 60_000.0,
-            'h' => 3_600_000.0,
-            'd' => 86_400_000.0,
-            'w' => 604_800_000.0,
-            _ => return Err(self.error("时间量单位须为 s/m/h/d/w")),
-        };
-        self.pos += unit.len_utf8();
-        let delta = amount * unit_ms;
-        Ok(Val::Ts(self.now_ms + (sign * delta) as i64))
-    }
-
-    /// 读取数字字面量,返回 `(原文, 是否无小数/指数)`。
-    fn parse_number_text(&mut self) -> Result<(&'a str, bool)> {
-        let rest = self.rest();
-        let bytes = rest.as_bytes();
-        let mut end = 0;
-        if end < bytes.len() && (bytes[end] == b'-' || bytes[end] == b'+') {
-            end += 1;
-        }
-        let digits_start = end;
-        while end < bytes.len() && bytes[end].is_ascii_digit() {
-            end += 1;
-        }
-        let mut is_int = true;
-        if end < bytes.len() && bytes[end] == b'.' {
-            is_int = false;
-            end += 1;
-            while end < bytes.len() && bytes[end].is_ascii_digit() {
-                end += 1;
-            }
-        }
-        if end < bytes.len() && (bytes[end] == b'e' || bytes[end] == b'E') {
-            is_int = false;
-            end += 1;
-            if end < bytes.len() && (bytes[end] == b'-' || bytes[end] == b'+') {
-                end += 1;
-            }
-            while end < bytes.len() && bytes[end].is_ascii_digit() {
-                end += 1;
-            }
-        }
-        if end == digits_start {
-            return Err(self.error("期望数字"));
-        }
-        let text = &rest[..end];
-        if text.parse::<f64>().is_err() {
-            return Err(self.error("非法数字"));
-        }
-        self.pos += end;
-        Ok((text, is_int))
-    }
-
-    /// 双引号字符串(支持 `\"` `\\` `\n` `\t` `\r`)。
-    fn parse_quoted(&mut self) -> Result<String> {
-        self.skip_ws();
-        if !self.eat_symbol("\"") {
-            return Err(self.error("期望字符串字面量"));
-        }
-        let mut out = String::new();
-        loop {
-            let Some(c) = self.rest().chars().next() else {
-                return Err(self.error("字符串未闭合"));
-            };
-            match c {
-                '"' => {
-                    self.pos += 1;
-                    return Ok(out);
-                }
-                '\\' => {
-                    self.pos += 1;
-                    let Some(escaped) = self.rest().chars().next() else {
-                        return Err(self.error("转义序列未完成"));
-                    };
-                    let decoded = match escaped {
-                        '"' => '"',
-                        '\\' => '\\',
-                        'n' => '\n',
-                        't' => '\t',
-                        'r' => '\r',
-                        _ => return Err(self.error("不支持的转义序列")),
-                    };
-                    out.push(decoded);
-                    self.pos += escaped.len_utf8();
-                }
-                _ => {
-                    out.push(c);
-                    self.pos += c.len_utf8();
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -638,7 +461,35 @@ mod tests {
             let error = Expr::from_str(text)
                 .err()
                 .unwrap_or_else(|| panic!("{text} 应解析失败"));
-            assert!(matches!(error, MnemeError::FilterParse(_)));
+            let MnemeError::FilterParse(message) = error else {
+                panic!("{text} 应是 FilterParse");
+            };
+            assert!(
+                message.contains("第 ") && message.contains(" 字节"),
+                "{text}: 错误消息缺位置: {message}"
+            );
+        }
+    }
+
+    /// FC-QUERY-ERR-001(数字/时间量超出可表示范围时结构化拒绝,绝不溢出 panic)
+    #[test]
+    fn out_of_range_numbers_and_durations_are_rejected() {
+        for text in [
+            "x == 1e999",
+            "x == -1e999",
+            "x == inf",
+            "created_at > now + 9999999999999999999d",
+            "created_at > now - 9999999999999999999d",
+            "created_at > now + 1e300w",
+            "created_at > now + 3000000d",
+            "created_at > now - 3000000d",
+            r#"created_at > ts"9999-12-31T23:59:59.999-23:59""#,
+            r#"created_at > ts"0000-01-01T00:00:00.000+23:59""#,
+        ] {
+            assert!(
+                matches!(Expr::from_str(text), Err(MnemeError::FilterParse(_))),
+                "{text} 应被结构化拒绝"
+            );
         }
     }
 

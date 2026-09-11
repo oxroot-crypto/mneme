@@ -29,7 +29,7 @@ impl Table {
     pub(crate) fn new_with(config: Arc<Config>, persist: Option<Arc<dyn PersistHook>>) -> Self {
         let mut writer = WriterState::new();
         // 检索加速结构的容量/开关由建库配置决定(空状态上重建无数据损失)。
-        writer.stopwords = config.tuning.stopwords;
+        writer.stopwords_enabled = config.tuning.stopwords;
         writer.index_fields_max = config.tuning.field_dict_max as usize;
         writer.bloom_fpp = config.tuning.bloom_fpp;
         writer.zones = Arc::new(ZoneIndex::new(config.tuning.field_dict_max as usize));

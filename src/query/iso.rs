@@ -5,6 +5,22 @@
 
 /// 一天的毫秒数。
 const DAY_MS: i64 = 86_400_000;
+/// 一小时的毫秒数。
+const HOUR_MS: i64 = 3_600_000;
+/// 一小时的秒数。
+const HOUR_SECS: i64 = 3_600;
+/// 一分钟的秒数。
+const MINUTE_SECS: i64 = 60;
+/// 一分钟的毫秒数。
+const MINUTE_MS: i64 = 60_000;
+
+/// [`format_iso8601_ms`] 可被 [`parse_iso8601_ms`] 原样读回的最小 Unix 毫秒
+/// (`0000-01-01T00:00:00.000Z`);解析器只接受 4 位年份,超出即无法往返。
+pub(crate) const MIN_ROUNDTRIP_MS: i64 = -62_167_219_200_000;
+
+/// [`format_iso8601_ms`] 可被 [`parse_iso8601_ms`] 原样读回的最大 Unix 毫秒
+/// (`9999-12-31T23:59:59.999Z`)。
+pub(crate) const MAX_ROUNDTRIP_MS: i64 = 253_402_300_799_999;
 
 /// 吃掉恰好 `count` 位数字并返回其值。
 fn take_fixed_digits(bytes: &[u8], count: usize) -> Option<(i64, &[u8])> {
@@ -79,7 +95,7 @@ fn parse_offset(bytes: &[u8]) -> Option<i64> {
     if !rest.is_empty() || hour > 23 || minute > 59 {
         return None;
     }
-    Some(sign * (hour * 3_600_000 + minute * 60_000))
+    Some(sign * (hour * HOUR_MS + minute * MINUTE_MS))
 }
 
 /// 解析日期时间部分(年-月-日之后),返回 `(时, 分, 秒, 毫秒, 时区偏移)`。
@@ -139,7 +155,7 @@ pub(crate) fn parse_iso8601_ms(input: &str) -> Option<i64> {
     if civil_from_days(days) != (year, month as u32, day as u32) {
         return None;
     }
-    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    let seconds = days * 86_400 + hour * HOUR_SECS + minute * MINUTE_SECS + second;
     Some(seconds * 1_000 + milli - offset)
 }
 
@@ -155,8 +171,8 @@ pub(crate) fn format_iso8601_ms(ms: i64) -> String {
     let rem = ms.rem_euclid(DAY_MS);
     let (year, month, day) = civil_from_days(days);
     let (hour, minute, second, milli) = (
-        rem / 3_600_000,
-        rem / 60_000 % 60,
+        rem / HOUR_MS,
+        rem / MINUTE_MS % 60,
         rem / 1_000 % 60,
         rem % 1_000,
     );
@@ -249,5 +265,16 @@ mod tests {
     #[test]
     fn leap_day_is_accepted() {
         assert!(parse_iso8601_ms("2024-02-29T00:00:00Z").is_some());
+    }
+
+    #[test]
+    fn roundtrip_bounds_cover_exact_range() {
+        for (ms, text) in [
+            (MIN_ROUNDTRIP_MS, "0000-01-01T00:00:00.000Z".to_string()),
+            (MAX_ROUNDTRIP_MS, "9999-12-31T23:59:59.999Z".to_string()),
+        ] {
+            assert_eq!(format_iso8601_ms(ms), text);
+            assert_eq!(parse_iso8601_ms(&text), Some(ms));
+        }
     }
 }

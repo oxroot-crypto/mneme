@@ -31,6 +31,15 @@ use super::{fusion, plan};
 /// 全局查询标识分配器(`execute()` 缺省生成 `QueryId`)。
 static NEXT_QUERY_ID: AtomicU64 = AtomicU64::new(1);
 
+/// 单通道执行的公共上下文(视图/命名空间/时刻/条数/共享候选)。
+struct ChannelCtx<'a> {
+    view: &'a ReaderView,
+    ns_id: NsId,
+    now: i64,
+    top_k: usize,
+    candidates: &'a [u32],
+}
+
 impl SearchBuilder<'_> {
     /// 执行检索。
     ///
@@ -60,7 +69,11 @@ impl SearchBuilder<'_> {
         let Some(ns_id) = self.resolve_ns_id(&view) else {
             return Ok(Vec::new());
         };
-        let now = self.config.clock.now_unix_ms();
+        // 历史视图(`as_of`)的 TTL 判定以视图时刻为准(设计 07 §25):
+        // 记录在 `as_of(t)` 中可见当且仅当 `expires_at > t`,与墙上时钟无关。
+        let now = self
+            .as_of
+            .unwrap_or_else(|| self.config.clock.now_unix_ms());
         let view = self.apply_as_of(view);
         let scored = self.run_channels(&view, ns_id, now)?;
         let (scored, via_map) = self.apply_expansion(&view, scored, now);
@@ -182,17 +195,24 @@ impl SearchBuilder<'_> {
         } else {
             self.top_k
         };
+        let channel = ChannelCtx {
+            view,
+            ns_id,
+            now,
+            top_k: channel_k,
+            candidates,
+        };
         let vector_hits = match &self.vector {
-            Some(query) => Some(self.run_vector(view, ns_id, query, now, channel_k, candidates)?),
+            Some(query) => Some(self.run_vector(&channel, query)?),
             None => None,
         };
         let text_hits = self.text.as_deref().map(|text| {
             bm25::search(&Bm25Query {
-                view,
-                ns_id,
+                view: channel.view,
+                ns_id: channel.ns_id,
                 query: text,
-                top_k: channel_k,
-                now_ms: now,
+                top_k: channel.top_k,
+                now_ms: channel.now,
                 stopwords: self.config.tuning.stopwords,
                 candidates: Some(&plan.bits),
             })
@@ -202,8 +222,10 @@ impl SearchBuilder<'_> {
                 vector,
                 text,
                 self.fusion.unwrap_or_default(),
-                self.top_k,
-                self.config.metric == Metric::Euclidean,
+                fusion::FusionParams {
+                    top_k: self.top_k,
+                    vector_is_distance: self.config.metric == Metric::Euclidean,
+                },
             )),
             (Some(vector), None) => Ok(vector),
             (None, Some(text)) => Ok(text),
@@ -214,30 +236,22 @@ impl SearchBuilder<'_> {
     }
 
     /// 向量通道(带共享候选位图)。
-    fn run_vector(
-        &self,
-        view: &ReaderView,
-        ns_id: NsId,
-        query: &[f32],
-        now: i64,
-        top_k: usize,
-        candidates: &[u32],
-    ) -> Result<Vec<Scored>> {
+    fn run_vector(&self, ctx: &ChannelCtx<'_>, query: &[f32]) -> Result<Vec<Scored>> {
         search::search(&search::SearchParams {
-            view,
-            ns_id,
+            view: ctx.view,
+            ns_id: ctx.ns_id,
             query,
             metric: self.config.metric,
-            top_k,
+            top_k: ctx.top_k,
             ef: self.ef.unwrap_or(self.config.hnsw.ef_search as usize),
             filter: self.filter.as_ref(),
-            now_ms: now,
+            now_ms: ctx.now,
             block: self.config.tuning.parallel_block,
             parallelism: self.config.parallelism,
             brute_force_max_rows: self.config.tuning.brute_force_max_rows as usize,
             filter_post_threshold: self.config.tuning.filter_post_threshold,
             filter_brute_threshold: self.config.tuning.filter_brute_threshold,
-            candidates: Some(candidates),
+            candidates: Some(ctx.candidates),
         })
     }
 

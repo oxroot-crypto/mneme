@@ -120,12 +120,20 @@ fn corrupted(reason: &'static str) -> MnemeError {
     }
 }
 
-/// 由目标误判率计算最优哈希位置数 `k = ⌈ln(1/p)/ln 2⌉`,至少 1。
+/// 由目标误判率计算最优哈希位置数 `k = ⌈ln(1/p)/ln 2⌉`,夹在 `[1, 64]`。
+///
+/// 上限 64 与 [`BloomSet::from_words`] 的校验一致:极小 `fpp` 也必须落在
+/// 可落盘、可重开读回的范围内,绝不生产自读不回的文件。
 fn optimal_k(fpp: f32) -> usize {
-    let p = f64::from(fpp.clamp(f64::MIN_POSITIVE as f32, 1.0));
+    // 非有限/非正 `fpp` 视为最保守的极小值(`f32::clamp` 对 NaN 不生效,需显式兜底)。
+    let p = if fpp.is_finite() && fpp > 0.0 {
+        f64::from(fpp.min(1.0))
+    } else {
+        f64::MIN_POSITIVE
+    };
     ((1.0_f64 / p).ln() / std::f64::consts::LN_2)
         .ceil()
-        .max(1.0) as usize
+        .clamp(1.0, 64.0) as usize
 }
 
 /// 第 `index` 个哈希位置(双哈希展开)。
@@ -174,5 +182,20 @@ mod tests {
     fn optimal_k_matches_formula() {
         assert_eq!(optimal_k(0.01), 7);
         assert_eq!(optimal_k(0.1), 4);
+    }
+
+    /// 极小 `fpp` 也必须夹在可落盘范围,自产文件必须能重开读回。
+    #[test]
+    fn extreme_fpp_stays_within_storable_k() {
+        for fpp in [0.0_f32, 1e-30, f32::MIN_POSITIVE, 1.0, -1.0, f32::NAN] {
+            let k = optimal_k(fpp);
+            assert!((1..=64).contains(&k), "fpp={fpp}: k={k}");
+            let bloom = BloomSet::new(64, fpp);
+            assert!(
+                BloomSet::from_words(bloom.bit_len(), bloom.hash_count(), bloom.words().to_vec())
+                    .is_ok(),
+                "fpp={fpp} 的 bloom 必须可重建"
+            );
+        }
     }
 }

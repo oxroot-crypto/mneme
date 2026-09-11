@@ -80,7 +80,7 @@ impl Store {
             manifest_io::cleanup_orphans(root)?;
         }
 
-        let (manifest, version) = load_or_init_manifest(root, options.dimension, options.metric)?;
+        let (manifest, version) = load_or_init_manifest(root, &options)?;
 
         // 可写实例清理 MANIFEST 未引用的段孤儿(garbage),只读实例不写盘。
         if !options.read_only {
@@ -137,11 +137,8 @@ fn wal_config(manifest: &Manifest, options: &OpenOptions) -> WalConfig {
 }
 
 /// 载入既有 MANIFEST,或据请求与 WAL 头初始化一个新 MANIFEST。
-fn load_or_init_manifest(
-    root: &Path,
-    requested_dimension: Option<u32>,
-    requested_metric: Option<Metric>,
-) -> Result<(Manifest, u64)> {
+fn load_or_init_manifest(root: &Path, options: &OpenOptions) -> Result<(Manifest, u64)> {
+    let (requested_dimension, requested_metric) = (options.dimension, options.metric);
     let loaded = manifest_io::load_manifest(root)?;
     match loaded {
         Some((manifest, version)) => {
@@ -162,7 +159,12 @@ fn load_or_init_manifest(
                 });
             }
             Ok((
-                init_manifest_from_wal(root, requested_dimension, requested_metric)?,
+                init_manifest_from_wal(
+                    root,
+                    requested_dimension,
+                    requested_metric,
+                    options.tuning.stopwords,
+                )?,
                 0,
             ))
         }
@@ -211,6 +213,7 @@ fn init_manifest_from_wal(
     root: &Path,
     requested_dimension: Option<u32>,
     requested_metric: Option<Metric>,
+    stopwords: bool,
 ) -> Result<Manifest> {
     let wal_header = storage::read_file_opt(root, WAL_FILE)?
         .and_then(|bytes| wal::parse_file_header(&bytes).ok());
@@ -219,6 +222,7 @@ fn init_manifest_from_wal(
     Ok(Manifest {
         dimension,
         metric,
+        stopwords,
         next_rel_kind: NEXT_REL_KIND_INITIAL,
         manifest_version: 0,
         watermark_seqno: 0,
@@ -271,9 +275,9 @@ fn load_write_state(
     options: &OpenOptions,
 ) -> Result<WriterState> {
     let mut state = recover::empty_state(manifest);
-    // 恢复期重建的加速结构必须与建库配置同口径(分词/字段上限/bloom 误判率),
-    // 否则查询分词与索引分词不一致会静默漏召回。
-    state.stopwords = options.tuning.stopwords;
+    // 恢复期重建的加速结构必须与建库配置同口径(分词/字段上限/bloom 误判率):
+    // 停用词开关以 MANIFEST 为准(建库即锁定),否则查询分词与索引分词不一致会静默漏召回。
+    state.stopwords_enabled = manifest.stopwords;
     state.index_fields_max = options.tuning.field_dict_max as usize;
     state.bloom_fpp = options.tuning.bloom_fpp;
     state.zones = Arc::new(ZoneIndex::new(options.tuning.field_dict_max as usize));

@@ -14,11 +14,11 @@
 > 交行级残差求值;③ 计划编译仍含 $O(N)$ 的逐行可见性判定(待段句柄重构消除,
 > 契约 `FC-QUERY-CPLX-002`);④ `ttl_map` 与段内反向表随 L5 落地。验收:`tests/l4_contracts.rs`。
 
-模块:`query/{parse.rs, plan.rs, zmap.rs, bm25.rs, fusion.rs, result_dedup.rs, exec.rs}`
+模块:`query/{parse/{mod,literal}.rs, display.rs, json.rs, iso.rs, plan.rs, zmap.rs, bm25.rs, fusion.rs, exec.rs}`
 
 ---
 
-## 1. 过滤 DSL:`parse.rs`
+## 1. 过滤 DSL:`parse/{mod,literal}.rs`
 
 ### 1.1 文法(EBNF)
 
@@ -44,7 +44,7 @@ duration_expr = "now" ( "-" | "+" ) duration ;   (* now - 7d *)
 duration = number ( "s" | "m" | "h" | "d" | "w" ) ;
 ```
 
-- **解析器**:递归下降,约 300 行手写;优先级 `not > and > or`;
+- **解析器**:递归下降,语法与运算符分派(`parse/mod.rs`)+ 字面量解析(`parse/literal.rs`);优先级 `not > and > or`;
 - **路径**:`path` 为 `a.b.c` 形式的点路径(嵌套元数据字段);
 - **运算符别名**:`&&` / `||` / `!` 作为 `and` / `or` / `not` 的等价写法被接受
   (01 §6 的 `filter!` 示例即用 `&&`);
@@ -174,9 +174,13 @@ IDF = ln((1000 - 100 + 0.5)/(100 + 0.5) + 1) = ln(8.96 + 1) = ln 9.96 ≈ 2.299
 
 ```text
 term_dict: [term → (df, postings_offset, postings_len)]   (段内排序,二分查找)
-postings:  [slot_delta varint][tf varint] × df           (SlotId 升序,差分编码)
-doc_len:   f32 × count                                     (|D|,归一用)
+postings:  [slot_delta varint][tf varint] × df           (SlotId 严格升序,差分编码)
+doc 区:    [u32 doc_count] + [u32 ns_id][u32 slot][u32 doc_len] × count   (归一用)
 ```
+
+> 落盘在词表与 postings 区之间写入 `[u64 postings_total_len]` 显式长度,doc 区起点
+> 不靠"各词条声明区间的最大值"推断;重复词条与重复槽位在解码/编码时显式拒绝
+> (见 `src/persist/msec/inverted.rs`)。
 
 - **差分 + varint**:SlotId 升序时相邻差多为小整数,varint 平均 1–2 字节
   ([02 §6](02-l0-core.md));整条 postings 空间 ≈ $df \times 3$ 字节量级(经验值);
@@ -198,7 +202,7 @@ $$T = O\!\left(2\sum_{t \in Q} df_t\right)\ \text{postings accesses (count pass 
 规则:按 Unicode 空白切词 → 小写化 → 去首尾标点;**CJK 连续段做 bigram**
 ("记忆库" → "记忆","忆库")——bigram 是无词典分词的保底方案,精度对
 关键词通道足够;拉丁词按词切。停用词表为内置常量,经 `Tuning::stopwords` 开关(默认开,
-见 [16 §2](16-api-reference.md))。未来替换 jieba 级分词器只动 `bm25::tokenize` 一个函数。
+见 [16 §2](16-api-reference.md))。未来替换 jieba 级分词器只动 `core::text::tokenize` 一个函数。
 
 ---
 
@@ -298,7 +302,7 @@ C              0.85 / 1           缺席 / —           1/61        = 0.01639
 
 ---
 
-## 6. 去重服务:`result_dedup.rs`
+## 6. 结果级去重(实现于 L1 `memory::expand`)
 
 写入期去重(`Dedup`,见 [03 §6](03-l1-memory.md))与**结果级去重**是两个独立旋钮;
 后者只作用于本次 `execute()` 返回的命中列表:

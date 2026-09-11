@@ -467,6 +467,9 @@ impl Expr {
 }
 // `Display`(打印为可被 `from_str` 读回的文本)亦已实现,见 06 §1。
 
+/// 分词:按空白切词 + CJK bigram + 可选停用词;公开给自建文本索引的宿主(见 06 §3.5)。
+pub fn tokenize(text: &str, stopwords_enabled: bool) -> Vec<String>;
+
 /// 字段组合器(定义见 [03 §5.1](03-l1-memory.md)):`eq/ne/gt/ge/lt/le/is_in` 返回 `Expr`。
 pub struct FieldBuilder { /* field: String */ }
 
@@ -635,7 +638,7 @@ pub struct Tuning {
     pub brute_force_max_rows: u32,      // 默认 2048  段行数低于此值恒用暴力(05 §9)
     pub filter_post_threshold: f32,     // 默认 0.10  过滤三档:后过滤/放大后过滤分界(05 §8)
     pub filter_brute_threshold: f32,    // 默认 0.001 过滤三档:放大后过滤/候选暴力分界(05 §8)
-    pub stopwords: bool,                // 默认 true  启用内置停用词表(06 §3.5)
+    pub stopwords: bool,                // 默认 true  启用内置停用词表(06 §3.5;建库即锁定,既存库以 MANIFEST 为准)
 }
 ```
 

@@ -4,7 +4,7 @@
 //! [`WriterState::commit_version`](super::super::table::WriterState) 时增量插入;
 //! 旧版本槽位保留在 postings 中,由查询期按视图可见性过滤(支持 `as_of`)。
 //!
-//! 倒排按命名空间分桶,B25 统计天然满足 NS 隔离(I21)。
+//! 倒排按命名空间分桶,BM25 统计天然满足 NS 隔离(I21)。
 
 use std::collections::HashMap;
 use std::sync::Arc;

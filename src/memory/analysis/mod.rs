@@ -10,7 +10,7 @@ mod zones;
 
 pub(crate) use bloom::BloomSet;
 pub(crate) use inv::{InvertedIndex, Posting};
-pub(crate) use zones::{ZONE_BLOCK_ROWS, ZoneIndex, ZoneKind};
+pub(crate) use zones::{MAX_EXACT_INT, ZONE_BLOCK_ROWS, ZoneIndex, ZoneKind};
 
 /// bloom 位图的初始容量预估(元素数)。
 ///
