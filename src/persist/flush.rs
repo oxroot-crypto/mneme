@@ -8,11 +8,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::core::error::Result;
+use crate::memory::analysis::ZONE_BLOCK_ROWS;
 use crate::memory::config::Config;
 use crate::memory::index::{IndexNode, VectorIndex};
 use crate::memory::table::{SlotData, WriterState};
 use crate::persist::edges::EdgeData;
-use crate::persist::msec::{self, EntryData, MsecInput, NsStatRow, SlotMeta};
+use crate::persist::msec::{self, EntryData, FieldKind, MsecInput, NsStatRow, SlotMeta};
 use crate::persist::vsec::{self, VsecInput};
 
 /// 段内槽位及其对应的向量/范数/删除位(向量借用自写状态)。
@@ -61,11 +62,16 @@ pub(crate) fn build_segment(
     let ns_stats = build_ns_stats(ws, config);
     let relations = build_relations(ws);
     let relations_bytes = crate::persist::edges::encode(&relations, false);
+    let indexes = build_indexes(ws, config, built.slots.len())?;
     let msec_bytes = msec::encode(&MsecInput {
         slots: &built.slots,
         ns_stats: &ns_stats,
         delta: &[],
         relations: &relations_bytes,
+        field_dict: &indexes.field_dict,
+        zmap: &indexes.zmap,
+        bloom: &indexes.bloom,
+        inverted: &indexes.inverted,
     })?;
 
     let built_index = build_index(ws, config)?;
@@ -77,6 +83,49 @@ pub(crate) fn build_segment(
         entry_slot: built_index.entry_slot,
         entry_level: built_index.entry_level,
     })
+}
+
+/// 由写状态的加速结构构建 msec 四区(字段字典 / zone map / bloom / 倒排)。
+///
+/// 字段字典包含 zone 已索引的数值/时间字段与 `key`(bloom 字段),总数受
+/// `Tuning.field_dict_max` 约束;超出的 metadata 字段查询期仍走行级求值。
+///
+/// # Errors
+/// 倒排编码超 `u32` 长度或 postings 违背升序不变量时返回结构化错误。
+fn build_indexes(ws: &WriterState, config: &Config, row_count: usize) -> Result<SegmentIndexBlobs> {
+    let max_fields = (config.tuning.field_dict_max as usize).max(1);
+    let mut fields: Vec<(Arc<str>, FieldKind)> = ws
+        .zones
+        .fields_iter()
+        .map(|(name, kind)| (Arc::from(name), FieldKind::from_zone(kind)))
+        .collect();
+    fields.sort_by(|left, right| left.0.cmp(&right.0));
+    // 给 `key`(bloom 字段)预留一个槽位。
+    fields.truncate(max_fields.saturating_sub(1));
+    fields.push((Arc::from("key"), FieldKind::Str));
+    let key_field_id = u16::try_from(fields.len() - 1).map_err(|_| {
+        crate::core::error::MnemeError::LimitExceeded {
+            field: "field_dict",
+            limit: u16::MAX as usize,
+            got: fields.len(),
+        }
+    })?;
+
+    let block_count = row_count.div_ceil(ZONE_BLOCK_ROWS);
+    Ok(SegmentIndexBlobs {
+        field_dict: msec::encode_field_dict(&fields),
+        zmap: msec::encode_zmap(&ws.zones, &fields, block_count),
+        bloom: msec::encode_bloom(&ws.key_bloom, key_field_id),
+        inverted: msec::encode_inverted(&ws.inv)?,
+    })
+}
+
+/// 一次段索引编码的产物(四个区字节)。
+struct SegmentIndexBlobs {
+    field_dict: Vec<u8>,
+    zmap: Vec<u8>,
+    bloom: Vec<u8>,
+    inverted: Vec<u8>,
 }
 
 /// 一次索引构建的产物(hidx 字节、内存索引与入口)。

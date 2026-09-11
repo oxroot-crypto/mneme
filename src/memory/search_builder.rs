@@ -1,18 +1,16 @@
 //! 检索构建器(`search_builder.rs`)。
 //!
-//! 承载 `SearchBuilder` 的链式配置与公开入口 `execute()`;执行流水线
-//! (视图准备/扫描/扩展/排序/去重)见 [`search_exec`](crate::memory::search_exec)。
-//! 公开签名在 L1 冻结(设计 03 §2.2)。
+//! 承载 `SearchBuilder` 的链式配置与字段;公开入口 `execute()` 与执行流水线
+//! (视图准备/双通道扫描/融合/扩展/排序/去重)见 L4 的
+//! [`query::exec`](crate::query)。公开签名在 L1 冻结(设计 03 §2.2)。
 
 use std::marker::PhantomData;
 use std::sync::Arc;
 
-use crate::core::error::{MnemeError, Result};
 use crate::core::options::{Diversity, QueryId, Scoring};
 use crate::memory::config::Config;
 use crate::memory::dedup::ResultDedup;
 use crate::memory::pred::Expr;
-use crate::memory::record::Hit;
 use crate::memory::relation::RelationExpand;
 use crate::memory::rerank::{Fusion, Reranker};
 use crate::memory::table::{ReaderView, Table};
@@ -48,7 +46,7 @@ pub struct SearchBuilder<'a> {
     pub(crate) ef: Option<usize>,
     pub(crate) filter: Option<Expr>,
     pub(crate) dedup: ResultDedup,
-    /// 双通道融合器;`None` = 未设置(L1 未落地,设置即 `Unsupported`)。
+    /// 双通道融合器;`None` = 使用默认 RRF(仅双通道时生效)。
     pub(crate) fusion: Option<Fusion>,
     pub(crate) scoring: Option<Scoring>,
     pub(crate) diversify: Diversity,
@@ -74,11 +72,11 @@ impl SearchBuilder<'_> {
         self
     }
 
-    /// 设置查询文本(L4 前 `execute()` 返回 `Unsupported`)。
+    /// 设置查询文本(BM25 关键词通道;可与 `vector` 组合做 RRF 融合)。
     ///
     /// # Arguments
     ///
-    /// * `query` - 查询文本;作为 BM25 通道(未实现)。
+    /// * `query` - 查询文本;分词后按命名空间全局统计打分(设计 06 §3)。
     ///
     /// # Returns
     ///
@@ -144,11 +142,12 @@ impl SearchBuilder<'_> {
         self
     }
 
-    /// 设置双通道融合器(L4 前 `execute()` 返回 `Unsupported`)。
+    /// 设置双通道融合器(默认 RRF `k=60`;仅双通道时生效)。
     ///
     /// # Arguments
     ///
-    /// * `fusion` - RRF 或加权融合;单独设置(无需 text 通道)即拒绝,绝不静默忽略。
+    /// * `fusion` - RRF 或加权融合;未同时设置向量与文本通道时
+    ///   `execute()` 返回 `Config`,绝不静默忽略。
     ///
     /// # Returns
     ///
@@ -240,46 +239,6 @@ impl SearchBuilder<'_> {
     pub fn rerank(mut self, rerank: Arc<dyn Reranker>) -> Self {
         self.rerank = Some(rerank);
         self
-    }
-
-    /// 执行检索。
-    ///
-    /// # Errors
-    /// * 无查询通道 → [`MnemeError::Config`];
-    /// * 设置 `text`/`Fusion`(L4 前未实现)→ [`MnemeError::Unsupported`];
-    /// * 查询向量维度不符 → [`MnemeError::DimensionMismatch`];
-    /// * `top_k`/`ef` 超上限 → [`MnemeError::LimitExceeded`];
-    /// * MMR `lambda` 含非有限值 → [`MnemeError::Config`](`clamp` 对 NaN 失效会静默退化);
-    /// * 库已关闭 → [`MnemeError::Closed`]。
-    ///
-    /// # Examples
-    /// ```
-    /// use mneme::{Mneme, Record};
-    /// let db = Mneme::in_memory(2).unwrap();
-    /// let ns = db.namespace("demo");
-    /// ns.insert(Record::new(vec![1.0, 0.0]).key("a")).unwrap();
-    /// let hits = ns.search().vector(&[1.0, 0.0]).top_k(1).execute().unwrap();
-    /// assert_eq!(hits.len(), 1);
-    /// ```
-    pub fn execute(&self) -> Result<Vec<Hit>> {
-        let view = self.prepare_view()?;
-        let Some(query) = &self.vector else {
-            return Err(MnemeError::Config {
-                reason: "检索至少需要一个查询通道",
-            });
-        };
-        self.validate_query(query)?;
-        self.validate_diversify()?;
-        let Some(ns_id) = self.resolve_ns_id(&view) else {
-            return Ok(Vec::new());
-        };
-        let now = self.config.clock.now_unix_ms();
-        let view = self.apply_as_of(view);
-        let scored = self.run_search(&view, ns_id, query, now)?;
-        let (scored, via_map) = self.apply_expansion(&view, scored, now);
-        let ranked = self.rank(&view, scored, now);
-        let hits = self.build_hits(&view, ranked, self.resolve_query_id(), &via_map);
-        Ok(self.apply_rerank(hits))
     }
 }
 

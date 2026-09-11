@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::core::error::Result;
+use crate::core::error::{MnemeError, Result};
 use crate::core::types::{NsId, SeqNo};
 use crate::memory::table::WriterState;
 use crate::persist::manifest::Manifest;
@@ -62,6 +62,8 @@ pub(crate) fn load_segments(
     verify_payload: bool,
     fail_fast: bool,
 ) -> Result<RecoveredSegments> {
+    // 恢复期间暂停索引增量维护:段载入完成后由磁盘索引或全量重建接管。
+    state.indexing_paused = true;
     // 收集全部版本并按 (rowid, seqno) 全局排序,保证同一 RowId 的版本链有序。
     let mut versions: Vec<(VersionRow, usize)> = Vec::new();
     let mut parsed: Vec<(vsec::VsecView<'_>, msec::MsecView<'_>)> = Vec::new();
@@ -80,7 +82,7 @@ pub(crate) fn load_segments(
     }
     versions.sort_by_key(|(row, _)| (row.rowid, row.seqno));
 
-    // 单段且有 hidx 时才需要"段内槽位 → 全局槽位"重排映射(见 [`build_remap`])。
+    // 单段时构建"段内槽位 → 全局槽位"重排映射(倒排载入与 hidx 均需要)。
     let row_count = parsed
         .first()
         .map_or(0, |(view, _)| view.row_count() as usize);
@@ -89,14 +91,76 @@ pub(crate) fn load_segments(
     apply_versions(state, &versions, &parsed)?;
     apply_relations(state, &parsed)?;
     state.pending.clear();
+    apply_indexes(state, &parsed, remap.as_deref(), fail_fast)?;
+    state.indexing_paused = false;
     Ok(RecoveredSegments { skipped, remap })
 }
 
-/// 构建单段 hidx 所需的"段内槽位 → 全局槽位"重排映射。
+/// 载入或重建检索加速结构(倒排 / zone map / bloom)。
+///
+/// 单段且存在重排映射时优先用段内四区装载倒排(免重新分词);结构不合法时
+/// `fail_fast` 报错,否则降级为从槽位全量重建——两条路径产生等价的索引。
+fn apply_indexes(
+    state: &mut WriterState,
+    parsed: &[(vsec::VsecView<'_>, msec::MsecView<'_>)],
+    remap: Option<&[u32]>,
+    fail_fast: bool,
+) -> Result<()> {
+    if let (Some(remap), [(_, msec_view)]) = (remap, parsed) {
+        match load_disk_indexes(state, msec_view, remap) {
+            Ok(()) => return Ok(()),
+            Err(error) if fail_fast => return Err(error),
+            // 索引是查询加速器而非数据来源:损坏时降级全量重建仍然正确。
+            Err(_) => {}
+        }
+    }
+    if !parsed.is_empty() {
+        state.rebuild_indexes();
+    }
+    Ok(())
+}
+
+/// 由段内四区装载索引:字段字典/zone map 校验,倒排经重排映射,bloom 直接复用。
+fn load_disk_indexes(
+    state: &mut WriterState,
+    msec_view: &msec::MsecView<'_>,
+    remap: &[u32],
+) -> Result<()> {
+    let fields = msec::decode_field_dict(msec_view.field_dict_bytes())?;
+    let block_count = state
+        .slots
+        .len()
+        .div_ceil(crate::memory::analysis::ZONE_BLOCK_ROWS);
+    msec::validate_zmap(msec_view.zmap_bytes(), &fields, block_count)?;
+    let str_ids: Vec<u16> = fields
+        .iter()
+        .filter(|field| field.kind == msec::FieldKind::Str)
+        .map(|field| field.id)
+        .collect();
+    let blooms = msec::decode_bloom(msec_view.bloom_bytes())?;
+    let Some(key_bloom) = blooms
+        .into_iter()
+        .find_map(|(id, bloom)| str_ids.contains(&id).then_some(bloom))
+    else {
+        return Err(MnemeError::Corrupted {
+            segment: None,
+            reason: "msec: bloom 区缺少 key 字段".to_string(),
+        });
+    };
+    let inv = if msec_view.inverted_bytes().is_empty() {
+        crate::memory::analysis::InvertedIndex::default()
+    } else {
+        msec::decode_inverted(msec_view.inverted_bytes(), remap)?
+    };
+    state.load_disk_indexes(inv, key_bloom);
+    Ok(())
+}
+
+/// 构建单段的"段内槽位 → 全局槽位"重排映射。
 ///
 /// 第 k 个被应用的版本落入全局槽位 k(槽位从空开始),故
 /// `remap[段内槽位] = 该版本在 `(rowid, seqno)` 有序链中的位置`。
-/// 无 hidx、多段或存在跳过段时返回 `None`(调用方降级暴力)。
+/// 多段或存在跳过段时返回 `None`(调用方降级重建索引)。
 ///
 /// # Errors
 /// 版本槽位越界/重复,或存在未被版本行引用的段内槽位(vsec/msec 行数不一致)时
@@ -107,11 +171,7 @@ fn build_remap(
     skipped: &[u32],
     row_count: usize,
 ) -> Result<Option<Vec<u32>>> {
-    let has_hidx = segments
-        .first()
-        .is_some_and(|segment| segment.hidx.is_some());
-    // 无 hidx 的库不需要该映射,避免为百万级槽位白分配两份 O(N) 向量。
-    if !has_hidx || segments.len() != 1 || !skipped.is_empty() {
+    if segments.len() != 1 || !skipped.is_empty() {
         return Ok(None);
     }
     let mut remap = vec![0_u32; row_count];
@@ -164,7 +224,7 @@ mod tests {
     }
 
     /// FC-PERSIST-ERR-009:映射按"(rowid, seqno) 有序链位置"重排(非恒等);
-    /// 无 `hidx` 时返回 `None`(调用方降级暴力,非错误)。
+    /// 无 hidx 同样构建(倒排载入需要);多段或存在跳过段时返回 `None`。
     #[test]
     fn build_remap_maps_slots_in_version_chain_order() {
         let segments = [segment_with_hidx()];
@@ -172,7 +232,7 @@ mod tests {
         let versions = [(version(1, 1), 0), (version(2, 0), 0)];
         let remap = build_remap(&versions, &segments, &[], 2)
             .expect("合法布局不得报错")
-            .expect("带 hidx 的单段必须产生映射");
+            .expect("单段必须产生映射");
         assert_eq!(remap, vec![1, 0], "remap[段内槽位] = 有序链位置");
 
         let without_hidx = [SegmentBytes {
@@ -181,6 +241,13 @@ mod tests {
         }];
         assert_eq!(
             build_remap(&versions, &without_hidx, &[], 2).expect("无 hidx 不是错误"),
+            Some(vec![1, 0]),
+            "无 hidx 也需映射(倒排载入用)"
+        );
+
+        let multi = [segment_with_hidx(), segment_with_hidx()];
+        assert_eq!(
+            build_remap(&versions, &multi, &[], 2).expect("多段返回 None,非错误"),
             None
         );
     }

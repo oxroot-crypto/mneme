@@ -15,8 +15,9 @@
 签名在 L1 冻结([01 §6](01-overview.md))。`Mneme` 是库句柄,`Namespace` 是逻辑分区,
 二者都通过内部 `Arc` 共享、可自由克隆并跨线程传递(见 §5)。
 
-> **L1 实现状态**:本参考按冻结签名描述目标语义;标注「L1 未落地」的方法在当前
-> 版本返回 `Unsupported{feature}`(FC-MEM-ERR-002),不静默降级,见 §4 错误表。
+> **实现状态**:本参考按冻结签名描述目标语义。L4 起 `text`(BM25)、`Fusion`、
+> `Expr::from_str`/`Display`/JSON 往返与 `filter!` 均已落地;尚未落地的能力以结构化
+> 错误返回、绝不静默降级(FC-MEM-ERR-002),见 §4 错误表。
 
 ### 1.1 构建与打开
 
@@ -237,14 +238,14 @@ impl SearchBuilder<'_> {
     pub fn ef(self, ef: usize) -> Self;                     // 仅 L3+ 生效;上限 4096
     pub fn filter(self, e: Expr) -> Self;                   // 预过滤(语义见 03 §2.2)
     pub fn dedup(self, d: ResultDedup) -> Self;             // 结果级去重(见 06 §6)
-    pub fn fusion(self, f: Fusion) -> Self;                 // 双通道融合(见 06 §4);L1 未落地:设置即 `Unsupported`(L4)
+    pub fn fusion(self, f: Fusion) -> Self;                 // 双通道融合(见 06 §4);未同时启用双通道时 execute() 返回 Config
     pub fn score(self, s: Scoring) -> Self;                 // 时序/重要度/访问感知打分(见 10 §2)
     pub fn diversify(self, d: Diversity) -> Self;           // MMR 多样性(见 10 §5)
     pub fn expand(self, e: RelationExpand) -> Self;         // 关系联想扩展(见 10 §3)
     pub fn as_of(self, ts_ms: i64) -> Self;                 // 双时态历史读(见 09 §3)
     pub fn query_id(self, id: QueryId) -> Self;             // 指定本次查询的幂等标识;默认由 execute() 生成(见 10 §4)
     pub fn rerank(self, r: Arc<dyn Reranker>) -> Self;      // 可选精排钩子
-    pub fn execute(&self) -> Result<Vec<Hit>>;              // 至少一个通道非空,否则 Config;查询向量维度不符返回 DimensionMismatch;MMR lambda 非有限值返回 Config
+    pub fn execute(&self) -> Result<Vec<Hit>>;              // 至少一个通道非空,否则 Config;Fusion 未同时启用双通道或 Weighted.alpha 越界/非有限 → Config;查询向量维度不符返回 DimensionMismatch;MMR lambda 非有限值返回 Config
 }
 ```
 
@@ -459,8 +460,12 @@ impl Expr {
     pub fn field(name: &str) -> FieldBuilder;
     /// DSL 字符串解析,对任意输入不 panic(I7);`filter!` 即其 expect 封装(见 06 §1)。
     pub fn from_str(s: &str) -> Result<Expr>;
-    // Display(打印)与 Meta ↔ Expr 的 JSON 往返见 06 §1。
+    /// 编码为 JSON(单键对象,见 06 §1)。
+    pub fn to_meta(&self) -> Meta;
+    /// 从 JSON 解码;结构非法返回 `FilterParse`。
+    pub fn from_meta(meta: &Meta) -> Result<Expr>;
 }
+// `Display`(打印为可被 `from_str` 读回的文本)亦已实现,见 06 §1。
 
 /// 字段组合器(定义见 [03 §5.1](03-l1-memory.md)):`eq/ne/gt/ge/lt/le/is_in` 返回 `Expr`。
 pub struct FieldBuilder { /* field: String */ }
@@ -702,8 +707,8 @@ pub struct Tuning {
 | `TooLarge` / `LimitExceeded` / `MetaTooDeep` | ❌ | 数据/参数超限,见 §8 |
 | `NonFinite` | ❌ | 向量分量或 `importance`/`confidence`/边权/`boost` 含 `NaN`/`±Inf`,会污染排序与打分;修正输入 |
 | `Closed` | ❌ | 库已关闭;不要再使用该库的任何克隆句柄 |
-| `Config` | ❌ | 建库/查询配置非法(缺维度、无查询通道、MMR `lambda` 非有限值),策略参数含非有限值(`min_importance`/`access_weight`/`threshold`/`dedup_threshold`)或非法(如 `max_cluster = 0`) |
-| `Unsupported` | ❌ | 该能力延后到后续层,或对当前形态不适用(text/Fusion;**纯内存库 `backup_to`**;只读模式写);`Fusion` 单独设置即拒绝;按版本升级 |
+| `Config` | ❌ | 建库/查询配置非法(缺维度、无查询通道、MMR `lambda` 非有限值、`Fusion` 未同时启用双通道、`Weighted.alpha` 越界或非有限),策略参数含非有限值(`min_importance`/`access_weight`/`threshold`/`dedup_threshold`)或非法(如 `max_cluster = 0`) |
+| `Unsupported` | ❌ | 该能力延后到后续层,或对当前形态不适用(**纯内存库 `backup_to`**;只读模式写);按版本升级 |
 | `Inconsistent` | ❌ | 内部不变量被破坏(应为 bug);上报并附上下文 |
 | `UnsupportedVersion` | ❌ | 库由更新版本的 Mneme 写入;升级库,勿降级读 |
 | `Corrupted` | ❌ | 数据损坏:立即停止写入,跑 `db.check()`,按 §7 恢复 |

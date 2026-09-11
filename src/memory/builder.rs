@@ -207,6 +207,7 @@ impl Builder {
                         fail_fast_on_corruption: self.fail_fast_on_corruption,
                         hook: self.fsync_hook.clone(),
                         index_factory: Some(crate::index::default_factory()),
+                        tuning: self.tuning.clone(),
                     },
                 )?;
                 Ok((Some(store), Some(state), Dimension::new(dimension)?, metric))

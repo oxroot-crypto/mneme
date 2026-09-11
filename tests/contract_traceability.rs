@@ -33,6 +33,8 @@ const LIFE_TESTS: &str = include_str!("life_contracts.rs");
 const PERSIST_TESTS: &str = include_str!("persist_contracts.rs");
 /// L3 契约验收测试(HNSW 召回/收敛/过滤/hidx)。
 const HNSW_TESTS: &str = include_str!("hnsw_contracts.rs");
+/// L4 契约验收测试(DSL/BM25/融合/计划器/四区落盘)。
+const L4_TESTS: &str = include_str!("l4_contracts.rs");
 /// 承载操作计数单测的源码文件。
 const SRC_SEARCH: &str = include_str!("../src/memory/search.rs");
 const SRC_TABLE: &str = include_str!("../src/memory/table/state.rs");
@@ -64,7 +66,7 @@ const SRC_RECOVER_STATE: &str = include_str!("../src/persist/recover/state.rs");
 const SRC_STORE_OPEN: &str = include_str!("../src/persist/store/open.rs");
 
 /// 契约测试文件(孤立检查与覆盖声明检查的范围)。
-const CONTRACT_TEST_FILES: [(&str, &str); 7] = [
+const CONTRACT_TEST_FILES: [(&str, &str); 8] = [
     ("tests/core_contracts.rs", CORE_TESTS),
     ("tests/memory_contracts.rs", MEMORY_TESTS),
     ("tests/query_contracts.rs", QUERY_TESTS),
@@ -72,10 +74,11 @@ const CONTRACT_TEST_FILES: [(&str, &str); 7] = [
     ("tests/life_contracts.rs", LIFE_TESTS),
     ("tests/persist_contracts.rs", PERSIST_TESTS),
     ("tests/hnsw_contracts.rs", HNSW_TESTS),
+    ("tests/l4_contracts.rs", L4_TESTS),
 ];
 
 /// 契约引用的测试可能落在的全部文件(路径必须与 `contracts.md` 中书写一致)。
-const SOURCES: [(&str, &str); 25] = [
+const SOURCES: [(&str, &str); 26] = [
     ("tests/core_contracts.rs", CORE_TESTS),
     ("tests/memory_contracts.rs", MEMORY_TESTS),
     ("tests/query_contracts.rs", QUERY_TESTS),
@@ -83,6 +86,7 @@ const SOURCES: [(&str, &str); 25] = [
     ("tests/life_contracts.rs", LIFE_TESTS),
     ("tests/persist_contracts.rs", PERSIST_TESTS),
     ("tests/hnsw_contracts.rs", HNSW_TESTS),
+    ("tests/l4_contracts.rs", L4_TESTS),
     ("src/memory/search.rs", SRC_SEARCH),
     ("src/memory/table/state.rs", SRC_TABLE),
     ("src/memory/lifecycle.rs", SRC_LIFECYCLE),

@@ -154,8 +154,11 @@ RowId 水位:回放含大 rowid 的 WAL → next_rowid > 该 rowid
 
 > **L3 落地状态**:召回 / `ef→∞` 收敛 / 过滤三档 / hidx 往返与损坏 / 重开载入(含
 > 非恒等重排映射)与 `as_of` + ANN 已在 `tests/hnsw_contracts.rs` 与
-> `src/index/{hnsw,hidx}.rs` 单测中实现并通过;hidx 另以 proptest 断言任意字节不 panic;
-> L4 的混合检索等价性仍待落地。
+> `src/index/{hnsw,hidx}.rs` 单测中实现并通过;hidx 另以 proptest 断言任意字节不 panic。
+>
+> **L4 落地状态(2026-09)**:单通道向量暴力对照、过滤先行与融合顺序、融合参数校验、
+> BM25 全局统计/NS 隔离、四区落盘重开一致性与计划器过滤全等,已在
+> `tests/l4_contracts.rs` 落地并纳入追溯门禁;`fuzz_dsl`(cargo-fuzz)仍待接线(§5)。
 
 ```text
 数据: 种子固定;随机均匀 64 维 10 万条 + 8 簇合成数据 10 万条(两套)

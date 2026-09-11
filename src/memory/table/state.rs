@@ -8,6 +8,7 @@ use crate::core::error::{MnemeError, Result};
 use crate::core::meta::Meta;
 use crate::core::options::RelationKind;
 use crate::core::types::{Key, NsId, RowId, SeqNo, SlotId};
+use crate::memory::analysis::{BLOOM_INITIAL_CAPACITY, BloomSet, InvertedIndex, ZoneIndex};
 use crate::memory::index::VectorIndex;
 use crate::memory::relation::Edge;
 
@@ -89,6 +90,20 @@ pub(crate) struct WriterState {
     pub(crate) ns_by_path: Arc<HashMap<Arc<str>, NsId>>,
     /// 当前已构建的向量索引(覆盖槽位前缀;`None` = 恒暴力扫描)。
     pub(crate) index: Option<Arc<dyn VectorIndex>>,
+    /// 内存倒排索引(BM25;设计 04 §5.4)。
+    pub(crate) inv: Arc<InvertedIndex>,
+    /// 块级 zone map(过滤下推;设计 04 §5.2)。
+    pub(crate) zones: Arc<ZoneIndex>,
+    /// `key` 字段的布隆预筛(设计 04 §5.3)。
+    pub(crate) key_bloom: Arc<BloomSet>,
+    /// 索引与查询共用的分词停用词开关(`Tuning::stopwords`)。
+    pub(crate) stopwords: bool,
+    /// 可索引字段上限(`Tuning::field_dict_max`;重建 zone map 用)。
+    pub(crate) index_fields_max: usize,
+    /// bloom 目标误判率(`Tuning::bloom_fpp`;重建 bloom 用)。
+    pub(crate) bloom_fpp: f32,
+    /// 恢复期暂停索引增量维护(段载入完成后由磁盘索引或全量重建接管)。
+    pub(crate) indexing_paused: bool,
     // 反馈幂等键(I27);L1 常驻内存,L5 随访问统计一并落盘。经 `Arc` COW,
     // 使批量写入快照(`WriterState::clone`)与回滚不深拷贝该集合。
     pub(crate) feedback_seen: Arc<HashSet<(RowId, u64)>>,
@@ -116,6 +131,13 @@ impl WriterState {
             ns_registry: Arc::new(HashMap::new()),
             ns_by_path: Arc::new(HashMap::new()),
             index: None,
+            inv: Arc::new(InvertedIndex::default()),
+            zones: Arc::new(ZoneIndex::new(16)),
+            key_bloom: Arc::new(BloomSet::new(BLOOM_INITIAL_CAPACITY, 0.01)),
+            stopwords: true,
+            index_fields_max: 16,
+            bloom_fpp: 0.01,
+            indexing_paused: false,
             feedback_seen: Arc::new(HashSet::new()),
             pending: Vec::new(),
             closed: false,
@@ -250,6 +272,9 @@ impl WriterState {
         let arc = Arc::new(slot_data);
         Arc::make_mut(&mut self.slots).push(Arc::clone(&arc));
         self.link_version(rowid, slot);
+        if !deleted && !self.indexing_paused {
+            self.index_observe(slot, &arc);
+        }
         // 记录待持久化操作:墓碑落 `DeleteRow`,其余落完整新版本 `Insert`。
         if deleted {
             self.pending.push(WriteOp::DeleteRow {
@@ -261,6 +286,55 @@ impl WriterState {
             self.pending.push(WriteOp::Insert { slot: arc });
         }
         Ok(slot)
+    }
+
+    /// 把新提交的记录增量加入检索加速结构(倒排 / zone map / key bloom)。
+    ///
+    /// 墓碑不参与(zone 只统计实际字段值);被遮蔽的旧版本保留在索引中,
+    /// 由查询期按视图可见性过滤,`as_of` 历史视图因此仍可检索旧版本文本。
+    fn index_observe(&mut self, slot: SlotId, data: &SlotData) {
+        if let Some(text) = &data.text {
+            Arc::make_mut(&mut self.inv).insert_text(slot, data.ns_id, text, self.stopwords);
+        }
+        Arc::make_mut(&mut self.zones).observe(slot.get() as usize, data);
+        if let Some(key) = &data.key {
+            Arc::make_mut(&mut self.key_bloom).insert(key.as_str());
+        }
+    }
+
+    /// 从槽位全量重建三类加速结构(无磁盘索引或映射不可用时使用)。
+    ///
+    /// 分词开关与字段上限取自本状态(建库/打开时由配置注入)。
+    pub(crate) fn rebuild_indexes(&mut self) {
+        self.inv = Arc::new(InvertedIndex::default());
+        self.zones = Arc::new(ZoneIndex::new(self.index_fields_max));
+        self.key_bloom = Arc::new(BloomSet::new(BLOOM_INITIAL_CAPACITY, self.bloom_fpp));
+        for index in 0..self.slots.len() {
+            let data = Arc::clone(&self.slots[index]);
+            if data.deleted {
+                continue;
+            }
+            // 槽位下标 ≤ u32::MAX(FC-MEM-INV-004),转换可证明不会失败。
+            let slot =
+                SlotId::new(u32::try_from(index).expect("槽位下标必可转入 u32(FC-MEM-INV-004)"));
+            self.index_observe(slot, &data);
+        }
+    }
+
+    /// 装载磁盘倒排与 bloom,并从槽位重建 zone map。
+    ///
+    /// zone map 无法直接复用段内块统计:恢复按 `(rowid, seqno)` 重排槽位后,
+    /// 段内块与全局块不再对应;重建结果与磁盘内容等价(roundtrip 测试保证)。
+    pub(crate) fn load_disk_indexes(&mut self, inv: InvertedIndex, bloom: BloomSet) {
+        self.inv = Arc::new(inv);
+        self.key_bloom = Arc::new(bloom);
+        self.zones = Arc::new(ZoneIndex::new(self.index_fields_max));
+        for index in 0..self.slots.len() {
+            if self.slots[index].deleted {
+                continue;
+            }
+            Arc::make_mut(&mut self.zones).observe(index, &self.slots[index]);
+        }
     }
 
     /// 给 `rowid` 追加一个墓碑版本;若已无活版本则返回 `false`。
@@ -293,6 +367,9 @@ impl WriterState {
             access: Arc::clone(&self.access),
             ns_registry: Arc::clone(&self.ns_registry),
             index: self.index.clone(),
+            inv: Arc::clone(&self.inv),
+            zones: Arc::clone(&self.zones),
+            key_bloom: Arc::clone(&self.key_bloom),
             seqno: self.seqno,
             closed: self.closed,
         }

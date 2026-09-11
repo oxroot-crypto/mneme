@@ -30,9 +30,13 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<MsecView<'_>> {
     Ok(MsecView {
         row_count: header.row_count,
         data: &bytes[data_start..data_end],
+        field_dict: slice_of(bytes, header.regions.field_dict),
         version_table: slice_of(bytes, header.regions.version),
         key_index: slice_of(bytes, header.regions.key),
+        inverted: slice_of(bytes, header.regions.inv),
         ns_stats: slice_of(bytes, header.regions.ns_stats),
+        zmap: slice_of(bytes, header.regions.zmap),
+        bloom: slice_of(bytes, header.regions.bloom),
         relations: slice_of(bytes, header.regions.rel),
         payload_crc: header.payload_crc,
         payload_crc_ok: None,
@@ -73,8 +77,8 @@ fn parse_header(bytes: &[u8]) -> Result<HeaderLayout> {
     let row_count = cursor.u64()?;
     Ok(HeaderLayout {
         row_count,
-        // field_dict(16) 留空(L4)。
         regions: Regions {
+            field_dict: read_pair(bytes, 16),
             version: read_pair(bytes, 32),
             key: read_pair(bytes, 48),
             inv: read_pair(bytes, 64),
@@ -104,6 +108,7 @@ fn read_u32_at(bytes: &[u8], index: usize) -> u32 {
 /// 校验各非空数据区的偏移/长度落在数据区内。
 fn validate_regions(regions: &Regions, data_start: usize, data_end: usize) -> Result<()> {
     let all = [
+        regions.field_dict,
         regions.version,
         regions.key,
         regions.inv,
@@ -147,9 +152,13 @@ fn slice_of(bytes: &[u8], region: Region) -> &[u8] {
 pub(crate) struct MsecView<'a> {
     row_count: u64,
     data: &'a [u8],
+    field_dict: &'a [u8],
     version_table: &'a [u8],
     key_index: &'a [u8],
+    inverted: &'a [u8],
     ns_stats: &'a [u8],
+    zmap: &'a [u8],
+    bloom: &'a [u8],
     relations: &'a [u8],
     payload_crc: u32,
     payload_crc_ok: Option<bool>,
@@ -239,6 +248,26 @@ impl MsecView<'_> {
     /// relations 区原始字节(可能为空)。
     pub(crate) const fn relations_bytes(&self) -> &[u8] {
         self.relations
+    }
+
+    /// 字段字典区原始字节(L4;无索引字段时为空)。
+    pub(crate) const fn field_dict_bytes(&self) -> &[u8] {
+        self.field_dict
+    }
+
+    /// zone map 区原始字节(L4;无索引字段时为空)。
+    pub(crate) const fn zmap_bytes(&self) -> &[u8] {
+        self.zmap
+    }
+
+    /// bloom 区原始字节(L4;无 `key` 字段时为空)。
+    pub(crate) const fn bloom_bytes(&self) -> &[u8] {
+        self.bloom
+    }
+
+    /// 倒排区原始字节(L4;无文本记录时为空)。
+    pub(crate) const fn inverted_bytes(&self) -> &[u8] {
+        self.inverted
     }
 
     /// 读取某个 `doc_offset` 处的记录体;墓碑偏移返回 `None`。

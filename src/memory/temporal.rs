@@ -60,6 +60,9 @@ pub(crate) fn snapshot_at(view: &ReaderView, tx_ms: i64) -> ReaderView {
         access: Arc::clone(&view.access),
         ns_registry: Arc::clone(&view.ns_registry),
         index: view.index.clone(),
+        inv: Arc::clone(&view.inv),
+        zones: Arc::clone(&view.zones),
+        key_bloom: Arc::clone(&view.key_bloom),
         seqno,
         closed: view.closed,
     }

@@ -8,8 +8,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::error::{MnemeError, Result};
 use crate::core::metric::Metric;
-use crate::core::options::FsyncPolicy;
+use crate::core::options::{FsyncPolicy, Tuning};
 use crate::core::types::SlotId;
+use crate::memory::analysis::{BLOOM_INITIAL_CAPACITY, BloomSet, ZoneIndex};
 use crate::memory::index::{IndexFactory, IndexNode, VectorIndex};
 use crate::memory::table::WriterState;
 use crate::persist::hook::FsyncHook;
@@ -46,6 +47,8 @@ pub(crate) struct OpenOptions {
     pub(crate) hook: Option<Arc<dyn FsyncHook>>,
     /// 索引工厂(L3);`None` = 不载入 hidx(恒暴力)。
     pub(crate) index_factory: Option<Arc<dyn IndexFactory>>,
+    /// 进阶调参(分词开关 / 字段上限 / bloom 误判率;恢复期重建加速结构用)。
+    pub(crate) tuning: Tuning,
 }
 
 impl Store {
@@ -268,6 +271,16 @@ fn load_write_state(
     options: &OpenOptions,
 ) -> Result<WriterState> {
     let mut state = recover::empty_state(manifest);
+    // 恢复期重建的加速结构必须与建库配置同口径(分词/字段上限/bloom 误判率),
+    // 否则查询分词与索引分词不一致会静默漏召回。
+    state.stopwords = options.tuning.stopwords;
+    state.index_fields_max = options.tuning.field_dict_max as usize;
+    state.bloom_fpp = options.tuning.bloom_fpp;
+    state.zones = Arc::new(ZoneIndex::new(options.tuning.field_dict_max as usize));
+    state.key_bloom = Arc::new(BloomSet::new(
+        BLOOM_INITIAL_CAPACITY,
+        options.tuning.bloom_fpp,
+    ));
     let segments =
         manifest_io::read_segment_bytes(root, manifest, options.fail_fast_on_corruption)?;
     let recovered = recover::load_segments(

@@ -155,8 +155,9 @@ flowchart LR
 
 **渐进式的两个关键手段**:
 
-> **落地状态**:L0–L3 已实现(L3 = `src/index/` 自研 HNSW + `hidx` 持久化 + 过滤三档,
-> 验收 `tests/hnsw_contracts.rs`);L4–L6 尚无代码。
+> **落地状态**:L0–L4 已实现(L3 = `src/index/` 自研 HNSW + `hidx` 持久化 + 过滤三档,
+> 验收 `tests/hnsw_contracts.rs`;L4 = `src/query/` 过滤 DSL + zone map/bloom 计划器 +
+> BM25/RRF 融合 + msec 四区落盘,验收 `tests/l4_contracts.rs`);L5–L6 尚无代码。
 
 1. **接口先于实现**:公开 API 在 L1 冻结(暴力与 HNSW 同签名),L3 **引入内部 trait
    `memory::index::{VectorIndex, IndexFactory}`** 作为暴力→HNSW 的替换缝;L2 的段文件头从第一天就带 `format_version` 字段。

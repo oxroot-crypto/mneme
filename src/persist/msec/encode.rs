@@ -95,17 +95,19 @@ fn assemble_regions(
     key_rows: &[KeyIndexRow],
 ) -> (Vec<u8>, Regions) {
     let mut data = doc_region;
+    let field_dict = append_region(&mut data, input.field_dict);
     let version = append_region(&mut data, &encode_version_table(version_table));
     let key = append_region(&mut data, &encode_key_index(key_rows));
-    let inv = append_region(&mut data, &[]); // 倒排索引:L4
+    let inv = append_region(&mut data, input.inverted);
     let ns_stats = append_region(&mut data, &encode_ns_stats(input.ns_stats));
-    let zmap = append_region(&mut data, &[]); // zone map / ttl map:L4
-    let bloom = append_region(&mut data, &[]); // bloom:L4
+    let zmap = append_region(&mut data, input.zmap);
+    let bloom = append_region(&mut data, input.bloom);
     let delta = append_region(&mut data, input.delta);
     let rel = append_region(&mut data, input.relations);
     (
         data,
         Regions {
+            field_dict,
             version,
             key,
             inv,
@@ -141,8 +143,9 @@ fn encode_header(row_count: u64, regions: Regions) -> [u8; HEADER_LEN as usize] 
         out[index..index + 8].copy_from_slice(&region.offset.to_le_bytes());
         out[index + 8..index + 16].copy_from_slice(&region.len.to_le_bytes());
     };
-    // field_dict(16)留空(L4);其余按设计顺序。
-    put_pair(16, Region::default());
+    // 按设计顺序:field_dict(16)、version(32)、key(48)、inv(64)、ns_stats(80)、
+    // zmap(96)、bloom(112)、delta(128)、rel(144)。
+    put_pair(16, regions.field_dict);
     put_pair(32, regions.version);
     put_pair(48, regions.key);
     put_pair(64, regions.inv);

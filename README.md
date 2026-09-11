@@ -4,8 +4,8 @@
 > 专为 **AI Agent 的超长期记忆层**设计:进程内运行、无需服务端、数据经年累月增长而不失控。
 
 **状态**:开发中(尚未发布到 crates.io)。**L0 原语层(`src/core/`)、L1 内存引擎(`src/memory/`)、
-L2 持久层(`src/persist/`)与 L3 索引层(`src/index/`)**已实现并通过形式化契约验收,后续按 L4→L6
-逐层推进,每层完成时都是一个可独立交付的完整产品。
+L2 持久层(`src/persist/`)、L3 索引层(`src/index/`)与 L4 检索层(`src/query/`)**已实现并通过
+形式化契约验收,后续按 L5→L6 逐层推进,每层完成时都是一个可独立交付的完整产品。
 设计与验收标准见 [docs/DESIGN.md](docs/DESIGN.md)。
 
 ---
@@ -132,9 +132,9 @@ mdbook build               # 输出到 book/
 
 ## 开发与测试
 
-> 当前已实现 L0 原语层、L1 内存引擎、L2 持久层与 L3 索引层,下列命令即可运行;`cargo test
-> --features async`(async 门面等价性)等 feature 相关命令待对应层落地后加入。`cargo bench`
-> 已在 L3 引入(见 `benches/hnsw.rs`)。
+> 当前已实现 L0 原语层、L1 内存引擎、L2 持久层、L3 索引层与 L4 检索层,下列命令即可运行;
+> `cargo test --features async`(async 门面等价性)等 feature 相关命令待对应层落地后加入。
+> `cargo bench` 已在 L3 引入(见 `benches/hnsw.rs`)。
 
 ```bash
 cargo fmt --all -- --check

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use crate::core::bitset::BitSet;
 use crate::core::types::{Key, NsId, RowId, SeqNo, SlotId};
+use crate::memory::analysis::{BloomSet, InvertedIndex, ZoneIndex};
 use crate::memory::index::VectorIndex;
 use crate::memory::relation::Edge;
 
@@ -24,6 +25,12 @@ pub(crate) struct ReaderView {
     pub(crate) ns_registry: Arc<HashMap<NsId, Arc<str>>>,
     /// 覆盖槽位前缀的向量索引(与视图一同快照,保证快照一致)。
     pub(crate) index: Option<Arc<dyn VectorIndex>>,
+    /// 内存倒排索引(BM25 两遍统计;与视图一同快照)。
+    pub(crate) inv: Arc<InvertedIndex>,
+    /// 块级 zone map(过滤下推)。
+    pub(crate) zones: Arc<ZoneIndex>,
+    /// `key` 字段的布隆预筛。
+    pub(crate) key_bloom: Arc<BloomSet>,
     pub(crate) seqno: SeqNo,
     /// 库是否已关闭(关闭后读写返回 `Closed`)。
     pub(crate) closed: bool,

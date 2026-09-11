@@ -44,6 +44,33 @@ impl BitSet {
             .map(|word| word.count_ones() as usize)
             .sum()
     }
+
+    /// 与另一位置图按位与(短边缺失位视为 0)。
+    pub(crate) fn intersect_with(&mut self, other: &BitSet) {
+        for (word, other_word) in self.words.iter_mut().zip(&other.words) {
+            *word &= *other_word;
+        }
+        if other.words.len() < self.words.len() {
+            for word in &mut self.words[other.words.len()..] {
+                *word = 0;
+            }
+        }
+    }
+
+    /// 与另一位置图按位或。
+    pub(crate) fn union_with(&mut self, other: &BitSet) {
+        if other.words.len() > self.words.len() {
+            self.words.resize(other.words.len(), 0);
+        }
+        for (word, other_word) in self.words.iter_mut().zip(&other.words) {
+            *word |= *other_word;
+        }
+    }
+
+    /// 是否无任何置位。
+    pub(crate) fn is_empty(&self) -> bool {
+        self.words.iter().all(|word| *word == 0)
+    }
 }
 
 #[cfg(test)]

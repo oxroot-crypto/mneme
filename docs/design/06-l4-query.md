@@ -5,6 +5,14 @@
 > **前置阅读**:[03 §5](03-l1-memory.md)(过滤 AST)、[04 §5](04-l2-persist.md)(zone map/bloom)、[05 §8](05-l3-hnsw.md)(过滤三档)。
 > **本章你将学到**:DSL 文法与解析器 → 查询计划器 → BM25 公式逐项拆解(含手算)→
 > RRF/加权融合 → 执行管线 → 去重服务。
+>
+> **落地状态(2026-09)**:本章已落地于 `src/query/`(解析/展示/JSON 往返、计划器、
+> BM25、融合、执行管线)与 `src/memory/analysis/`(内存倒排 / zone map / bloom),
+> msec 四区随 `flush` 落盘、`open` 经重排映射重建(设计 04 §5,契约 `FC-PERSIST-POST-008`)。
+> 与本章设计的工程口径差异:① 内存引擎只维护一份全局倒排(见 [04 §5.4](04-l2-persist.md)
+> 落地注);② 三值语义下 `Not` 不做块级取反(位图取反会把 `Unknown` 误判为命中),
+> 交行级残差求值;③ 计划编译仍含 $O(N)$ 的逐行可见性判定(待段句柄重构消除,
+> 契约 `FC-QUERY-CPLX-002`);④ `ttl_map` 与段内反向表随 L5 落地。验收:`tests/l4_contracts.rs`。
 
 模块:`query/{parse.rs, plan.rs, zmap.rs, bm25.rs, fusion.rs, result_dedup.rs, exec.rs}`
 

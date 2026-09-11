@@ -14,6 +14,7 @@
 //! * [`varint`] —— 变长整数编解码。
 //! * [`meta`] —— 元数据(JSON)隔离区。
 //! * `bitset` —— 可增长位图(不可见版本标记 / 索引层候选位图)。
+//! * [`text`] —— 文本分词(空白切词 + CJK bigram,BM25 与倒排共用)。
 //! * [`options`] —— 全局配置与选项类型。
 
 pub(crate) mod bitset;
@@ -23,5 +24,6 @@ pub mod meta;
 pub mod metric;
 pub mod options;
 pub mod simd;
+pub mod text;
 pub mod types;
 pub mod varint;
