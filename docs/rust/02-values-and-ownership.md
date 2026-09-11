@@ -3,7 +3,8 @@
 > **本章目标**:掌握 Rust 的变量、基本类型,以及最重要的**所有权(ownership)**。
 > **前置**:读过 [01 章](01-toolchain.md),会 `cargo build`。
 > **对应源码**:[`src/core/types.rs`](../../src/core/types.rs)、[`src/core/varint.rs`](../../src/core/varint.rs)、
-> [`src/core/metric.rs`](../../src/core/metric.rs)、[`src/memory/table/state.rs`](../../src/memory/table/state.rs)。
+> [`src/core/metric.rs`](../../src/core/metric.rs)、[`src/memory/table/state.rs`](../../src/memory/table/state.rs)、
+> [`src/index/hidx.rs`](../../src/index/hidx.rs)、[`src/index/filtered.rs`](../../src/index/filtered.rs)。
 
 这是全书**最关键**的一章。所有权是 Rust 区别于其他语言的核心,也是初学者最容易卡住的地方。
 读完本章你能理解 mneme 里为什么大量使用 `u32`/`u64`/`f32`、为什么 `newtype` 里直接包一个整数。
@@ -101,6 +102,59 @@ let unsigned: u32 = neg as u32;   // 4294967295:补码按位重新解释
 所以涉及可能溢出的运算要小心,或使用 `checked_add` / `saturating_add` 等方法。
 mneme 的 varint 解码显式检查溢出,见 [`src/core/varint.rs:99`](../../src/core/varint.rs)。
 
+#### 2.1.2 不丢数据的转换:`TryFrom` 与受检运算
+
+`as` 的危险在于"悄悄丢数据"。当不允许丢数据时,标准库给了三种工具:
+
+```rust
+// ① TryFrom:可能失败的转换,返回 Result
+let len: usize = 70_000;
+let too_big = u16::try_from(len);       // Err(TryFromIntError) —— 超出 u16 范围
+let ok = u16::try_from(300_usize);      // Ok(300)
+
+// ② checked_*:可能溢出的算术,返回 Option
+let big = usize::MAX;
+big.checked_add(1);                     // None
+4_usize.checked_mul(big);               // None
+
+// ③ saturating_*:溢出时"夹住"到边界,绝不回绕
+4_usize.saturating_mul(big);            // usize::MAX
+```
+
+L3 的 hidx 编码要保证"长度字段必须塞得进 `u32`"(`put_u32` 的入参就是 `u32`):
+
+```rust
+put_u32(
+    &mut node_table,
+    u32::try_from(adj_blob.len())
+        .map_err(|_| encode_too_large("hidx 邻接区字节数", adj_blob.len()))?,
+);
+```
+
+见 [`src/index/hidx.rs:78-82`](../../src/index/hidx.rs)。`try_from` 失败返回 `Err`,配合
+`.map_err(...)?` 转成带字段名与实际值的领域错误——**绝不静默截断**。
+解码路径同理:`validate_layout` 用 `checked_mul`/`checked_add` 防止恶意长度在偏移计算时回绕,
+溢出就用 `ok_or_else` 变成结构化错误:
+
+```rust
+let expected_node_table = header
+    .count
+    .checked_mul(NODE_TABLE_ENTRY)
+    .ok_or_else(|| corrupt("node_table_len 溢出"))?;
+```
+
+见 [`src/index/hidx.rs:243-246`](../../src/index/hidx.rs),`ok_or_else` 的用法在
+[05 §1.2](05-errors.md) 展开。
+
+选择原则:
+
+- `From`/`Into`:转换**永远成功**(如 `u32 → u64`),用最自然的写法;
+- `TryFrom`:转换**可能失败**(窄化、解析),必须显式处理 `Err`;
+- `checked_*`:算术**可能溢出**,返回 `Option`,适合"溢出即非法输入";
+- `saturating_*`:算术溢出时**取边界值**,适合"宁可夹紧不可回绕"——过滤档②的
+  `ef` 放大就用了 `base.saturating_mul(AMPLIFIED_TIER_FACTOR)`,见
+  [`src/index/filtered.rs:148-154`](../../src/index/filtered.rs)。
+
 ### 2.2 浮点
 
 - `f32`(单精度,约 7 位有效数字)、`f64`(双精度)。
@@ -114,6 +168,29 @@ assert!((s - 0.3).abs() < 1e-6);   // 惯用写法
 ```
 
 mneme 的测试里到处是 `(x - expected).abs() < 1e-6`,见 [`src/core/metric.rs:192`](../../src/core/metric.rs)。
+
+浮点还有几个 mneme 常用的"防 NaN / 防失控"工具:
+
+```rust
+let ml = 0.5_f32;
+ml.is_finite();            // true;NaN、±inf 都是 false
+
+let amp = 2.5_f32;
+amp.clamp(1.0, 8.0);       // 2.5;把值夹到 [1.0, 8.0] 闭区间
+
+f32::MIN_POSITIVE;         // 最小的正规格化浮点数,常用来替代 0 做除数下限
+```
+
+- `is_finite` 用于**入口校验**:hidx 头部解码到 `ml` 时,先 `!ml.is_finite() || ml <= 0.0`
+  就拒绝,绝不让 `NaN` 混进建图参数(见 [`src/index/hidx.rs:235`](../../src/index/hidx.rs))。
+- `clamp(min, max)` 同时完成上下限约束;过滤档①的 `ef` 放大系数写作
+  `(1.0 / selectivity.max(f32::MIN_POSITIVE)).clamp(1.0, MAX_EF_AMPLIFICATION)`,
+  既不除以 0 也不超放大上限(见 [`src/index/filtered.rs:149-151`](../../src/index/filtered.rs))。
+- `MIN_POSITIVE` 是**下限哨兵**:把可能为 0 的分母抬到最小正数,结果虽大但有限,
+  比 `0.0` 分母产生的 `inf`/`NaN` 更好处理。
+
+> `clamp` 要求 `min <= max` 且两者非 `NaN`,否则 panic;值本身是 `NaN` 时返回 `NaN`,
+> 所以**先 `is_finite` 校验、再 `clamp`** 是安全顺序。
 
 ### 2.3 布尔与字符
 
@@ -279,7 +356,18 @@ pub(crate) fn hide_latest(&mut self, rowid: RowId) {
 (用法见 [04 §5.1](04-borrowing-strings-slices.md) 与 [07 §4.3](07-iterators-closures.md))。
 
 > 记录体里的向量也用 `Arc<[f32]>`(`SlotData::vector`):克隆一条记录只加计数,只有真正
-> 替换向量时才分配新数组。
+> 替换向量时才分配新数组。L3 的 `IndexNode::vector` 同样是 `Arc<[f32]>`,构建索引节点时
+> 把 `Vec<f32>` 转成"不可增长、共享只读"的 `Arc<[f32]>`:
+>
+> ```rust
+> let vector: Vec<f32> = ...;
+> let shared: Arc<[f32]> = Arc::from(vector.into_boxed_slice());
+> ```
+>
+> 见 [`src/index/hnsw.rs:475-480`](../../src/index/hnsw.rs)。`into_boxed_slice()` 把
+> `Vec<T>` 收缩成 `Box<[T]>`(丢掉多余容量,长度固定),`Arc::from` 再接管这块内存。
+> 此后每次克隆都只是引用计数 +1,索引与段数据因此可以零拷贝共享同一份向量——和
+> `Arc<str>` 是同一个套路,只是元素从 `u8` 换成了 `f32`。
 
 ---
 
@@ -309,17 +397,21 @@ pub struct SlotId(u32);
 | `use of possibly-uninitialized variable` | 变量没初始化就用 | 先赋值 |
 | `mismatched types expected u64, found u32` | 整数类型不匹配 | 显式 `as` 或 `u64::from(...)` |
 | `cannot move out of ... which is behind a shared reference` | 想从 `&T` 里拿走所有权 | 用 `.clone()`,或改成借用 |
+| `attempt to ... with overflow` | debug 下整数溢出 | 确认输入范围,或用 `checked_*`/`saturating_*` |
+| `the trait bound ... From<...> is not satisfied` | 转换不是"永远成功" | 用 `TryFrom`/`try_from` 显式处理失败 |
 
 ---
 
 ## 6. 本章小结
 
 - `let` 默认不可变,要改加 `mut`;常量用 `const` + 全大写下划线。
-- 整数按位宽/符号分很多种,Rust **不做隐式转换**;浮点比较用误差阈值。
+- 整数按位宽/符号分很多种,Rust **不做隐式转换**;`as` 会静默截断,不允许丢数据时用
+  `TryFrom`/`checked_*`/`saturating_*`;浮点比较用误差阈值,`is_finite`/`clamp` 防 NaN 与失控。
 - 数组定长、元组可异构;需要可增长列表用 `Vec`。
 - **所有权**:每个值一个所有者,离开作用域自动释放;赋值对堆类型是**移动**,对 `Copy` 类型是复制;
   想复制堆数据用 `.clone()`。
-- **共享所有权**用 `Arc<T>`(`Arc::clone` 只加计数);要改共享数据用 `Arc::make_mut` 写时复制。
+- **共享所有权**用 `Arc<T>`(`Arc::clone` 只加计数);要改共享数据用 `Arc::make_mut` 写时复制;
+  `Arc<[f32]>` 可由 `Arc::from(vec.into_boxed_slice())` 构造,适合共享只读的大数组。
 - newtype 用类型区分语义,把错误挡在编译期。
 
 ## 动手练习

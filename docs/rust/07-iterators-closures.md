@@ -3,7 +3,8 @@
 > **本章目标**:掌握 `for` 循环、迭代器链式调用(adapter)、闭包,以及 `sort_by` + `Ordering`。
 > **前置**:[04 章](04-borrowing-strings-slices.md)(引用)、[06 章](06-generics-traits.md)(trait)。
 > **对应源码**:[`src/core/simd.rs`](../../src/core/simd.rs)、[`src/core/heap.rs`](../../src/core/heap.rs)、
-> [`src/core/varint.rs`](../../src/core/varint.rs)、[`src/memory/namespace/access.rs`](../../src/memory/namespace/access.rs)。
+> [`src/core/varint.rs`](../../src/core/varint.rs)、[`src/memory/namespace/access.rs`](../../src/memory/namespace/access.rs)、
+> [`src/index/hnsw.rs`](../../src/index/hnsw.rs)、[`src/index/filtered.rs`](../../src/index/filtered.rs)。
 
 Rust 的迭代器是**惰性(lazy)**的:你写一串转换,只有到"消费"时(如 `sum`、`collect`、`for`)
 才真正执行。它既表达力强,又能被编译器优化到和手写循环一样快。
@@ -82,6 +83,8 @@ pub fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
 | `zip(other)` | 把两个迭代器配成对 |
 | `enumerate()` | 加上下标,产出 `(usize, T)` |
 | `take(n)` / `skip(n)` | 取前 n 个 / 跳过前 n 个 |
+| `rev()` | 反向迭代(`DoubleEndedIterator` 才有) |
+| `copied()` | 把 `&T` 变成 `T`(`T: Copy`),省去 `|x| *x` |
 | `flat_map(f)` | 每个元素展开成多个 |
 | `peekable()` | 可以偷看下一个元素 |
 
@@ -96,6 +99,7 @@ pub fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
 | `any(f)` / `all(f)` | 是否任一 / 全部满足 |
 | `find(f)` / `position(f)` | 找第一个满足的 |
 | `min()` / `max()` | 极值(要求 `Ord`;`f32` 不能直接用,见 [03 §4.1](03-structs-enums-impl.md)) |
+| `min_by_key(f)` / `max_by_key(f)` | 按"键"取极值,如 `max_by_key(\|item\| item.level)` |
 
 ### 3.1 `enumerate` 的例子
 
@@ -230,7 +234,105 @@ self.table.write_tx(move |ws| {
 
 ---
 
-## 5. `Option` 与数组:都是"可迭代"的(常见组合)
+## 5. 优先队列:`BinaryHeap` 与 `Reverse`
+
+[03 §4.2](03-structs-enums-impl.md) 给 `Cand` 手写 `Ord`,就是为了把它放进标准库的
+**优先队列** `BinaryHeap<T: Ord>`——不用每次全排序,插入/取最值都是 $O(\log n)$:
+
+```rust
+use std::collections::BinaryHeap;
+
+let mut heap = BinaryHeap::new();
+heap.push(3);
+heap.push(1);
+heap.push(2);
+assert_eq!(heap.peek(), Some(&3));   // 堆顶是最大值(只借看不弹出)
+assert_eq!(heap.pop(), Some(3));     // 弹出最大值
+assert_eq!(heap.pop(), Some(2));
+```
+
+- **`BinaryHeap` 是最大堆**:`peek()`/`pop()` 拿到的都是最大元素;
+- 元素必须实现 `Ord`——所以 `f32` 不能直接放(见 [03 §4.1](03-structs-enums-impl.md)),
+  得像 `Cand` 那样包一层并手写全序;
+- `while let Some(x) = heap.pop()` 是"从大到小依次消费"的惯用写法(见 [05 §4.5](05-errors.md))。
+
+**要最小堆,就包一层 `std::cmp::Reverse<T>`**——它把 `Ord` 整个反过来:
+
+```rust
+use std::cmp::Reverse;
+
+let mut min_heap: BinaryHeap<Reverse<u32>> = BinaryHeap::new();
+min_heap.push(Reverse(3));
+min_heap.push(Reverse(1));
+assert_eq!(min_heap.peek(), Some(&Reverse(1)));   // 堆顶变成最小值
+```
+
+L3 的 HNSW 搜索同时用了这两种堆:
+
+```rust
+let mut frontier: BinaryHeap<Cand> = BinaryHeap::new();                   // 最大堆
+let mut results: BinaryHeap<std::cmp::Reverse<Cand>> = BinaryHeap::new(); // 最小堆
+
+while let Some(current) = frontier.pop() {
+    if results.len() >= ef {
+        // results.peek() 看到的是"最差"候选;当前候选比它还差就不必继续探查
+        let worst = results.peek().map_or(current, |rev| rev.0);
+        if current.key.total_cmp(&worst.key) == Ordering::Less {
+            break;
+        }
+    }
+    for &neighbor in self.graph.neighbors(current.node, level) {
+        ...
+        if results.len() < ef {
+            frontier.push(cand);
+            results.push(std::cmp::Reverse(cand));
+        } else if let Some(worst) = results.peek().map(|rev| rev.0)
+            && cand.key.total_cmp(&worst.key) == Ordering::Greater
+        {
+            results.pop();                        // 淘汰最差
+            results.push(std::cmp::Reverse(cand));
+            frontier.push(cand);
+        }
+    }
+}
+```
+
+见 [`src/index/hnsw.rs:232-266`](../../src/index/hnsw.rs)。两个堆的分工:
+
+- `frontier`(最大堆):按"越近键越大",每次弹**最有希望**的候选继续扩展——best-first;
+- `results`(最小堆 + `Reverse`):固定大小 `ef`,只淘汰**最差**。`Reverse` 让"堆顶 =
+  最小值 = 最差",`pop()` 一步甩掉它,不必遍历找最小值。
+
+> 为什么不用 L0 的 `TopK`?`TopK` 为"在线维护 top-k 结果"设计;图搜索还需要一个可继续
+> 扩展的**前沿堆**和"当前最优 vs 当前最差"的提前终止判断,标准 `BinaryHeap` 更直接。
+> 两者都是堆,职责不同。`Reverse` 是标准库的 newtype 包装(见 [03 §1.2](03-structs-enums-impl.md)),
+> 只影响比较,不改变数据。
+
+### 5.1 `HashSet`:O(1) 去重访问
+
+搜索还要避免重复访问节点。`HashSet<u32>` 的 `insert` 返回 `bool`——**新插入为 `true`,
+已存在为 `false`**,"检查 + 标记"因此一步完成:
+
+```rust
+let mut visited: HashSet<u32> = HashSet::new();
+...
+if !visited.insert(neighbor) {
+    continue;   // 已经访问过,跳过
+}
+```
+
+见 [`src/index/hnsw.rs:250-252`](../../src/index/hnsw.rs)。对照 `Vec<u32>` 的 `contains`
+是 $O(n)$ 线性扫描;需要反复问"在不在集合里"时,`HashSet` 的期望 $O(1)$ 是数量级差别
+(代价是哈希与额外内存)。要放进 `HashSet` 的类型必须实现 `Hash + Eq`(见
+[03 §4](03-structs-enums-impl.md))。
+
+> `Vec::contains` 也有用武之地:元素少时线性扫描比哈希更快,而且不要求 `Hash`。L3 的
+> 邻接去重 `slot.contains(&other)` 就是这么用的(节点度数 ≤ 32,见
+> [`src/index/graph.rs:79-86`](../../src/index/graph.rs))。
+
+---
+
+## 6. `Option` 与数组:都是"可迭代"的(常见组合)
 
 `Option<T>` 实现了 `IntoIterator`(注意:不是 `Iterator`),产出 0 或 1 个元素。因此可以:
 
@@ -245,15 +347,17 @@ mneme 的测试里也常见 `for (score, id) in [...]` 直接遍历数组,见
 
 ---
 
-## 6. 性能提示
+## 7. 性能提示
 
 - 迭代器链是**惰性且零开销**的:编译器通常会内联成与手写循环等价的机器码。
 - 但过度嵌套会降低可读性;mneme 规范允许在算法清晰性优先时使用显式 `while` 循环
   (如 SIMD 内核里为了控制分块,见 [09 章](09-cfg-unsafe-simd.md))。
+- 预知结果规模时用 `Vec::with_capacity(n)` 预留容量,避免边 push 边扩容
+  (L3 的 hidx 编码就这么做,见 [04 §2.3](04-borrowing-strings-slices.md))。
 
 ---
 
-## 7. 你会遇到的编译器报错
+## 8. 你会遇到的编译器报错
 
 | 报错关键词 | 原因 | 修法 |
 |---|---|---|
@@ -265,20 +369,26 @@ mneme 的测试里也常见 `for (score, id) in [...]` 直接遍历数组,见
 
 ---
 
-## 8. 本章小结
+## 9. 本章小结
 
 - `for` + Range 是基本循环;`iter`/`iter_mut`/`into_iter` 决定借用还是消耗。
-- 迭代器适配器(`map`/`filter`/`zip`/`enumerate`)+ 消费器(`sum`/`collect`/`fold`)链式组合,惰性零开销。
+- 迭代器适配器(`map`/`filter`/`zip`/`enumerate`/`rev`/`copied`)+ 消费器
+  (`sum`/`collect`/`fold`/`max_by_key`)链式组合,惰性零开销。
 - 闭包 `|x| ...` 能捕获环境;`move` 强制转移所有权。
 - 接收闭包的函数用 `FnOnce`/`FnMut`/`Fn` 声明调用方式;L1 写事务 `write_tx` 用 `FnOnce` 执行一次、
   失败整体回滚。
 - `sort_by` 配 `Ordering::{Less, Greater, Equal}` 做自定义排序;mneme 的 `TopK` 借此实现度量感知排序。
+- `BinaryHeap` 是最大堆,`Reverse` 把它反转成最小堆;L3 用"最大堆做前沿 + 最小堆淘汰最差"
+  实现 best-first 图搜索。
+- `HashSet::insert` 返回 `bool`,把"查重 + 标记"合并成一步;元素少时 `Vec::contains` 更划算。
 
 ## 动手练习
 
 1. 用一行迭代器求 `vec![1, 2, 3, 4, 5]` 中所有偶数的平方和。
 2. 用 `enumerate` 打印一个 `Vec<&str>` 的 `下标:值`。
 3. 用 `sort_by` 把 `vec![(2, "b"), (1, "a")]` 按第一个元素升序排序。
+4. 用 `BinaryHeap<Reverse<u32>>` 实现"流式取最大的 3 个":不断 `push`,堆里超过 3 个就弹出
+   堆顶(当前最小值),最后把堆里的元素取出反转,就是从大到小的前三。
 
 ## 下一章
 

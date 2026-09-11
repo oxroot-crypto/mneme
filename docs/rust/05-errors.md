@@ -4,7 +4,8 @@
 > 以及 mneme 用 `thiserror` 定义统一错误枚举的方式。
 > **前置**:[03 章](03-structs-enums-impl.md)(枚举与 `impl`)。
 > **对应源码**:[`src/core/error.rs`](../../src/core/error.rs)、[`src/core/varint.rs`](../../src/core/varint.rs)、
-> [`src/core/options/dimension.rs`](../../src/core/options/dimension.rs)、[`src/core/meta.rs`](../../src/core/meta.rs)。
+> [`src/core/options/dimension.rs`](../../src/core/options/dimension.rs)、[`src/core/meta.rs`](../../src/core/meta.rs)、
+> [`src/index/hidx.rs`](../../src/index/hidx.rs)、[`src/index/graph.rs`](../../src/index/graph.rs)。
 
 Rust 没有异常(exception)和 `try/catch`。它把"可能失败"编码进**类型**:
 
@@ -53,6 +54,52 @@ n.is_some();           // true
 > 要么改用 `n.as_ref().unwrap_or(...)` 这类借用式 API。
 >
 > 另外 `map`/`and_then` 返回的 `Option` 标了 `#[must_use]`:直接丢弃会有警告,提醒你"这个结果还没处理"。
+
+L3 还大量使用几个"取值 + 兜底"的组合子:
+
+```rust
+let filter: Option<&BitSet> = None;
+// is_none_or:None -> true;Some(v) -> f(v)
+// 正好表达"没有过滤位图 = 不过滤,放行"
+filter.is_none_or(|bits| bits.get(slot));
+// 等价写法:filter.map_or(true, |bits| bits.get(slot))
+
+let level: Option<u8> = None;
+level.map_or(0, |l| l as usize);      // None 时给默认 0
+```
+
+见 [`src/index/filtered.rs:100-104`](../../src/index/filtered.rs) 与
+[`src/index/hnsw.rs:243`](../../src/index/hnsw.rs)。`is_none_or` 是 Rust 1.82 稳定的
+新方法,名字直译就是"是 `None` 或者满足条件";在"默认放行、有值才检查"的语义下比
+`map_or(true, ...)` 更不容易读反。
+
+把 `Option` 转成 `Result` 用 `ok_or` / `ok_or_else`——后者**只在失败时才构造错误**:
+
+```rust
+let expected_node_table = header
+    .count
+    .checked_mul(NODE_TABLE_ENTRY)
+    .ok_or_else(|| corrupt("node_table_len 溢出"))?;
+```
+
+见 [`src/index/hidx.rs:243-246`](../../src/index/hidx.rs)。`checked_mul` 返回 `Option<usize>`
+(见 [02 §2.1.2](02-values-and-ownership.md)),`ok_or_else` 把 `None` 变成
+`Err(MnemeError::Corrupted { .. })`,`?` 再立即返回——这是"受检运算 + 结构化错误"的标准配合。
+
+> 惰性的意义:`ok_or_else(|| ...)` 的闭包只在 `None` 时执行;`ok_or(...)` 会**先**把错误值
+> 构造出来,成功路径也白付一次代价。错误里含 `format!` 时一律用 `ok_or_else`。
+
+测试里常把 `Result` 的**错误值**取出来检查,惯用 `.err().expect(...)`:`.err()` 把
+`Result<T, E>` 转成 `Option<E>`(`Ok` 变 `None`),于是可以像普通 `Option` 一样解包:
+
+```rust
+let error = HnswIndex::load(...)
+    .err()
+    .expect("节点数不一致必须拒绝载入");
+assert!(matches!(error, MnemeError::Corrupted { .. }));
+```
+
+见 [`src/index/hnsw.rs:677-683`](../../src/index/hnsw.rs)。
 
 mneme 的 `meta::get_path` 用 `?` 在 `Option` 上做链式短路:
 
@@ -217,7 +264,7 @@ Corrupted {
 
 ---
 
-## 4. `match`、`if let`、`matches!`
+## 4. `match`、`if let`、`matches!` 与 `let` 家族
 
 ### 4.1 `match` 穷尽所有情况
 
@@ -239,6 +286,20 @@ if let Some(v) = maybe {
 
 等价于只写 `match` 的 `Some` 分支,忽略其余。
 
+`if let` 的模式还能直接解构引用。例如 L3 这段:
+
+```rust
+if let Some(&(_, best)) = candidates.first() {
+    entry = best;
+}
+```
+
+见 [`src/index/hnsw.rs:355-357`](../../src/index/hnsw.rs)。`candidates.first()` 返回
+`Option<&(Score, u32)>`(切片首元素的引用);模式最前面的 `&` 把引用"拆开",`(_, best)`
+再解出元组第二个字段,`_` 忽略分数。于是 `best` 是复制出来的 `u32`,不是引用。
+规则:模式要对**值的类型**匹配,加 `&` 可以"透过引用看进去"——和 [07 §3.1](07-iterators-closures.md)
+的 `for (index, &byte) in ...` 是同一个原理。
+
 ### 4.3 `matches!`:返回布尔值
 
 ```rust
@@ -257,6 +318,72 @@ assert!(matches!(err, MnemeError::Corrupted { .. }));
 ```
 
 `{ .. }` 表示"结构体变体,字段随便"。见 [`src/core/varint.rs:219-222`](../../src/core/varint.rs)。
+
+### 4.5 `while let`:循环地匹配一个分支
+
+`if let` 只判断一次;`while let` 反复判断,直到模式不再匹配:
+
+```rust
+while let Some(current) = frontier.pop() {   // 堆非空就弹出一个继续搜
+    ...
+}
+```
+
+见 [`src/index/hnsw.rs:241`](../../src/index/hnsw.rs)。`pop()` 返回 `Option<Cand>`:
+`Some` 进入循环体,`None`(堆空)结束循环。它等价于:
+
+```rust
+loop {
+    match frontier.pop() {
+        Some(current) => { ... }
+        None => break,
+    }
+}
+```
+
+> 什么时候用 `while let`:消费一个"每次取出一个、可能取空"的来源——堆的 `pop`、迭代器的
+> `next`、通道的 `recv`。前提是**循环必然终止**:这里的堆每 `pop` 一次少一个元素,
+> 终会走到 `None`。
+
+### 4.6 `let...else`:匹配失败就提前退出
+
+当"匹配成功继续、失败立刻返回"时,`let...else` 比 `if let` 少一层缩进,也不会把后续代码
+关进花括号:
+
+```rust
+let Ok(decoded) = decode(&bytes) else {
+    return Ok(());      // 解码失败:本用例视为不适用,直接结束
+};
+// 从这里起,decoded 一定可用
+```
+
+见 [`src/index/hidx.rs:780-782`](../../src/index/hidx.rs)。规则:
+
+- `else` 块**必须发散(diverge)**:里面必须以 `return`/`break`/`continue`/`panic!` 结束,
+  编译器才能保证"走到下面时模式一定匹配成功";
+- 成功绑定(`decoded`)在整条语句之后都可用,不像 `if let` 的绑定被限制在块内;
+- 常见于"先解构出结果,失败就早退"的卫语句写法,与 [CONTRIBUTING.md](../../CONTRIBUTING.md)
+  要求的"提前返回、拒绝深嵌套"相配。
+
+### 4.7 `let` 链:多个条件连续匹配
+
+`edition = "2024"` 起,`if let` / `while let` 可以和普通条件、其它 `let` 用 `&&` 串起来:
+
+```rust
+if let Some(links) = self.nodes.get_mut(node as usize)
+    && let Some(slot) = links.neighbors.get_mut(level)
+{
+    *slot = neighbors;
+}
+```
+
+见 [`src/index/graph.rs:70-76`](../../src/index/graph.rs)。要点:
+
+- 只有前面的条件为真,后面的 `let` 才执行;任一失败整个 `if` 为假——语义就是短路,
+  前面的 `Option` 是 `None` 时后面的表达式根本不求值;
+- 每层解构出的绑定,在后续条件和块里都可用(`links` 在第二个 `let` 里就能用);
+- 它取代嵌套的 `if let` 金字塔,可读性更好;**只在 `edition = "2024"` 可用**
+  (mneme 正是 2024,见 [01 §4.3](01-toolchain.md))。
 
 ---
 
@@ -293,6 +420,7 @@ if denominator < COSINE_EPSILON { 0.0 } else { simd::dot(a, b) / denominator }
 | `unused `Result` that must be used` | 拿到 `Result` 没处理 | 用 `?`、`match`、或显式 `.ok()` 并注释 |
 | `no variant named X` | 枚举变体名写错 | 对照定义 |
 | `non-exhaustive patterns` | `match` 漏分支 | 补全,或加 `_`(库外部类型) |
+| `refutable pattern in local binding` | 用 `let` 匹配了可能失败的模式 | 补 `else`(`let...else`),或改用 `if let`/`match` |
 
 ---
 
@@ -300,8 +428,11 @@ if denominator < COSINE_EPSILON { 0.0 } else { simd::dot(a, b) / denominator }
 
 - `Option<T>` 表示"有/无",`Result<T, E>` 表示"成功/失败",都由编译器强制处理。
 - `?` 在 `Result` 或 `Option` 上短路传播;`unwrap`/`expect` 会 panic,生产代码禁用。
+- `map_or`/`is_none_or`/`ok_or_else` 等组合子把"取值 + 兜底 / 转错误"写成表达式,
+  `ok_or_else` 惰性构造错误,优先于 `ok_or`。
+- `if let` 只匹配一个分支,`matches!` 返回布尔值;`while let` 反复匹配直到失败,
+  `let...else` 匹配失败即早退,`edition 2024` 的 let 链用 `&&` 串起多个条件与 `let`。
 - 用 `thiserror` 的 `#[error]` 定义消息、`#[from]` 自动转换、字段携带上下文、`#[source]` 保留根因。
-- `if let` 只匹配一个分支,`matches!` 返回布尔值;`match` 必须穷尽。
 - mneme 原则:可预期失败返回 `Result`,公开 API 不 panic,绝不静默吞错。
 
 ## 动手练习
