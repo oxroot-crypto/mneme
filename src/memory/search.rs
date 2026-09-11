@@ -11,7 +11,7 @@ use crate::core::heap::TopK;
 use crate::core::metric::{Metric, Score};
 use crate::core::simd;
 use crate::core::types::{NsId, RowId, SlotId};
-use crate::memory::index::{IndexSearch, VectorIndex};
+use crate::memory::index::IndexSearch;
 use crate::memory::pred::{self, EvalCtx, Expr};
 use crate::memory::table::ReaderView;
 
@@ -125,12 +125,17 @@ pub(crate) fn search(params: &SearchParams<'_>) -> Result<Vec<Scored>> {
         return Ok(Vec::new());
     }
 
-    // L3:前缀走 HNSW(ANN),尾部暴力扫描(内存段),归并后统一重取分。
-    if let Some(index) = params.view.index.as_ref()
-        && index.node_count() > params.brute_force_max_rows
-    {
+    // L3/L5:各已落盘段图分别 ANN,未覆盖槽位(未落盘尾部/无 hidx 段)暴力,
+    // 归并后统一重取分(多段形态下语义与全量暴力统计等价,设计 05 §9)。
+    let indexed: usize = params
+        .view
+        .indexes
+        .iter()
+        .map(|segment| segment.covered.count_ones())
+        .sum();
+    if indexed > params.brute_force_max_rows {
         let budget = AnnBudget { query_norm, k };
-        return ann_search(params, index.as_ref(), candidates, budget);
+        return ann_search(params, candidates, budget);
     }
 
     let top = run_scan(params, candidates, query_norm, k)?;
@@ -166,63 +171,72 @@ struct AnnBudget {
     k: usize,
 }
 
-/// ANN 路径:前缀 HNSW + 尾部暴力,归并后再取分。
+/// ANN 路径:逐段图搜索 + 未覆盖候选暴力,归并后再取分。
 fn ann_search(
     params: &SearchParams<'_>,
-    index: &dyn VectorIndex,
     candidates: &[u32],
     budget: AnnBudget,
 ) -> Result<Vec<Scored>> {
     let AnnBudget { query_norm, k } = budget;
-    let indexed = index.node_count().min(params.view.slots.len());
-    let (alive, filter) = prefix_bitmaps(params, indexed, candidates);
-    let index_top = index.search(&IndexSearch {
-        query: params.query,
-        query_norm,
-        ef: params.ef,
-        k,
-        alive: &alive,
-        filter: filter.as_ref(),
-        post_threshold: params.filter_post_threshold,
-        brute_threshold: params.filter_brute_threshold,
-    });
+    let mut top = TopK::new(k, params.metric);
+    let mut covered = BitSet::default();
+    for segment in params.view.indexes.iter() {
+        // 每段只处理与该段覆盖相交的候选;`alive` 亦限制在本段覆盖内,
+        // 避免选择性口径被其他段的位图稀释(过滤三档按段独立分派)。
+        let (alive, filter) = segment_bitmaps(params, segment, candidates);
+        let partial = segment.index.search(&IndexSearch {
+            query: params.query,
+            query_norm,
+            ef: params.ef,
+            k,
+            alive: &alive,
+            filter: filter.as_ref(),
+            post_threshold: params.filter_post_threshold,
+            brute_threshold: params.filter_brute_threshold,
+        });
+        top.merge(partial);
+        covered.union_with(&segment.covered);
+    }
 
     let tail: Vec<u32> = candidates
         .iter()
         .copied()
-        .filter(|&idx| idx as usize >= indexed)
+        .filter(|&idx| !covered.get(idx as usize))
         .collect();
-    let top = if tail.is_empty() {
-        index_top
-    } else {
-        let mut merged = run_scan(params, &tail, query_norm, k)?;
-        merged.merge(index_top);
-        merged
-    };
+    if !tail.is_empty() {
+        top.merge(run_scan(params, &tail, query_norm, k)?);
+    }
     Ok(rescore(params, top, query_norm))
 }
 
-/// 构造索引前缀的 `alive` 位图与候选过滤位图(均按全局槽位)。
-fn prefix_bitmaps(
+/// 构造单个段索引的 `alive` 位图与候选过滤位图(均按全局槽位)。
+fn segment_bitmaps(
     params: &SearchParams<'_>,
-    indexed: usize,
+    segment: &crate::memory::index::SegmentIndex,
     candidates: &[u32],
 ) -> (BitSet, Option<BitSet>) {
     let mut alive = BitSet::default();
-    for idx in 0..indexed {
-        let slot = &params.view.slots[idx];
-        if !params.view.dead.get(idx) && slot.ns_id == params.ns_id && slot.is_live(params.now_ms) {
+    for slot in &segment.slots {
+        let idx = slot.get() as usize;
+        let Some(slot_data) = params.view.slots.get(idx) else {
+            continue;
+        };
+        if !params.view.dead.get(idx)
+            && slot_data.ns_id == params.ns_id
+            && slot_data.is_live(params.now_ms)
+        {
             alive.set(idx);
         }
     }
-    // 仅当存在用户过滤(`filter`)时构造索引前缀过滤位图:exec 无过滤时
-    // 传全 1 候选且 `filter = None`,不得把"全 1 候选"误当过滤(否则会触发
-    // 契约 FC-INDEX-POST-001 的档③「候选暴力」路径)。
+    // 仅当存在用户过滤(`filter`)时构造索引段过滤位图:exec 无过滤时传全 1
+    // 候选且 `filter = None`,不得把"全 1 候选"误当过滤(否则会触发契约
+    // FC-INDEX-POST-001 的档③「候选暴力」路径)。
     let filter = params.filter.is_some().then(|| {
         let mut bits = BitSet::default();
         for &idx in candidates {
-            if (idx as usize) < indexed {
-                bits.set(idx as usize);
+            let idx = idx as usize;
+            if segment.covered.get(idx) {
+                bits.set(idx);
             }
         }
         bits

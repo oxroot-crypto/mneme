@@ -27,11 +27,11 @@ pub(super) fn apply_if_after_watermark(
     frame: PendingFrame<'_>,
     watermark: u64,
 ) -> Result<()> {
-    // 注册帧是幂等元数据,且可能在首次 flush 前落盘(watermark 仍为 0),
+    // 注册/注销帧是幂等元数据,且可能在首次 flush 前落盘(watermark 仍为 0),
     // 故不受水位约束,始终重放(设计 04 §3.3「注册与水位恢复」)。
     let metadata = matches!(
         frame.kind,
-        FrameKind::NsRegister | FrameKind::RelKindRegister
+        FrameKind::NsRegister | FrameKind::NsUnregister | FrameKind::RelKindRegister
     );
     if !metadata && frame.seqno <= watermark {
         return Ok(());
@@ -47,6 +47,7 @@ pub(super) fn apply_if_after_watermark(
 fn apply_frame(state: &mut WriterState, seqno: u64, kind: FrameKind, payload: &[u8]) -> Result<()> {
     match kind {
         FrameKind::NsRegister => apply_ns_register(state, payload),
+        FrameKind::NsUnregister => apply_ns_unregister(state, payload),
         FrameKind::Insert => apply_insert(state, payload),
         FrameKind::DeleteRow => {
             let (rowid, tx_ms) = wal::decode_delete_row(payload)?;
@@ -81,6 +82,15 @@ fn apply_ns_register(state: &mut WriterState, payload: &[u8]) -> Result<()> {
     Arc::make_mut(&mut state.ns_by_path).insert(path, id);
     if ns_id >= state.next_ns_id {
         state.next_ns_id = ns_id + 1;
+    }
+    Ok(())
+}
+
+/// 应用 `NsUnregister` 帧:移除注册表项与路径映射;`NsId` 水位不回退、永不复用。
+fn apply_ns_unregister(state: &mut WriterState, payload: &[u8]) -> Result<()> {
+    let ns_id = NsId::new(wal::decode_ns_unregister(payload)?);
+    if let Some(path) = Arc::make_mut(&mut state.ns_registry).remove(&ns_id) {
+        Arc::make_mut(&mut state.ns_by_path).remove(&path);
     }
     Ok(())
 }

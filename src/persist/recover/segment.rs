@@ -148,23 +148,80 @@ fn commit_recovered_slot(
     Ok(())
 }
 
-/// 从各段 relations 区重建关系边(出边 + 入边)。
+/// 从单个段的 relations 区重建关系边(出边 + 入边)。
+///
+/// `RelationIndex::Both` 的段带反向表:入边由反向表 + 正向表并集恢复
+/// (并集对损坏文件更稳健,upsert 幂等;设计 04 §2.2b、FC-MODEL-POST-007)。
 pub(super) fn apply_relations(
     state: &mut WriterState,
-    parsed: &[(vsec::VsecView<'_>, msec::MsecView<'_>)],
+    msec_view: &msec::MsecView<'_>,
 ) -> Result<()> {
-    for (_, msec_view) in parsed {
-        let edges = crate::persist::edges::parse(msec_view.relations_bytes())?;
-        for edge in edges.forward {
-            let built = Edge {
-                from: RowId::new(edge.from),
-                to: RowId::new(edge.to),
-                kind: RelationKind(edge.kind),
-                weight: edge.weight,
-                metadata: edge.meta,
-            };
-            relation::upsert_edge(Arc::make_mut(&mut state.out_edges), built.clone());
-            relation::upsert_edge(Arc::make_mut(&mut state.in_edges), built);
+    let edges = crate::persist::edges::parse(msec_view.relations_bytes())?;
+    let build = |edge: &crate::persist::edges::EdgeData| Edge {
+        from: RowId::new(edge.from),
+        to: RowId::new(edge.to),
+        kind: RelationKind(edge.kind),
+        weight: edge.weight,
+        metadata: edge.meta.clone(),
+    };
+    for edge in &edges.forward {
+        relation::upsert_edge(Arc::make_mut(&mut state.out_edges), build(edge));
+        relation::upsert_edge(Arc::make_mut(&mut state.in_edges), build(edge));
+    }
+    for edge in &edges.reverse {
+        relation::upsert_edge(Arc::make_mut(&mut state.in_edges), build(edge));
+    }
+    Ok(())
+}
+
+/// 从单个段的 delta 区回放跨段访问统计与关系变更(设计 04 §2.2a)。
+pub(super) fn apply_delta(state: &mut WriterState, msec_view: &msec::MsecView<'_>) -> Result<()> {
+    for entry in msec::decode_delta(msec_view.delta_bytes())? {
+        match entry {
+            msec::DeltaEntry::Access {
+                rowid,
+                last_access_ms,
+                access_delta,
+                ..
+            } => {
+                let stat = Arc::make_mut(&mut state.access)
+                    .entry(RowId::new(rowid))
+                    .or_default();
+                stat.access_count = stat.access_count.saturating_add(access_delta);
+                stat.last_access_ms = last_access_ms;
+            }
+            msec::DeltaEntry::Relate {
+                from,
+                to,
+                kind,
+                weight,
+                meta,
+                ..
+            } => {
+                let edge = Edge {
+                    from: RowId::new(from),
+                    to: RowId::new(to),
+                    kind: RelationKind(kind),
+                    weight,
+                    metadata: meta,
+                };
+                relation::upsert_edge(Arc::make_mut(&mut state.out_edges), edge.clone());
+                relation::upsert_edge(Arc::make_mut(&mut state.in_edges), edge);
+            }
+            msec::DeltaEntry::Unrelate { from, to, kind, .. } => {
+                relation::remove_edge(
+                    Arc::make_mut(&mut state.out_edges),
+                    RowId::new(from),
+                    RowId::new(to),
+                    RelationKind(kind),
+                );
+                relation::remove_edge(
+                    Arc::make_mut(&mut state.in_edges),
+                    RowId::new(to),
+                    RowId::new(from),
+                    RelationKind(kind),
+                );
+            }
         }
     }
     Ok(())

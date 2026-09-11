@@ -13,7 +13,7 @@ use crate::persist::manifest::Manifest;
 use crate::persist::msec::{self, VersionRow};
 use crate::persist::vsec;
 
-use super::segment::{apply_relations, apply_versions, load_segment_views};
+use super::segment::{apply_delta, apply_relations, apply_versions, load_segment_views};
 
 /// 一个待恢复的段:`(segment_id, vsec 字节, msec 字节, 可选 hidx 字节)`。
 pub(crate) struct SegmentBytes {
@@ -27,13 +27,20 @@ pub(crate) struct SegmentBytes {
     pub(crate) hidx: Option<Vec<u8>>,
 }
 
+/// 一个已解析段及其"段内槽位 → 全局槽位"重排映射。
+pub(crate) struct SegmentRemap {
+    /// 段编号。
+    pub(crate) segment_id: u32,
+    /// 段内槽位 → 全局槽位(`remap[local] = global`)。
+    pub(crate) remap: Vec<u32>,
+}
+
 /// [`load_segments`] 的恢复结果。
 pub(crate) struct RecoveredSegments {
     /// 被隔离(跳过)的段 id 列表。
     pub(crate) skipped: Vec<u32>,
-    /// 单段场景下"段内槽位 → 全局槽位"的重排映射(用于把 hidx 节点 id 映射回
-    /// 恢复后全局 `SlotId`);多段或存在跳过段时为 `None`。
-    pub(crate) remap: Option<Vec<u32>>,
+    /// 每个已解析段的重排映射(倒排载入与 hidx 载入共用)。
+    pub(crate) remaps: Vec<SegmentRemap>,
 }
 
 /// 从零构建写状态,并载入命名空间注册表与 ID 水位。
@@ -52,7 +59,8 @@ pub(crate) fn empty_state(manifest: &Manifest) -> WriterState {
 
 /// 把各段记录重建成写状态(调用前请先用 [`empty_state`] 载入注册表/水位)。
 ///
-/// 返回被隔离(跳过)的段 id 与单段重排映射,供调用方移入 `trash/` 并按需载入 hidx。
+/// 返回被隔离(跳过)的段 id 与各段重排映射,供调用方移入 `trash/` 并按需载入 hidx。
+/// 段按 MANIFEST 所列顺序处理:关系表与 delta 逐段交错回放,保证时序正确。
 ///
 /// # Errors
 /// 段头/记录体损坏且 `fail_fast` 时返回错误;否则损坏段被跳过并计入返回值。
@@ -67,6 +75,7 @@ pub(crate) fn load_segments(
     // 收集全部版本并按 (rowid, seqno) 全局排序,保证同一 RowId 的版本链有序。
     let mut versions: Vec<(VersionRow, usize)> = Vec::new();
     let mut parsed: Vec<(vsec::VsecView<'_>, msec::MsecView<'_>)> = Vec::new();
+    let mut parsed_ids: Vec<u32> = Vec::new();
     let mut skipped: Vec<u32> = Vec::new();
     for segment in segments {
         let Some((vsec_view, msec_view)) = load_segment_views(segment, verify_payload, fail_fast)?
@@ -79,35 +88,44 @@ pub(crate) fn load_segments(
             versions.push((row, index));
         }
         parsed.push((vsec_view, msec_view));
+        parsed_ids.push(segment.segment_id);
     }
     versions.sort_by_key(|(row, _)| (row.rowid, row.seqno));
 
-    // 单段时构建"段内槽位 → 全局槽位"重排映射(倒排载入与 hidx 均需要)。
-    let row_count = parsed
-        .first()
-        .map_or(0, |(view, _)| view.row_count() as usize);
-    let remap = build_remap(&versions, segments, &skipped, row_count)?;
+    // 每段构建"段内槽位 → 全局槽位"重排映射(倒排载入与 hidx 载入均需要)。
+    let row_counts: Vec<usize> = parsed
+        .iter()
+        .map(|(view, _)| view.row_count() as usize)
+        .collect();
+    let remaps = build_remaps(&versions, &row_counts, &parsed_ids)?;
 
     apply_versions(state, &versions, &parsed)?;
-    apply_relations(state, &parsed)?;
+    for (_, msec_view) in parsed.iter() {
+        apply_relations(state, msec_view)?;
+        apply_delta(state, msec_view)?;
+    }
     state.pending.clear();
-    apply_indexes(state, &parsed, remap.as_deref(), fail_fast)?;
+    apply_indexes(state, &parsed, &remaps, fail_fast)?;
     state.is_indexing_paused = false;
-    Ok(RecoveredSegments { skipped, remap })
+    Ok(RecoveredSegments { skipped, remaps })
 }
 
 /// 载入或重建检索加速结构(倒排 / zone map / bloom)。
 ///
-/// 单段且存在重排映射时优先用段内四区装载倒排(免重新分词);结构不合法时
-/// `fail_fast` 报错,否则降级为从槽位全量重建——两条路径产生等价的索引。
+/// 单段且存在重排映射时优先用段内四区装载倒排(免重新分词);多段时逐段解码倒排
+/// 并按全局槽位合并,bloom/zone map 从槽位重建;结构不合法时 `fail_fast` 报错,
+/// 否则降级为从槽位全量重建——两条路径产生等价的索引。
 fn apply_indexes(
     state: &mut WriterState,
     parsed: &[(vsec::VsecView<'_>, msec::MsecView<'_>)],
-    remap: Option<&[u32]>,
+    remaps: &[SegmentRemap],
     fail_fast: bool,
 ) -> Result<()> {
-    if let (Some(remap), [(_, msec_view)]) = (remap, parsed) {
-        match load_disk_indexes(state, msec_view, remap) {
+    if parsed.is_empty() {
+        return Ok(());
+    }
+    if let ([(_, msec_view)], [remap]) = (parsed, remaps) {
+        match load_disk_indexes(state, msec_view, &remap.remap) {
             // 新段四区完整:直接复用磁盘索引。
             Ok(true) => return Ok(()),
             // 旧版段未写四区:显式降级全量重建,不是损坏。
@@ -116,10 +134,43 @@ fn apply_indexes(
             // 索引是查询加速器而非数据来源:损坏时降级全量重建仍然正确。
             Err(_) => {}
         }
-    }
-    if !parsed.is_empty() {
         state.rebuild_indexes();
+        return Ok(());
     }
+
+    // 多段:逐段解码倒排(经各自重排映射)并合并;任一结构不一致即整库重建。
+    let mut merged = crate::memory::analysis::InvertedIndex::default();
+    for ((_, msec_view), remap) in parsed.iter().zip(remaps.iter()) {
+        if msec_view.field_dict_bytes().is_empty() {
+            // 旧版段四区全空 → 走重建;半新半旧属结构不一致,按损坏拒绝。
+            let others_empty = msec_view.zmap_bytes().is_empty()
+                && msec_view.bloom_bytes().is_empty()
+                && msec_view.inverted_bytes().is_empty();
+            if others_empty {
+                state.rebuild_indexes();
+                return Ok(());
+            }
+            let error = MnemeError::Corrupted {
+                segment: None,
+                reason: "msec: field_dict 为空但其它索引区非空".to_string(),
+            };
+            if fail_fast {
+                return Err(error);
+            }
+            state.rebuild_indexes();
+            return Ok(());
+        }
+        let inv = match msec::decode_inverted(msec_view.inverted_bytes(), &remap.remap) {
+            Ok(inv) => inv,
+            Err(error) if fail_fast => return Err(error),
+            Err(_) => {
+                state.rebuild_indexes();
+                return Ok(());
+            }
+        };
+        merged.merge_from(inv);
+    }
+    state.load_merged_indexes(merged, None);
     Ok(())
 }
 
@@ -153,6 +204,9 @@ fn load_disk_indexes(
         .len()
         .div_ceil(crate::memory::analysis::ZONE_BLOCK_ROWS);
     msec::validate_zmap(msec_view.zmap_bytes(), &fields, block_count)?;
+    // `ttl_map`(块级 TTL 剪枝元数据)在载入期解码校验;运行期 zone map 从槽位
+    // 重建,该元数据不直接参与查询(设计 04 §5.2,FC-LIFE-CPLX-001)。
+    let _ttl_map = msec::decode_ttl_map(msec_view.zmap_bytes(), &fields, block_count)?;
     let str_ids: Vec<u16> = fields
         .iter()
         .filter(|field| field.kind == msec::FieldKind::Str)
@@ -177,44 +231,46 @@ fn load_disk_indexes(
     Ok(true)
 }
 
-/// 构建单段的"段内槽位 → 全局槽位"重排映射。
+/// 为每个已解析段构建"段内槽位 → 全局槽位"重排映射。
 ///
 /// 第 k 个被应用的版本落入全局槽位 k(槽位从空开始),故
-/// `remap[段内槽位] = 该版本在 `(rowid, seqno)` 有序链中的位置`。
-/// 多段或存在跳过段时返回 `None`(调用方降级重建索引)。
+/// `remap[段内槽位] = 该版本在 (rowid, seqno) 有序链中的位置`。多段各自独立映射。
 ///
 /// # Errors
 /// 版本槽位越界/重复,或存在未被版本行引用的段内槽位(vsec/msec 行数不一致)时
 /// 返回 [`MnemeError::Corrupted`]——继续使用会把未引用槽位静默映射到槽位 0。
-fn build_remap(
+fn build_remaps(
     versions: &[(VersionRow, usize)],
-    segments: &[SegmentBytes],
-    skipped: &[u32],
-    row_count: usize,
-) -> Result<Option<Vec<u32>>> {
-    if segments.len() != 1 || !skipped.is_empty() {
-        return Ok(None);
-    }
-    let mut remap = vec![0_u32; row_count];
-    let mut occupied = vec![false; row_count];
-    for (position, (row, _)) in versions.iter().enumerate() {
+    row_counts: &[usize],
+    parsed_ids: &[u32],
+) -> Result<Vec<SegmentRemap>> {
+    let mut remaps: Vec<Vec<u32>> = row_counts.iter().map(|&count| vec![0_u32; count]).collect();
+    let mut occupied: Vec<Vec<bool>> = row_counts.iter().map(|&count| vec![false; count]).collect();
+    for (position, (row, segment)) in versions.iter().enumerate() {
+        let remap = &mut remaps[*segment];
         let index = row.slot_id as usize;
-        if index >= remap.len() || occupied[index] {
-            return Err(crate::core::error::MnemeError::Corrupted {
+        if index >= remap.len() || occupied[*segment][index] {
+            return Err(MnemeError::Corrupted {
                 segment: None,
                 reason: "recover: 版本槽位越界或重复".to_string(),
             });
         }
-        occupied[index] = true;
+        occupied[*segment][index] = true;
         remap[index] = position as u32;
     }
-    if occupied.iter().any(|&used| !used) {
-        return Err(crate::core::error::MnemeError::Corrupted {
-            segment: None,
-            reason: "recover: 存在未被版本行引用的段内槽位".to_string(),
-        });
+    for used in &occupied {
+        if used.iter().any(|&slot| !slot) {
+            return Err(MnemeError::Corrupted {
+                segment: None,
+                reason: "recover: 存在未被版本行引用的段内槽位".to_string(),
+            });
+        }
     }
-    Ok(Some(remap))
+    Ok(parsed_ids
+        .iter()
+        .zip(remaps)
+        .map(|(&segment_id, remap)| SegmentRemap { segment_id, remap })
+        .collect())
 }
 
 #[cfg(test)]
@@ -314,69 +370,47 @@ mod tests {
         }
     }
 
-    /// 带 `hidx` 的空段占位(字节内容不参与重排映射测试)。
-    fn segment_with_hidx() -> SegmentBytes {
-        SegmentBytes {
-            segment_id: 0,
-            vsec: Vec::new(),
-            msec: Vec::new(),
-            hidx: Some(Vec::new()),
-        }
-    }
-
     /// FC-PERSIST-ERR-009:映射按"(rowid, seqno) 有序链位置"重排(非恒等);
-    /// 无 hidx 同样构建(倒排载入需要);多段或存在跳过段时返回 `None`。
+    /// 多段各自独立映射,互不影响。
     #[test]
-    fn build_remap_maps_slots_in_version_chain_order() {
-        let segments = [segment_with_hidx()];
+    fn build_remaps_maps_slots_in_version_chain_order() {
         // 段内槽位 1 的版本排在链首、槽位 0 排在其后 → 映射必须非恒等。
         let versions = [(version(1, 1), 0), (version(2, 0), 0)];
-        let remap = build_remap(&versions, &segments, &[], 2)
-            .expect("合法布局不得报错")
-            .expect("单段必须产生映射");
-        assert_eq!(remap, vec![1, 0], "remap[段内槽位] = 有序链位置");
+        let remaps = build_remaps(&versions, &[2], &[0]).expect("合法布局不得报错");
+        assert_eq!(remaps.len(), 1);
+        assert_eq!(remaps[0].remap, vec![1, 0], "remap[段内槽位] = 有序链位置");
 
-        let without_hidx = [SegmentBytes {
-            hidx: None,
-            ..segment_with_hidx()
-        }];
-        assert_eq!(
-            build_remap(&versions, &without_hidx, &[], 2).expect("无 hidx 不是错误"),
-            Some(vec![1, 0]),
-            "无 hidx 也需映射(倒排载入用)"
-        );
-
-        let multi = [segment_with_hidx(), segment_with_hidx()];
-        assert_eq!(
-            build_remap(&versions, &multi, &[], 2).expect("多段返回 None,非错误"),
-            None
-        );
+        // 多段:段 7 占全局槽位 0/1,段 8 的版本排在其后。
+        let multi_versions = [(version(1, 1), 0), (version(2, 0), 0), (version(3, 0), 1)];
+        let multi = build_remaps(&multi_versions, &[2, 1], &[7, 8]).expect("多段独立映射");
+        assert_eq!(multi[0].segment_id, 7);
+        assert_eq!(multi[0].remap, vec![1, 0]);
+        assert_eq!(multi[1].segment_id, 8);
+        assert_eq!(multi[1].remap, vec![2]);
     }
 
     /// FC-PERSIST-ERR-009:槽位越界、重复、存在未被版本行引用的槽位
     /// (vsec/msec 行数不一致)→ `Corrupted`,绝不静默映射到槽位 0。
     #[test]
-    fn build_remap_rejects_out_of_range_duplicate_or_unreferenced_slots() {
-        let segments = [segment_with_hidx()];
-
+    fn build_remaps_rejects_out_of_range_duplicate_or_unreferenced_slots() {
         // 槽位越界:slot 2 不在 [0, row_count)。
         let out_of_range = [(version(1, 2), 0)];
         assert!(matches!(
-            build_remap(&out_of_range, &segments, &[], 2),
+            build_remaps(&out_of_range, &[2], &[0]),
             Err(MnemeError::Corrupted { .. })
         ));
 
         // 槽位重复:两条版本行同占 slot 0。
         let duplicate = [(version(1, 0), 0), (version(2, 0), 0)];
         assert!(matches!(
-            build_remap(&duplicate, &segments, &[], 2),
+            build_remaps(&duplicate, &[2], &[0]),
             Err(MnemeError::Corrupted { .. })
         ));
 
         // 未被引用:row_count = 2 但只有 slot 0 出现。
         let unreferenced = [(version(1, 0), 0)];
         assert!(matches!(
-            build_remap(&unreferenced, &segments, &[], 2),
+            build_remaps(&unreferenced, &[2], &[0]),
             Err(MnemeError::Corrupted { .. })
         ));
     }

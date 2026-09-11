@@ -26,6 +26,8 @@ pub struct Mneme {
     pub(crate) control: CompactionControl,
     /// 持久层协调句柄;纯内存库为 `None`。
     pub(crate) store: Option<Arc<Store>>,
+    /// 后台维护线程句柄(读路径命中攒批 / 自动遗忘 / 自动 compaction)。
+    pub(crate) maintenance: Option<crate::life::maintenance::MaintenanceHandle>,
 }
 
 impl std::fmt::Debug for Mneme {
@@ -33,6 +35,18 @@ impl std::fmt::Debug for Mneme {
         f.debug_struct("Mneme")
             .field("config", &self.config)
             .finish_non_exhaustive()
+    }
+}
+
+impl Drop for Mneme {
+    fn drop(&mut self) {
+        // 最后一个库句柄释放时同步停掉后台维护,保证独占锁随 `Store` Drop 及时释放;
+        // 其它句柄(命名空间/快照)仍存活时线程继续,由弱引用失效自行退出。
+        if let Some(maintenance) = &self.maintenance
+            && maintenance.is_last_handle()
+        {
+            maintenance.stop();
+        }
     }
 }
 
@@ -85,11 +99,12 @@ impl Mneme {
     /// 返回命名空间句柄;注册表在首次成功写入时惰性登记。
     ///
     /// # Arguments
-    /// * `path` - 命名空间路径,按 `/` 分层(如 `"project/session"`),
-    ///   前缀关系供 `drop_namespace` 级联删除;不校验是否已注册。
+    /// * `path` - 命名空间路径,按 `/` 分层(如 `"project/session"`);自动规范化
+    ///   (去首尾 `/`、合并连续 `/`),前缀关系供 `drop_namespace` 级联删除;
+    ///   深度/非法字符在首次写入时以 `Config` 报告。
     ///
     /// # Returns
-    /// 指向 `path` 的命名空间句柄;不校验路径是否已注册。
+    /// 指向规范化路径的命名空间句柄;不校验路径是否已注册。
     ///
     /// # Examples
     /// ```
@@ -103,7 +118,7 @@ impl Mneme {
         Namespace {
             table: Arc::clone(&self.table),
             config: Arc::clone(&self.config),
-            ns_path: Arc::from(path),
+            ns_path: Arc::from(crate::memory::namespace::normalize_path(path)),
         }
     }
 
@@ -136,10 +151,14 @@ impl Mneme {
         Ok(paths)
     }
 
-    /// 删除命名空间及其所有子命名空间,返回删除的命名空间数。
+    /// 删除命名空间及其所有子命名空间,返回被墓碑的记录行数。
     ///
     /// # Arguments
-    /// * `path` - 要删除的命名空间路径;精确匹配该路径及全部 `path/` 前缀子命名空间。
+    /// * `path` - 要删除的命名空间路径(自动规范化);按 `/` 段边界精确匹配该路径
+    ///   及全部 `path/` 前缀子命名空间(`"a/b"` 不含 `"a/bc"`);空路径表示根。
+    ///
+    /// # Returns
+    /// 实际打墓碑的记录行数(物理回收留给 compaction)。
     ///
     /// # Errors
     /// 库已关闭时返回 [`MnemeError::Closed`];槽位编号溢出 `u32::MAX` 时返回
@@ -153,23 +172,25 @@ impl Mneme {
     /// assert_eq!(db.drop_namespace("demo").unwrap(), 1);
     /// ```
     pub fn drop_namespace(&self, path: &str) -> Result<usize> {
+        let path = crate::memory::namespace::normalize_path(path);
         let config = Arc::clone(&self.config);
         self.table.write_tx(move |ws| {
             if ws.closed {
                 return Err(MnemeError::Closed);
             }
             let prefix = format!("{path}/");
-            let victims: Vec<(NsId, Arc<str>)> = ws
+            let victims: Vec<NsId> = ws
                 .ns_registry
                 .iter()
                 .filter(|(_, registered)| {
                     let registered: &str = registered;
-                    registered == path || registered.starts_with(&prefix)
+                    path.is_empty() || registered == path || registered.starts_with(&prefix)
                 })
-                .map(|(id, registered)| (*id, Arc::clone(registered)))
+                .map(|(id, _)| *id)
                 .collect();
             let now = config.clock.now_unix_ms();
-            for (ns_id, _) in &victims {
+            let mut rows = 0_usize;
+            for ns_id in &victims {
                 let rowids: Vec<RowId> = ws
                     .slots
                     .iter()
@@ -178,14 +199,15 @@ impl Mneme {
                     .collect();
                 for rowid in rowids {
                     let seqno = ws.alloc_seqno();
-                    ws.tombstone(rowid, now, seqno)?;
+                    if ws.tombstone(rowid, now, seqno)? {
+                        rows += 1;
+                    }
                 }
-                Arc::make_mut(&mut ws.ns_registry).remove(ns_id);
             }
-            for (_, path) in &victims {
-                Arc::make_mut(&mut ws.ns_by_path).remove(path);
+            for ns_id in &victims {
+                ws.unregister_ns(*ns_id);
             }
-            Ok(victims.len())
+            Ok(rows)
         })
     }
 
@@ -288,6 +310,10 @@ impl Mneme {
     /// db.close().unwrap();
     /// ```
     pub fn close(self) -> Result<()> {
+        // 先停后台维护,再做最终 flush,避免维护并发写入。
+        if let Some(maintenance) = &self.maintenance {
+            maintenance.stop();
+        }
         if let Some(store) = &self.store {
             let mut ws = self.table.write();
             // 只读库不写盘;可写库在关闭前把全部已确认写入落成段(I16)。

@@ -59,7 +59,9 @@ pub(crate) fn snapshot_at(view: &ReaderView, tx_ms: i64) -> ReaderView {
         in_edges: Arc::clone(&view.in_edges),
         access: Arc::clone(&view.access),
         ns_registry: Arc::clone(&view.ns_registry),
-        index: view.index.clone(),
+        indexes: Arc::clone(&view.indexes),
+        slot_segment: Arc::clone(&view.slot_segment),
+        reclaimed_versions: view.reclaimed_versions,
         inv: Arc::clone(&view.inv),
         zones: Arc::clone(&view.zones),
         key_bloom: Arc::clone(&view.key_bloom),
@@ -81,17 +83,18 @@ mod tests {
     #[test]
     fn snapshot_at_preserves_index_handle() {
         let mut ws = WriterState::new();
-        ws.index = Some(Arc::new(HnswIndex::build(
-            &[],
-            HnswParams::default(),
-            Metric::Dot,
-        )));
+        let built = Arc::new(HnswIndex::build(&[], HnswParams::default(), Metric::Dot));
+        Arc::make_mut(&mut ws.indexes).push(crate::memory::index::SegmentIndex::new(
+            0,
+            built,
+            Vec::new(),
+        ));
         let view = ws.snapshot();
-        assert!(view.index.is_some(), "构造的视图应携带索引");
+        assert!(!view.indexes.is_empty(), "构造的视图应携带索引");
 
         let snapshot = snapshot_at(&view, i64::MAX);
         assert!(
-            snapshot.index.is_some(),
+            !snapshot.indexes.is_empty(),
             "as_of 历史视图必须保留索引句柄(不得静默降级为暴力)"
         );
     }

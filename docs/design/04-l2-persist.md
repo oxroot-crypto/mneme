@@ -8,7 +8,7 @@
 
 模块:`persist/{wal/, vsec.rs, msec/, edges.rs, manifest.rs, recover/, flush.rs, source.rs, storage.rs, trash.rs, store/}`
 (`store/` 是协调句柄 `Store`:实现内存引擎的 `PersistHook`、承接 `open`/`flush`/Checkpoint;
-`delta/` 编解码模块已删除,`delta` 数据区保留给 L5,见 §2.2a)
+`delta/` 编解码模块已删除,`delta` 数据区自 L5 起实际写入访问/关系变更条目,见 §2.2a)
 
 ---
 
@@ -98,7 +98,7 @@ agent_memory/
 80     ns_stats_offset / ns_stats_len 2×u64 → 命名空间级统计(§5.6)
 96     zmap_offset / zmap_len        2×u64  → zone maps(每字段)+ ttl_map(见数据区)
 112    bloom_offset / bloom_len      2×u64  → bloom 组
-128    delta_offset / delta_len      2×u64  → 跨段覆盖区(L2 恒空,保留给 L5,§2.2a)
+128    delta_offset / delta_len      2×u64  → 跨段覆盖区(访问/关系变更,L5 起写入,§2.2a)
 144    rel_offset / rel_len          2×u64  → 关系邻接索引(仅正向表,§2.2b)
 160    header_crc32                  u32    (覆盖 [0,160))
 164..192 padding                      (补齐到 64B 对齐;header_len = 192)
@@ -119,8 +119,8 @@ agent_memory/
                     (编码与打分见 [06 §3.4](06-l4-query.md);无文本记录时为空)
        ns_stats:    每命名空间一行 (NsId u32, doc_count u64, total_doc_len u64)
                     → 段内块级剪枝用(§5.6);BM25 的 N/avgdl 需跨段全局聚合
-       delta:       跨段覆盖区(§2.2a):墓碑/更新/访问/关系变更的持久化载体(L5 目标);
-                    L2 写空,覆盖操作以墓碑/新版本进 version_table(§2.2a 落地状态)
+       delta:       跨段覆盖区(§2.2a):访问/关系变更的持久化载体(L5 起写入);
+                    墓碑/更新仍由 version_table 版本行承载
        relations:   关系邻接索引(§2.2b):按 (from RowId) 排序的边表,供联想检索
 --- 尾部 ------------------------------------------------------------
        payload_crc32                 u32
@@ -129,8 +129,8 @@ agent_memory/
 > **落地状态**:定长头实际为 **192 B**(偏移 `0..160` 为字段区、`header_crc32` 在
 > 偏移 **160**、`164..192` 为对齐填充)。L2 落地 `doc_region`、`version_table`、
 > `key_index`、`ns_stats` 与正向 `relations`;**L4 起** `field_dict`、`zmap`
-> (zone map;`ttl_map` 随 L5 落地)、`bloom` 与 `inverted`(倒排)四区也实际写入
-> (布局与构建见 §5.1–§5.4);`delta` 区恒为空(`delta: &[]`,保留给 L5,§2.2a)。
+> (zone map;`ttl_map` 自 L5 起写入)、`bloom` 与 `inverted`(倒排)四区也实际写入
+> (布局与构建见 §5.1–§5.4);`delta` 区自 L5 起写入增量段携带的访问/关系变更(§2.2a)。
 
 **记录体(entry)格式**(doc_region 内,长度前缀):
 
@@ -164,12 +164,13 @@ agent_memory/
 > 的版本被回收。因此 `as_of(t)` 在保留窗口内始终可读,默认永久;需要控制磁盘时设置有限
 > horizon(见 [07 §4.2a](07-l5-life.md))。
 
-### 2.2a 跨段覆盖区(delta,目标设计;L2 不写)
+### 2.2a 跨段覆盖区(delta;L5 起写入访问/关系变更)
 
-> **L2 落地状态(重要)**:L2 使用**全量快照 flush**(§3.2),msec 的 `delta` 区**恒写空**
-> (`delta: &[]`),`src/persist/delta/**` 编解码模块已删除(未接线)。L2 把删除/更新持久化为
-> **完整新版本 + 墓碑**,写入 `version_table`/`key_index`(§2.2、§5.5),**不依赖 delta 区**;
-> 不变量 I19 由"全量快照 + WAL 不提前截断"保证,而非 delta。下述 delta 设计是 **L5 compaction**
+> **落地状态(重要)**:删除/更新始终持久化为**完整新版本 + 墓碑**,写入
+> `version_table`/`key_index`(§2.2、§5.5),不依赖 delta 区;不变量 I19 由"WAL 不提前截断 +
+> 版本行"保证。L5 起 `delta` 区承载增量段中"作用于旧段记录"的非版本化变更
+> (kind=4 Access、kind=5/6 Relate/Unrelate;kind 1–3 保留),恢复时按段序回放、
+> compaction 时物化进新段。下述 delta 设计是 **L5 compaction**
 > 的目标形态。
 
 **问题**:`delete(key)` / `update(key, patch)` / `touch` / `relate` 作用的对象可能位于
@@ -214,9 +215,9 @@ relations: [from u64][to u64][kind u16][f32 weight][meta len+bytes] × edge_coun
            供 ns.predecessors() 以 O(log n + degree) 定位(见 09 §2.3)
 ```
 
-> **L2 落地状态**:段内 relations 区**只写正向表**(`edges::encode(&relations, false)`);
-> `RelationIndex::Both` 的反向表落盘属 **L5**。恢复时 `neighbors` 读段内正向表,
-> `predecessors` 的入边由**内存 `in_edges`**(WAL 重放 / 写状态)重建,不依赖段内反向表。
+> **落地状态**:默认 `RelationIndex::Outgoing` 只写正向表;`Both` 时自 L5 起追加反向表
+> (`edges::encode(&relations, config.relation_index == Both)`),恢复时入边由正向+反向表并集
+> 重建(FC-MODEL-POST-007)。
 
 - 边的可见性同样受 delta 的 Relate/Unrelate 与墓碑约束:任一端被删除,该边在读取时
   视为不可见(悬挂边不返回,compaction 时物理清除);
@@ -416,21 +417,22 @@ last_error }`。提交者追加后 `wait_while(last_durable < my_seqno)`。
 
 ### 3.2 轮转与检查点
 
-> **L2 落地状态**:L2 只有**一个** WAL 文件 `wal/wal_000001.log`,**不做轮转**。检查点 =
-> "全量快照 flush → 新 MANIFEST 记录 `watermark_seqno` → 重置(截断并重写文件头)该 WAL";
-> `Checkpoint` 帧类型(§2.3 type 4)保留但**不发出**。多文件轮转与按文件的保留/删除是 **L5**
-> 的 compaction 形态。
+> **落地状态(L5 起)**:WAL 支持多文件轮转 `wal/wal_NNNNNN.log`;活动文件达
+> `wal_file_bytes` 后在事务末(批提交之后)换新文件,**整批不跨文件**。检查点 = "增量段
+> flush → 新 MANIFEST 记录 `watermark_seqno` → 截断活动文件并删除已完全覆盖的旧文件";
+> 回放按文件序跳过 `seqno ≤ watermark` 的帧。`Checkpoint` 帧类型(§2.3 type 4)保留但
+> 仍不发出(以 MANIFEST 水位为准)。
 
-- **L2 检查点流程**:`flush` 把整个可变表(含墓碑/新版本/正向关系表)写成**一个新段**的
+- **检查点流程(L5 起)**:`flush` 把未落盘槽位与访问/关系 delta 写成**增量段**的
   `vsec + msec`,在 `MANIFEST.<v+1>` 中记录 `watermark_seqno = 当前 seqno` 并提交,随后
-  `WalWriter::reset` 把 `wal/wal_000001.log` 截断为空并重写文件头。截断发生在 MANIFEST 提交
+  `WalWriter::reset` 截断活动 WAL 文件并删除已覆盖旧文件。截断发生在 MANIFEST 提交
   **之后**,故任何已确认的覆盖操作(删除/更新/访问/关系)都已随快照段物化——**这是防止
   "删除复活/更新丢失"的关键**(不变量 I19):只要某条墓碑或更新还只存在于 WAL,就不得截断它。
-- **L2 阶段兜底**(还没有 compaction):WAL 总量超限(默认 256MB,`CompactionPolicy.wal_bytes`)
-  即触发上述全量快照 flush,保证 WAL 有界(I4)。L5 之后该兜底由正规 compaction 取代。
-- **L5 目标(未落地)**:WAL 文件达 `wal_file_bytes`(默认 64MB)换新文件,旧文件保留到
+- **WAL 压力兜底**:WAL 总量超限(默认 256MB,`CompactionPolicy.wal_bytes`)即触发增量段
+  flush,保证 WAL 有界(I4)。
+- **轮转节拍**:活动文件达 `wal_file_bytes`(默认 64MB)换新文件,旧文件保留到
   Checkpoint;**整批不跨文件提交**——`BatchBegin…BatchCommit` 必须完整落在同一文件内,由此批
-  原子性(I15)不依赖跨文件逻辑,回放器单文件即可判定整批取舍。
+  原子性(I15)不依赖跨文件逻辑,回放器单文件即可判定整批取舍(FC-PERSIST-POST-011)。
 
 ### 3.3 回放(恢复路径的一部分,见 §7)
 
@@ -531,7 +533,7 @@ $O(n)$ 时间(查表法每字节 1 次表查 + XOR,8KB 表)、$O(1)$ 空间;`crc
 > **落地状态**:`key_index`(§5.5)与 `ns_stats`(§5.6)自 L2 起写入;`field_dict`、
 > zone map、bloom 与倒排自 **L4** 起实际写入——构建在 `flush` 期由写状态的加速结构
 > 编码,查询期由 L4 计划器下推与 BM25 打分消费,`open` 校验区结构并从磁盘倒排经
-> "段内槽位 → 全局槽位"重排映射直接重建(`ttl_map` 随 L5 TTL 剪枝落地)。
+> "段内槽位 → 全局槽位"重排映射直接重建(`ttl_map` 自 L5 起随段写入并在载入期校验)。
 > 字节布局与偏移见 §2.2,四区编码见 `src/persist/msec/index.rs`。
 
 ### 5.1 字段字典
@@ -633,7 +635,7 @@ key 同时进入该字符串字段的 bloom(§5.3),不存在的 key 先被 bloom
   4. seqno 相同不可能(全局单调分配),故无并列。
 ```
 
-> **L2 落地状态**:来源 b)(段内 delta)在 L2 **恒空**(§2.2a);可见性完全由来源 a)
+> **L2 落地状态**:来源 b)(段内 delta)在 L2 恒空;L5 起含访问/关系变更条目(§2.2a);可见性由来源 a)
 > (`version_table` 版本链,含墓碑版本)与 c)(可变表/WAL 覆盖)解析。L2 的按 key 删除/访问在
 > WAL 中以 `DeleteRow`/`TouchRow` 落盘(§2.3),表现为版本链上的墓碑版本与内存访问统计。
 
@@ -724,7 +726,7 @@ open(dir):
     遇撕裂帧 → 可写实例截断该文件尾部;只读实例(`read_only`)不写盘,仅在内存中忽略
     该帧及其后(见 §13 只读模式)
  4. 构建 ReaderView{ manifest 版本, 可变表 }:合并各段 version_table 与 WAL 覆盖
-    (L2 的 delta 区恒空,§2.2a),重建每个 RowId 的版本链与当前可见版本(§5.5) → 对外服务
+    (含 §2.2a delta 区),重建每个 RowId 的版本链与当前可见版本(§5.5) → 对外服务
 不变量:恢复后的状态 = "已 fsync 确认的全部操作" 的重放结果(可多,不可错;
        Batched 策略下多出的只能是被 OS 已刷盘但确认事件未送达的帧,重放是幂等的)
 ```

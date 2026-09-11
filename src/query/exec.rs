@@ -65,6 +65,16 @@ impl SearchBuilder<'_> {
     /// assert_eq!(hits.len(), 1);
     /// ```
     pub fn execute(&self) -> Result<Vec<Hit>> {
+        // 查询延迟采样(固定 32 桶直方图;失败查询同样计入,便于定位慢路径)。
+        let started = std::time::Instant::now();
+        let result = self.execute_inner();
+        self.table
+            .record_query_latency(started.elapsed().as_secs_f64() * 1000.0);
+        result
+    }
+
+    /// `execute` 的实际流水线(延迟采样包裹在外层)。
+    fn execute_inner(&self) -> Result<Vec<Hit>> {
         let view = self.prepare_view()?;
         self.validate_query()?;
         self.validate_fusion()?;
@@ -82,6 +92,11 @@ impl SearchBuilder<'_> {
         let (scored, via_map) = self.apply_expansion(&view, scored, now);
         let ranked = self.rank(&view, scored, now);
         let hits = self.build_hits(&view, ranked, self.resolve_query_id(), &via_map);
+        // 读路径命中计入访问统计:仅当前视图检索(历史/快照检索不污染当前统计),
+        // 且仅在有持久层或自动遗忘时报数(设计 07 §2;热路径一次内存追加)。
+        if self.pinned.is_none() && self.as_of.is_none() && self.table.tracks_access_hits() {
+            self.table.record_hits(hits.iter().map(|hit| hit.rowid));
+        }
         Ok(self.apply_rerank(hits))
     }
 

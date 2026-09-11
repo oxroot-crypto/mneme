@@ -125,12 +125,23 @@ impl Builder {
         let config = Arc::new(self.into_config(dimension, metric));
         let hook = store.as_ref();
         let table = build_table(hook, recovered, &config);
-        Ok(Mneme {
+        let mut db = Mneme {
             table,
             config,
             control: CompactionControl::new(),
             store,
-        })
+            maintenance: None,
+        };
+        // 后台维护:持久库(访问攒批/自动 compaction)或显式开启自动遗忘的纯内存库。
+        if !db.config.read_only && (db.store.is_some() || db.config.retention.is_some()) {
+            db.maintenance = Some(crate::life::maintenance::spawn(
+                &db.table,
+                &db.config,
+                &db.control,
+                db.store.as_ref(),
+            ));
+        }
+        Ok(db)
     }
 
     /// 校验跨字段配置约束(FC-GLOBAL-PRE-004、FC-INDEX-PRE-001)。
@@ -143,6 +154,34 @@ impl Builder {
         }
         self.validate_hnsw()?;
         self.validate_tuning()?;
+        self.validate_compaction()?;
+        Ok(())
+    }
+
+    /// 校验 compaction 策略(FC-LIFE-PRE-001):分级比/阈值至少 2、段初始行数至少 1、
+    /// 死比率与 IO 配额为 `[0,1]` 内有限值,否则触发条件永假或除零。
+    fn validate_compaction(&self) -> Result<()> {
+        let policy = self.compaction;
+        if policy.tier_ratio < 2 || policy.tier_count < 2 {
+            return Err(MnemeError::Config {
+                reason: "compaction tier_ratio/tier_count 必须 ≥ 2",
+            });
+        }
+        if policy.segment_rows < 1 {
+            return Err(MnemeError::Config {
+                reason: "compaction segment_rows 必须 ≥ 1",
+            });
+        }
+        if !(0.0..=1.0).contains(&policy.dead_ratio) {
+            return Err(MnemeError::Config {
+                reason: "compaction dead_ratio 必须是 [0,1] 内的有限值",
+            });
+        }
+        if !(0.0..=1.0).contains(&policy.io_budget) {
+            return Err(MnemeError::Config {
+                reason: "compaction io_budget 必须是 [0,1] 内的有限值",
+            });
+        }
         Ok(())
     }
 
@@ -229,6 +268,7 @@ impl Builder {
                         fail_fast_on_corruption: self.fail_fast_on_corruption,
                         hook: self.fsync_hook.clone(),
                         index_factory: Some(crate::index::default_factory()),
+                        wal_file_bytes: self.compaction.wal_file_bytes,
                         tuning: self.tuning.clone(),
                     },
                 )?;

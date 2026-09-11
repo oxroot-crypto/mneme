@@ -21,10 +21,11 @@ impl IndexFactory for HnswFactory {
     fn build(
         &self,
         nodes: &[IndexNode],
+        slot_of: &[SlotId],
         params: HnswParams,
         metric: Metric,
     ) -> Arc<dyn VectorIndex> {
-        Arc::new(rebuild::rebuild(nodes, params, metric))
+        Arc::new(rebuild::rebuild_with_slots(nodes, slot_of, params, metric))
     }
 
     fn verify(&self, bytes: &[u8]) -> Result<()> {

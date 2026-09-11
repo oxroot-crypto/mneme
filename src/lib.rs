@@ -38,6 +38,7 @@ pub mod core;
 pub mod memory;
 
 mod index;
+mod life;
 mod persist;
 mod query;
 
@@ -59,8 +60,8 @@ pub use crate::memory::{
     ConsolidateReport, ConsolidationPolicy, Dedup, Edge, Expr, FieldBuilder, Fusion, Histogram,
     HistoryStat, Hit, InsertOutcome, Mneme, Namespace, NsStat, QuantStat, QueryCtx, Record,
     RecordRef, RelateOptions, RelationExpand, Reranker, ResultDedup, RetainReport, Retention,
-    ScoreBreakdown, SearchBuilder, SegmentStat, SnapshotHandle, SnapshotNamespace, Stats,
-    StorageStat, Summarizer, UpdateOutcome, Val,
+    ScoreBreakdown, SearchBuilder, SegmentStat, SnapshotHandle, SnapshotNamespace, SnapshotStats,
+    Stats, StorageStat, Summarizer, UpdateOutcome, Val,
 };
 pub use crate::persist::hook::{FsyncHook, IoAction};
 

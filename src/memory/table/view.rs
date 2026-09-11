@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::core::bitset::BitSet;
 use crate::core::types::{Key, NsId, RowId, SeqNo, SlotId};
 use crate::memory::analysis::{BloomSet, InvertedIndex, ZoneIndex};
-use crate::memory::index::VectorIndex;
+use crate::memory::index::SegmentIndex;
 use crate::memory::relation::Edge;
 
 use super::AccessStat;
@@ -23,8 +23,12 @@ pub(crate) struct ReaderView {
     pub(crate) in_edges: Arc<HashMap<RowId, Vec<Edge>>>,
     pub(crate) access: Arc<HashMap<RowId, AccessStat>>,
     pub(crate) ns_registry: Arc<HashMap<NsId, Arc<str>>>,
-    /// 覆盖槽位前缀的向量索引(与视图一同快照,保证快照一致)。
-    pub(crate) index: Option<Arc<dyn VectorIndex>>,
+    /// 各已落盘段的向量索引(与视图一同快照,保证快照一致;空 = 恒暴力)。
+    pub(crate) indexes: Arc<Vec<SegmentIndex>>,
+    /// 与 `slots` 平行的"槽位 → 所属段编号"(`None` = 未落盘尾部)。
+    pub(crate) slot_segment: Arc<Vec<Option<u32>>>,
+    /// 本进程累计物理回收的版本数(compaction)。
+    pub(crate) reclaimed_versions: u64,
     /// 内存倒排索引(BM25 两遍统计;与视图一同快照)。
     pub(crate) inv: Arc<InvertedIndex>,
     /// 块级 zone map(过滤下推)。

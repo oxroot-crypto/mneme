@@ -37,6 +37,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<MsecView<'_>> {
         ns_stats: slice_of(bytes, header.regions.ns_stats),
         zmap: slice_of(bytes, header.regions.zmap),
         bloom: slice_of(bytes, header.regions.bloom),
+        delta: slice_of(bytes, header.regions.delta),
         relations: slice_of(bytes, header.regions.rel),
         payload_crc: header.payload_crc,
         payload_crc_ok: None,
@@ -159,6 +160,7 @@ pub(crate) struct MsecView<'a> {
     ns_stats: &'a [u8],
     zmap: &'a [u8],
     bloom: &'a [u8],
+    delta: &'a [u8],
     relations: &'a [u8],
     payload_crc: u32,
     payload_crc_ok: Option<bool>,
@@ -248,6 +250,11 @@ impl MsecView<'_> {
     /// relations 区原始字节(可能为空)。
     pub(crate) const fn relations_bytes(&self) -> &[u8] {
         self.relations
+    }
+
+    /// delta 区原始字节(可能为空;跨段访问/关系变更)。
+    pub(crate) const fn delta_bytes(&self) -> &[u8] {
+        self.delta
     }
 
     /// 字段字典区原始字节(L4;无索引字段时为空)。

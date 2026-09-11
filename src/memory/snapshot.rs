@@ -41,6 +41,33 @@ impl SnapshotHandle {
         self.as_of_ms
     }
 
+    /// 返回钉住视图的只读统计(段数/物理行数/基线水位)。
+    ///
+    /// 统计取自快照钉住的 `ReaderView`,不随后续写入或后台 compaction 变化
+    /// (设计 07 §6、I17)。
+    ///
+    /// # Examples
+    /// ```
+    /// use mneme::{Mneme, Record};
+    /// let db = Mneme::in_memory(2).unwrap();
+    /// db.namespace("demo")
+    ///     .insert(Record::new(vec![1.0, 0.0]).key("a"))
+    ///     .unwrap();
+    /// let stats = db.snapshot().stats();
+    /// assert_eq!(stats.rows, 1);
+    /// ```
+    pub fn stats(&self) -> crate::memory::ops::SnapshotStats {
+        let mut segments = std::collections::HashSet::new();
+        for segment in self.view.slot_segment.iter().flatten() {
+            segments.insert(*segment);
+        }
+        crate::memory::ops::SnapshotStats {
+            version: self.version(),
+            segments: segments.len(),
+            rows: self.view.slots.len() as u64,
+        }
+    }
+
     /// 在钉住的快照上取命名空间只读视图。
     ///
     /// # Arguments
@@ -62,7 +89,7 @@ impl SnapshotHandle {
         SnapshotNamespace {
             table: Arc::clone(&self.table),
             view: Arc::clone(&self.view),
-            ns_path: Arc::from(path),
+            ns_path: Arc::from(crate::memory::namespace::normalize_path(path)),
             as_of_ms: self.as_of_ms,
         }
     }
@@ -228,6 +255,45 @@ impl SnapshotNamespace {
         Ok(keys
             .iter()
             .map(|key| ns_id.and_then(|ns_id| point_get(&self.view, ns_id, &Key::new(*key), now)))
+            .collect())
+    }
+
+    /// 按 `RowId` 批量点读。
+    ///
+    /// # Arguments
+    /// * `ids` - `RowId` 列表;未命中的位置以 `None` 占位。
+    ///
+    /// # Returns
+    /// 与 `ids` 等长、顺序一致的命中视图列表;可见性以快照时刻 `as_of_ms`
+    /// 判定(同 [`get_by_rowid`](Self::get_by_rowid))。
+    ///
+    /// # Errors
+    /// 当前恒 `Ok`(视图被钉住、不探测关闭态;`Result` 为 L2 持久层错误预留)。
+    ///
+    /// # Examples
+    /// ```
+    /// use mneme::{InsertOutcome, Mneme, Record};
+    /// let db = Mneme::in_memory(2).unwrap();
+    /// let ns = db.namespace("demo");
+    /// let rowid = match ns.insert(Record::new(vec![1.0, 0.0])).unwrap() {
+    ///     InsertOutcome::Inserted(id) => id,
+    ///     other => panic!("unexpected: {other:?}"),
+    /// };
+    /// let snap = db.snapshot().namespace("demo");
+    /// let refs = snap.get_many_by_rowid(&[rowid]).unwrap();
+    /// assert!(refs[0].is_some());
+    /// ```
+    pub fn get_many_by_rowid(&self, ids: &[RowId]) -> Result<Vec<Option<RecordRef<'_>>>> {
+        let now = self.as_of_ms;
+        Ok(ids
+            .iter()
+            .map(|id| {
+                self.view
+                    .live_slot(*id)
+                    .map(|slot| Arc::clone(&self.view.slots[slot.get() as usize]))
+                    .filter(|slot_data| slot_data.is_live(now))
+                    .map(RecordRef::new)
+            })
             .collect())
     }
 

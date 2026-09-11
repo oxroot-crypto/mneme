@@ -8,10 +8,11 @@
 //! zmap:       [u32 field_count][u64 block_count]
 //!             每数值字段: [u32 field_id][block × (f64 min, f64 max, u8 flags)]
 //!                       flags: bit0=has_value bit1=has_null;±∞ 表示"区间未知"
+//!             [i64 × block_count](可选,0x0003 起)每块 min(expires_at),无 TTL 记 +∞
+//!                       —— 块级 TTL 剪枝:min > now ⇒ 整块记录全未过期,免逐行判定
 //! bloom:      [u32 count] 每条: [u16 field_id][u32 bit_len][u32 k][u64 × bit_len/64]
 //! ```
 //!
-//! `ttl_map`(每块 `min(expires_at)`)随 L5 TTL 剪枝落地,暂不写入。
 //! 所有区在 msec 同一 payload CRC 保护下,与记录体同生同灭。
 
 use std::sync::Arc;
@@ -151,6 +152,61 @@ pub(crate) fn encode_zmap(
     out
 }
 
+/// 编码 `ttl_map`(每块 `min(expires_at)`;无 TTL 行记 `i64::MAX` = +∞)。
+///
+/// 紧接 zone map 数据之后存放(计入 `zmap_len`)。块内 `min > now` 是"整块记录
+/// 均未过期"的充分条件(无 TTL 行视为 +∞),查询期据此免逐行 TTL 判定。
+pub(crate) fn encode_ttl_map(min_expires: &[i64]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(min_expires.len() * 8);
+    for value in min_expires {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out
+}
+
+/// 解码 `ttl_map`(须给定与编码一致的字段字典与块数)。
+///
+/// # Errors
+/// zone map 区结构不符、尾部长度既非 0 也非 `block_count × 8` 时返回
+/// [`MnemeError::Corrupted`]。
+pub(crate) fn decode_ttl_map(
+    bytes: &[u8],
+    fields: &[FieldDef],
+    block_count: usize,
+) -> Result<Vec<i64>> {
+    let mut cursor = Cursor::new(bytes, "msec zmap");
+    let field_count = cursor.u32()? as usize;
+    let expected_fields = fields
+        .iter()
+        .filter(|field| field.kind != FieldKind::Str)
+        .count();
+    if field_count != expected_fields {
+        return Err(corrupted("zmap: 字段数与 field_dict 不符"));
+    }
+    let stored_blocks = cursor.u64()? as usize;
+    if stored_blocks != block_count {
+        return Err(corrupted("zmap: 块数与段行数不符"));
+    }
+    // 跳过 zone map 数据区(field_id + 每块 17 B)。
+    for _ in 0..field_count {
+        let _ = cursor.u32()?;
+        for _ in 0..block_count {
+            let _ = cursor.take(17)?;
+        }
+    }
+    let tail = cursor.take(cursor.remaining())?;
+    if tail.is_empty() {
+        return Ok(Vec::new());
+    }
+    if tail.len() != block_count * 8 {
+        return Err(corrupted("zmap: ttl_map 尾部长度不符"));
+    }
+    Ok(tail
+        .chunks_exact(8)
+        .map(|chunk| i64::from_le_bytes(chunk.try_into().unwrap_or([0; 8])))
+        .collect())
+}
+
 /// 校验 zone map 区结构:字段数/块数与字段字典及段行数一致,统计布局完整。
 pub(crate) fn validate_zmap(bytes: &[u8], fields: &[FieldDef], block_count: usize) -> Result<()> {
     let expected_fields = fields
@@ -195,8 +251,10 @@ pub(crate) fn validate_zmap(bytes: &[u8], fields: &[FieldDef], block_count: usiz
             }
         }
     }
-    if !cursor.is_empty() {
-        return Err(corrupted("zmap: 尾部有残留字节"));
+    let tail = cursor.remaining();
+    // 0x0002 旧段无 `ttl_map`;0x0003 起尾部为 `block_count × 8` 字节 min(expires_at)。
+    if tail != 0 && tail != block_count * 8 {
+        return Err(corrupted("zmap: ttl_map 尾部长度不符"));
     }
     Ok(())
 }
@@ -307,6 +365,39 @@ mod tests {
         // 截断与块数不符必须被检出。
         assert!(validate_zmap(&bytes[..bytes.len() - 1], &defs, 1).is_err());
         assert!(validate_zmap(&bytes, &defs, 2).is_err());
+    }
+
+    /// FC-LIFE-CPLX-001(`ttl_map` 往返:尾部 0 兼容旧段;`block_count × 8` 有效)
+    #[test]
+    fn ttl_map_roundtrip_and_legacy_tail() {
+        let fields = vec![
+            (Arc::from("created_at"), FieldKind::Ts),
+            (Arc::from("key"), FieldKind::Str),
+        ];
+        let zones = ZoneIndex::new(16);
+        let legacy = encode_zmap(&zones, &fields, 2);
+        let defs = decode_field_dict(&encode_field_dict(&fields)).expect("defs");
+        assert!(
+            decode_ttl_map(&legacy, &defs, 2)
+                .expect("旧段无 ttl_map")
+                .is_empty()
+        );
+        validate_zmap(&legacy, &defs, 2).expect("旧段尾长 0 必须兼容");
+
+        let mut with_ttl = legacy.clone();
+        with_ttl.extend_from_slice(&encode_ttl_map(&[1_700_000_000_000, i64::MAX]));
+        let decoded = decode_ttl_map(&with_ttl, &defs, 2).expect("decode");
+        assert_eq!(decoded, vec![1_700_000_000_000, i64::MAX]);
+        validate_zmap(&with_ttl, &defs, 2).expect("valid");
+
+        // 尾部长度既非 0 也非 blocks×8 → Corrupted。
+        let mut bad = with_ttl.clone();
+        bad.push(0);
+        assert!(matches!(
+            decode_ttl_map(&bad, &defs, 2),
+            Err(MnemeError::Corrupted { .. })
+        ));
+        assert!(validate_zmap(&bad, &defs, 2).is_err());
     }
 
     /// FC-PERSIST-POST-008(bloom 往返;否定语义保持)

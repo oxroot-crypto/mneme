@@ -176,7 +176,7 @@ impl Namespace {
                 .collect();
             let clusters = score::cluster_by_similarity(&vectors, policy.threshold);
             let target_path = consolidation_target(&ns_path, &policy);
-            let target_id = ws.register_ns(&target_path);
+            let target_id = ws.register_ns(&target_path)?;
             let mut report = ConsolidateReport::default();
             {
                 let mut ctx = ConsolidationCtx {

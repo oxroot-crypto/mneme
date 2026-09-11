@@ -12,15 +12,22 @@ use crate::memory::table::ReaderView;
 
 use super::zmap;
 
-// 单测操作计数:统计残余谓词的行级求值次数(线程局部,避免测试间干扰)。
+// 单测操作计数:统计残余谓词的行级求值次数与 TTL 逐行判定次数
+// (线程局部,避免测试间干扰)。
 #[cfg(test)]
 thread_local! {
     static ROW_EVALS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static TTL_CHECKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 fn bump_row_evals() {
     ROW_EVALS.with(|evals| evals.set(evals.get() + 1));
+}
+
+#[cfg(test)]
+fn bump_ttl_checks() {
+    TTL_CHECKS.with(|checks| checks.set(checks.get() + 1));
 }
 
 /// 一次查询的执行计划。
@@ -45,11 +52,22 @@ pub(crate) fn compile(view: &ReaderView, ns_id: NsId, filter: Option<&Expr>, now
         || zmap::full_mask(zmap::block_count(view)),
         |expr| zmap::block_mask(expr, view),
     );
+    // TTL 块级剪枝:块内 `min(expires_at) > now`(或无任何 TTL 值)时整块未过期,
+    // 逐行可见性判定可跳过 TTL 比较(FC-LIFE-CPLX-001)。
+    let ttl_unexpired = ttl_unexpired_blocks(view, now_ms);
     let mut candidates = Vec::new();
     let mut bits = BitSet::default();
     let mut alive = 0_usize;
     for (index, slot) in view.slots.iter().enumerate() {
-        if view.dead.get(index) || slot.ns_id != ns_id || !slot.is_live(now_ms) {
+        let ttl_proven = ttl_unexpired.get(index / ZONE_BLOCK_ROWS);
+        #[cfg(test)]
+        if !ttl_proven {
+            bump_ttl_checks();
+        }
+        if view.dead.get(index)
+            || slot.ns_id != ns_id
+            || !slot.is_live_with_ttl(now_ms, !ttl_proven)
+        {
             continue;
         }
         alive += 1;
@@ -82,6 +100,26 @@ pub(crate) fn compile(view: &ReaderView, ns_id: NsId, filter: Option<&Expr>, now
         bits,
         selectivity,
     }
+}
+
+/// 计算"整块记录均未过期"的块位图(块级 TTL 剪枝依据)。
+///
+/// 判定:`zones` 中 `expires_at` 的块最小值 > `now`(无 TTL 行按 +∞ 处理);
+/// 该块无任何 TTL 值时同样视为未过期。统计退化(类型冲突/缺失)只会令该块
+/// 退回逐行判定,绝不误判整块过期。
+fn ttl_unexpired_blocks(view: &ReaderView, now_ms: i64) -> BitSet {
+    let blocks = zmap::block_count(view);
+    let mut unexpired = BitSet::default();
+    for block in 0..blocks {
+        let proven = match view.zones.block_stat("expires_at", block) {
+            None => true,
+            Some(stat) => !stat.has_value || stat.min > now_ms as f64,
+        };
+        if proven {
+            unexpired.set(block);
+        }
+    }
+    unexpired
 }
 
 #[cfg(test)]
@@ -301,5 +339,41 @@ mod tests {
         }
         let plan = compile(&view, ns_id, Some(&Expr::field("key.x").eq(5_i64)), 0);
         assert_eq!(plan.candidates.len(), 1, "嵌套子路径行必须保留");
+    }
+
+    /// FC-LIFE-CPLX-001(TTL 块级剪枝:整块无过期风险时零逐行 TTL 判定)
+    #[test]
+    fn ttl_unexpired_block_skips_per_row_checks() {
+        let db = Mneme::in_memory(2).expect("in_memory");
+        let ns = db.namespace("n");
+        // 块 0(1024 行):无 TTL —— 整块可证明未过期。
+        let plain: Vec<Record> = (0..1024)
+            .map(|index| Record::new(vec![1.0, 0.0]).key(format!("p{index}")))
+            .collect();
+        ns.insert_batch(plain).expect("plain batch");
+        // 块 1(1024 行):带 1ms TTL,配合 `now = i64::MAX` 全部逻辑过期。
+        let expiring: Vec<Record> = (0..1024)
+            .map(|index| {
+                Record::new(vec![0.0, 1.0])
+                    .key(format!("t{index}"))
+                    .ttl(std::time::Duration::from_millis(1))
+            })
+            .collect();
+        ns.insert_batch(expiring).expect("ttl batch");
+        let view = db.table.view();
+        let ns_id = view
+            .ns_registry
+            .iter()
+            .find_map(|(id, path)| (**path == *"n").then_some(*id))
+            .expect("命名空间已注册");
+
+        TTL_CHECKS.with(|checks| checks.set(0));
+        let plan = compile(&view, ns_id, None, i64::MAX);
+        assert_eq!(plan.candidates.len(), 1024, "过期 TTL 行不入候选");
+        assert_eq!(
+            TTL_CHECKS.with(std::cell::Cell::get),
+            1024,
+            "仅第二块(存在 TTL 值)需要逐行判定,块 0 必须零判定"
+        );
     }
 }

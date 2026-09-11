@@ -9,7 +9,7 @@ use crate::core::meta::Meta;
 use crate::core::options::RelationKind;
 use crate::core::types::{Key, NsId, RowId, SeqNo, SlotId};
 use crate::memory::analysis::{BLOOM_INITIAL_CAPACITY, BloomSet, InvertedIndex, ZoneIndex};
-use crate::memory::index::VectorIndex;
+use crate::memory::index::{SegmentIndex, VectorIndex};
 use crate::memory::relation::Edge;
 
 use super::view::ReaderView;
@@ -65,6 +65,14 @@ impl SlotData {
     pub(crate) fn is_live(&self, now_ms: i64) -> bool {
         !self.deleted && self.expires_at.is_none_or(|expires| expires > now_ms)
     }
+
+    /// 可见性判定,可跳过 TTL 逐行比较(块级 `ttl_map` 已证明整块未过期时)。
+    pub(crate) fn is_live_with_ttl(&self, now_ms: i64, check_ttl: bool) -> bool {
+        if self.deleted {
+            return false;
+        }
+        !check_ttl || self.expires_at.is_none_or(|expires| expires > now_ms)
+    }
 }
 
 /// 写路径的可变状态;容器字段均为 `Arc`,写入经 `Arc::make_mut` 触发 COW。
@@ -88,8 +96,16 @@ pub(crate) struct WriterState {
     pub(crate) next_ns_id: u32,
     pub(crate) ns_registry: Arc<HashMap<NsId, Arc<str>>>,
     pub(crate) ns_by_path: Arc<HashMap<Arc<str>, NsId>>,
-    /// 当前已构建的向量索引(覆盖槽位前缀;`None` = 恒暴力扫描)。
-    pub(crate) index: Option<Arc<dyn VectorIndex>>,
+    /// 各已落盘段的向量索引(多段架构;空 = 恒暴力扫描)。
+    pub(crate) indexes: Arc<Vec<SegmentIndex>>,
+    /// 与 `slots` 平行的"槽位 → 所属段编号";`None` = 尚未落盘的尾部槽位。
+    pub(crate) slot_segment: Arc<Vec<Option<u32>>>,
+    /// 自上次 flush 以来访问计数增量(按 RowId;delta 区 Access 条目来源)。
+    pub(crate) access_dirty: Arc<HashMap<RowId, u32>>,
+    /// 自上次 flush 以来关系边变更(按 `(from, to, kind)`;delta 区 Relate/Unrelate 来源)。
+    pub(crate) edge_dirty: Arc<HashSet<(RowId, RowId, u16)>>,
+    /// 本进程累计物理回收的版本数(compaction;`history_horizon` 有限时增长)。
+    pub(crate) reclaimed_versions: u64,
     /// 内存倒排索引(BM25;设计 04 §5.4)。
     pub(crate) inv: Arc<InvertedIndex>,
     /// 块级 zone map(过滤下推;设计 04 §5.2)。
@@ -100,6 +116,8 @@ pub(crate) struct WriterState {
     pub(crate) stopwords_enabled: bool,
     /// 可索引字段上限(`Tuning::field_dict_max`;重建 zone map 用)。
     pub(crate) index_fields_max: usize,
+    /// 命名空间路径最大深度(`Limits::ns_depth`;首次写入时校验)。
+    pub(crate) ns_depth_max: u16,
     /// bloom 目标误判率(`Tuning::bloom_fpp`;重建 bloom 用)。
     pub(crate) bloom_fpp: f32,
     /// 恢复期暂停索引增量维护(段载入完成后由磁盘索引或全量重建接管)。
@@ -130,7 +148,11 @@ impl WriterState {
             next_ns_id: 1,
             ns_registry: Arc::new(HashMap::new()),
             ns_by_path: Arc::new(HashMap::new()),
-            index: None,
+            indexes: Arc::new(Vec::new()),
+            slot_segment: Arc::new(Vec::new()),
+            access_dirty: Arc::new(HashMap::new()),
+            edge_dirty: Arc::new(HashSet::new()),
+            reclaimed_versions: 0,
             // 加速结构的兜底初值:生产入口(Builder/open)都会用配置覆写;
             // 16 / 0.01 与 `Tuning::default()` 保持同口径,仅供 `Default` 构造。
             inv: Arc::new(InvertedIndex::default()),
@@ -138,6 +160,7 @@ impl WriterState {
             key_bloom: Arc::new(BloomSet::new(BLOOM_INITIAL_CAPACITY, 0.01)),
             stopwords_enabled: true,
             index_fields_max: 16,
+            ns_depth_max: 32,
             bloom_fpp: 0.01,
             is_indexing_paused: false,
             feedback_seen: Arc::new(HashSet::new()),
@@ -165,9 +188,34 @@ impl WriterState {
     }
 
     /// 注册命名空间路径(已存在则返回既有 `NsId`),分配单调 `NsId`。
-    pub(crate) fn register_ns(&mut self, path: &str) -> NsId {
+    ///
+    /// 首次登记时校验路径深度 ≤ `Limits.ns_depth` 且不含控制字符:
+    /// `namespace()` 不返回 `Result`,错误在首次写入时以 `Config` 报告
+    /// (FC-LIFE-POST-005)。
+    ///
+    /// # Errors
+    /// 路径过深或含控制字符时返回 [`MnemeError::Config`]。
+    pub(crate) fn register_ns(&mut self, path: &str) -> Result<NsId> {
         if let Some(id) = self.ns_by_path.get(path) {
-            return *id;
+            return Ok(*id);
+        }
+        let depth = if path.is_empty() {
+            0
+        } else {
+            path.split('/').count()
+        };
+        if depth > usize::from(self.ns_depth_max) {
+            return Err(MnemeError::Config {
+                reason: "命名空间路径深度超限",
+            });
+        }
+        if path
+            .split('/')
+            .any(|segment| segment.chars().any(char::is_control))
+        {
+            return Err(MnemeError::Config {
+                reason: "命名空间路径含控制字符",
+            });
         }
         let id = NsId::new(self.next_ns_id);
         self.next_ns_id += 1;
@@ -178,13 +226,23 @@ impl WriterState {
             ns_id: id.get(),
             path,
         });
-        id
+        Ok(id)
+    }
+
+    /// 注销命名空间(移除注册表与路径映射并记录 WAL 帧);`NsId` 水位不回退、永不复用。
+    pub(crate) fn unregister_ns(&mut self, ns_id: NsId) {
+        if let Some(path) = Arc::make_mut(&mut self.ns_registry).remove(&ns_id) {
+            Arc::make_mut(&mut self.ns_by_path).remove(&path);
+        }
+        self.pending
+            .push(WriteOp::NsUnregister { ns_id: ns_id.get() });
     }
 
     /// 建立/更新关系边并记录 WAL 操作。
     pub(crate) fn relate_edge(&mut self, edge: Edge) {
         crate::memory::relation::upsert_edge(Arc::make_mut(&mut self.out_edges), edge.clone());
         crate::memory::relation::upsert_edge(Arc::make_mut(&mut self.in_edges), edge.clone());
+        Arc::make_mut(&mut self.edge_dirty).insert((edge.from, edge.to, edge.kind.0));
         let seqno = self.alloc_seqno();
         self.pending.push(WriteOp::Relate {
             from: edge.from,
@@ -206,6 +264,7 @@ impl WriterState {
         );
         crate::memory::relation::remove_edge(Arc::make_mut(&mut self.in_edges), to, from, kind);
         if removed {
+            Arc::make_mut(&mut self.edge_dirty).insert((from, to, kind.0));
             let seqno = self.alloc_seqno();
             self.pending.push(WriteOp::Unrelate {
                 from,
@@ -273,6 +332,7 @@ impl WriterState {
         self.hide_latest(rowid);
         let arc = Arc::new(slot_data);
         Arc::make_mut(&mut self.slots).push(Arc::clone(&arc));
+        Arc::make_mut(&mut self.slot_segment).push(None);
         self.link_version(rowid, slot);
         if !deleted && !self.is_indexing_paused {
             self.index_observe(slot, &arc);
@@ -344,6 +404,141 @@ impl WriterState {
         }
     }
 
+    /// 装载多段合并倒排并按需重建 bloom / zone map(多段恢复路径)。
+    ///
+    /// `bloom = None` 时从全部槽位重建(各段 bloom 参数不一致时无法按位或合并);
+    /// zone map 逐段块偏移与全局块不再对应,统一从槽位重建。
+    pub(crate) fn load_merged_indexes(&mut self, inv: InvertedIndex, bloom: Option<BloomSet>) {
+        self.inv = Arc::new(inv);
+        self.zones = Arc::new(ZoneIndex::new(self.index_fields_max));
+        self.key_bloom = Arc::new(BloomSet::new(BLOOM_INITIAL_CAPACITY, self.bloom_fpp));
+        for index in 0..self.slots.len() {
+            let slot_data = Arc::clone(&self.slots[index]);
+            if slot_data.deleted {
+                continue;
+            }
+            Arc::make_mut(&mut self.zones).observe(index, &slot_data);
+            if let Some(key) = &slot_data.key {
+                Arc::make_mut(&mut self.key_bloom).insert(key.as_str());
+            }
+        }
+        if let Some(bloom) = bloom {
+            self.key_bloom = Arc::new(bloom);
+        }
+    }
+
+    /// 安装刚提交的段:登记槽位归属与段索引(供查询多图归并)。
+    ///
+    /// `slot_indices` 为该段包含的全局槽位(升序);`index = None` 表示该段无
+    /// `hidx`(或未配置索引工厂),其槽位由查询期暴力覆盖。
+    pub(crate) fn install_segment(
+        &mut self,
+        segment_id: u32,
+        slot_indices: &[usize],
+        index: Option<Arc<dyn VectorIndex>>,
+    ) {
+        {
+            let slot_segment = Arc::make_mut(&mut self.slot_segment);
+            for &idx in slot_indices {
+                if let Some(entry) = slot_segment.get_mut(idx) {
+                    *entry = Some(segment_id);
+                }
+            }
+        }
+        if let Some(index) = index {
+            let slots: Vec<SlotId> = slot_indices
+                .iter()
+                .map(|&idx| {
+                    // 槽位下标 ≤ u32::MAX(FC-MEM-INV-004),转换可证明不会失败。
+                    SlotId::new(u32::try_from(idx).expect("槽位下标必可转入 u32(FC-MEM-INV-004)"))
+                })
+                .collect();
+            Arc::make_mut(&mut self.indexes).push(SegmentIndex::new(segment_id, index, slots));
+        }
+    }
+
+    /// 清空自上次 flush 以来的访问/关系 delta 标记(段提交成功后调用)。
+    pub(crate) fn clear_flush_dirty(&mut self) {
+        self.access_dirty = Arc::new(HashMap::new());
+        self.edge_dirty = Arc::new(HashSet::new());
+    }
+
+    /// 记录一次访问计数增量(delta 区 `Access` 条目来源)。
+    pub(crate) fn mark_access_dirty(&mut self, rowid: RowId) {
+        self.mark_access_dirty_by(rowid, 1);
+    }
+
+    /// 记录 `delta` 次访问计数增量(读路径攒批合并后调用)。
+    pub(crate) fn mark_access_dirty_by(&mut self, rowid: RowId, delta: u32) {
+        if delta == 0 {
+            return;
+        }
+        let entry = Arc::make_mut(&mut self.access_dirty)
+            .entry(rowid)
+            .or_insert(0);
+        *entry = entry.saturating_add(delta);
+    }
+
+    /// 返回尚未落盘的槽位下标(升序;delta 段物化输入)。
+    pub(crate) fn unpersisted_slots(&self) -> Vec<usize> {
+        self.slot_segment
+            .iter()
+            .enumerate()
+            .filter_map(|(index, segment)| segment.is_none().then_some(index))
+            .collect()
+    }
+
+    /// 清空自上次 flush 以来关系变更标记(全量重写关系表后调用)。
+    pub(crate) fn clear_edge_dirty(&mut self) {
+        self.edge_dirty = Arc::new(HashSet::new());
+    }
+
+    /// 记录本轮 compaction 回收的版本数。
+    pub(crate) fn note_reclaimed(&mut self, count: usize) {
+        self.reclaimed_versions = self.reclaimed_versions.saturating_add(count as u64);
+    }
+
+    /// 把已物理回收的槽位从版本链/索引中剪除并标死(段提交成功后调用)。
+    ///
+    /// 只剪引用、不重排槽位:被回收的物理槽位留在内存中由 `dead` 位图遮蔽,
+    /// `as_of` 与当前读都不可见;内存重排(段句柄零拷贝)留待后续层。
+    pub(crate) fn prune_reclaimed(&mut self, reclaimed: &[usize]) {
+        for &index in reclaimed {
+            // 槽位下标 ≤ u32::MAX(FC-MEM-INV-004),转换可证明不会失败。
+            let slot =
+                SlotId::new(u32::try_from(index).expect("槽位下标必可转入 u32(FC-MEM-INV-004)"));
+            let rowid = self.slots[index].rowid;
+            let mut row_empty = false;
+            {
+                let versions = Arc::make_mut(&mut self.versions);
+                if let Some(entries) = versions.get_mut(&rowid) {
+                    entries.retain(|entry| *entry != slot);
+                    row_empty = entries.is_empty();
+                }
+                if row_empty {
+                    versions.remove(&rowid);
+                }
+            }
+            if row_empty {
+                Arc::make_mut(&mut self.latest).remove(&rowid);
+                let slot_data = &self.slots[index];
+                if let Some(key) = &slot_data.key {
+                    let key = (slot_data.ns_id, key.clone());
+                    if self.key_index.get(&key) == Some(&rowid) {
+                        Arc::make_mut(&mut self.key_index).remove(&key);
+                    }
+                }
+                if let Some(hash) = slot_data.text_hash {
+                    let key = (slot_data.ns_id, hash);
+                    if self.text_index.get(&key) == Some(&rowid) {
+                        Arc::make_mut(&mut self.text_index).remove(&key);
+                    }
+                }
+            }
+            Arc::make_mut(&mut self.dead).set(index);
+        }
+    }
+
     /// 给 `rowid` 追加一个墓碑版本;若已无活版本则返回 `false`。
     pub(crate) fn tombstone(&mut self, rowid: RowId, tx_ms: i64, seqno: SeqNo) -> Result<bool> {
         let Some(latest) = self.latest.get(&rowid).copied() else {
@@ -373,7 +568,9 @@ impl WriterState {
             in_edges: Arc::clone(&self.in_edges),
             access: Arc::clone(&self.access),
             ns_registry: Arc::clone(&self.ns_registry),
-            index: self.index.clone(),
+            indexes: Arc::clone(&self.indexes),
+            slot_segment: Arc::clone(&self.slot_segment),
+            reclaimed_versions: self.reclaimed_versions,
             inv: Arc::clone(&self.inv),
             zones: Arc::clone(&self.zones),
             key_bloom: Arc::clone(&self.key_bloom),

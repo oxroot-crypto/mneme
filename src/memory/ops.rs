@@ -193,6 +193,17 @@ pub struct BackupReport {
     pub hardlinked: bool,
 }
 
+/// `SnapshotHandle::stats()` 的只读视图统计(设计 07 §6)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotStats {
+    /// 视图基线序号水位(与 `SnapshotHandle::version` 一致)。
+    pub version: u64,
+    /// 视图内活跃段数(`slot_segment` 去重)。
+    pub segments: usize,
+    /// 视图内物理槽位数(含历史版本与墓碑)。
+    pub rows: u64,
+}
+
 /// 后台合并控制句柄(见设计 16 §1.6);克隆共享同一状态。
 #[derive(Debug, Clone, Default)]
 pub struct CompactionControl {
@@ -246,8 +257,6 @@ impl CompactionControl {
     }
 
     /// 更新内部状态(供后台任务调用;L5 起使用)。
-    // reason: 为 L5 后台 compaction 预留的写入口,L1 无调用方。
-    #[allow(dead_code)]
     pub(crate) fn set_state(&self, state: CompactionState) {
         *self
             .inner
@@ -255,4 +264,40 @@ impl CompactionControl {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = state;
     }
+
+    /// 标记合并开始(参与段列表)。
+    pub(crate) fn mark_running(&self, segments: Vec<SegmentId>) {
+        self.set_state(CompactionState::Running {
+            progress: 0.0,
+            segments,
+        });
+    }
+
+    /// 更新合并进度(`[0,1]`)。
+    pub(crate) fn mark_progress(&self, progress: f32) {
+        let mut guard = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let CompactionState::Running { segments, .. } = &*guard {
+            let segments = segments.clone();
+            *guard = CompactionState::Running {
+                progress: progress.clamp(0.0, 1.0),
+                segments,
+            };
+        }
+    }
+
+    /// 标记合并回到空闲。
+    pub(crate) fn mark_idle(&self) {
+        self.set_state(CompactionState::Idle);
+    }
+}
+
+/// 一次 compaction 的选段计划(内部;由 L5 调度器产出,持久层执行)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompactionPlan {
+    /// 参与本轮合并的段编号(按 MANIFEST 顺序)。
+    pub(crate) segments: Vec<u32>,
 }

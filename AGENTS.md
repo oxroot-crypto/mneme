@@ -2,10 +2,11 @@
 
 Mneme:纯 Rust 的嵌入式向量存储引擎(面向 AI Agent 超长期记忆)。单 crate,edition 2024,
 MSRV 1.93。**当前实现了 L0 原语层 `src/core/`、L1 内存引擎 `src/memory/`、L2 持久层
-`src/persist/`、L3 索引层 `src/index/` 与 L4 检索层 `src/query/`**(WAL、段文件、MANIFEST、
-崩溃恢复、全量快照 flush、自研 HNSW、过滤三档、hidx 图持久化、mmap 段读取、过滤 DSL、
-zone map/bloom 计划器、BM25、RRF/加权融合、msec 轻量索引四区落盘);L5–L6 目前仅有设计文档,
-`src/` 下没有对应代码。L2 依赖 `crc32fast`;L3 经 feature `mmap`(默认开)引入 `memmap2`,
+`src/persist/`、L3 索引层 `src/index/`、L4 检索层 `src/query/` 与 L5 生命周期层
+`src/life/`**(WAL 轮转、增量段、MANIFEST、崩溃恢复、size-tiered compaction、自研 HNSW、
+过滤三档、hidx 图持久化、mmap 段读取、过滤 DSL、zone map/bloom/ttl_map 计划器、BM25、
+RRF/加权融合、msec 轻量索引四区与 delta 区、后台维护线程、命名空间/快照/备份/统计);
+L6 尚无代码。L2 依赖 `crc32fast`;L3 经 feature `mmap`(默认开)引入 `memmap2`,
 `criterion` 为 dev-dependency。
 
 ## 契约优先工作流(FSVDD,强制)

@@ -23,7 +23,7 @@ use crate::persist::trash;
 use crate::persist::wal;
 
 use super::manifest_io;
-use super::wal_writer::{WAL_FILE, WalConfig, WalWriter};
+use super::wal_writer::{self, WalConfig, WalWriter};
 use super::{ManifestState, Store};
 
 /// 新建库时首个可分配的关系类型编号(内建关系占用 `0..16`)。
@@ -47,6 +47,8 @@ pub(crate) struct OpenOptions {
     pub(crate) hook: Option<Arc<dyn FsyncHook>>,
     /// 索引工厂(L3);`None` = 不载入 hidx(恒暴力)。
     pub(crate) index_factory: Option<Arc<dyn IndexFactory>>,
+    /// WAL 单文件轮转阈值(字节;`0` = 不轮转)。
+    pub(crate) wal_file_bytes: u64,
     /// 进阶调参(分词开关 / 字段上限 / bloom 误判率;恢复期重建加速结构用)。
     pub(crate) tuning: Tuning,
 }
@@ -131,6 +133,7 @@ fn wal_config(manifest: &Manifest, options: &OpenOptions) -> WalConfig {
         dimension: manifest.dimension,
         metric: manifest.metric,
         policy: options.fsync,
+        max_file_bytes: options.wal_file_bytes,
         hook: options.hook.clone(),
         read_only: options.read_only,
     }
@@ -171,16 +174,17 @@ fn load_or_init_manifest(root: &Path, options: &OpenOptions) -> Result<(Manifest
     }
 }
 
-/// WAL 是否含至少一个完整可应用帧(用于区分「首次 flush 崩溃」与「MANIFEST 丢失」)。
+/// WAL 文件集是否含至少一个完整可应用帧(区分「首次 flush 崩溃」与「MANIFEST 丢失」)。
 fn wal_has_frames(root: &Path) -> Result<bool> {
-    let Some(bytes) = storage::read_file_opt(root, WAL_FILE)? else {
-        return Ok(false);
-    };
-    match wal::visit_frames(&bytes, |_, _, _, _| Ok(())) {
-        Ok(valid_len) => Ok(valid_len > wal::FILE_HEADER_LEN),
-        // 头部损坏视作无可应用帧(来源不明,交由上层拒绝覆盖)。
-        Err(_) => Ok(false),
+    for rel in wal_writer::wal_files(root)? {
+        let bytes = storage::read_file(root, &rel)?;
+        match wal::visit_frames(&bytes, |_, _, _, _| Ok(())) {
+            Ok(valid_len) if valid_len > wal::FILE_HEADER_LEN => return Ok(true),
+            // 头部损坏视作无可应用帧(来源不明,交由上层拒绝覆盖)。
+            _ => {}
+        }
     }
+    Ok(false)
 }
 
 /// 校验调用方请求的维度/度量与既有 MANIFEST 一致。
@@ -208,15 +212,18 @@ fn verify_requested_identity(
     Ok(())
 }
 
-/// 无 MANIFEST 但可能有 WAL(崩溃在首次 flush 前):以 WAL 头为准初始化。
+/// 无 MANIFEST 但可能有 WAL(崩溃在首次 flush 前):以最早 WAL 文件头为准初始化。
 fn init_manifest_from_wal(
     root: &Path,
     requested_dimension: Option<u32>,
     requested_metric: Option<Metric>,
     stopwords: bool,
 ) -> Result<Manifest> {
-    let wal_header = storage::read_file_opt(root, WAL_FILE)?
-        .and_then(|bytes| wal::parse_file_header(&bytes).ok());
+    let wal_header = wal_writer::wal_files(root)?.into_iter().find_map(|rel| {
+        storage::read_file(root, &rel)
+            .ok()
+            .and_then(|bytes| wal::parse_file_header(&bytes).ok())
+    });
     let dimension = resolve_dimension(requested_dimension, wal_header.as_ref())?;
     let metric = resolve_metric(requested_metric, wal_header.as_ref())?;
     Ok(Manifest {
@@ -294,34 +301,62 @@ fn load_write_state(
         options.fail_fast_on_corruption,
     )?;
     move_skipped_segments_to_trash(root, &recovered.skipped, options.read_only)?;
-    // 载入 hidx 并安装到写状态(索引是优化:损坏时降级暴力,`check()` 报告)。
-    if let Some(factory) = options.index_factory.as_ref()
-        && let Some(remap) = recovered.remap.as_ref()
-        && let Some(hidx) = segments.first().and_then(|segment| segment.hidx.as_ref())
-    {
-        match load_index(
-            factory,
-            hidx,
-            SlotRemap {
-                state: &state,
-                remap,
-            },
-            manifest.metric,
-        ) {
-            Ok(index) => state.index = Some(index),
-            Err(error) if options.fail_fast_on_corruption => return Err(error),
-            // reason: 索引是查询加速器而非数据来源;hidx 损坏时降级为暴力扫描仍然正确,
-            // `db.check()` 会校验 hidx 字节并报告损坏;节点数不匹配的降级可由
-            // `stats().segments[*].index_nodes == 0` 观测,绝不静默丢数据。
-            Err(_) => {}
+    // 载入各段 hidx 并安装为多段索引(索引是优化:损坏时降级暴力,`check()` 报告)。
+    if let Some(factory) = options.index_factory.as_ref() {
+        let mut indexes = Vec::new();
+        for segment in &segments {
+            if recovered.skipped.contains(&segment.segment_id) {
+                continue;
+            }
+            let Some(remap) = recovered
+                .remaps
+                .iter()
+                .find(|remap| remap.segment_id == segment.segment_id)
+            else {
+                continue;
+            };
+            let Some(hidx) = segment.hidx.as_ref() else {
+                continue;
+            };
+            match load_index(
+                factory,
+                hidx,
+                SlotRemap {
+                    state: &state,
+                    remap: &remap.remap,
+                },
+                manifest.metric,
+            ) {
+                Ok(index) => {
+                    let slots: Vec<SlotId> = remap
+                        .remap
+                        .iter()
+                        .map(|&global| SlotId::new(global))
+                        .collect();
+                    indexes.push(crate::memory::index::SegmentIndex::new(
+                        segment.segment_id,
+                        index,
+                        slots,
+                    ));
+                }
+                Err(error) if options.fail_fast_on_corruption => return Err(error),
+                // reason: 索引是查询加速器而非数据来源;hidx 损坏时降级为暴力扫描仍然
+                // 正确,`db.check()` 会校验 hidx 字节并报告损坏;节点数不匹配的降级可由
+                // `stats().segments[*].index_nodes == 0` 观测,绝不静默丢数据。
+                Err(_) => {}
+            }
         }
+        state.indexes = Arc::new(indexes);
     }
-    // 回放 WAL(仅 seqno > watermark),并在可写打开时截断撕裂尾部。
-    if let Some(bytes) = storage::read_file_opt(root, WAL_FILE)? {
+    // 回放全部 WAL 文件(仅 seqno > watermark),并在可写打开时截断最后一个文件的撕裂尾部。
+    let wal_files = wal_writer::wal_files(root)?;
+    for (position, rel) in wal_files.iter().enumerate() {
+        let bytes = storage::read_file(root, rel)?;
         let valid_len = recover::replay_wal(&mut state, &bytes, manifest.watermark_seqno)?;
-        // 撕裂帧之后的字节会永久屏蔽后续追加,必须物理截断后再复用该 WAL。
-        if !options.read_only && valid_len < bytes.len() {
-            storage::truncate(root, WAL_FILE, valid_len as u64)?;
+        // 撕裂帧之后的字节会永久屏蔽后续追加,必须物理截断后再复用该 WAL;
+        // 只有最后一个文件可能带撕裂尾(轮转前该文件已完整 fsync)。
+        if position + 1 == wal_files.len() && !options.read_only && valid_len < bytes.len() {
+            storage::truncate(root, rel, valid_len as u64)?;
         }
     }
     Ok(state)
@@ -417,6 +452,7 @@ mod tests {
         fn build(
             &self,
             _nodes: &[IndexNode],
+            _slot_of: &[SlotId],
             _params: HnswParams,
             _metric: Metric,
         ) -> Arc<dyn VectorIndex> {

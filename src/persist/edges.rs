@@ -83,9 +83,8 @@ pub(crate) struct EdgeView {
     pub(crate) forward: Vec<EdgeData>,
     /// 反向边(`(to, kind, from)` 升序);未存储时为空。
     ///
-    /// L2 段只写正向表,`predecessors` 的入边由内存 `in_edges` 重建,故本字段在
-    /// 运行时不被读取(仅编解码往返测试);反向索引落盘属 L5(设计 04 §2.2b)。
-    #[allow(dead_code)]
+    /// `RelationIndex::Both` 段写入;恢复时与正向表并集重建 `in_edges`
+    /// (FC-MODEL-POST-007)。
     pub(crate) reverse: Vec<EdgeData>,
 }
 

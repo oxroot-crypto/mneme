@@ -4,11 +4,14 @@
 //! (运行统计、fsck、合并控制、落盘空操作),与库生命周期方法分置于不同文件。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::core::error::{MnemeError, Result};
+use crate::core::types::SegmentId;
+use crate::life::compact::{self, SegmentInfo};
 use crate::memory::engine::Mneme;
 use crate::memory::ops::{
-    CheckReport, CompactionControl, Histogram, HistoryStat, NsStat, QuantStat, Stats, StorageStat,
+    CheckReport, CompactionControl, HistoryStat, NsStat, QuantStat, Stats, StorageStat,
 };
 use crate::memory::table::ReaderView;
 
@@ -37,6 +40,34 @@ fn aggregate_namespaces(view: &ReaderView, now: i64) -> (HashMap<String, NsStat>
     (per_namespace, live_rows)
 }
 
+/// 统计每段"墓碑 + 逻辑过期"占比(按视图的槽位归属;无段归属的尾部槽位不计)。
+fn dead_ratios(view: &ReaderView, now: i64) -> HashMap<u32, f32> {
+    let mut dead: HashMap<u32, u64> = HashMap::new();
+    let mut total: HashMap<u32, u64> = HashMap::new();
+    for (index, segment) in view.slot_segment.iter().enumerate() {
+        let Some(id) = segment else {
+            continue;
+        };
+        *total.entry(*id).or_insert(0) += 1;
+        let slot = &view.slots[index];
+        if view.dead.get(index) || slot.deleted || !slot.is_live(now) {
+            *dead.entry(*id).or_insert(0) += 1;
+        }
+    }
+    total
+        .into_iter()
+        .map(|(id, count)| {
+            let dead_count = dead.get(&id).copied().unwrap_or(0);
+            let ratio = if count == 0 {
+                0.0
+            } else {
+                dead_count as f32 / count as f32
+            };
+            (id, ratio)
+        })
+        .collect()
+}
+
 impl Mneme {
     /// 返回运行统计。
     ///
@@ -61,7 +92,13 @@ impl Mneme {
         let now = self.config.clock.now_unix_ms();
         let (per_namespace, live_rows) = aggregate_namespaces(&view, now);
         let relations = view.out_edges.values().map(Vec::len).sum::<usize>() as u64;
-        let store = self.collect_store_stats(&view);
+        let mut store = self.collect_store_stats(&view);
+        let dead = dead_ratios(&view, now);
+        for segment in &mut store.segments {
+            if let Some(ratio) = dead.get(&segment.id.get()) {
+                segment.dead_ratio = *ratio;
+            }
+        }
         Ok(Stats {
             segments: store.segments,
             wal_bytes: store.wal_bytes,
@@ -69,7 +106,7 @@ impl Mneme {
                 * u64::from(self.config.dimension.get())
                 * std::mem::size_of::<f32>() as u64,
             trash_bytes: store.trash_bytes,
-            query_latency: Histogram::default(),
+            query_latency: self.table.latency_histogram(),
             per_namespace,
             quant: QuantStat {
                 configured: self.config.quantization,
@@ -77,11 +114,11 @@ impl Mneme {
                 recall_est: None,
             },
             compaction: self.control.state(),
-            retain: None,
+            retain: self.table.retain_report(),
             relations,
             history: HistoryStat {
-                retained_versions: view.slots.len() as u64,
-                reclaimed_versions: 0,
+                retained_versions: view.versions.values().map(|chain| chain.len() as u64).sum(),
+                reclaimed_versions: view.reclaimed_versions,
                 horizon: self.config.compaction.history_horizon,
             },
             storage: StorageStat {
@@ -97,7 +134,7 @@ impl Mneme {
     fn collect_store_stats(&self, view: &ReaderView) -> StoreStats {
         match &self.store {
             Some(store) => StoreStats {
-                segments: store.segment_stats(view.index.as_deref()),
+                segments: store.segment_stats(&view.indexes),
                 wal_bytes: store.wal_bytes(),
                 trash_bytes: store.trash_bytes(),
                 total_segments: store.total_segments(),
@@ -106,11 +143,12 @@ impl Mneme {
         }
     }
 
-    /// fsck:校验内部索引一致性与持久段完整性。
+    /// fsck:校验内部索引一致性与持久段完整性,并给出运维建议。
     ///
     /// 内存侧:仅当 key 索引指向不存在的物理版本,或最新版本 `ns_id`/`key` 与索引
     /// 不符时报告不一致;已删除(墓碑)与已逻辑过期的记录不算不一致(FC-MEM-POST-008)。
     /// 持久侧(L2):逐段校验头部/payload CRC 与版本链记录体(设计 16 §1.6)。
+    /// 另报告每段墓碑/过期占比与合并建议(FC-LIFE-POST-009;建议不影响 `ok`)。
     ///
     /// # Errors
     /// 库已关闭时返回 [`MnemeError::Closed`]。
@@ -131,8 +169,10 @@ impl Mneme {
         if view.closed {
             return Err(MnemeError::Closed);
         }
+        let now = self.config.clock.now_unix_ms();
         let mut suggestions = Vec::new();
         let mut corrupted = Vec::new();
+        let mut inconsistent = false;
         // L2:逐段校验头部/payload CRC 与版本链(设计 16 §1.6)。
         if let Some(store) = &self.store {
             for id in store.verify_segments() {
@@ -147,14 +187,34 @@ impl Mneme {
                 Some(slot) => {
                     let slot_data = &view.slots[slot.get() as usize];
                     if slot_data.ns_id != *ns_id || slot_data.key.as_ref() != Some(key) {
+                        inconsistent = true;
                         suggestions.push(format!("key 索引不一致:{key}"));
                     }
                 }
-                None => suggestions.push(format!("key 索引指向不存在的版本:{key}")),
+                None => {
+                    inconsistent = true;
+                    suggestions.push(format!("key 索引指向不存在的版本:{key}"));
+                }
+            }
+        }
+        // 运维建议:死比率超线的段与可合并段数(仅提示,不影响 `ok`)。
+        let ratios = dead_ratios(&view, now);
+        for (id, ratio) in &ratios {
+            if *ratio > self.config.compaction.dead_ratio {
+                suggestions.push(format!(
+                    "段 {id} 墓碑/过期占比 {:.0}%,建议合并回收",
+                    ratio * 100.0
+                ));
+            }
+        }
+        if let Some(store) = &self.store {
+            let total = store.total_segments();
+            if total >= self.config.compaction.tier_count.max(2) as usize {
+                suggestions.push(format!("建议合并 {total} 个段"));
             }
         }
         Ok(CheckReport {
-            ok: suggestions.is_empty(),
+            ok: corrupted.is_empty() && !inconsistent,
             corrupted,
             suggestions,
         })
@@ -190,5 +250,88 @@ impl Mneme {
             self.table.publish(&ws);
         }
         Ok(())
+    }
+
+    /// 显式执行一轮 size-tiered compaction(设计 07 §4)。
+    ///
+    /// 选段与幸存版本筛选由 L5 完成;合并段写盘与 MANIFEST 替换由持久层完成。
+    /// 无触发条件、已暂停或纯内存库时为空操作。合并期间 `stats().compaction`
+    /// 反映 `Running`;`pause()` 在提交前生效,中止时不改动任何已提交状态。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`];只读模式返回
+    /// [`MnemeError::Unsupported`];I/O/编码失败返回结构化错误并回到 `Idle`。
+    ///
+    /// # Examples
+    /// ```
+    /// use mneme::{Mneme, Record};
+    /// let db = Mneme::in_memory(2).unwrap();
+    /// db.namespace("demo")
+    ///     .insert(Record::new(vec![1.0, 0.0]).key("a"))
+    ///     .unwrap();
+    /// // 纯内存库无段可合并:空操作。
+    /// db.compact().unwrap();
+    /// ```
+    pub fn compact(&self) -> Result<()> {
+        let view = self.table.view();
+        if view.closed {
+            return Err(MnemeError::Closed);
+        }
+        drop(view);
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let mut ws = self.table.write();
+        if ws.closed {
+            return Err(MnemeError::Closed);
+        }
+        if self.control.is_paused() {
+            return Ok(());
+        }
+        let now_ms = self.config.clock.now_unix_ms();
+        let manifest = store.manifest_snapshot();
+        let infos: Vec<SegmentInfo> = manifest
+            .segments
+            .iter()
+            .map(|segment| SegmentInfo {
+                id: segment.segment_id,
+                rows: segment.row_count,
+            })
+            .collect();
+        let dead = compact::segment_dead_ratios(&ws, now_ms);
+        let Some(plan) = compact::plan(&infos, &dead, &self.config.compaction) else {
+            return Ok(());
+        };
+        self.control
+            .mark_running(plan.segments.iter().map(|id| SegmentId::new(*id)).collect());
+        if self.control.is_paused() {
+            self.control.mark_idle();
+            return Ok(());
+        }
+        let survivors =
+            compact::select_survivors(&ws, &plan, now_ms, self.config.compaction.history_horizon);
+        match store.compact(&mut ws, &self.config, &plan, &survivors.keep, &self.control) {
+            Ok(false) => {
+                // 暂停中止:段集与内存状态都不动。
+                self.control.mark_idle();
+                Ok(())
+            }
+            Ok(true) => {
+                // 提交成功后才剪除已回收版本并同步内存统计。
+                ws.prune_reclaimed(&survivors.reclaim);
+                ws.note_reclaimed(survivors.reclaim.len());
+                for &index in &survivors.keep {
+                    let rowid = ws.slots[index].rowid;
+                    Arc::make_mut(&mut ws.access_dirty).remove(&rowid);
+                }
+                self.table.publish(&ws);
+                self.control.mark_idle();
+                Ok(())
+            }
+            Err(error) => {
+                self.control.mark_idle();
+                Err(error)
+            }
+        }
     }
 }

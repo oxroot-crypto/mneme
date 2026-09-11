@@ -285,9 +285,9 @@ impl Namespace {
 
 ```rust
 impl Mneme {
-    pub fn namespace(&self, path: &str) -> Namespace;               // 返回句柄;注册表在首次成功写入时惰性登记(见 07 §5)
-    pub fn list_namespaces(&self) -> Result<Vec<String>>;           // 前缀树顺序
-    pub fn drop_namespace(&self, path: &str) -> Result<usize>;      // 含所有子命名空间
+    pub fn namespace(&self, path: &str) -> Namespace;               // 路径规范化(去首尾 `/`、合并 `//`);首次写入时惰性登记并校验深度/字符(见 07 §5)
+    pub fn list_namespaces(&self) -> Result<Vec<String>>;           // 规范化路径字典序
+    pub fn drop_namespace(&self, path: &str) -> Result<usize>;      // 按 `/` 段边界级联墓碑,返回行数;注销经 WAL 持久化(FC-LIFE-POST-006)
 }
 ```
 
@@ -301,18 +301,19 @@ impl Mneme {
     pub fn as_of(&self, ts_ms: i64) -> Result<SnapshotHandle>;  // 双时态历史读:版本链上取 tx_ms ≤ ts 的可见版本(默认永久保留,见 07 §4.2a)
     pub fn backup_to(&self, dir: impl AsRef<Path>) -> Result<BackupReport>;  // 先 flush 再备份(见 §7);L2 已落地(纯内存库返回 `Unsupported`)
     pub fn stats(&self) -> Result<Stats>;
-    pub fn check(&self) -> Result<CheckReport>;  // fsck:L1 做 key 索引 ↔ 最新版本对账(FC-MEM-POST-008);L2 起扩展段 CRC/版本链等全量校验
+    pub fn check(&self) -> Result<CheckReport>;  // fsck:key 索引 ↔ 最新版本对账 + 段 CRC/版本链 + 死比率与合并建议(FC-LIFE-POST-009)
     pub fn compact_control(&self) -> CompactionControl;  // pause()/resume()/state()
-    pub fn flush(&self) -> Result<()>;           // 把可变表落成段并 fsync WAL
-    pub fn close(self) -> Result<()>;            // flush + 释放文件锁;幂等(对已关闭的库经其他句柄再调返回 Ok)
+    pub fn compact(&self) -> Result<()>;         // 显式触发一轮 size-tiered compaction(无触发/暂停/纯内存库时空操作,见 07 §4)
+    pub fn flush(&self) -> Result<()>;           // 把可变表落成增量段并 fsync WAL
+    pub fn close(self) -> Result<()>;            // flush + 停后台维护 + 释放文件锁;幂等(对已关闭的库经其他句柄再调返回 Ok)
 }
 
 impl SnapshotHandle {
-    pub fn version(&self) -> u64;                          // 构建该视图时的基线 MANIFEST 版本
+    pub fn version(&self) -> u64;                          // 构建该视图时的基线序号水位(view.seqno)
     pub fn as_of_ms(&self) -> i64;                         // 事务时间上界;普通 snapshot() = 当前,as_of(t) = t
     /// 在钉住的快照上取命名空间视图(键唯一性按命名空间隔离,故读取须先选命名空间)。
     pub fn namespace(&self, path: &str) -> SnapshotNamespace;
-    pub fn stats(&self) -> SnapshotStats;                  // L5 规划,当前无此 API
+    pub fn stats(&self) -> SnapshotStats;                  // 快照钉住的视图统计(不随后续写入/compaction 变化)
 }
 
 /// 快照上的命名空间只读视图;持有快照视图的 `Arc`,克隆廉价、可跨线程使用。
@@ -322,6 +323,7 @@ impl SnapshotNamespace {
     pub fn get(&self, key: &str) -> Result<Option<RecordRef<'_>>>;
     pub fn get_by_rowid(&self, id: RowId) -> Result<Option<RecordRef<'_>>>;
     pub fn get_many(&self, keys: &[&str]) -> Result<Vec<Option<RecordRef<'_>>>>;
+    pub fn get_many_by_rowid(&self, ids: &[RowId]) -> Result<Vec<Option<RecordRef<'_>>>>;
     pub fn get_vector(&self, id: RowId) -> Result<Option<Vec<f32>>>;
     pub fn exists(&self, key: &str) -> Result<bool>;
     pub fn count(&self, filter: Option<Expr>) -> Result<u64>;
@@ -365,7 +367,7 @@ pub enum Fusion { Rrf { k: u32 }, Weighted { alpha: f32 } }
 pub struct RetainReport { pub scanned: usize, pub forgotten: usize, pub sampled_ids: Vec<RowId> }  // 可审计(I23)
 pub struct BackupReport { pub files: usize, pub bytes: u64, pub hardlinked: bool }
 pub struct CheckReport  { pub ok: bool, pub corrupted: Vec<SegmentId>, pub suggestions: Vec<String> }
-pub struct SnapshotStats { pub version: u64, pub segments: usize, pub rows: u64 }  // L5 规划,当前无此 API
+pub struct SnapshotStats { pub version: u64, pub segments: usize, pub rows: u64 }  // version = 视图基线序号水位;rows 为物理槽位数(含历史/墓碑)
 ```
 
 #### 运行统计
@@ -626,7 +628,7 @@ pub struct CompactionPolicy {
     pub tier_count: u32,     // 默认 4   同层合并阈值 T
     pub dead_ratio: f32,     // 默认 0.25 墓碑+过期占比触发线
     pub wal_bytes: u64,      // 默认 256MB WAL 压力触发线
-    pub wal_file_bytes: u64, // 默认 64MB  单个 WAL 文件轮转阈值(L5 落地;L2 单文件、未使用,见 04 §3.2)
+    pub wal_file_bytes: u64, // 默认 64MB  单个 WAL 文件轮转阈值(已落地,见 04 §3.2、FC-PERSIST-POST-011)
     pub segment_rows: u64,   // 默认 8192  段初始目标行数 B(07 §4.2)
     pub io_budget: f32,      // 默认 0.30 后台合并磁盘配额
     pub history_horizon: Option<Duration>, // 历史版本保留窗口,默认 None = 永久(07 §4.2a)

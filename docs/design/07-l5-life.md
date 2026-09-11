@@ -6,7 +6,16 @@
 > **本章你将学到**:TTL 双阶段过期 → 访问统计的零写放大设计 → 指数遗忘曲线推导 →
 > compaction 写放大分析 → 命名空间 → 快照备份 → stats/fsck。
 
-模块:`life/{ttl.rs, retain.rs, access.rs, namespace.rs, compact.rs, backup.rs, stats.rs}`
+模块:`life/{compact.rs, maintenance.rs}`(调度与幸存版本筛选)+ 既有挂点
+(`memory/{ttl 逻辑过期, namespace, snapshot, engine_ops}`, `persist/{flush, compact, wal 轮转, delta 区}`);
+公开契约验收见 [`tests/l5_contracts.rs`](../../tests/l5_contracts.rs)。
+
+> **落地状态**:本节语义已随 L5 落地——TTL 两阶段(逻辑过期 + compaction 物理回收,
+> msec `ttl_map` 块级剪枝)、访问攒批后台落盘、自动遗忘(默认关闭)、size-tiered
+> compaction(多段增量段 + MANIFEST 原子替换 + `history_horizon`)、命名空间规范化与
+> 注销持久化、`SnapshotStats`/硬链接备份/死比率 fsck。已知取舍:压缩后的物理槽位从
+> 版本链剪除并标死,但**内存槽位不重排**(零拷贝段句柄属后续层),RSS 回收待段句柄重构;
+> `history_horizon = None`(默认)时墓碑/历史永久保留,物理回收仅在有限窗口下发生。
 
 ---
 

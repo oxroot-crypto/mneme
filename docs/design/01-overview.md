@@ -155,9 +155,11 @@ flowchart LR
 
 **渐进式的两个关键手段**:
 
-> **落地状态**:L0–L4 已实现(L3 = `src/index/` 自研 HNSW + `hidx` 持久化 + 过滤三档,
+> **落地状态**:L0–L5 已实现(L3 = `src/index/` 自研 HNSW + `hidx` 持久化 + 过滤三档,
 > 验收 `tests/hnsw_contracts.rs`;L4 = `src/query/` 过滤 DSL + zone map/bloom 计划器 +
-> BM25/RRF 融合 + msec 四区落盘,验收 `tests/l4_contracts.rs`);L5–L6 尚无代码。
+> BM25/RRF 融合 + msec 四区落盘,验收 `tests/l4_contracts.rs`;L5 = `src/life/` 多段
+> size-tiered compaction + 后台维护 + TTL 块剪枝 + 命名空间/快照/备份/统计运维面,
+> 验收 `tests/l5_contracts.rs`);L6 尚无代码。
 
 1. **接口先于实现**:公开 API 在 L1 冻结(暴力与 HNSW 同签名),L3 **引入内部 trait
    `memory::index::{VectorIndex, IndexFactory}`** 作为暴力→HNSW 的替换缝;L2 的段文件头从第一天就带 `format_version` 字段。
@@ -184,7 +186,7 @@ mneme/
 │   ├── persist/        # L2:mod.rs codec.rs hook.rs wal/ msec/ recover/ store/ vsec.rs manifest.rs edges.rs flush.rs source.rs storage.rs trash.rs
 │   ├── index/          # L3:hnsw.rs graph.rs filtered.rs rebuild.rs hidx.rs factory.rs
 │   ├── query/          # L4:parse/{mod,literal}.rs display.rs json.rs iso.rs plan.rs zmap.rs bm25.rs fusion.rs exec.rs
-│   ├── life/           # L5:ttl.rs retain.rs access.rs namespace.rs compact.rs backup.rs stats.rs
+│   ├── life/           # L5:compact.rs(选段/幸存版本)maintenance.rs(后台维护)
 │   ├── quant/          # L6:scalar_i8.rs f16.rs rescore.rs
 │   ├── model/          # 记忆模型:relation.rs temporal.rs provenance.rs consolidate.rs   (09)
 │   ├── score/          # 排序层:formula.rs expand.rs feedback.rs diversify.rs           (10)
@@ -326,13 +328,14 @@ ns.retain(Retention::new()
 
 // ---- 命名空间 / 运维 ----
 let names = db.list_namespaces()?;
-db.drop_namespace("agent-42/session-88")?;                // 含子命名空间
+db.drop_namespace("agent-42/session-88")?;                // 含子命名空间,返回墓碑行数
 let snap = db.snapshot();                                 // 钉住当前版本的只读句柄
 let s = db.stats()?;        // 段数/行数/WAL 尺寸/延迟直方图/每 NS 统计
-db.check()?;                // fsck:校验 CRC 与索引一致性
-db.backup_to("./backup")?;  // 一致性快照备份
-db.flush()?;                // 显式落盘(把可变表写成段)
-db.close()?;                // flush + 释放文件锁;Drop 只尽力 flush
+db.check()?;                // fsck:校验 CRC 与索引一致性,并给出合并建议
+db.backup_to("./backup")?;  // 一致性快照备份(同盘优先硬链接)
+db.compact()?;              // 显式触发一轮 size-tiered compaction
+db.flush()?;                // 显式落盘(把可变表写成增量段)
+db.close()?;                // flush + 停后台维护 + 释放文件锁;Drop 只尽力 flush
 ```
 
 > 示例中的 `json!` / `filter!` 由库导出;`ts("2024-03-01")` 为 ISO 8601 → Unix 毫秒的示意辅助函数。
@@ -369,7 +372,7 @@ db.close()?;                // flush + 释放文件锁;Drop 只尽力 flush
 | `AsyncNamespace` | async 门面(feature `async`),共享同一底层句柄 |
 | `Reranker` / `QueryCtx` | 精排回调钩子及其查询上下文 |
 | `Stats` / `SegmentStat` / `NsStat` / `Histogram` / `QuantStat` / `StorageStat` / `HistoryStat` | 运行统计(段/WAL/延迟/每命名空间/量化/合并/存储安全/版本链) |
-| `CheckReport` / `BackupReport` / `RetainReport` / `SnapshotStats`(L5 规划) | 运维报告(前三者已落地,`backup_to` 持久库自 L2 可用、纯内存库 `Unsupported`;`SnapshotStats` 待 L5) |
+| `CheckReport` / `BackupReport` / `RetainReport` / `SnapshotStats` | 运维报告(`SnapshotStats` 为快照钉住视图的段数/行数/水位) |
 | `CompactionState` / `CompactionControl` | 后台合并状态与 pause/resume 控制 |
 | `AccessStat` | 单条记录的访问统计(`last_access_ms` / `access_count`) |
 | `MnemeError` | 统一错误(见 [02 §2](02-l0-core.md)) |

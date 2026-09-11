@@ -8,7 +8,9 @@ use crate::core::error::{MnemeError, Result};
 /// 当前支持的文件格式版本:高 8 位主版本、低 8 位次版本(设计 04 §2、§12)。
 ///
 /// 次版本 2:L4 起 msec 的 field_dict / zone map / bloom / 倒排四区实际写入。
-pub(crate) const FORMAT_VERSION: u16 = 0x0002;
+/// 次版本 3:L5 起 msec 的 zmap 区尾追加 `ttl_map`(每块 `min(expires_at)`),
+/// 旧段尾长 0 按兼容路径解析。
+pub(crate) const FORMAT_VERSION: u16 = 0x0003;
 
 /// 库支持的最大主版本;`major(found) > MAX_MAJOR` 时拒绝打开(I18)。
 pub(crate) const MAX_MAJOR: u8 = 0x00;

@@ -37,7 +37,7 @@ impl Namespace {
             if ws.closed {
                 return Err(MnemeError::Closed);
             }
-            let ns_id = ws.register_ns(&ns_path);
+            let ns_id = ws.register_ns(&ns_path)?;
             insert_one(
                 ws,
                 &config,
@@ -93,7 +93,7 @@ impl Namespace {
             for rec in &recs {
                 validate_insert(&config, rec)?;
             }
-            let ns_id = ws.register_ns(&ns_path);
+            let ns_id = ws.register_ns(&ns_path)?;
             let now = config.clock.now_unix_ms();
             let mut outcomes = Vec::with_capacity(recs.len());
             for rec in recs {

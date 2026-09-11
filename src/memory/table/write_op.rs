@@ -22,6 +22,11 @@ pub(crate) enum WriteOp {
         /// 命名空间路径。
         path: Arc<str>,
     },
+    /// 命名空间注销(路径删除后其 `NsId` 作废、永不复用)。
+    NsUnregister {
+        /// 被注销的命名空间编号。
+        ns_id: u32,
+    },
     /// 提交一个新物理版本(记录体)。
     Insert {
         /// 新版本的槽位数据(`deleted == false`)。
@@ -44,6 +49,8 @@ pub(crate) enum WriteOp {
         seqno: SeqNo,
         /// 访问时刻(Unix 毫秒)。
         at_ms: i64,
+        /// 本次合并的访问次数增量(读路径攒批 ≥1;显式 `touch` 恒为 1)。
+        access_delta: u32,
         /// 重要度增量。
         importance_delta: f32,
     },

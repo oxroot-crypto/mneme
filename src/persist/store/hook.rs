@@ -94,6 +94,7 @@ fn append_transaction(wal: &mut WalWriter, ops: &[WriteOp], batch_count: u32) ->
 fn op_dispatch(op: &WriteOp) -> (u64, FrameKind) {
     match op {
         WriteOp::NsRegister { .. } => (0, FrameKind::NsRegister),
+        WriteOp::NsUnregister { .. } => (0, FrameKind::NsUnregister),
         WriteOp::Insert { slot } => (slot.seqno.get(), FrameKind::Insert),
         WriteOp::DeleteRow { seqno, .. } => (seqno.get(), FrameKind::DeleteRow),
         WriteOp::Access { seqno, .. } => (seqno.get(), FrameKind::TouchRow),
@@ -106,6 +107,7 @@ fn op_dispatch(op: &WriteOp) -> (u64, FrameKind) {
 fn op_payload(op: &WriteOp) -> Result<Vec<u8>> {
     Ok(match op {
         WriteOp::NsRegister { ns_id, path } => wal::encode_ns_register(*ns_id, path),
+        WriteOp::NsUnregister { ns_id } => wal::encode_ns_unregister(*ns_id),
         WriteOp::Insert { slot } => {
             let entry = entry_from_slot(slot);
             wal::encode_insert(&entry, &slot.vector, slot.tx_ms)?
@@ -114,9 +116,10 @@ fn op_payload(op: &WriteOp) -> Result<Vec<u8>> {
         WriteOp::Access {
             rowid,
             at_ms,
+            access_delta,
             importance_delta,
             ..
-        } => wal::encode_touch_row(rowid.get(), *at_ms, 1, *importance_delta),
+        } => wal::encode_touch_row(rowid.get(), *at_ms, *access_delta, *importance_delta),
         WriteOp::Relate {
             from,
             to,
