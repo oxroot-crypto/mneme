@@ -116,6 +116,16 @@ pub(crate) struct Manifest {
 /// # Errors
 /// 条目数或文件长度溢出 `u32` 时返回 [`MnemeError::TooLarge`]。
 pub(crate) fn encode(manifest: &Manifest) -> Result<Vec<u8>> {
+    let body = encode_body(manifest);
+    let header = encode_manifest_header(manifest)?;
+    let mut out = header.to_vec();
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&crc32(&body).to_le_bytes());
+    Ok(out)
+}
+
+/// 编码命名空间 / 关系类型 / 活跃段三个变长表。
+fn encode_body(manifest: &Manifest) -> Vec<u8> {
     let mut body = Vec::new();
     for ns in &manifest.namespaces {
         put_u32(&mut body, ns.ns_id);
@@ -138,7 +148,11 @@ pub(crate) fn encode(manifest: &Manifest) -> Result<Vec<u8>> {
         put_u32(&mut body, seg.entry_slot);
         body.push(seg.entry_level);
     }
+    body
+}
 
+/// 编码定长头部(含头部 CRC)。
+fn encode_manifest_header(manifest: &Manifest) -> Result<[u8; HEADER_LEN as usize]> {
     let mut header = [0_u8; HEADER_LEN as usize];
     header[0..4].copy_from_slice(&MAGIC);
     header[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
@@ -164,11 +178,7 @@ pub(crate) fn encode(manifest: &Manifest) -> Result<Vec<u8>> {
         .copy_from_slice(&count_u32(manifest.rel_kinds.len(), "rel_kind_count")?.to_le_bytes());
     let crc = header_crc(&header);
     header[8..12].copy_from_slice(&crc.to_le_bytes());
-
-    let mut out = header.to_vec();
-    out.extend_from_slice(&body);
-    out.extend_from_slice(&crc32(&body).to_le_bytes());
-    Ok(out)
+    Ok(header)
 }
 
 /// 计算头部 CRC(覆盖除 [8,12) 外的全部头部字节)。
@@ -247,6 +257,25 @@ struct ManifestHeader {
 
 /// 校验并解析 MANIFEST 定长头部。
 fn parse_header(bytes: &[u8]) -> Result<ManifestHeader> {
+    validate_header(bytes)?;
+    Ok(ManifestHeader {
+        dimension: u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+        metric: metric_from_u8(bytes[16])?,
+        stopwords: decode_stopwords(bytes[17])?,
+        next_rel_kind: u16::from_le_bytes([bytes[22], bytes[23]]),
+        manifest_version: read_u64(bytes, 24),
+        watermark_seqno: read_u64(bytes, 32),
+        next_rowid: read_u64(bytes, 40),
+        next_segment_id: read_u32(bytes, 48),
+        next_ns_id: read_u32(bytes, 52),
+        active_count: read_u32(bytes, 56) as usize,
+        ns_count: read_u32(bytes, 60) as usize,
+        rel_kind_count: read_u32(bytes, 64) as usize,
+    })
+}
+
+/// 校验头部长度、魔数、版本、`header_len` 与头部 CRC。
+fn validate_header(bytes: &[u8]) -> Result<()> {
     if bytes.len() < HEADER_LEN as usize + 4 {
         return Err(MnemeError::Corrupted {
             segment: None,
@@ -274,30 +303,19 @@ fn parse_header(bytes: &[u8]) -> Result<ManifestHeader> {
             reason: "manifest: header_crc32 不符".to_string(),
         });
     }
-    let stopwords = match bytes[17] {
-        STOPWORDS_ENABLED | STOPWORDS_UNRECORDED => true,
-        STOPWORDS_DISABLED => false,
-        _ => {
-            return Err(MnemeError::Corrupted {
-                segment: None,
-                reason: "manifest: stopwords 标志非法".to_string(),
-            });
-        }
-    };
-    Ok(ManifestHeader {
-        dimension: u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
-        metric: metric_from_u8(bytes[16])?,
-        stopwords,
-        next_rel_kind: u16::from_le_bytes([bytes[22], bytes[23]]),
-        manifest_version: read_u64(bytes, 24),
-        watermark_seqno: read_u64(bytes, 32),
-        next_rowid: read_u64(bytes, 40),
-        next_segment_id: read_u32(bytes, 48),
-        next_ns_id: read_u32(bytes, 52),
-        active_count: read_u32(bytes, 56) as usize,
-        ns_count: read_u32(bytes, 60) as usize,
-        rel_kind_count: read_u32(bytes, 64) as usize,
-    })
+    Ok(())
+}
+
+/// 解析 `stopwords` 标志(旧库未记录按启用处理)。
+fn decode_stopwords(flag: u8) -> Result<bool> {
+    match flag {
+        STOPWORDS_ENABLED | STOPWORDS_UNRECORDED => Ok(true),
+        STOPWORDS_DISABLED => Ok(false),
+        _ => Err(MnemeError::Corrupted {
+            segment: None,
+            reason: "manifest: stopwords 标志非法".to_string(),
+        }),
+    }
 }
 
 /// 解析命名空间条目列表(按剩余字节数设预分配上界,抵御损坏计数)。

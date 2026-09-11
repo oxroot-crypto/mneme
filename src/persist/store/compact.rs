@@ -12,6 +12,7 @@ use crate::memory::ops::{CompactionControl, CompactionPlan};
 use crate::memory::table::WriterState;
 use crate::persist::flush::{self, EncodedSegment, SegmentBuildInput};
 use crate::persist::manifest::{Manifest, NsEntry, SegmentEntry};
+use crate::persist::msec;
 use crate::persist::storage::{self, SEGMENTS_DIR, hidx_name, msec_name, vsec_name};
 use crate::persist::trash;
 use crate::persist::{FORMAT_VERSION, crc32};
@@ -30,6 +31,16 @@ pub(crate) struct CompactInput<'a> {
     pub(crate) keep_slots: &'a [usize],
     /// 后台合并控制句柄。
     pub(crate) control: &'a CompactionControl,
+}
+
+/// 一次合并的段组上下文(参数收敛)。
+struct MergeContext<'a> {
+    /// 提交前的 MANIFEST。
+    previous: &'a Manifest,
+    /// 被替换的旧段组。
+    group: &'a [SegmentEntry],
+    /// 合并时刻(Unix 毫秒)。
+    now_ms: i64,
 }
 
 /// 已写完三件套、尚未提交的新段。
@@ -83,8 +94,12 @@ impl Store {
         }
         let previous = self.manifest_snapshot();
         let group = resolve_group(&previous, input.plan)?;
-        let now_ms = config.clock.now_unix_ms();
-        let Some(merged) = self.build_merged(ws, config, &previous, input, now_ms)? else {
+        let context = MergeContext {
+            previous: &previous,
+            group: &group,
+            now_ms: config.clock.now_unix_ms(),
+        };
+        let Some(merged) = self.build_merged(ws, config, &context, input)? else {
             return Ok(false);
         };
         let new_manifest = next_manifest_after_merge(&MergeManifestInput {
@@ -93,7 +108,7 @@ impl Store {
             segment_id: merged.segment_id,
             keep_slots: input.keep_slots,
             group: &group,
-            created_ms: now_ms,
+            created_ms: context.now_ms,
             encoded: &merged.encoded,
         });
         manifest_io::commit_manifest(&self.root, &new_manifest, self.hook.as_deref())?;
@@ -107,18 +122,18 @@ impl Store {
         &self,
         ws: &WriterState,
         config: &Config,
-        previous: &Manifest,
+        context: &MergeContext<'_>,
         input: &CompactInput<'_>,
-        now_ms: i64,
     ) -> Result<Option<MergedSegment>> {
-        let segment_id = previous.next_segment_id;
+        let segment_id = context.previous.next_segment_id;
+        let carried = self.carried_access_deltas(context.group, ws, input.keep_slots)?;
         let encoded = flush::build_segment(
             ws,
             config,
-            now_ms,
+            context.now_ms,
             &SegmentBuildInput {
                 slots: input.keep_slots,
-                delta: &[],
+                delta: &carried,
                 full_relations: true,
             },
         )?;
@@ -136,6 +151,39 @@ impl Store {
             segment_id,
             encoded,
         }))
+    }
+
+    /// 收集被合并段中尚未被新段覆盖的 `Access` delta。
+    ///
+    /// 新段版本行只覆盖 `keep_slots` 中的 RowId;其余 RowId 的访问增量必须随新段
+    /// 继续承载,否则 compaction 后丢失(FC-PERSIST-POST-010)。关系变更不携带:
+    /// 新段为全量关系表,已包含当前状态。
+    fn carried_access_deltas(
+        &self,
+        group: &[SegmentEntry],
+        ws: &WriterState,
+        keep_slots: &[usize],
+    ) -> Result<Vec<msec::DeltaEntry>> {
+        let keep: std::collections::HashSet<usize> = keep_slots.iter().copied().collect();
+        let mut carried = Vec::new();
+        for segment in group {
+            let rel = format!("{SEGMENTS_DIR}/{}", msec_name(segment.segment_id));
+            let bytes = storage::read_file(&self.root, &rel)?;
+            let view = msec::parse(&bytes)?;
+            for entry in msec::decode_delta(view.delta_bytes())? {
+                let msec::DeltaEntry::Access { rowid, .. } = entry else {
+                    continue;
+                };
+                let Some(latest) = ws.latest.get(&crate::core::types::RowId::new(rowid)) else {
+                    continue;
+                };
+                if keep.contains(&(latest.get() as usize)) {
+                    continue;
+                }
+                carried.push(entry);
+            }
+        }
+        Ok(carried)
     }
 
     /// 写入新段的 vsec/msec(以及可选的 hidx)文件。

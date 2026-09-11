@@ -14,6 +14,7 @@
 //! * FC-MODEL-POST-004(history_horizon 回收)、FC-MODEL-POST-005(入边)、FC-MODEL-POST-007(反向关系表)
 //! * FC-LIFE-POST-003(增量段 flush)、FC-PERSIST-STA-004(多段 MANIFEST 提交)
 //! * FC-PERSIST-POST-010(delta 区往返/回放)、FC-PERSIST-POST-011(WAL 轮转)
+//! * FC-PERSIST-POST-012(槽位归属恢复)
 //! * FC-PERSIST-CPLX-011(增量 flush 复杂度)
 //! * FC-INDEX-INV-008(多段 ANN + 未落盘尾归并 ≡ 全量暴力)
 
@@ -1005,7 +1006,17 @@ fn backup_hardlinks_segments_when_possible() {
 #[test]
 fn stats_report_latency_dead_ratio_and_fsck_suggestions() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let db = build(dir.path(), 2);
+    // 有限 horizon 才会给出"建议合并回收":默认 None 时没有任何版本可回收,
+    // 建议会与实际触发口径矛盾(FC-LIFE-POST-009)。
+    let db = Builder::default()
+        .dimension(2)
+        .path(dir.path())
+        .compaction(CompactionPolicy {
+            history_horizon: Some(Duration::from_secs(3_600)),
+            ..CompactionPolicy::default()
+        })
+        .build()
+        .expect("build");
     let ns = db.namespace("demo");
     for key in 0..4_u32 {
         ns.insert(Record::new(vec![key as f32, 1.0]).key(format!("k{key}")))
@@ -1347,36 +1358,67 @@ fn checkpoint_removes_covered_wal_files() {
 #[test]
 fn compaction_never_revives_deleted_record_under_clock_skew() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let clock = FakeClock::default();
-    clock.set(1_000);
     let policy = CompactionPolicy {
         history_horizon: Some(Duration::from_millis(50)),
-        ..CompactionPolicy::default()
+        ..tiered_policy()
     };
+    // 第一段:活版本 tx=280。
     {
+        let clock = FakeClock::default();
+        clock.set(280);
         let db = Builder::default()
             .dimension(2)
             .path(dir.path())
             .compaction(policy)
-            .clock(Arc::new(clock.clone()))
+            .clock(Arc::new(clock))
             .build()
             .expect("build");
-        let ns = db.namespace("demo");
-        // 时钟回拨:活版本 tx=280,之后删除的墓碑 tx=100。
-        clock.set(280);
-        ns.insert(Record::new(vec![1.0, 0.0]).key("a")).expect("a");
+        db.namespace("demo")
+            .insert(Record::new(vec![1.0, 0.0]).key("a"))
+            .expect("a");
+        db.flush().expect("flush live");
+        db.close().expect("close");
+    }
+    // 第二段:新进程时钟回拨到 100,删除产生早于活版本的墓碑 tx=100。
+    {
+        let clock = FakeClock::default();
         clock.set(100);
-        assert!(ns.delete("a").expect("delete"));
-        db.flush().expect("flush");
+        let db = Builder::default()
+            .dimension(2)
+            .path(dir.path())
+            .compaction(policy)
+            .clock(Arc::new(clock))
+            .build()
+            .expect("reopen");
+        assert!(db.namespace("demo").delete("a").expect("delete"));
+        db.flush().expect("flush tombstone");
+        db.close().expect("close");
+    }
+    // 第三段:时钟前进后 compaction。墓碑 tx=100 < cutoff=250(窗口外),
+    // 整链(含 tx=280 的活版本)一并回收 —— 绝不只回收墓碑留下悬挂 latest。
+    {
+        let clock = FakeClock::default();
         clock.set(300);
+        let db = Builder::default()
+            .dimension(2)
+            .path(dir.path())
+            .compaction(policy)
+            .clock(Arc::new(clock))
+            .build()
+            .expect("reopen2");
         db.compact().expect("compact");
-        assert!(!ns.exists("a").expect("exists"), "整链回收后删除语义不变");
+        let stats = db.stats().expect("stats");
+        assert_eq!(
+            stats.history.reclaimed_versions, 2,
+            "时钟回拨下必须整链回收(墓碑+活版本)"
+        );
+        assert!(!db.namespace("demo").exists("a").expect("exists"));
+        db.close().expect("close");
     }
 
-    let db = Mneme::open(dir.path()).expect("reopen");
-    let ns = db.namespace("demo");
+    let db = Mneme::open(dir.path()).expect("reopen3");
     assert!(
-        !ns.exists("a").expect("exists"),
+        !db.namespace("demo").exists("a").expect("exists"),
         "重开后被删记录绝不复活(latest 不得悬挂)"
     );
     assert!(db.check().expect("check").ok);
@@ -1438,4 +1480,253 @@ fn relation_index_modes_agree_after_reopen() {
         edges(both_dir.path()),
         "Outgoing 与 Both 的边语义必须逐边一致"
     );
+}
+
+/// FC-LIFE-POST-003 / FC-MODEL-POST-004:恢复后"槽位 → 段"归属必须回填;
+/// 重开后空 flush 不产段、compaction 不得丢弃已落盘段。
+#[test]
+fn reopen_preserves_segment_membership() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let db = Builder::default()
+            .dimension(2)
+            .path(dir.path())
+            .compaction(tiered_policy())
+            .build()
+            .expect("build");
+        let ns = db.namespace("demo");
+        for batch in 0..3_u32 {
+            let records: Vec<Record> = (0..4_u32)
+                .map(|row| Record::new(vec![row as f32, 1.0]).key(format!("k{}", batch * 4 + row)))
+                .collect();
+            ns.insert_batch(records).expect("batch");
+            db.flush().expect("flush");
+        }
+        assert_eq!(db.stats().expect("stats").segments.len(), 3);
+        db.close().expect("close");
+    }
+
+    let db = Builder::default()
+        .dimension(2)
+        .path(dir.path())
+        .compaction(tiered_policy())
+        .build()
+        .expect("reopen");
+    let ns = db.namespace("demo");
+    // 恢复后空 flush 必须为空操作(槽位归属已回填)。
+    let before = db.stats().expect("stats").segments.len();
+    db.flush().expect("flush");
+    assert_eq!(
+        db.stats().expect("stats").segments.len(),
+        before,
+        "重开后空 flush 必须为空操作(FC-LIFE-POST-003)"
+    );
+    // 恢复后 compaction 必须保留全部记录。
+    db.compact().expect("compact");
+    assert_eq!(db.stats().expect("stats").segments.len(), 2);
+    for key in 0..12_u32 {
+        assert!(
+            ns.get(&format!("k{key}")).expect("get").is_some(),
+            "重开后 compaction 不得丢记录 k{key}"
+        );
+    }
+    db.close().expect("close");
+
+    let db = Mneme::open(dir.path()).expect("reopen2");
+    let ns = db.namespace("demo");
+    for key in 0..12_u32 {
+        assert!(
+            ns.get(&format!("k{key}")).expect("get").is_some(),
+            "再次重开后记录必须还在 k{key}"
+        );
+    }
+    assert!(db.check().expect("check").ok);
+    db.close().expect("close");
+}
+
+/// FC-MODEL-POST-007:compaction 后旧段已删除的关系边不得经并集复活。
+#[test]
+fn compaction_does_not_resurrect_removed_edges() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let db = Builder::default()
+            .dimension(2)
+            .path(dir.path())
+            .compaction(tiered_policy())
+            .build()
+            .expect("build");
+        let ns = db.namespace("demo");
+        let a = ns.insert(Record::new(vec![1.0, 0.0]).key("a")).expect("a");
+        let b = ns.insert(Record::new(vec![0.0, 1.0]).key("b")).expect("b");
+        let a = match a {
+            mneme::InsertOutcome::Inserted(id) | mneme::InsertOutcome::Merged(id) => id,
+            other => panic!("期望写入,得到 {other:?}"),
+        };
+        let b = match b {
+            mneme::InsertOutcome::Inserted(id) | mneme::InsertOutcome::Merged(id) => id,
+            other => panic!("期望写入,得到 {other:?}"),
+        };
+        ns.relate(a, b, mneme::RelationKind::RELATED, 0.5)
+            .expect("relate");
+        db.flush().expect("flush base"); // 段 0:全量关系(含 a→b)
+        ns.insert(Record::new(vec![1.0, 1.0]).key("c")).expect("c");
+        db.flush().expect("flush c"); // 段 1
+        ns.unrelate(a, b, mneme::RelationKind::RELATED)
+            .expect("unrelate");
+        db.flush().expect("flush unrelate"); // 段 2:delta Unrelate
+        db.compact().expect("compact");
+        assert_eq!(db.stats().expect("stats").segments.len(), 2);
+        db.close().expect("close");
+    }
+
+    let db = Mneme::open(dir.path()).expect("reopen");
+    let ns = db.namespace("demo");
+    let a = ns.get("a").expect("a").expect("存在").rowid();
+    let edges = ns
+        .neighbors(a, &[mneme::RelationKind::RELATED])
+        .expect("neighbors");
+    assert!(
+        edges.is_empty(),
+        "compaction 后被删除的边不得复活,实际 {edges:?}"
+    );
+    assert!(db.check().expect("check").ok);
+    db.close().expect("close");
+}
+
+/// FC-PERSIST-POST-010:compaction 不得丢弃尚未随版本物化的访问增量。
+#[test]
+fn compaction_carries_access_delta_for_unmerged_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clock = FakeClock::default();
+    clock.set(1_000);
+    {
+        let db = Builder::default()
+            .dimension(2)
+            .path(dir.path())
+            .compaction(tiered_policy())
+            .clock(Arc::new(clock.clone()))
+            .build()
+            .expect("build");
+        let ns = db.namespace("demo");
+        // 段 0:4 行(level 1,含 a)。
+        let a = ns.insert(Record::new(vec![1.0, 0.0]).key("a")).expect("a");
+        let a = match a {
+            mneme::InsertOutcome::Inserted(id) | mneme::InsertOutcome::Merged(id) => id,
+            other => panic!("期望写入,得到 {other:?}"),
+        };
+        for row in 0..3_u32 {
+            ns.insert(Record::new(vec![row as f32, 1.0]).key(format!("fill{row}")))
+                .expect("fill");
+        }
+        db.flush().expect("flush level1");
+        clock.set(2_000);
+        assert!(ns.touch_by_rowid(a, None).expect("touch"));
+        db.flush().expect("flush delta"); // 段 1:纯 delta(含 a 的 Access)
+        ns.insert(Record::new(vec![9.0, 9.0]).key("tail"))
+            .expect("tail");
+        db.flush().expect("flush tail"); // 段 2:1 行(level 0)
+        db.compact().expect("compact level0"); // 合并 [段 1, 段 2],a 的 latest 在段 0
+        db.close().expect("close");
+    }
+
+    let db = Mneme::open(dir.path()).expect("reopen");
+    let ns = db.namespace("demo");
+    assert_eq!(
+        ns.count(Some(mneme::Expr::field("access_count").eq(1)))
+            .expect("count"),
+        1,
+        "compaction 必须携带未物化的 Access delta"
+    );
+    db.close().expect("close");
+}
+
+/// FC-PERSIST-POST-010:仅历史版本被合并时不得清掉该 RowId 的访问增量。
+#[test]
+fn compaction_keeps_access_dirty_for_history_only_row() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clock = FakeClock::default();
+    clock.set(1_000);
+    {
+        let db = Builder::default()
+            .dimension(2)
+            .path(dir.path())
+            .compaction(tiered_policy())
+            .clock(Arc::new(clock.clone()))
+            .build()
+            .expect("build");
+        let ns = db.namespace("demo");
+        // 段 0(level 0):a 的 v1。
+        let a = ns.insert(Record::new(vec![1.0, 0.0]).key("a")).expect("a");
+        let a = match a {
+            mneme::InsertOutcome::Inserted(id) | mneme::InsertOutcome::Merged(id) => id,
+            other => panic!("期望写入,得到 {other:?}"),
+        };
+        db.flush().expect("flush v1");
+        // 段 1(level 1):a 的 v2(latest)+ 3 行填充。
+        ns.update("a", UpdatePatch::new().importance(0.9))
+            .expect("update");
+        for row in 0..3_u32 {
+            ns.insert(Record::new(vec![row as f32, 1.0]).key(format!("fill{row}")))
+                .expect("fill");
+        }
+        db.flush().expect("flush v2");
+        // 段 2(level 0):1 行,触发 level0 合并 [段 0, 段 2]。
+        ns.insert(Record::new(vec![9.0, 9.0]).key("tail"))
+            .expect("tail");
+        db.flush().expect("flush tail");
+        clock.set(2_000);
+        assert!(ns.touch_by_rowid(a, None).expect("touch"));
+        // 此时 a 的 latest(v2)在段 1、不在 level0 组内;合并后不得清 dirty。
+        db.compact().expect("compact");
+        db.flush().expect("flush dirty delta");
+        db.close().expect("close");
+    }
+
+    let db = Mneme::open(dir.path()).expect("reopen");
+    let ns = db.namespace("demo");
+    assert_eq!(
+        ns.count(Some(mneme::Expr::field("access_count").eq(1)))
+            .expect("count"),
+        1,
+        "仅历史版本入段时,访问增量必须保留到下一段 delta"
+    );
+    db.close().expect("close");
+}
+
+/// FC-PERSIST-POST-011 / FC-LIFE-POST-006:reset 删除失败残留的旧 WAL 文件
+/// 不得让已注销命名空间复活(metadata 帧同样受 watermark 约束)。
+#[test]
+fn stale_wal_files_do_not_resurrect_unregistered_namespace() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // 1. 写入注册与数据帧,不 close(仅 drop):WAL 保留完整帧。
+    {
+        let db = build(dir.path(), 2);
+        db.namespace("demo")
+            .insert(Record::new(vec![1.0, 0.0]).key("a"))
+            .expect("a");
+    }
+    // 2. 备份这份"旧 WAL"(模拟 reset 删除失败残留的文件)。
+    let wal_path = dir.path().join("wal").join("wal_000001.log");
+    let stale = std::fs::read(&wal_path).expect("read stale wal");
+
+    // 3. 重开、注销并 flush:注册表清空、watermark 覆盖旧帧,reset 删除旧文件。
+    {
+        let db = Mneme::open(dir.path()).expect("reopen");
+        assert_eq!(db.drop_namespace("demo").expect("drop"), 1);
+        db.flush().expect("flush");
+        db.close().expect("close");
+    }
+
+    // 4. 把旧 WAL 文件放回。
+    std::fs::write(&wal_path, &stale).expect("restore stale wal");
+
+    // 5. 重开:旧帧(含 NsRegister)必须被水位跳过,注销不得复活。
+    let db = Mneme::open(dir.path()).expect("reopen2");
+    assert!(
+        db.list_namespaces().expect("list").is_empty(),
+        "残留旧 WAL 不得复活已注销命名空间"
+    );
+    assert!(db.namespace("demo").get("a").expect("get").is_none());
+    assert!(db.check().expect("check").ok);
+    db.close().expect("close");
 }

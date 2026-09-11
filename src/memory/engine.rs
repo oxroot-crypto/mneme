@@ -14,7 +14,7 @@ use crate::memory::config::Config;
 use crate::memory::namespace::Namespace;
 use crate::memory::ops::{BackupReport, CompactionControl};
 use crate::memory::snapshot::SnapshotHandle;
-use crate::memory::table::Table;
+use crate::memory::table::{Table, WriterState};
 use crate::memory::temporal;
 use crate::persist::store::Store;
 
@@ -191,23 +191,7 @@ impl Mneme {
             let now = config.clock.now_unix_ms();
             let mut rows = 0_usize;
             for ns_id in &victims {
-                // 每个 RowId 只取其最新版本一次:历史版本不进列表,避免重复烧
-                // `seqno` 与对已墓碑行做无效 tombstone。
-                let rowids: Vec<RowId> = ws
-                    .latest
-                    .iter()
-                    .filter(|(_, slot)| {
-                        let data = &ws.slots[slot.get() as usize];
-                        data.ns_id == *ns_id && !data.deleted
-                    })
-                    .map(|(rowid, _)| *rowid)
-                    .collect();
-                for rowid in rowids {
-                    let seqno = ws.alloc_seqno();
-                    if ws.tombstone(rowid, now, seqno)? {
-                        rows += 1;
-                    }
-                }
+                rows += tombstone_namespace(ws, *ns_id, now)?;
             }
             for ns_id in &victims {
                 ws.unregister_ns(*ns_id);
@@ -334,4 +318,28 @@ impl Mneme {
             Ok(())
         })
     }
+}
+
+/// 为单个命名空间下所有可见记录落墓碑;返回墓碑行数。
+///
+/// 每个 RowId 只取其最新版本一次:历史版本不进列表,避免重复烧 `seqno` 与对
+/// 已墓碑行做无效 tombstone。
+fn tombstone_namespace(ws: &mut WriterState, ns_id: NsId, now: i64) -> Result<usize> {
+    let rowids: Vec<RowId> = ws
+        .latest
+        .iter()
+        .filter(|(_, slot)| {
+            let data = &ws.slots[slot.get() as usize];
+            data.ns_id == ns_id && !data.deleted
+        })
+        .map(|(rowid, _)| *rowid)
+        .collect();
+    let mut rows = 0;
+    for rowid in rowids {
+        let seqno = ws.alloc_seqno();
+        if ws.tombstone(rowid, now, seqno)? {
+            rows += 1;
+        }
+    }
+    Ok(rows)
 }

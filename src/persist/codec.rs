@@ -10,7 +10,11 @@ use crate::core::error::{MnemeError, Result};
 /// 次版本 2:L4 起 msec 的 field_dict / zone map / bloom / 倒排四区实际写入。
 /// 次版本 3:L5 起 msec 的 zmap 区尾追加 `ttl_map`(每块 `min(expires_at)`),
 /// 旧段尾长 0 按兼容路径解析。
-pub(crate) const FORMAT_VERSION: u16 = 0x0003;
+/// 次版本 4:关系区带「全量/增量」标志;旧版本段一律视为全量关系表。
+pub(crate) const FORMAT_VERSION: u16 = 0x0004;
+
+/// 关系区「全量/增量」语义的分界次版本(≥ 该版本的段按 edges 标志判定)。
+pub(crate) const FULL_RELATIONS_VERSION: u16 = 0x0004;
 
 /// 库支持的最大主版本;`major(found) > MAX_MAJOR` 时拒绝打开(I18)。
 pub(crate) const MAX_MAJOR: u8 = 0x00;

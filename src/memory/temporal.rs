@@ -15,40 +15,8 @@ use crate::memory::table::ReaderView;
 /// 每个 `RowId` 取版本链中 `tx_ms ≤ t` 的最新版本;被墓碑遮蔽的版本不进入
 /// `key_index`/`text_index`,但物理槽位仍保留以便 `iter_with(_, true)` 审计。
 pub(crate) fn snapshot_at(view: &ReaderView, tx_ms: i64) -> ReaderView {
-    let mut latest: HashMap<crate::core::types::RowId, crate::core::types::SlotId> = HashMap::new();
-    for (rowid, chain) in view.versions.iter() {
-        let mut chosen = None;
-        for &slot in chain.iter() {
-            let slot_data = &view.slots[slot.get() as usize];
-            if slot_data.tx_ms <= tx_ms {
-                chosen = Some(slot);
-            } else {
-                break;
-            }
-        }
-        if let Some(slot) = chosen {
-            latest.insert(*rowid, slot);
-        }
-    }
-
-    let mut dead = BitSet::default();
-    for idx in 0..view.slots.len() {
-        dead.set(idx);
-    }
-    let mut key_index = HashMap::new();
-    let mut seqno = SeqNo::new(0);
-    for (rowid, slot) in &latest {
-        let slot_data = &view.slots[slot.get() as usize];
-        seqno = SeqNo::new(seqno.get().max(slot_data.seqno.get()));
-        if slot_data.deleted {
-            continue;
-        }
-        dead.clear(slot.get() as usize);
-        if let Some(key) = &slot_data.key {
-            key_index.insert((slot_data.ns_id, key.clone()), *rowid);
-        }
-    }
-
+    let latest = historical_latest(view, tx_ms);
+    let (dead, key_index, seqno) = history_visibility(view, &latest);
     ReaderView {
         slots: Arc::clone(&view.slots),
         dead: Arc::new(dead),
@@ -68,6 +36,58 @@ pub(crate) fn snapshot_at(view: &ReaderView, tx_ms: i64) -> ReaderView {
         seqno,
         closed: view.closed,
     }
+}
+
+/// 历史时点每个 RowId 可见的最新版本(`tx_ms` 之前最后一个版本)。
+fn historical_latest(
+    view: &ReaderView,
+    tx_ms: i64,
+) -> HashMap<crate::core::types::RowId, crate::core::types::SlotId> {
+    let mut latest: HashMap<crate::core::types::RowId, crate::core::types::SlotId> = HashMap::new();
+    for (rowid, chain) in view.versions.iter() {
+        let mut chosen = None;
+        for &slot in chain.iter() {
+            let slot_data = &view.slots[slot.get() as usize];
+            if slot_data.tx_ms <= tx_ms {
+                chosen = Some(slot);
+            } else {
+                break;
+            }
+        }
+        if let Some(slot) = chosen {
+            latest.insert(*rowid, slot);
+        }
+    }
+    latest
+}
+
+/// 历史视图的 `dead` 位图、`key` 索引与水位(墓碑不可见,活版本清除 `dead`)。
+fn history_visibility(
+    view: &ReaderView,
+    latest: &HashMap<crate::core::types::RowId, crate::core::types::SlotId>,
+) -> (
+    BitSet,
+    HashMap<(crate::core::types::NsId, crate::core::types::Key), crate::core::types::RowId>,
+    SeqNo,
+) {
+    let mut dead = BitSet::default();
+    for idx in 0..view.slots.len() {
+        dead.set(idx);
+    }
+    let mut key_index = HashMap::new();
+    let mut seqno = SeqNo::new(0);
+    for (rowid, slot) in latest {
+        let slot_data = &view.slots[slot.get() as usize];
+        seqno = SeqNo::new(seqno.get().max(slot_data.seqno.get()));
+        if slot_data.deleted {
+            continue;
+        }
+        dead.clear(slot.get() as usize);
+        if let Some(key) = &slot_data.key {
+            key_index.insert((slot_data.ns_id, key.clone()), *rowid);
+        }
+    }
+    (dead, key_index, seqno)
 }
 
 #[cfg(test)]

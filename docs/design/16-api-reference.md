@@ -67,6 +67,11 @@ impl Builder {
 }
 ```
 
+> **公开类型补充**:`lib.rs` 另导出 L0 标识类型 `Key`/`NsId`/`RowId`/`SegmentId`/
+> `SeqNo`/`SlotId`(定义见 [02 §1](02-l0-core.md)),以及测试崩溃注入钩子
+> `FsyncHook` 与 `IoAction`(见 [04 §10.1](04-l2-persist.md));`SeqNo`/`SlotId` 分别
+> 为版本水位与物理槽位标识,随 L4/L5 的查询与段统计公开使用。
+
 ### 1.2 写入
 
 ```rust

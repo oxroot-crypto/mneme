@@ -72,9 +72,52 @@ pub(crate) fn load_segments(
 ) -> Result<RecoveredSegments> {
     // 恢复期间暂停索引增量维护:段载入完成后由磁盘索引或全量重建接管。
     state.is_indexing_paused = true;
-    // 收集全部版本并按 (rowid, seqno) 全局排序,保证同一 RowId 的版本链有序。
+    let collected = collect_versions(segments, verify_payload, fail_fast)?;
+    let mut versions = collected.versions;
+    let parsed = collected.parsed;
+    let parsed_ids = collected.parsed_ids;
+    let skipped = collected.skipped;
+    versions.sort_by_key(|(row, _)| (row.rowid, row.seqno));
+
+    // 每段构建"段内槽位 → 全局槽位"重排映射(倒排载入与 hidx 载入均需要)。
+    let row_counts: Vec<usize> = parsed
+        .iter()
+        .map(|(view, _)| view.row_count() as usize)
+        .collect();
+    let remaps = build_remaps(&versions, &row_counts, &parsed_ids)?;
+
+    apply_versions(state, &versions, &parsed)?;
+    backfill_slot_segments(state, &remaps);
+    for (_, msec_view) in parsed.iter() {
+        apply_relations(state, msec_view)?;
+        apply_delta(state, msec_view)?;
+    }
+    state.pending.clear();
+    apply_indexes(state, &parsed, &remaps, fail_fast)?;
+    state.is_indexing_paused = false;
+    Ok(RecoveredSegments { skipped, remaps })
+}
+
+/// [`load_segments`] 的解析中间态:版本行、已解析段视图与跳过段。
+struct CollectedSegments<'a> {
+    /// `(版本行, 所属已解析段下标)`。
+    versions: Vec<(VersionRow, usize)>,
+    /// 已解析段的 vsec/msec 视图。
+    parsed: Vec<(vsec::VsecView<'a>, msec::MsecView<'a>)>,
+    /// 已解析段编号。
+    parsed_ids: Vec<u32>,
+    /// 被隔离(跳过)的损坏段编号。
+    skipped: Vec<u32>,
+}
+
+/// 逐段解析视图并收集全部版本行;损坏段按 `fail_fast` 上报或跳过。
+fn collect_versions<'a>(
+    segments: &'a [SegmentBytes],
+    verify_payload: bool,
+    fail_fast: bool,
+) -> Result<CollectedSegments<'a>> {
     let mut versions: Vec<(VersionRow, usize)> = Vec::new();
-    let mut parsed: Vec<(vsec::VsecView<'_>, msec::MsecView<'_>)> = Vec::new();
+    let mut parsed: Vec<(vsec::VsecView<'a>, msec::MsecView<'a>)> = Vec::new();
     let mut parsed_ids: Vec<u32> = Vec::new();
     let mut skipped: Vec<u32> = Vec::new();
     for segment in segments {
@@ -90,24 +133,28 @@ pub(crate) fn load_segments(
         parsed.push((vsec_view, msec_view));
         parsed_ids.push(segment.segment_id);
     }
-    versions.sort_by_key(|(row, _)| (row.rowid, row.seqno));
+    Ok(CollectedSegments {
+        versions,
+        parsed,
+        parsed_ids,
+        skipped,
+    })
+}
 
-    // 每段构建"段内槽位 → 全局槽位"重排映射(倒排载入与 hidx 载入均需要)。
-    let row_counts: Vec<usize> = parsed
-        .iter()
-        .map(|(view, _)| view.row_count() as usize)
-        .collect();
-    let remaps = build_remaps(&versions, &row_counts, &parsed_ids)?;
-
-    apply_versions(state, &versions, &parsed)?;
-    for (_, msec_view) in parsed.iter() {
-        apply_relations(state, msec_view)?;
-        apply_delta(state, msec_view)?;
+/// 回填"槽位 → 所属段"归属。
+///
+/// 恢复出的槽位都属于其来源段,供增量 flush 与 compaction 辨识已落盘数据;
+/// 缺失会让 `unpersisted_slots` 把全部活跃槽位当作未落盘,重开后的 compaction
+/// 会以空段替换活跃段集(永久丢数据,FC-PERSIST-POST-012)。
+fn backfill_slot_segments(state: &mut WriterState, remaps: &[SegmentRemap]) {
+    for remap in remaps {
+        let slot_segment = Arc::make_mut(&mut state.slot_segment);
+        for &global in &remap.remap {
+            if let Some(entry) = slot_segment.get_mut(global as usize) {
+                *entry = Some(remap.segment_id);
+            }
+        }
     }
-    state.pending.clear();
-    apply_indexes(state, &parsed, &remaps, fail_fast)?;
-    state.is_indexing_paused = false;
-    Ok(RecoveredSegments { skipped, remaps })
 }
 
 /// 载入或重建检索加速结构(倒排 / zone map / bloom)。
@@ -141,37 +188,63 @@ fn apply_indexes(
     // 多段:逐段解码倒排(经各自重排映射)并合并;任一结构不一致即整库重建。
     let mut merged = crate::memory::analysis::InvertedIndex::default();
     for ((_, msec_view), remap) in parsed.iter().zip(remaps.iter()) {
-        if msec_view.field_dict_bytes().is_empty() {
-            // 旧版段四区全空 → 走重建;半新半旧属结构不一致,按损坏拒绝。
-            let others_empty = msec_view.zmap_bytes().is_empty()
-                && msec_view.bloom_bytes().is_empty()
-                && msec_view.inverted_bytes().is_empty();
-            if others_empty {
+        match decode_segment_index(msec_view, &remap.remap) {
+            Ok(SegmentIndexLoad::Loaded(inv)) => merged.merge_from(inv),
+            Ok(SegmentIndexLoad::LegacyRebuild) => {
                 state.rebuild_indexes();
                 return Ok(());
             }
-            let error = MnemeError::Corrupted {
-                segment: None,
-                reason: "msec: field_dict 为空但其它索引区非空".to_string(),
-            };
-            if fail_fast {
-                return Err(error);
-            }
-            state.rebuild_indexes();
-            return Ok(());
-        }
-        let inv = match msec::decode_inverted(msec_view.inverted_bytes(), &remap.remap) {
-            Ok(inv) => inv,
             Err(error) if fail_fast => return Err(error),
+            // 索引是查询加速器而非数据来源:损坏时降级全量重建仍然正确。
             Err(_) => {
                 state.rebuild_indexes();
                 return Ok(());
             }
-        };
-        merged.merge_from(inv);
+        }
     }
     state.load_merged_indexes(merged, None);
     Ok(())
+}
+
+/// 单段索引区装载结果。
+enum SegmentIndexLoad {
+    /// 四区结构校验通过,倒排已解码。
+    Loaded(crate::memory::analysis::InvertedIndex),
+    /// 旧格式段(四区全空),调用方应全量重建。
+    LegacyRebuild,
+}
+
+/// 校验单段四区结构并解码倒排(多段恢复路径)。
+///
+/// 与单段路径同口径:字段字典/zone map/`ttl_map`/bloom 全部校验;任一畸形返回
+/// `Corrupted`(调用方按 `fail_fast` 决定上报或降级重建),旧格式段显式返回
+/// [`SegmentIndexLoad::LegacyRebuild`]。
+fn decode_segment_index(msec_view: &msec::MsecView<'_>, remap: &[u32]) -> Result<SegmentIndexLoad> {
+    if msec_view.field_dict_bytes().is_empty() {
+        // 旧版段四区全空 → 走重建;半新半旧属结构不一致,按损坏拒绝。
+        let others_empty = msec_view.zmap_bytes().is_empty()
+            && msec_view.bloom_bytes().is_empty()
+            && msec_view.inverted_bytes().is_empty();
+        if others_empty {
+            return Ok(SegmentIndexLoad::LegacyRebuild);
+        }
+        return Err(MnemeError::Corrupted {
+            segment: None,
+            reason: "msec: field_dict 为空但其它索引区非空".to_string(),
+        });
+    }
+    let fields = msec::decode_field_dict(msec_view.field_dict_bytes())?;
+    let block_count =
+        (msec_view.row_count() as usize).div_ceil(crate::memory::analysis::ZONE_BLOCK_ROWS);
+    msec::validate_zmap(msec_view.zmap_bytes(), &fields, block_count)?;
+    let _ttl_map = msec::decode_ttl_map(msec_view.zmap_bytes(), &fields, block_count)?;
+    msec::decode_bloom(msec_view.bloom_bytes())?;
+    let inv = if msec_view.inverted_bytes().is_empty() {
+        crate::memory::analysis::InvertedIndex::default()
+    } else {
+        msec::decode_inverted(msec_view.inverted_bytes(), remap)?
+    };
+    Ok(SegmentIndexLoad::Loaded(inv))
 }
 
 /// 由段内四区装载索引:字段字典/zone map 校验,倒排经重排映射,bloom 直接复用。
@@ -199,29 +272,8 @@ fn load_disk_indexes(
         return Ok(false);
     }
     let fields = msec::decode_field_dict(msec_view.field_dict_bytes())?;
-    let block_count = state
-        .slots
-        .len()
-        .div_ceil(crate::memory::analysis::ZONE_BLOCK_ROWS);
-    msec::validate_zmap(msec_view.zmap_bytes(), &fields, block_count)?;
-    // `ttl_map`(块级 TTL 剪枝元数据)在载入期解码校验;运行期 zone map 从槽位
-    // 重建,该元数据不直接参与查询(设计 04 §5.2,FC-LIFE-CPLX-001)。
-    let _ttl_map = msec::decode_ttl_map(msec_view.zmap_bytes(), &fields, block_count)?;
-    let str_ids: Vec<u16> = fields
-        .iter()
-        .filter(|field| field.kind == msec::FieldKind::Str)
-        .map(|field| field.id)
-        .collect();
-    let blooms = msec::decode_bloom(msec_view.bloom_bytes())?;
-    let Some(key_bloom) = blooms
-        .into_iter()
-        .find_map(|(id, bloom)| str_ids.contains(&id).then_some(bloom))
-    else {
-        return Err(MnemeError::Corrupted {
-            segment: None,
-            reason: "msec: bloom 区缺少 key 字段".to_string(),
-        });
-    };
+    validate_disk_regions(state, msec_view, &fields)?;
+    let key_bloom = decode_key_bloom(msec_view, &fields)?;
     let inv = if msec_view.inverted_bytes().is_empty() {
         crate::memory::analysis::InvertedIndex::default()
     } else {
@@ -229,6 +281,43 @@ fn load_disk_indexes(
     };
     state.load_disk_indexes(inv, key_bloom);
     Ok(true)
+}
+
+/// 校验段内 zone map / `ttl_map` 结构(块数按恢复后的全局槽位数)。
+fn validate_disk_regions(
+    state: &WriterState,
+    msec_view: &msec::MsecView<'_>,
+    fields: &[msec::FieldDef],
+) -> Result<()> {
+    let block_count = state
+        .slots
+        .len()
+        .div_ceil(crate::memory::analysis::ZONE_BLOCK_ROWS);
+    msec::validate_zmap(msec_view.zmap_bytes(), fields, block_count)?;
+    // `ttl_map`(块级 TTL 剪枝元数据)在载入期解码校验;运行期 zone map 从槽位
+    // 重建,该元数据不直接参与查询(设计 04 §5.2,FC-LIFE-CPLX-001)。
+    let _ttl_map = msec::decode_ttl_map(msec_view.zmap_bytes(), fields, block_count)?;
+    Ok(())
+}
+
+/// 从 bloom 区取 `key` 字段的布隆过滤器;缺失按损坏拒绝。
+fn decode_key_bloom(
+    msec_view: &msec::MsecView<'_>,
+    fields: &[msec::FieldDef],
+) -> Result<crate::memory::analysis::BloomSet> {
+    let str_ids: Vec<u16> = fields
+        .iter()
+        .filter(|field| field.kind == msec::FieldKind::Str)
+        .map(|field| field.id)
+        .collect();
+    let blooms = msec::decode_bloom(msec_view.bloom_bytes())?;
+    blooms
+        .into_iter()
+        .find_map(|(id, bloom)| str_ids.contains(&id).then_some(bloom))
+        .ok_or_else(|| MnemeError::Corrupted {
+            segment: None,
+            reason: "msec: bloom 区缺少 key 字段".to_string(),
+        })
 }
 
 /// 为每个已解析段构建"段内槽位 → 全局槽位"重排映射。

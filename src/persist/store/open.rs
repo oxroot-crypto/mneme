@@ -282,16 +282,7 @@ fn load_write_state(
     options: &OpenOptions,
 ) -> Result<WriterState> {
     let mut state = recover::empty_state(manifest);
-    // 恢复期重建的加速结构必须与建库配置同口径(分词/字段上限/bloom 误判率):
-    // 停用词开关以 MANIFEST 为准(建库即锁定),否则查询分词与索引分词不一致会静默漏召回。
-    state.stopwords_enabled = manifest.stopwords;
-    state.index_fields_max = options.tuning.field_dict_max as usize;
-    state.bloom_fpp = options.tuning.bloom_fpp;
-    state.zones = Arc::new(ZoneIndex::new(options.tuning.field_dict_max as usize));
-    state.key_bloom = Arc::new(BloomSet::new(
-        BLOOM_INITIAL_CAPACITY,
-        options.tuning.bloom_fpp,
-    ));
+    prepare_rebuild_structures(&mut state, manifest, options);
     let segments =
         manifest_io::read_segment_bytes(root, manifest, options.fail_fast_on_corruption)?;
     let recovered = recover::load_segments(
@@ -301,65 +292,121 @@ fn load_write_state(
         options.fail_fast_on_corruption,
     )?;
     move_skipped_segments_to_trash(root, &recovered.skipped, options.read_only)?;
-    // 载入各段 hidx 并安装为多段索引(索引是优化:损坏时降级暴力,`check()` 报告)。
     if let Some(factory) = options.index_factory.as_ref() {
-        let mut indexes = Vec::new();
-        for segment in &segments {
-            if recovered.skipped.contains(&segment.segment_id) {
-                continue;
-            }
-            let Some(remap) = recovered
-                .remaps
-                .iter()
-                .find(|remap| remap.segment_id == segment.segment_id)
-            else {
-                continue;
-            };
-            let Some(hidx) = segment.hidx.as_ref() else {
-                continue;
-            };
-            match load_index(
+        state.indexes = load_hidx_indexes(
+            &state,
+            &HidxxLoadInput {
+                segments: &segments,
+                recovered: &recovered,
+                options,
                 factory,
-                hidx,
-                SlotRemap {
-                    state: &state,
-                    remap: &remap.remap,
-                },
-                manifest.metric,
-            ) {
-                Ok(index) => {
-                    let slots: Vec<SlotId> = remap
-                        .remap
-                        .iter()
-                        .map(|&global| SlotId::new(global))
-                        .collect();
-                    indexes.push(crate::memory::index::SegmentIndex::new(
-                        segment.segment_id,
-                        index,
-                        slots,
-                    ));
-                }
-                Err(error) if options.fail_fast_on_corruption => return Err(error),
-                // reason: 索引是查询加速器而非数据来源;hidx 损坏时降级为暴力扫描仍然
-                // 正确,`db.check()` 会校验 hidx 字节并报告损坏;节点数不匹配的降级可由
-                // `stats().segments[*].index_nodes == 0` 观测,绝不静默丢数据。
-                Err(_) => {}
-            }
-        }
-        state.indexes = Arc::new(indexes);
+                metric: manifest.metric,
+            },
+        )?;
     }
-    // 回放全部 WAL 文件(仅 seqno > watermark),并在可写打开时截断最后一个文件的撕裂尾部。
+    replay_all_wal(&mut state, root, manifest, options)?;
+    Ok(state)
+}
+
+/// 初始化恢复期重建加速结构所需的配置口径。
+///
+/// 必须与建库配置同口径(分词/字段上限/bloom 误判率):停用词开关以 MANIFEST 为准
+/// (建库即锁定),否则查询分词与索引分词不一致会静默漏召回。
+fn prepare_rebuild_structures(state: &mut WriterState, manifest: &Manifest, options: &OpenOptions) {
+    state.stopwords_enabled = manifest.stopwords;
+    state.index_fields_max = options.tuning.field_dict_max as usize;
+    state.bloom_fpp = options.tuning.bloom_fpp;
+    state.zones = Arc::new(ZoneIndex::new(options.tuning.field_dict_max as usize));
+    state.key_bloom = Arc::new(BloomSet::new(
+        BLOOM_INITIAL_CAPACITY,
+        options.tuning.bloom_fpp,
+    ));
+}
+
+/// [`load_hidx_indexes`] 的输入(参数收敛)。
+struct HidxxLoadInput<'a> {
+    /// 各段字节(含可选 hidx)。
+    segments: &'a [recover::SegmentBytes],
+    /// 恢复结果(重排映射与跳过段)。
+    recovered: &'a recover::RecoveredSegments,
+    /// 打开选项(fail-fast 等)。
+    options: &'a OpenOptions,
+    /// 图构建工厂。
+    factory: &'a Arc<dyn IndexFactory>,
+    /// 距离度量。
+    metric: Metric,
+}
+
+/// 载入各段 hidx 并安装为多段索引(索引是优化:损坏时降级暴力,`check()` 报告)。
+fn load_hidx_indexes(
+    state: &WriterState,
+    input: &HidxxLoadInput<'_>,
+) -> Result<Arc<Vec<crate::memory::index::SegmentIndex>>> {
+    let mut indexes = Vec::new();
+    for segment in input.segments {
+        if input.recovered.skipped.contains(&segment.segment_id) {
+            continue;
+        }
+        let Some(remap) = input
+            .recovered
+            .remaps
+            .iter()
+            .find(|remap| remap.segment_id == segment.segment_id)
+        else {
+            continue;
+        };
+        let Some(hidx) = segment.hidx.as_ref() else {
+            continue;
+        };
+        match load_index(
+            input.factory,
+            hidx,
+            SlotRemap {
+                state,
+                remap: &remap.remap,
+            },
+            input.metric,
+        ) {
+            Ok(index) => {
+                let slots: Vec<SlotId> = remap
+                    .remap
+                    .iter()
+                    .map(|&global| SlotId::new(global))
+                    .collect();
+                indexes.push(crate::memory::index::SegmentIndex::new(
+                    segment.segment_id,
+                    index,
+                    slots,
+                ));
+            }
+            Err(error) if input.options.fail_fast_on_corruption => return Err(error),
+            // reason: 索引是查询加速器而非数据来源;hidx 损坏时降级为暴力扫描仍然
+            // 正确,`db.check()` 会校验 hidx 字节并报告损坏;节点数不匹配的降级可由
+            // `stats().segments[*].index_nodes == 0` 观测,绝不静默丢数据。
+            Err(_) => {}
+        }
+    }
+    Ok(Arc::new(indexes))
+}
+
+/// 回放全部 WAL 文件(仅 seqno > watermark),并截断最后一个文件的撕裂尾部。
+fn replay_all_wal(
+    state: &mut WriterState,
+    root: &Path,
+    manifest: &Manifest,
+    options: &OpenOptions,
+) -> Result<()> {
     let wal_files = wal_writer::wal_files(root)?;
     for (position, rel) in wal_files.iter().enumerate() {
         let bytes = storage::read_file(root, rel)?;
-        let valid_len = recover::replay_wal(&mut state, &bytes, manifest.watermark_seqno)?;
+        let valid_len = recover::replay_wal(state, &bytes, manifest.watermark_seqno)?;
         // 撕裂帧之后的字节会永久屏蔽后续追加,必须物理截断后再复用该 WAL;
         // 只有最后一个文件可能带撕裂尾(轮转前该文件已完整 fsync)。
         if position + 1 == wal_files.len() && !options.read_only && valid_len < bytes.len() {
             storage::truncate(root, rel, valid_len as u64)?;
         }
     }
-    Ok(state)
+    Ok(())
 }
 
 /// 把被隔离的损坏段三件套移入 `trash/`(只读打开不动文件系统)。

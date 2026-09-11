@@ -150,13 +150,23 @@ fn commit_recovered_slot(
 
 /// 从单个段的 relations 区重建关系边(出边 + 入边)。
 ///
+/// 全量段(`FLAG_FULL`,或旧格式版本段)先重置关系表再应用;增量段仅 upsert,
+/// 其后由 delta 区施加关系变更。全量语义保证 compaction 后旧段的已删除边不会
+/// 因并集而"复活"(设计 04 §2.2b、FC-MODEL-POST-007)。
+///
 /// `RelationIndex::Both` 的段带反向表:入边由反向表 + 正向表并集恢复
-/// (并集对损坏文件更稳健,upsert 幂等;设计 04 §2.2b、FC-MODEL-POST-007)。
+/// (并集对损坏文件更稳健,upsert 幂等)。
 pub(super) fn apply_relations(
     state: &mut WriterState,
     msec_view: &msec::MsecView<'_>,
 ) -> Result<()> {
     let edges = crate::persist::edges::parse(msec_view.relations_bytes())?;
+    // 旧版本段(L2 全量快照时代)没有全量标志,一律按全量处理。
+    let full = msec_view.format_version() < crate::persist::FULL_RELATIONS_VERSION || edges.full;
+    if full {
+        state.out_edges = Arc::new(std::collections::HashMap::new());
+        state.in_edges = Arc::new(std::collections::HashMap::new());
+    }
     let build = |edge: &crate::persist::edges::EdgeData| Edge {
         from: RowId::new(edge.from),
         to: RowId::new(edge.to),
@@ -181,58 +191,68 @@ pub(super) fn apply_relations(
 /// 计数虚高(FC-PERSIST-POST-010)。关系边是操作语义(upsert/remove),不参与该判定。
 pub(super) fn apply_delta(state: &mut WriterState, msec_view: &msec::MsecView<'_>) -> Result<()> {
     for entry in msec::decode_delta(msec_view.delta_bytes())? {
-        match entry {
-            msec::DeltaEntry::Access {
-                seqno,
-                rowid,
-                last_access_ms,
-                access_delta,
-                ..
-            } => {
-                if superseded_by_latest_version(state, rowid, seqno) {
-                    continue;
-                }
-                let stat = Arc::make_mut(&mut state.access)
-                    .entry(RowId::new(rowid))
-                    .or_default();
-                stat.access_count = stat.access_count.saturating_add(access_delta);
-                stat.last_access_ms = last_access_ms;
-            }
-            msec::DeltaEntry::Relate {
-                from,
-                to,
-                kind,
-                weight,
-                meta,
-                ..
-            } => {
-                let edge = Edge {
-                    from: RowId::new(from),
-                    to: RowId::new(to),
-                    kind: RelationKind(kind),
-                    weight,
-                    metadata: meta,
-                };
-                relation::upsert_edge(Arc::make_mut(&mut state.out_edges), edge.clone());
-                relation::upsert_edge(Arc::make_mut(&mut state.in_edges), edge);
-            }
-            msec::DeltaEntry::Unrelate { from, to, kind, .. } => {
-                relation::remove_edge(
-                    Arc::make_mut(&mut state.out_edges),
-                    RowId::new(from),
-                    RowId::new(to),
-                    RelationKind(kind),
-                );
-                relation::remove_edge(
-                    Arc::make_mut(&mut state.in_edges),
-                    RowId::new(to),
-                    RowId::new(from),
-                    RelationKind(kind),
-                );
-            }
-        }
+        apply_delta_entry(state, entry);
     }
     Ok(())
+}
+
+/// 应用单条 delta 条目。
+fn apply_delta_entry(state: &mut WriterState, entry: msec::DeltaEntry) {
+    match entry {
+        msec::DeltaEntry::Access {
+            seqno,
+            rowid,
+            last_access_ms,
+            access_delta,
+            ..
+        } => {
+            if superseded_by_latest_version(state, rowid, seqno) {
+                return;
+            }
+            let stat = Arc::make_mut(&mut state.access)
+                .entry(RowId::new(rowid))
+                .or_default();
+            stat.access_count = stat.access_count.saturating_add(access_delta);
+            stat.last_access_ms = last_access_ms;
+        }
+        msec::DeltaEntry::Relate {
+            from,
+            to,
+            kind,
+            weight,
+            meta,
+            ..
+        } => {
+            let edge = Edge {
+                from: RowId::new(from),
+                to: RowId::new(to),
+                kind: RelationKind(kind),
+                weight,
+                metadata: meta,
+            };
+            relation::upsert_edge(Arc::make_mut(&mut state.out_edges), edge.clone());
+            relation::upsert_edge(Arc::make_mut(&mut state.in_edges), edge);
+        }
+        msec::DeltaEntry::Unrelate { from, to, kind, .. } => {
+            apply_unrelate_delta(state, from, to, kind);
+        }
+    }
+}
+
+/// 应用 `Unrelate` delta:移除出边与入边。
+fn apply_unrelate_delta(state: &mut WriterState, from: u64, to: u64, kind: u16) {
+    relation::remove_edge(
+        Arc::make_mut(&mut state.out_edges),
+        RowId::new(from),
+        RowId::new(to),
+        RelationKind(kind),
+    );
+    relation::remove_edge(
+        Arc::make_mut(&mut state.in_edges),
+        RowId::new(to),
+        RowId::new(from),
+        RelationKind(kind),
+    );
 }
 
 /// `Access` delta 是否已被该 RowId 更晚的版本行覆盖。

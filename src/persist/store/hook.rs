@@ -50,7 +50,7 @@ impl PersistHook for Store {
             return Ok(());
         }
         let limit = config.compaction.wal_bytes;
-        // L2 兜底:WAL 达到上限即全量快照 flush,保证 WAL 有界(I4)。
+        // 容量兜底:WAL 达上限即触发增量段 flush,保证 WAL 有界(I4)。
         if limit > 0 && self.wal_bytes() >= limit {
             self.flush(ws, config)?;
         }
@@ -93,8 +93,8 @@ fn append_transaction(wal: &mut WalWriter, ops: &[WriteOp], batch_count: u32) ->
 /// 取写操作的 `(seqno, 帧类型)`。
 fn op_dispatch(op: &WriteOp) -> (u64, FrameKind) {
     match op {
-        WriteOp::NsRegister { .. } => (0, FrameKind::NsRegister),
-        WriteOp::NsUnregister { .. } => (0, FrameKind::NsUnregister),
+        WriteOp::NsRegister { seqno, .. } => (seqno.get(), FrameKind::NsRegister),
+        WriteOp::NsUnregister { seqno, .. } => (seqno.get(), FrameKind::NsUnregister),
         WriteOp::Insert { slot } => (slot.seqno.get(), FrameKind::Insert),
         WriteOp::DeleteRow { seqno, .. } => (seqno.get(), FrameKind::DeleteRow),
         WriteOp::Access { seqno, .. } => (seqno.get(), FrameKind::TouchRow),
@@ -106,8 +106,8 @@ fn op_dispatch(op: &WriteOp) -> (u64, FrameKind) {
 /// 编码写操作的 WAL 负载。
 fn op_payload(op: &WriteOp) -> Result<Vec<u8>> {
     Ok(match op {
-        WriteOp::NsRegister { ns_id, path } => wal::encode_ns_register(*ns_id, path),
-        WriteOp::NsUnregister { ns_id } => wal::encode_ns_unregister(*ns_id),
+        WriteOp::NsRegister { ns_id, path, .. } => wal::encode_ns_register(*ns_id, path),
+        WriteOp::NsUnregister { ns_id, .. } => wal::encode_ns_unregister(*ns_id),
         WriteOp::Insert { slot } => {
             let entry = entry_from_slot(slot);
             wal::encode_insert(&entry, &slot.vector, slot.tx_ms)?

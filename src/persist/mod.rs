@@ -42,6 +42,6 @@ pub(crate) mod vsec;
 pub(crate) mod wal;
 
 pub(crate) use codec::{
-    Cursor, FORMAT_VERSION, align_up, check_version, crc32, put_bytes_u32, put_i64, put_u16,
-    put_u32, put_u64,
+    Cursor, FORMAT_VERSION, FULL_RELATIONS_VERSION, align_up, check_version, crc32, put_bytes_u32,
+    put_i64, put_u16, put_u32, put_u64,
 };

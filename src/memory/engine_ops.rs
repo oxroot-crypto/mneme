@@ -213,19 +213,24 @@ fn check_key_index(view: &ReaderView, suggestions: &mut Vec<String>) -> bool {
 }
 
 /// 运维建议:死比率超线的段与可合并段数(仅提示,不影响 `ok`)。
+///
+/// 死比率建议仅在 `history_horizon` 有限时给出——默认 `None` 时没有任何版本
+/// 可回收,给"建议合并回收"会与实际触发口径矛盾(FC-LIFE-POST-009)。
 fn append_fsck_suggestions(
     engine: &Mneme,
     view: &ReaderView,
     now: i64,
     suggestions: &mut Vec<String>,
 ) {
-    let ratios = dead_ratios(view, now);
-    for (id, ratio) in &ratios {
-        if *ratio > engine.config.compaction.dead_ratio {
-            suggestions.push(format!(
-                "段 {id} 墓碑/过期占比 {:.0}%,建议合并回收",
-                ratio * 100.0
-            ));
+    if engine.config.compaction.history_horizon.is_some() {
+        let ratios = dead_ratios(view, now);
+        for (id, ratio) in &ratios {
+            if *ratio > engine.config.compaction.dead_ratio {
+                suggestions.push(format!(
+                    "段 {id} 墓碑/过期占比 {:.0}%,建议合并回收",
+                    ratio * 100.0
+                ));
+            }
         }
     }
     if let Some(store) = &engine.store {
@@ -317,17 +322,7 @@ impl Mneme {
         store: &Arc<crate::persist::store::Store>,
     ) -> Result<()> {
         let now_ms = self.config.clock.now_unix_ms();
-        let manifest = store.manifest_snapshot();
-        let infos: Vec<SegmentInfo> = manifest
-            .segments
-            .iter()
-            .map(|segment| SegmentInfo {
-                id: segment.segment_id,
-                rows: segment.row_count,
-            })
-            .collect();
-        let dead = compact::segment_dead_ratios(ws, now_ms, self.config.compaction.history_horizon);
-        let Some(plan) = compact::plan(&infos, &dead, &self.config.compaction) else {
+        let Some(plan) = self.plan_compaction(ws, store, now_ms) else {
             return Ok(());
         };
         self.control
@@ -350,15 +345,7 @@ impl Mneme {
                 Ok(())
             }
             Ok(true) => {
-                // 提交成功后才剪除已回收版本并同步内存统计。
-                ws.prune_reclaimed(&survivors.reclaim);
-                ws.note_reclaimed(survivors.reclaim.len());
-                for &index in &survivors.keep {
-                    let rowid = ws.slots[index].rowid;
-                    Arc::make_mut(&mut ws.access_dirty).remove(&rowid);
-                }
-                self.table.publish(ws);
-                self.control.mark_idle();
+                self.finish_compaction(ws, &survivors);
                 Ok(())
             }
             Err(error) => {
@@ -366,5 +353,48 @@ impl Mneme {
                 Err(error)
             }
         }
+    }
+
+    /// 由当前 MANIFEST 与写状态选出本轮合并计划;无触发条件时 `None`。
+    fn plan_compaction(
+        &self,
+        ws: &WriterState,
+        store: &Arc<crate::persist::store::Store>,
+        now_ms: i64,
+    ) -> Option<crate::memory::ops::CompactionPlan> {
+        let manifest = store.manifest_snapshot();
+        let infos: Vec<SegmentInfo> = manifest
+            .segments
+            .iter()
+            .map(|segment| SegmentInfo {
+                id: segment.segment_id,
+                rows: segment.row_count,
+            })
+            .collect();
+        let dead = compact::segment_dead_ratios(ws, now_ms, self.config.compaction.history_horizon);
+        compact::plan(&infos, &dead, &self.config.compaction)
+    }
+
+    /// 提交成功后的收尾:剪除已回收版本、同步内存统计并发布视图。
+    fn finish_compaction(&self, ws: &mut WriterState, survivors: &compact::SurvivorSet) {
+        ws.prune_reclaimed(&survivors.reclaim);
+        ws.note_reclaimed(survivors.reclaim.len());
+        for &index in &survivors.keep {
+            let rowid = ws.slots[index].rowid;
+            // 只有该 RowId 的**最新版本**本次被物化(版本行的 access 是累计快照)
+            // 才能清 dirty;仅历史版本入段时,增量必须留给下一段 delta,否则访问
+            // 计数丢失(FC-PERSIST-POST-010)。
+            let latest_materialized = ws.latest.get(&rowid).is_some_and(|latest| {
+                survivors
+                    .keep
+                    .binary_search(&(latest.get() as usize))
+                    .is_ok()
+            });
+            if latest_materialized {
+                Arc::make_mut(&mut ws.access_dirty).remove(&rowid);
+            }
+        }
+        self.table.publish(ws);
+        self.control.mark_idle();
     }
 }

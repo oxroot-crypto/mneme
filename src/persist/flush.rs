@@ -83,7 +83,8 @@ pub(crate) fn build_segment(
         Vec::new()
     };
     let write_reverse = config.relation_index == crate::core::options::RelationIndex::Both;
-    let relations_bytes = crate::persist::edges::encode(&relations, write_reverse)?;
+    let relations_bytes =
+        crate::persist::edges::encode(&relations, write_reverse, input.full_relations)?;
     let indexes = build_indexes(ws, config, input.slots)?;
     let delta_bytes = msec::encode_delta(input.delta)?;
     let msec_bytes = msec::encode(&MsecInput {
@@ -123,6 +124,20 @@ pub(crate) fn build_delta(
         in_segment.set(idx);
     }
     let mut entries = Vec::new();
+    collect_access_deltas(ws, &in_segment, now_ms, &mut entries);
+    if !full_relations {
+        collect_edge_deltas(ws, now_ms, &mut entries);
+    }
+    entries
+}
+
+/// 访问增量条目:最新版本随本段物化时跳过(记录体已携带统计)。
+fn collect_access_deltas(
+    ws: &WriterState,
+    in_segment: &BitSet,
+    now_ms: i64,
+    entries: &mut Vec<DeltaEntry>,
+) {
     for (&rowid, &access_delta) in ws.access_dirty.iter() {
         // 最新版本随本段落盘时,记录体的 access 列已携带最新统计。
         if let Some(latest) = ws.latest.get(&rowid)
@@ -131,10 +146,7 @@ pub(crate) fn build_delta(
             continue;
         }
         let stat = ws.access.get(&rowid).copied().unwrap_or_default();
-        let ns_id = ws
-            .latest
-            .get(&rowid)
-            .map_or(0, |slot| ws.slots[slot.get() as usize].ns_id.get());
+        let ns_id = ns_of(ws, rowid);
         entries.push(DeltaEntry::Access {
             seqno: ws.seqno.get(),
             tx_ms: now_ms,
@@ -145,40 +157,45 @@ pub(crate) fn build_delta(
             importance_delta: 0.0,
         });
     }
-    if !full_relations {
-        for &(from, to, kind) in ws.edge_dirty.iter() {
-            let edge = ws.out_edges.get(&from).and_then(|edges| {
-                edges
-                    .iter()
-                    .find(|edge| edge.to == to && edge.kind.0 == kind)
-            });
-            let ns_id = ws
-                .latest
-                .get(&from)
-                .map_or(0, |slot| ws.slots[slot.get() as usize].ns_id.get());
-            entries.push(match edge {
-                Some(edge) => DeltaEntry::Relate {
-                    seqno: ws.seqno.get(),
-                    tx_ms: now_ms,
-                    ns_id,
-                    from: from.get(),
-                    to: to.get(),
-                    kind,
-                    weight: edge.weight,
-                    meta: edge.metadata.clone(),
-                },
-                None => DeltaEntry::Unrelate {
-                    seqno: ws.seqno.get(),
-                    tx_ms: now_ms,
-                    ns_id,
-                    from: from.get(),
-                    to: to.get(),
-                    kind,
-                },
-            });
-        }
+}
+
+/// 关系净变更条目(全量重写关系表时不需要)。
+fn collect_edge_deltas(ws: &WriterState, now_ms: i64, entries: &mut Vec<DeltaEntry>) {
+    for &(from, to, kind) in ws.edge_dirty.iter() {
+        let edge = ws.out_edges.get(&from).and_then(|edges| {
+            edges
+                .iter()
+                .find(|edge| edge.to == to && edge.kind.0 == kind)
+        });
+        let ns_id = ns_of(ws, from);
+        entries.push(match edge {
+            Some(edge) => DeltaEntry::Relate {
+                seqno: ws.seqno.get(),
+                tx_ms: now_ms,
+                ns_id,
+                from: from.get(),
+                to: to.get(),
+                kind,
+                weight: edge.weight,
+                meta: edge.metadata.clone(),
+            },
+            None => DeltaEntry::Unrelate {
+                seqno: ws.seqno.get(),
+                tx_ms: now_ms,
+                ns_id,
+                from: from.get(),
+                to: to.get(),
+                kind,
+            },
+        });
     }
-    entries
+}
+
+/// 该 RowId 最新版本所属命名空间;不存在时为 0。
+fn ns_of(ws: &WriterState, rowid: crate::core::types::RowId) -> u32 {
+    ws.latest
+        .get(&rowid)
+        .map_or(0, |slot| ws.slots[slot.get() as usize].ns_id.get())
 }
 
 /// 由本次物化的槽位构建局部 zone map / bloom / 倒排在段内局部编号上编码。
@@ -194,6 +211,31 @@ fn build_indexes(
     included: &[usize],
 ) -> Result<SegmentIndexBlobs> {
     let max_fields = (config.tuning.field_dict_max as usize).max(1);
+    let IndexFields {
+        fields,
+        key_field_id,
+    } = index_fields(ws, max_fields)?;
+    let local = observe_included(ws, config, max_fields, included);
+    let mut zmap = msec::encode_zmap(&local.zones, &fields, local.block_count);
+    zmap.extend_from_slice(&msec::encode_ttl_map(&local.min_expires));
+    Ok(SegmentIndexBlobs {
+        field_dict: msec::encode_field_dict(&fields),
+        zmap,
+        bloom: msec::encode_bloom(&local.bloom, key_field_id),
+        inverted: msec::encode_inverted(&local.inv)?,
+    })
+}
+
+/// 字段字典条目与 bloom 字段编号。
+struct IndexFields {
+    /// 字段定义 `(名称, 类型)`,按名称排序。
+    fields: Vec<(Arc<str>, FieldKind)>,
+    /// `key` 字段编号(bloom 使用)。
+    key_field_id: u16,
+}
+
+/// 字段字典条目与 bloom 字段编号(给 `key` 保留唯一槽位)。
+fn index_fields(ws: &WriterState, max_fields: usize) -> Result<IndexFields> {
     let mut fields: Vec<(Arc<str>, FieldKind)> = ws
         .zones
         .fields_iter()
@@ -212,44 +254,60 @@ fn build_indexes(
             got: fields.len(),
         }
     })?;
+    Ok(IndexFields {
+        fields,
+        key_field_id,
+    })
+}
 
+/// 段内局部索引观察结果。
+struct LocalIndexes {
+    zones: ZoneIndex,
+    bloom: BloomSet,
+    inv: InvertedIndex,
+    min_expires: Vec<i64>,
+    block_count: usize,
+}
+
+/// 在本段局部槽位编号上观察 zone map / bloom / 倒排与 TTL 块最小值。
+fn observe_included(
+    ws: &WriterState,
+    config: &Config,
+    max_fields: usize,
+    included: &[usize],
+) -> LocalIndexes {
     let block_count = included.len().div_ceil(ZONE_BLOCK_ROWS);
-    let mut local_zones = ZoneIndex::new(max_fields);
-    let mut local_bloom = BloomSet::new(BLOOM_INITIAL_CAPACITY, config.tuning.bloom_fpp);
-    let mut local_inv = InvertedIndex::default();
-    let mut min_expires = vec![i64::MAX; block_count];
-    for (local, &idx) in included.iter().enumerate() {
+    let mut local = LocalIndexes {
+        zones: ZoneIndex::new(max_fields),
+        bloom: BloomSet::new(BLOOM_INITIAL_CAPACITY, config.tuning.bloom_fpp),
+        inv: InvertedIndex::default(),
+        min_expires: vec![i64::MAX; block_count],
+        block_count,
+    };
+    for (local_slot, &idx) in included.iter().enumerate() {
         let slot_data = &ws.slots[idx];
         if slot_data.deleted {
             continue;
         }
-        local_zones.observe(local, slot_data);
+        local.zones.observe(local_slot, slot_data);
         if let Some(text) = &slot_data.text {
-            local_inv.insert_text(
-                SlotId::new(local as u32),
+            local.inv.insert_text(
+                SlotId::new(local_slot as u32),
                 slot_data.ns_id,
                 text,
                 ws.stopwords_enabled,
             );
         }
         if let Some(key) = &slot_data.key {
-            local_bloom.insert(key.as_str());
+            local.bloom.insert(key.as_str());
         }
         // TTL 块级剪枝:块内 min(expires_at),无 TTL 行记 +∞。
         if let Some(expires) = slot_data.expires_at {
-            let block = local / ZONE_BLOCK_ROWS;
-            min_expires[block] = min_expires[block].min(expires);
+            let block = local_slot / ZONE_BLOCK_ROWS;
+            local.min_expires[block] = local.min_expires[block].min(expires);
         }
     }
-    let mut zmap = msec::encode_zmap(&local_zones, &fields, block_count);
-    zmap.extend_from_slice(&msec::encode_ttl_map(&min_expires));
-
-    Ok(SegmentIndexBlobs {
-        field_dict: msec::encode_field_dict(&fields),
-        zmap,
-        bloom: msec::encode_bloom(&local_bloom, key_field_id),
-        inverted: msec::encode_inverted(&local_inv)?,
-    })
+    local
 }
 
 /// 一次段索引编码的产物(四个区字节)。
@@ -346,10 +404,10 @@ fn entry_body(slot: &SlotData, ws: &WriterState) -> Option<EntryData> {
     if slot.deleted {
         return None;
     }
-    let access = ws
-        .access
-        .get(&slot.rowid)
-        .map(|stat| (stat.last_access_ms, stat.access_count));
+    // 访问统计**始终**写出(缺省 0):版本行的 `access` 列是写入时刻的累计快照,
+    // 缺失会让恢复按"未携带"跳过覆盖,把更旧版本的值留在表里,delta 再累加即
+    // 重复计数(FC-PERSIST-POST-010)。写 0 明确表示"该版本时点为 0 次"。
+    let stat = ws.access.get(&slot.rowid).copied().unwrap_or_default();
     Some(EntryData {
         rowid: slot.rowid,
         seqno: slot.seqno,
@@ -360,7 +418,7 @@ fn entry_body(slot: &SlotData, ws: &WriterState) -> Option<EntryData> {
         created_at_ms: slot.created_at,
         expires_at_ms: slot.expires_at,
         importance: Some(slot.importance),
-        access,
+        access: Some((stat.last_access_ms, stat.access_count)),
         valid_time: Some((slot.valid_from, slot.valid_to)),
         confidence: Some(slot.confidence),
         provenance: slot.provenance.clone(),

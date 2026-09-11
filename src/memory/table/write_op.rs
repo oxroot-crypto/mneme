@@ -21,11 +21,15 @@ pub(crate) enum WriteOp {
         ns_id: u32,
         /// 命名空间路径。
         path: Arc<str>,
+        /// 版本序号(metadata 帧也参与水位判定,防止残留旧 WAL 复活注册表)。
+        seqno: SeqNo,
     },
     /// 命名空间注销(路径删除后其 `NsId` 作废、永不复用)。
     NsUnregister {
         /// 被注销的命名空间编号。
         ns_id: u32,
+        /// 版本序号(metadata 帧也参与水位判定)。
+        seqno: SeqNo,
     },
     /// 提交一个新物理版本(记录体)。
     Insert {

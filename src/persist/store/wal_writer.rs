@@ -91,64 +91,9 @@ impl WalWriter {
     pub(super) fn open_or_create(root: &Path, config: WalConfig) -> Result<Self> {
         let files = wal_files(root)?;
         if config.read_only {
-            // 只读实例不建目录、不创建文件;WAL 不存在时仅不持有句柄。
-            let file = match files.last() {
-                Some(rel) => Some(
-                    std::fs::OpenOptions::new()
-                        .read(true)
-                        .open(storage::resolve(root, rel)?)?,
-                ),
-                None => None,
-            };
-            let active_index = files
-                .last()
-                .and_then(|rel| wal_index_of(rel.rsplit('/').next().unwrap_or(rel)))
-                .unwrap_or(0);
-            return Ok(Self::from_parts(
-                root.to_path_buf(),
-                file,
-                active_index,
-                config,
-            ));
+            return open_read_only(root, &files, config);
         }
-
-        storage::ensure_dir(&root.join(WAL_DIR))?;
-        let Some(rel) = files.last() else {
-            return create_new(&storage::resolve(root, WAL_FILE)?, 1, config);
-        };
-        let path = storage::resolve(root, rel)?;
-        let index = wal_index_of(rel.rsplit('/').next().unwrap_or(rel)).unwrap_or(1);
-        let bytes = storage::read_file(root, rel)?;
-        let header = if bytes.len() >= wal::FILE_HEADER_LEN {
-            wal::parse_file_header(&bytes).ok()
-        } else {
-            None
-        };
-        match header {
-            Some(header)
-                if header.dimension != config.dimension || header.metric != config.metric =>
-            {
-                Err(MnemeError::Corrupted {
-                    segment: None,
-                    reason: "WAL 头维度/度量与 MANIFEST 不符".to_string(),
-                })
-            }
-            Some(_) => {
-                // 以 `write`(而非 `append`)打开:Windows 下 append-only 句柄缺少
-                // FILE_WRITE_DATA,`set_len`(Checkpoint 重置)会被拒绝。
-                let mut file = std::fs::OpenOptions::new().write(true).open(&path)?;
-                use std::io::{Seek, SeekFrom};
-                file.seek(SeekFrom::End(0))?;
-                Ok(Self::from_parts(
-                    root.to_path_buf(),
-                    Some(file),
-                    index,
-                    config,
-                ))
-            }
-            // 短头/损坏头(Checkpoint 中途崩溃):原地重建,后续帧本就不完整。
-            None => create_new(&path, index, config),
-        }
+        open_writable(root, &files, config)
     }
 
     /// 由文件句柄与配置组装写入器。
@@ -246,7 +191,7 @@ impl WalWriter {
         }
         let next = self.active_index.saturating_add(1);
         let path = storage::resolve(&self.root, &wal_name(next))?;
-        create_new(
+        create_truncating(
             &path,
             next,
             WalConfig {
@@ -350,7 +295,7 @@ impl WalWriter {
     /// 重置失败后的兜底:截断重建当前活动文件(写新头 + fsync)。
     fn recreate(&mut self) -> Result<()> {
         let path = storage::resolve(&self.root, &self.active_rel())?;
-        let writer = create_new(
+        let writer = create_truncating(
             &path,
             self.active_index,
             WalConfig {
@@ -367,8 +312,72 @@ impl WalWriter {
     }
 }
 
-/// 新建 WAL:写文件头并 fsync。
-fn create_new(path: &Path, index: u32, config: WalConfig) -> Result<WalWriter> {
+/// 只读打开:仅只读句柄、不创建文件;WAL 不存在时 `file = None`。
+fn open_read_only(root: &Path, files: &[String], config: WalConfig) -> Result<WalWriter> {
+    let file = match files.last() {
+        Some(rel) => Some(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .open(storage::resolve(root, rel)?)?,
+        ),
+        None => None,
+    };
+    let active_index = files
+        .last()
+        .and_then(|rel| wal_index_of(rel.rsplit('/').next().unwrap_or(rel)))
+        .unwrap_or(0);
+    Ok(WalWriter::from_parts(
+        root.to_path_buf(),
+        file,
+        active_index,
+        config,
+    ))
+}
+
+/// 可写打开:确保目录、校验/重建文件头并定位活动文件。
+fn open_writable(root: &Path, files: &[String], config: WalConfig) -> Result<WalWriter> {
+    storage::ensure_dir(&root.join(WAL_DIR))?;
+    let Some(rel) = files.last() else {
+        return create_truncating(&storage::resolve(root, WAL_FILE)?, 1, config);
+    };
+    let path = storage::resolve(root, rel)?;
+    let index = wal_index_of(rel.rsplit('/').next().unwrap_or(rel)).unwrap_or(1);
+    let bytes = storage::read_file(root, rel)?;
+    let header = if bytes.len() >= wal::FILE_HEADER_LEN {
+        wal::parse_file_header(&bytes).ok()
+    } else {
+        None
+    };
+    match header {
+        Some(header) if header.dimension != config.dimension || header.metric != config.metric => {
+            Err(MnemeError::Corrupted {
+                segment: None,
+                reason: "WAL 头维度/度量与 MANIFEST 不符".to_string(),
+            })
+        }
+        Some(_) => {
+            // 以 `write`(而非 `append`)打开:Windows 下 append-only 句柄缺少
+            // FILE_WRITE_DATA,`set_len`(Checkpoint 重置)会被拒绝。
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path)?;
+            use std::io::{Seek, SeekFrom};
+            file.seek(SeekFrom::End(0))?;
+            Ok(WalWriter::from_parts(
+                root.to_path_buf(),
+                Some(file),
+                index,
+                config,
+            ))
+        }
+        // 短头/损坏头(Checkpoint 中途崩溃):原地重建,后续帧本就不完整。
+        None => create_truncating(&path, index, config),
+    }
+}
+
+/// 以截断方式新建/重建 WAL:写文件头并 fsync。
+///
+/// 名为「truncating」是因为实现用 `File::create` **覆盖**既有文件;调用场景
+/// (首次创建、短头重建、重置兜底)都需要覆盖语义。
+fn create_truncating(path: &Path, index: u32, config: WalConfig) -> Result<WalWriter> {
     let header = wal::encode_file_header(config.dimension, config.metric);
     let rel = wal_name(index);
     let root = path

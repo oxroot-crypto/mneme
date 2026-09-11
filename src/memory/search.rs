@@ -328,17 +328,11 @@ fn scan_parallel(params: &ScanParams<'_>) -> Result<TopK<(RowId, SlotId)>> {
         .chunk
         .max(params.candidates.len().div_ceil(params.threads));
     let partials = std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for part in params.candidates.chunks(chunk) {
-            handles.push(scope.spawn(move || {
-                let mut local = TopK::new(params.k, params.metric);
-                for &idx in part {
-                    let (rowid, slot, score) = score_slot(params, idx);
-                    local.push(score, (rowid, slot));
-                }
-                local
-            }));
-        }
+        let handles: Vec<_> = params
+            .candidates
+            .chunks(chunk)
+            .map(|part| scope.spawn(move || scan_chunk(params, part)))
+            .collect();
         handles
             .into_iter()
             .map(|handle| match handle.join() {
@@ -357,6 +351,16 @@ fn scan_parallel(params: &ScanParams<'_>) -> Result<TopK<(RowId, SlotId)>> {
         top.merge(partial);
     }
     Ok(top)
+}
+
+/// 对单个候选分片打分为局部 `TopK`。
+fn scan_chunk(params: &ScanParams<'_>, part: &[u32]) -> TopK<(RowId, SlotId)> {
+    let mut local = TopK::new(params.k, params.metric);
+    for &idx in part {
+        let (rowid, slot, score) = score_slot(params, idx);
+        local.push(score, (rowid, slot));
+    }
+    local
 }
 
 #[cfg(test)]

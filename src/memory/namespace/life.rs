@@ -187,15 +187,25 @@ impl Namespace {
                     target_path: &target_path,
                     now,
                 };
-                for cluster in clusters {
-                    if cluster.len() >= 2 {
-                        ctx.merge_cluster(&cluster, &mut report)?;
-                    }
-                }
+                merge_consolidation_clusters(&mut ctx, clusters, &mut report)?;
             }
             Ok(report)
         })
     }
+}
+
+/// 合并每个候选簇(仅成员 ≥ 2 的簇)。
+fn merge_consolidation_clusters(
+    ctx: &mut ConsolidationCtx<'_>,
+    clusters: Vec<Vec<usize>>,
+    report: &mut ConsolidateReport,
+) -> Result<()> {
+    for cluster in clusters {
+        if cluster.len() >= 2 {
+            ctx.merge_cluster(&cluster, report)?;
+        }
+    }
+    Ok(())
 }
 
 /// 收集低于保留分、且未被 `protect` 豁免的记录;返回 `(扫描数, 待遗忘 RowId)`。

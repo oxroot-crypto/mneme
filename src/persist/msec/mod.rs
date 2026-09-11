@@ -33,8 +33,8 @@ pub(crate) use delta::{DeltaEntry, decode_delta, encode_delta};
 pub(crate) use encode::{encode, encode_entry};
 pub(crate) use entry::entry_from_prefix;
 pub(crate) use index::{
-    FieldKind, decode_bloom, decode_field_dict, decode_ttl_map, encode_bloom, encode_field_dict,
-    encode_ttl_map, encode_zmap, validate_zmap,
+    FieldDef, FieldKind, decode_bloom, decode_field_dict, decode_ttl_map, encode_bloom,
+    encode_field_dict, encode_ttl_map, encode_zmap, validate_zmap,
 };
 pub(crate) use inverted::{decode_inverted, encode_inverted};
 

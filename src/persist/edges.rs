@@ -21,6 +21,9 @@ use crate::persist::{
 pub(crate) const MAGIC: [u8; 4] = *b"EDG1";
 /// 反向表存在标志。
 const FLAG_REVERSE: u16 = 1 << 0;
+/// 关系区为**全量快照**的标志:恢复时先重置关系表再应用(L5 次版本 4 起;
+/// 旧版本段无此位,一律按全量语义处理)。
+const FLAG_FULL: u16 = 1 << 1;
 /// 单条边的最小编码字节数:`from(8)+to(8)+kind(2)+weight(4)+meta 长度(4)`。
 /// 用于按剩余字节数为边数预分配设上界,避免损坏文件的大计数触发超额分配。
 const MIN_EDGE_BYTES: usize = 26;
@@ -40,12 +43,12 @@ pub(crate) struct EdgeData {
     pub(crate) meta: Meta,
 }
 
-/// 编码关系区;`reverse = true` 时追加反向邻接表。
+/// 编码关系区;`reverse = true` 时追加反向邻接表,`full = true` 时标记为全量快照。
 ///
 /// # Errors
 /// 正向/反向边数超过 `u32::MAX` 时返回 [`MnemeError::LimitExceeded`],绝不静默
 /// 截断计数(截断会让解析端把多余边判为尾部残留)。
-pub(crate) fn encode(edges: &[EdgeData], reverse: bool) -> Result<Vec<u8>> {
+pub(crate) fn encode(edges: &[EdgeData], reverse: bool, full: bool) -> Result<Vec<u8>> {
     let mut forward: Vec<&EdgeData> = edges.iter().collect();
     forward.sort_by_key(|edge| (edge.from, edge.kind, edge.to));
     let mut reverse_edges: Vec<&EdgeData> = Vec::new();
@@ -67,10 +70,17 @@ pub(crate) fn encode(edges: &[EdgeData], reverse: bool) -> Result<Vec<u8>> {
             got: reverse_edges.len(),
         })?;
 
+    let mut flags = 0_u16;
+    if reverse {
+        flags |= FLAG_REVERSE;
+    }
+    if full {
+        flags |= FLAG_FULL;
+    }
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
     put_u16(&mut out, FORMAT_VERSION);
-    put_u16(&mut out, if reverse { FLAG_REVERSE } else { 0 });
+    put_u16(&mut out, flags);
     put_u32(&mut out, forward_count);
     put_u32(&mut out, reverse_count);
     for edge in forward {
@@ -101,6 +111,8 @@ pub(crate) struct EdgeView {
     /// `RelationIndex::Both` 段写入;恢复时与正向表并集重建 `in_edges`
     /// (FC-MODEL-POST-007)。
     pub(crate) reverse: Vec<EdgeData>,
+    /// 是否为全量关系表(`FLAG_FULL`);恢复时应先重置关系表再应用。
+    pub(crate) full: bool,
 }
 
 /// 校验并解析关系区。
@@ -112,6 +124,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<EdgeView> {
         return Ok(EdgeView {
             forward: Vec::new(),
             reverse: Vec::new(),
+            full: false,
         });
     }
     let mut cursor = Cursor::new(bytes, "relations");
@@ -145,7 +158,11 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<EdgeView> {
             reason: "relations: 区尾有残留字节".to_string(),
         });
     }
-    Ok(EdgeView { forward, reverse })
+    Ok(EdgeView {
+        forward,
+        reverse,
+        full: flags & FLAG_FULL != 0,
+    })
 }
 
 /// 解码单条边。
@@ -184,7 +201,7 @@ mod tests {
     #[test]
     fn edges_roundtrip_with_reverse() {
         let edges = vec![edge(2, 1, 3), edge(1, 2, 0), edge(1, 3, 0)];
-        let bytes = encode(&edges, true).expect("encode");
+        let bytes = encode(&edges, true, true).expect("encode");
         let view = parse(&bytes).expect("parse");
         assert_eq!(view.forward.len(), 3);
         // 正向按 (from,kind,to):(1,0,2),(1,0,3),(2,3,1)。
@@ -207,7 +224,7 @@ mod tests {
     /// 魔数损坏被检出。
     #[test]
     fn edges_detects_bad_magic() {
-        let mut bytes = encode(&[edge(1, 2, 0)], false).expect("encode");
+        let mut bytes = encode(&[edge(1, 2, 0)], false, false).expect("encode");
         bytes[0] = b'X';
         assert!(matches!(parse(&bytes), Err(MnemeError::Corrupted { .. })));
     }
@@ -215,7 +232,7 @@ mod tests {
     /// FC-PERSIST-ERR-011(口径一致):区尾残留字节 → `Corrupted`,绝不静默忽略。
     #[test]
     fn edges_reject_trailing_bytes() {
-        let mut bytes = encode(&[edge(1, 2, 0)], false).expect("encode");
+        let mut bytes = encode(&[edge(1, 2, 0)], false, false).expect("encode");
         bytes.push(0xAB);
         assert!(matches!(parse(&bytes), Err(MnemeError::Corrupted { .. })));
     }

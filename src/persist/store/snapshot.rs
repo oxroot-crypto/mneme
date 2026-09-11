@@ -20,63 +20,44 @@ use crate::persist::{FORMAT_VERSION, crc32};
 use super::Store;
 use super::manifest_io;
 
-/// 备份 MANIFEST 所列段:同盘优先硬链接,失败(跨盘/文件系统不支持)回退复制。
-///
-/// `hardlinked` 初值为「有待备份段」;任一文件回退复制即置 `false`(设计 16 §7.1)。
-fn copy_manifest_segments(
-    root: &Path,
-    target: &Path,
-    manifest: &Manifest,
-    counts: &mut CopyCounts,
-    hardlinked: &mut bool,
-) -> Result<()> {
-    for segment in &manifest.segments {
-        // 被 MANIFEST 引用的段必须存在;缺失即备份不可信,绝不静默产出残档。
-        link_or_copy_required(
-            root,
-            target,
-            &format!("{SEGMENTS_DIR}/{}", vsec_name(segment.segment_id)),
-            counts,
-            hardlinked,
-        )?;
-        link_or_copy_required(
-            root,
-            target,
-            &format!("{SEGMENTS_DIR}/{}", msec_name(segment.segment_id)),
-            counts,
-            hardlinked,
-        )?;
-        if segment.hidx_crc != 0 {
-            link_or_copy_required(
-                root,
-                target,
-                &format!("{SEGMENTS_DIR}/{}", hidx_name(segment.segment_id)),
-                counts,
-                hardlinked,
-            )?;
-        }
-    }
-    Ok(())
+/// 备份复制目标与统计(参数收敛);硬链接失败即把 `hardlinked` 置 `false`。
+struct CopySink<'a> {
+    /// 源库根目录。
+    root: &'a Path,
+    /// 备份目标目录。
+    target: &'a Path,
+    /// 已复制文件数与字节数。
+    counts: CopyCounts,
+    /// 是否全部走硬链接。
+    hardlinked: bool,
 }
 
-/// 同盘硬链接一个必存段文件;硬链接失败时回退逐字节复制(并清 `hardlinked`)。
-fn link_or_copy_required(
-    root: &Path,
-    target: &Path,
-    rel: &str,
-    counts: &mut CopyCounts,
-    hardlinked: &mut bool,
-) -> Result<()> {
-    let source = storage::resolve(root, rel)?;
-    let destination = storage::resolve(target, rel)?;
-    if std::fs::hard_link(&source, &destination).is_ok() {
-        counts.files += 1;
-        // reason: 统计为尽力而为;元数据读取失败仅少计字节,不影响备份正确性。
-        counts.bytes += std::fs::metadata(&source).map_or(0, |metadata| metadata.len());
-        return Ok(());
+impl CopySink<'_> {
+    /// 同盘优先硬链接一个必存段文件,失败时回退逐字节复制。
+    fn link_or_copy_required(&mut self, rel: &str) -> Result<()> {
+        let source = storage::resolve(self.root, rel)?;
+        let destination = storage::resolve(self.target, rel)?;
+        if std::fs::hard_link(&source, &destination).is_ok() {
+            self.counts.files += 1;
+            // reason: 统计为尽力而为;元数据读取失败仅少计字节,不影响备份正确性。
+            self.counts.bytes += std::fs::metadata(&source).map_or(0, |metadata| metadata.len());
+            return Ok(());
+        }
+        self.hardlinked = false;
+        self.copy_required(rel)
     }
-    *hardlinked = false;
-    copy_required(root, target, rel, counts)
+
+    /// 复制一个必须存在的库内文件;缺失返回 [`MnemeError::Corrupted`]。
+    fn copy_required(&mut self, rel: &str) -> Result<()> {
+        // 被 MANIFEST 引用的段必须存在;缺失即备份不可信,绝不静默产出残档。
+        let content = storage::read_file(self.root, rel).map_err(|_| MnemeError::Corrupted {
+            segment: None,
+            reason: format!("备份:必存文件缺失或不可读:{rel}"),
+        })?;
+        self.counts.files += 1;
+        self.counts.bytes += content.len() as u64;
+        storage::write_atomic(self.target, rel, &content)
+    }
 }
 
 impl Store {
@@ -99,43 +80,32 @@ impl Store {
         let full_relations = previous.segments.is_empty();
         let now_ms = config.clock.now_unix_ms();
         let delta = flush::build_delta(ws, &slot_indices, now_ms, full_relations);
-        let registry_changed = namespace_registry_changed(&previous, ws);
-        if slot_indices.is_empty() && delta.is_empty() && !registry_changed {
+        if slot_indices.is_empty() && delta.is_empty() && !namespace_registry_changed(&previous, ws)
+        {
             return Ok(());
         }
 
-        let encoded = if slot_indices.is_empty() && delta.is_empty() {
-            None
-        } else {
-            Some(flush::build_segment(
-                ws,
-                config,
-                now_ms,
-                &SegmentBuildInput {
-                    slots: &slot_indices,
-                    delta: &delta,
-                    full_relations,
-                },
-            )?)
-        };
         let segment_id = previous.next_segment_id;
+        // 有新数据/delta 时写新段;仅注册表变化时只提交 MANIFEST。
+        let encoded = self.encode_flush_segment(
+            ws,
+            config,
+            &FlushSegmentInput {
+                segment_id,
+                slot_indices: &slot_indices,
+                delta: &delta,
+                full_relations,
+                now_ms,
+            },
+        )?;
 
-        if let Some(encoded) = &encoded {
-            self.write_file(
-                &format!("{SEGMENTS_DIR}/{}", vsec_name(segment_id)),
-                &encoded.vsec,
-            )?;
-            self.write_file(
-                &format!("{SEGMENTS_DIR}/{}", msec_name(segment_id)),
-                &encoded.msec,
-            )?;
-            if let Some(hidx) = &encoded.hidx {
-                self.write_file(&format!("{SEGMENTS_DIR}/{}", hidx_name(segment_id)), hidx)?;
-            }
-        }
-
-        let new_manifest =
-            self.next_manifest(&previous, ws, encoded.as_ref(), &slot_indices, now_ms);
+        let new_manifest = self.next_manifest(&NextManifestInput {
+            previous: &previous,
+            ws,
+            encoded: encoded.as_ref(),
+            slot_indices: &slot_indices,
+            now_ms,
+        });
         manifest_io::commit_manifest(&self.root, &new_manifest, self.hook.as_deref())?;
 
         // 段文件已原子提交:登记槽位归属与索引,清空 delta 标记;WAL 重置(Checkpoint)。
@@ -144,6 +114,45 @@ impl Store {
         }
         ws.clear_flush_dirty();
         self.publish(&new_manifest);
+        Ok(())
+    }
+
+    /// 有新增槽位/delta 时编码并写出新段;否则 `None`(仅注册表变化)。
+    fn encode_flush_segment(
+        &self,
+        ws: &WriterState,
+        config: &Config,
+        input: &FlushSegmentInput<'_>,
+    ) -> Result<Option<flush::EncodedSegment>> {
+        if input.slot_indices.is_empty() && input.delta.is_empty() {
+            return Ok(None);
+        }
+        let encoded = flush::build_segment(
+            ws,
+            config,
+            input.now_ms,
+            &SegmentBuildInput {
+                slots: input.slot_indices,
+                delta: input.delta,
+                full_relations: input.full_relations,
+            },
+        )?;
+        self.write_segment_files(input.segment_id, &encoded)?;
+        Ok(Some(encoded))
+    }
+
+    /// 写入一个新段的 vsec/msec(以及可选 hidx)文件。
+    fn write_segment_files(&self, segment_id: u32, encoded: &flush::EncodedSegment) -> Result<()> {
+        let names = [
+            format!("{SEGMENTS_DIR}/{}", vsec_name(segment_id)),
+            format!("{SEGMENTS_DIR}/{}", msec_name(segment_id)),
+            format!("{SEGMENTS_DIR}/{}", hidx_name(segment_id)),
+        ];
+        self.write_file(&names[0], &encoded.vsec)?;
+        self.write_file(&names[1], &encoded.msec)?;
+        if let Some(hidx) = &encoded.hidx {
+            self.write_file(&names[2], hidx)?;
+        }
         Ok(())
     }
 
@@ -169,15 +178,19 @@ impl Store {
 
         let (version, manifest) = self.versioned_manifest();
 
-        let mut counts = CopyCounts::default();
-        let mut hardlinked = !manifest.segments.is_empty();
-        copy_manifest_segments(&self.root, target, &manifest, &mut counts, &mut hardlinked)?;
-        copy_required(&self.root, target, &manifest_name(version), &mut counts)?;
+        let mut sink = CopySink {
+            root: &self.root,
+            target,
+            counts: CopyCounts::default(),
+            hardlinked: !manifest.segments.is_empty(),
+        };
+        copy_segment_files(&mut sink, &manifest)?;
+        sink.copy_required(&manifest_name(version))?;
         // WAL 文件集可缺省(只读实例/刚 Checkpoint 后);逐文件复制。
         for rel in super::wal_writer::wal_files(&self.root)? {
-            copy_optional(&self.root, target, &rel, &mut counts)?;
+            copy_optional(&self.root, target, &rel, &mut sink.counts)?;
         }
-        let CopyCounts { files, bytes } = counts;
+        let CopyCounts { files, bytes } = sink.counts;
         // `current` 最后写:中途失败则备份不可打开,不会误认为完整。
         let current = version.to_string();
         storage::write_atomic(target, CURRENT_FILE, current.as_bytes())?;
@@ -185,63 +198,32 @@ impl Store {
         Ok(crate::memory::ops::BackupReport {
             files: files + 1,
             bytes: bytes + current.len() as u64,
-            hardlinked,
+            hardlinked: sink.hardlinked,
         })
     }
 
     /// 由当前写状态、刚物化的段(可缺省)与新增槽位构造下一个 MANIFEST 版本。
-    fn next_manifest(
-        &self,
-        previous: &Manifest,
-        ws: &WriterState,
-        encoded: Option<&flush::EncodedSegment>,
-        slot_indices: &[usize],
-        now_ms: i64,
-    ) -> Manifest {
-        let mut namespaces: Vec<NsEntry> = ws
-            .ns_registry
-            .iter()
-            .map(|(id, path)| NsEntry {
-                ns_id: id.get(),
-                path: Arc::clone(path),
-            })
-            .collect();
-        namespaces.sort_by_key(|entry| entry.ns_id);
-
-        let mut segments = previous.segments.clone();
-        let next_segment_id = match encoded {
+    fn next_manifest(&self, input: &NextManifestInput<'_>) -> Manifest {
+        let mut segments = input.previous.segments.clone();
+        let next_segment_id = match input.encoded {
             Some(encoded) => {
-                let (min_seqno, max_seqno) = seqno_range(ws, slot_indices);
-                segments.push(SegmentEntry {
-                    segment_id: previous.next_segment_id,
-                    format_version: FORMAT_VERSION,
-                    row_count: slot_indices.len() as u64,
-                    min_seqno,
-                    max_seqno,
-                    created_ms: now_ms,
-                    vsec_crc: crc32(&encoded.vsec),
-                    msec_crc: crc32(&encoded.msec),
-                    hidx_crc: encoded.hidx.as_deref().map_or(0, crc32),
-                    entry_slot: encoded.entry_slot,
-                    entry_level: encoded.entry_level,
-                });
-                previous.next_segment_id + 1
+                segments.push(segment_entry(input, encoded));
+                input.previous.next_segment_id + 1
             }
-            None => previous.next_segment_id,
+            None => input.previous.next_segment_id,
         };
-
         Manifest {
             dimension: self.dimension,
             metric: self.metric,
-            stopwords: previous.stopwords,
-            next_rel_kind: previous.next_rel_kind,
-            manifest_version: previous.manifest_version + 1,
-            watermark_seqno: ws.seqno.get(),
-            next_rowid: ws.next_rowid,
+            stopwords: input.previous.stopwords,
+            next_rel_kind: input.previous.next_rel_kind,
+            manifest_version: input.previous.manifest_version + 1,
+            watermark_seqno: input.ws.seqno.get(),
+            next_rowid: input.ws.next_rowid,
             next_segment_id,
-            next_ns_id: ws.next_ns_id,
-            namespaces,
-            rel_kinds: previous.rel_kinds.clone(),
+            next_ns_id: input.ws.next_ns_id,
+            namespaces: manifest_namespaces(input.ws),
+            rel_kinds: input.previous.rel_kinds.clone(),
             segments,
         }
     }
@@ -270,6 +252,66 @@ impl Store {
     }
 }
 
+/// [`Store::encode_flush_segment`] 的输入(参数收敛)。
+struct FlushSegmentInput<'a> {
+    /// 新段编号。
+    segment_id: u32,
+    /// 本次物化的未落盘槽位。
+    slot_indices: &'a [usize],
+    /// 跨段 delta 条目。
+    delta: &'a [crate::persist::msec::DeltaEntry],
+    /// 是否全量重写关系表(首段)。
+    full_relations: bool,
+    /// 新段创建时刻(Unix 毫秒)。
+    now_ms: i64,
+}
+
+/// [`Store::next_manifest`] 的输入(参数收敛)。
+struct NextManifestInput<'a> {
+    /// 提交前的 MANIFEST。
+    previous: &'a Manifest,
+    /// 写状态(水位/注册表)。
+    ws: &'a WriterState,
+    /// 本批物化的新段(仅注册表变化时为 `None`)。
+    encoded: Option<&'a flush::EncodedSegment>,
+    /// 新段包含的槽位。
+    slot_indices: &'a [usize],
+    /// 新段创建时刻(Unix 毫秒)。
+    now_ms: i64,
+}
+
+/// 新段的 MANIFEST 条目。
+fn segment_entry(input: &NextManifestInput<'_>, encoded: &flush::EncodedSegment) -> SegmentEntry {
+    let (min_seqno, max_seqno) = seqno_range(input.ws, input.slot_indices);
+    SegmentEntry {
+        segment_id: input.previous.next_segment_id,
+        format_version: FORMAT_VERSION,
+        row_count: input.slot_indices.len() as u64,
+        min_seqno,
+        max_seqno,
+        created_ms: input.now_ms,
+        vsec_crc: crc32(&encoded.vsec),
+        msec_crc: crc32(&encoded.msec),
+        hidx_crc: encoded.hidx.as_deref().map_or(0, crc32),
+        entry_slot: encoded.entry_slot,
+        entry_level: encoded.entry_level,
+    }
+}
+
+/// 注册表条目(按 `NsId` 排序)。
+fn manifest_namespaces(ws: &WriterState) -> Vec<NsEntry> {
+    let mut namespaces: Vec<NsEntry> = ws
+        .ns_registry
+        .iter()
+        .map(|(id, path)| NsEntry {
+            ns_id: id.get(),
+            path: Arc::clone(path),
+        })
+        .collect();
+    namespaces.sort_by_key(|entry| entry.ns_id);
+    namespaces
+}
+
 /// 备份已复制文件数与字节数。
 #[derive(Default)]
 struct CopyCounts {
@@ -277,15 +319,20 @@ struct CopyCounts {
     bytes: u64,
 }
 
-/// 复制一个必须存在的库内文件;缺失返回 [`MnemeError::Corrupted`]。
-fn copy_required(root: &Path, target: &Path, rel: &str, counts: &mut CopyCounts) -> Result<()> {
-    let content = storage::read_file(root, rel).map_err(|_| MnemeError::Corrupted {
-        segment: None,
-        reason: format!("备份:必存文件缺失或不可读:{rel}"),
-    })?;
-    counts.files += 1;
-    counts.bytes += content.len() as u64;
-    storage::write_atomic(target, rel, &content)
+/// 备份 MANIFEST 所列段(vsec/msec/可选 hidx);必存文件缺失即失败。
+fn copy_segment_files(sink: &mut CopySink<'_>, manifest: &Manifest) -> Result<()> {
+    for segment in &manifest.segments {
+        // 被 MANIFEST 引用的段必须存在;缺失即备份不可信,绝不静默产出残档。
+        sink.link_or_copy_required(&format!("{SEGMENTS_DIR}/{}", vsec_name(segment.segment_id)))?;
+        sink.link_or_copy_required(&format!("{SEGMENTS_DIR}/{}", msec_name(segment.segment_id)))?;
+        if segment.hidx_crc != 0 {
+            sink.link_or_copy_required(&format!(
+                "{SEGMENTS_DIR}/{}",
+                hidx_name(segment.segment_id)
+            ))?;
+        }
+    }
+    Ok(())
 }
 
 /// 复制一个可选文件(如只读实例中不存在的 WAL);缺失则跳过。
@@ -346,19 +393,16 @@ mod tests {
         // 目标已存在同名文件 → `hard_link` 失败 → 走复制回退。
         std::fs::write(&target_dir, b"stale").expect("write stale");
 
-        let mut counts = CopyCounts::default();
-        let mut hardlinked = true;
-        link_or_copy_required(
-            root.path(),
-            target.path(),
-            &rel,
-            &mut counts,
-            &mut hardlinked,
-        )
-        .expect("copy fallback");
-        assert!(!hardlinked, "硬链接失败必须如实报告回退");
-        assert_eq!(counts.files, 1);
-        assert_eq!(counts.bytes, content.len() as u64);
+        let mut sink = CopySink {
+            root: root.path(),
+            target: target.path(),
+            counts: CopyCounts::default(),
+            hardlinked: true,
+        };
+        sink.link_or_copy_required(&rel).expect("copy fallback");
+        assert!(!sink.hardlinked, "硬链接失败必须如实报告回退");
+        assert_eq!(sink.counts.files, 1);
+        assert_eq!(sink.counts.bytes, content.len() as u64);
         assert_eq!(std::fs::read(&target_dir).expect("read"), content);
     }
 }

@@ -107,9 +107,7 @@ pub(crate) fn segment_dead_ratios(
     now_ms: i64,
     horizon: Option<Duration>,
 ) -> HashMap<u32, f32> {
-    let Some(cutoff) = horizon
-        .map(|window| now_ms.saturating_sub(i64::try_from(window.as_millis()).unwrap_or(i64::MAX)))
-    else {
+    let Some(cutoff) = cutoff_of(now_ms, horizon) else {
         return HashMap::new();
     };
     let mut dead: HashMap<u32, u64> = HashMap::new();
@@ -119,19 +117,16 @@ pub(crate) fn segment_dead_ratios(
             continue;
         };
         *total.entry(*id).or_insert(0) += 1;
-        let slot = &ws.slots[index];
-        let is_latest = ws
-            .latest
-            .get(&slot.rowid)
-            .is_some_and(|latest| latest.get() as usize == index);
-        // 整链回收条件与 `select_survivors` 一致:最新版本为窗口外墓碑/逻辑过期。
-        let reclaimable = if is_latest {
-            (slot.deleted || slot.expires_at.is_some_and(|expires| expires <= now_ms))
-                && slot.tx_ms < cutoff
-        } else {
-            slot.tx_ms < cutoff
+        // 与计划共用同一回收口径(含"整链在该段内"判定),保证触发条件可达:
+        // 单段计划只回收链全在本段的版本,统计也必须按同口径计数,否则跨段
+        // 版本链会反复触发却零回收(无限写放大,FC-LIFE-INV-008)。
+        let window = Window {
+            cutoff: Some(cutoff),
+            now_ms,
         };
-        if reclaimable {
+        if classify_slot(ws, index, window, &|candidate| candidate == *id)
+            == SurvivorDecision::Reclaim
+        {
             *dead.entry(*id).or_insert(0) += 1;
         }
     }
@@ -159,8 +154,7 @@ pub(crate) fn select_survivors(
     horizon: Option<Duration>,
 ) -> SurvivorSet {
     let in_plan: HashSet<u32> = plan.segments.iter().copied().collect();
-    let cutoff = horizon
-        .map(|window| now_ms.saturating_sub(i64::try_from(window.as_millis()).unwrap_or(i64::MAX)));
+    let cutoff = cutoff_of(now_ms, horizon);
     let mut survivors = SurvivorSet::default();
     for (index, segment) in ws.slot_segment.iter().enumerate() {
         let Some(id) = segment else {
@@ -169,12 +163,28 @@ pub(crate) fn select_survivors(
         if !in_plan.contains(id) {
             continue;
         }
-        match classify_slot(ws, &in_plan, cutoff, now_ms, index) {
+        let window = Window { cutoff, now_ms };
+        match classify_slot(ws, index, window, &|candidate| in_plan.contains(&candidate)) {
             SurvivorDecision::Reclaim => survivors.reclaim.push(index),
             SurvivorDecision::Keep => survivors.keep.push(index),
         }
     }
     survivors
+}
+
+/// 时间窗口截断点;`None` = 永久保留。
+fn cutoff_of(now_ms: i64, horizon: Option<Duration>) -> Option<i64> {
+    horizon
+        .map(|window| now_ms.saturating_sub(i64::try_from(window.as_millis()).unwrap_or(i64::MAX)))
+}
+
+/// 回收时间窗口(截断点与当前时刻)。
+#[derive(Clone, Copy)]
+struct Window {
+    /// `now - history_horizon`;`None` = 永久保留。
+    cutoff: Option<i64>,
+    /// 当前事务时刻(Unix 毫秒)。
+    now_ms: i64,
 }
 
 /// 单个槽位在本轮 compaction 中的去留。
@@ -186,51 +196,59 @@ enum SurvivorDecision {
     Reclaim,
 }
 
-/// 判定单个槽位的去留(计划段组已确认包含其所属段)。
+/// 判定单个槽位的去留;`in_scope` 决定某段是否属于本轮回收范围
+/// (计划段组或单段统计,两种调用共用同一口径)。
 fn classify_slot(
     ws: &WriterState,
-    in_plan: &HashSet<u32>,
-    cutoff: Option<i64>,
-    now_ms: i64,
     index: usize,
+    window: Window,
+    in_scope: &dyn Fn(u32) -> bool,
 ) -> SurvivorDecision {
     let slot = &ws.slots[index];
     let rowid = slot.rowid;
-    let latest = ws
-        .latest
-        .get(&rowid)
-        .map(|slot| &ws.slots[slot.get() as usize]);
     let is_latest = ws
         .latest
         .get(&rowid)
         .is_some_and(|latest| latest.get() as usize == index);
-    // 整链回收:本轮段组覆盖全链,且最新版本为**窗口外**的墓碑/逻辑过期。
+    // 整链回收:回收范围覆盖全链,且最新版本为**窗口外**的墓碑/逻辑过期。
     // latest 与历史版本必须同进退——只回收 latest 会把旧活版本留在链上,
     // 造成被删记录"复活"或 `latest` 悬挂(FC-MODEL-POST-004;时钟回拨场景)。
-    let chain_reclaimable = chain_all_in_group(ws, rowid, in_plan)
-        && cutoff.is_some()
-        && latest.is_some_and(|latest| {
-            let window_expired = cutoff.is_some_and(|cutoff| latest.tx_ms < cutoff);
-            let dead = latest.deleted || latest.expires_at.is_some_and(|expires| expires <= now_ms);
-            dead && window_expired
-        });
+    let chain_reclaimable =
+        latest_dead_outside_window(ws, rowid, window) && chain_all_in_scope(ws, rowid, in_scope);
     if chain_reclaimable {
         return SurvivorDecision::Reclaim;
     }
     if is_latest {
         return SurvivorDecision::Keep;
     }
-    match cutoff {
+    match window.cutoff {
         Some(cutoff) if slot.tx_ms < cutoff => SurvivorDecision::Reclaim,
         _ => SurvivorDecision::Keep,
     }
 }
 
-/// 该 RowId 的整条版本链是否都落在计划段组内(否则回收会令旧版本在别段复活)。
-fn chain_all_in_group(
+/// 最新版本是否为窗口外的墓碑/逻辑过期(整链回收的充分条件之一)。
+fn latest_dead_outside_window(
     ws: &WriterState,
     rowid: crate::core::types::RowId,
-    in_plan: &HashSet<u32>,
+    window: Window,
+) -> bool {
+    let Some(slot) = ws.latest.get(&rowid) else {
+        return false;
+    };
+    let latest = &ws.slots[slot.get() as usize];
+    let dead = latest.deleted
+        || latest
+            .expires_at
+            .is_some_and(|expires| expires <= window.now_ms);
+    dead && window.cutoff.is_some_and(|cutoff| latest.tx_ms < cutoff)
+}
+
+/// 该 RowId 的整条版本链是否都落在回收范围内(否则回收会令旧版本在别段复活)。
+fn chain_all_in_scope(
+    ws: &WriterState,
+    rowid: crate::core::types::RowId,
+    in_scope: &dyn Fn(u32) -> bool,
 ) -> bool {
     let chain = ws
         .versions
@@ -241,7 +259,7 @@ fn chain_all_in_group(
         ws.slot_segment
             .get(chain_slot.get() as usize)
             .and_then(|segment| *segment)
-            .is_some_and(|segment_id| in_plan.contains(&segment_id))
+            .is_some_and(in_scope)
     })
 }
 

@@ -222,9 +222,11 @@ impl WriterState {
         let path: Arc<str> = Arc::from(path);
         Arc::make_mut(&mut self.ns_registry).insert(id, path.clone());
         Arc::make_mut(&mut self.ns_by_path).insert(path.clone(), id);
+        let seqno = self.alloc_seqno();
         self.pending.push(WriteOp::NsRegister {
             ns_id: id.get(),
             path,
+            seqno,
         });
         Ok(id)
     }
@@ -234,8 +236,11 @@ impl WriterState {
         if let Some(path) = Arc::make_mut(&mut self.ns_registry).remove(&ns_id) {
             Arc::make_mut(&mut self.ns_by_path).remove(&path);
         }
-        self.pending
-            .push(WriteOp::NsUnregister { ns_id: ns_id.get() });
+        let seqno = self.alloc_seqno();
+        self.pending.push(WriteOp::NsUnregister {
+            ns_id: ns_id.get(),
+            seqno,
+        });
     }
 
     /// 建立/更新关系边并记录 WAL 操作。
@@ -508,34 +513,42 @@ impl WriterState {
             let slot =
                 SlotId::new(u32::try_from(index).expect("槽位下标必可转入 u32(FC-MEM-INV-004)"));
             let rowid = self.slots[index].rowid;
-            let mut row_empty = false;
-            {
-                let versions = Arc::make_mut(&mut self.versions);
-                if let Some(entries) = versions.get_mut(&rowid) {
-                    entries.retain(|entry| *entry != slot);
-                    row_empty = entries.is_empty();
-                }
-                if row_empty {
-                    versions.remove(&rowid);
-                }
-            }
-            if row_empty {
-                Arc::make_mut(&mut self.latest).remove(&rowid);
-                let slot_data = &self.slots[index];
-                if let Some(key) = &slot_data.key {
-                    let key = (slot_data.ns_id, key.clone());
-                    if self.key_index.get(&key) == Some(&rowid) {
-                        Arc::make_mut(&mut self.key_index).remove(&key);
-                    }
-                }
-                if let Some(hash) = slot_data.text_hash {
-                    let key = (slot_data.ns_id, hash);
-                    if self.text_index.get(&key) == Some(&rowid) {
-                        Arc::make_mut(&mut self.text_index).remove(&key);
-                    }
-                }
+            if self.detach_slot_from_versions(rowid, slot) {
+                self.purge_row_indexes(rowid, index);
             }
             Arc::make_mut(&mut self.dead).set(index);
+        }
+    }
+
+    /// 从版本链移除槽位;该 RowId 已无版本时移除 `latest` 并返回 `true`。
+    fn detach_slot_from_versions(&mut self, rowid: RowId, slot: SlotId) -> bool {
+        let versions = Arc::make_mut(&mut self.versions);
+        let Some(entries) = versions.get_mut(&rowid) else {
+            return false;
+        };
+        entries.retain(|entry| *entry != slot);
+        if entries.is_empty() {
+            versions.remove(&rowid);
+            return true;
+        }
+        false
+    }
+
+    /// 整链清空时移除 `latest` 与 key/text 索引。
+    fn purge_row_indexes(&mut self, rowid: RowId, index: usize) {
+        Arc::make_mut(&mut self.latest).remove(&rowid);
+        let slot_data = &self.slots[index];
+        if let Some(key) = &slot_data.key {
+            let key = (slot_data.ns_id, key.clone());
+            if self.key_index.get(&key) == Some(&rowid) {
+                Arc::make_mut(&mut self.key_index).remove(&key);
+            }
+        }
+        if let Some(hash) = slot_data.text_hash {
+            let key = (slot_data.ns_id, hash);
+            if self.text_index.get(&key) == Some(&rowid) {
+                Arc::make_mut(&mut self.text_index).remove(&key);
+            }
         }
     }
 

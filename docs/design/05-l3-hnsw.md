@@ -192,8 +192,8 @@ Mneme 用 scoped threads 按批并行。50k 向量/秒的目标依赖批内并�
 的 SIMD 吞吐,基准验证见 [14 §4](14-testing.md)。
 
 > **L3 落地状态**:当前 `HnswIndex::build` 为**串行**构建(固定种子,同输入同图便于复现);
-> 批内并行随 L5 compaction 引入(见 §9 落地状态)。1M×1536 的吞吐/延迟基准尚未接入 CI,
-> `benches/hnsw.rs` 当前只是微缩趋势样本。
+> 批内并行尚未接线(L5 compaction 也仍为单线程顺序执行,见 [07 §4.4](07-l5-life.md))。
+> 1M×1536 的吞吐/延迟基准尚未接入 CI,`benches/hnsw.rs` 当前只是微缩趋势样本。
 
 ---
 
@@ -364,13 +364,15 @@ $s = |\text{cand}| / N_{\text{alive}}$ 自适应三档:
 
 > **落地状态**:L2 全量快照每次 flush 只保留一个活跃段,故 L3 的"多段图"退化为
 > **单个索引前缀 + 未建树尾扫描**:查询 = 前缀 ANN(`filtered.rs`)+ 尾部暴力,
-> 二者以 L0 `TopK::merge` 归并(见 `src/memory/search.rs`)。真正的多段 k 路归并
-> 随 L5 compaction(多段并存)恢复为独立模块;下述并行模型是 L5 的目标形态。
+> 二者以 L0 `TopK::merge` 归并(见 `src/memory/search.rs`)。L5 起多段并存已落地,
+> 查询按 MANIFEST 段序**串行**逐段归并(`merge` 仍由 `TopK::merge` 承担);
+> 下述 scoped threads 并行模型与独立归并模块是**目标形态**、尚未接线。
 
-库由多个段组成(追加式存储),每段有自己的图。查询 = 各段并行搜索 + 全局归并:
+库由多个段组成(追加式存储),每段有自己的图。查询 = 各段搜索 + 全局归并:
 
 ```text
-并行(scoped threads): 每段 → 选择 HNSW / 暴力(段行数 < 2048 恒暴力) → 段内 TopK(k)
+逐段(当前实现:串行;目标形态:scoped threads 并行):
+    每段 → 选择 HNSW / 暴力(段行数 < 2048 恒暴力) → 段内 TopK(k)
 归并: k 路分数归并([02 §5 TopK.merge]) → 全局 top-k
 ```
 

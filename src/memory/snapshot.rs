@@ -58,13 +58,21 @@ impl SnapshotHandle {
     /// ```
     pub fn stats(&self) -> crate::memory::ops::SnapshotStats {
         let mut segments = std::collections::HashSet::new();
-        for segment in self.view.slot_segment.iter().flatten() {
-            segments.insert(*segment);
+        let mut rows = 0_u64;
+        for (index, segment) in self.view.slot_segment.iter().enumerate() {
+            // 已被物理回收(dead)的槽位不属于任何活跃段,不计入统计。
+            if self.view.dead.get(index) {
+                continue;
+            }
+            rows += 1;
+            if let Some(id) = segment {
+                segments.insert(*id);
+            }
         }
         crate::memory::ops::SnapshotStats {
             version: self.version(),
             segments: segments.len(),
-            rows: self.view.slots.len() as u64,
+            rows,
         }
     }
 
