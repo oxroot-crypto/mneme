@@ -12,7 +12,7 @@
 //! * `edges` —— 关系邻接索引编解码。
 //! * `wal` —— WAL 帧编解码、回放与写入器。
 //! * `manifest` —— MANIFEST 编解码(write-once + `current` 指针)。
-//! * `source` —— 段读取后端抽象(`SegmentSource` 与 `FileSource`)。
+//! * `source` —— 段读取后端抽象(`SegmentSource` 与 `FileSource`/`MmapSource`)。
 //! * `storage` —— 目录布局、原子写入与独占文件锁。
 //! * `trash` —— 旧段文件的延迟删除。
 //! * `flush` —— 写状态 → 段文件(全量快照)。
@@ -20,7 +20,8 @@
 //! * `store` —— 协调句柄 `Store`(实现 `PersistHook`、`flush`、`open`)。
 //!
 //! > 本层向下依赖 [`crate::core`] 与 [`crate::memory`](L1,L2 高于 L1);
-//! > `memmap2`/`MmapSource` 按依赖白名单自 L3 引入,本层仅提供 `FileSource`。
+//! > `memmap2`/`MmapSource`(feature `mmap`,默认开)自 L3 引入并按白名单受控,
+//! > 未启用 feature 时 `source` 回退到基于 `std` 的 `FileSource`。
 
 mod codec;
 pub(crate) mod edges;

@@ -68,7 +68,7 @@ pub(crate) fn build_segment(
         relations: &relations_bytes,
     })?;
 
-    let built_index = build_index(ws, config);
+    let built_index = build_index(ws, config)?;
     Ok(EncodedSegment {
         vsec: vsec_bytes,
         msec: msec_bytes,
@@ -88,22 +88,25 @@ struct BuiltIndex {
 }
 
 /// 构建 HNSW 图并序列化为 hidx(无工厂或空表时各字段为空/零)。
-fn build_index(ws: &WriterState, config: &Config) -> BuiltIndex {
+///
+/// # Errors
+/// 图序列化失败(hidx 长度字段超出格式上限)时返回结构化错误。
+fn build_index(ws: &WriterState, config: &Config) -> Result<BuiltIndex> {
     let Some(factory) = config.index_factory.as_ref() else {
-        return BuiltIndex {
+        return Ok(BuiltIndex {
             bytes: None,
             index: None,
             entry_slot: 0,
             entry_level: 0,
-        };
+        });
     };
     if ws.slots.is_empty() {
-        return BuiltIndex {
+        return Ok(BuiltIndex {
             bytes: None,
             index: None,
             entry_slot: 0,
             entry_level: 0,
-        };
+        });
     }
     let nodes: Vec<IndexNode> = ws
         .slots
@@ -116,13 +119,13 @@ fn build_index(ws: &WriterState, config: &Config) -> BuiltIndex {
         .collect();
     let index = factory.build(&nodes, config.hnsw, config.metric);
     let entry = index.entry();
-    let bytes = index.serialize();
-    BuiltIndex {
+    let bytes = index.serialize()?;
+    Ok(BuiltIndex {
         bytes: Some(bytes),
         index: Some(index),
         entry_slot: entry.0.get(),
         entry_level: entry.1,
-    }
+    })
 }
 
 /// 由写状态构造段内槽位与 vsec 输入列。

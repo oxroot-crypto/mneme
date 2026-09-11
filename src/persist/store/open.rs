@@ -289,7 +289,15 @@ fn load_write_state(
         && let Some(remap) = recovered.remap.as_ref()
         && let Some(hidx) = segments.first().and_then(|segment| segment.hidx.as_ref())
     {
-        match load_index(factory, hidx, &state, remap, manifest.metric) {
+        match load_index(
+            factory,
+            hidx,
+            SlotRemap {
+                state: &state,
+                remap,
+            },
+            manifest.metric,
+        ) {
             Ok(index) => state.index = Some(index),
             Err(error) if options.fail_fast_on_corruption => return Err(error),
             // reason: 索引是查询加速器而非数据来源;hidx 损坏时降级为暴力扫描仍然正确,
@@ -308,6 +316,14 @@ fn load_write_state(
     Ok(state)
 }
 
+/// [`load_index`] 的槽位来源:恢复后的写状态与"段内槽位 → 全局槽位"重排映射。
+struct SlotRemap<'a> {
+    /// 恢复后的写状态(hidx 节点按段内顺序取 `rowid`/向量)。
+    state: &'a WriterState,
+    /// 段内节点 id → 全局槽位。
+    remap: &'a [u32],
+}
+
 /// 由 hidx 字节与恢复出的槽位构建索引。
 ///
 /// # Errors
@@ -315,14 +331,14 @@ fn load_write_state(
 fn load_index(
     factory: &Arc<dyn IndexFactory>,
     hidx: &[u8],
-    state: &WriterState,
-    remap: &[u32],
+    slots: SlotRemap<'_>,
     metric: Metric,
 ) -> Result<Arc<dyn VectorIndex>> {
-    let mut nodes = Vec::with_capacity(remap.len());
-    let mut slot_of = Vec::with_capacity(remap.len());
-    for &global in remap {
-        let slot = state
+    let mut nodes = Vec::with_capacity(slots.remap.len());
+    let mut slot_of = Vec::with_capacity(slots.remap.len());
+    for &global in slots.remap {
+        let slot = slots
+            .state
             .slots
             .get(global as usize)
             .ok_or_else(|| MnemeError::Corrupted {

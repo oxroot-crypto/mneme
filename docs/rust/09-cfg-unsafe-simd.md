@@ -5,8 +5,9 @@
 > **前置**:[04 章](04-borrowing-strings-slices.md)(切片与引用)、[08 章](08-modules-docs.md)。
 > **对应源码**:[`src/core/simd.rs`](../../src/core/simd.rs)。
 
-这一章涉及 Rust 里唯一"绕过编译器保护"的部分。**mneme 把 `unsafe` 限制在一个文件里**,
-每处都附证明,是学习"如何负责任地使用 unsafe"的范本。
+这一章涉及 Rust 里唯一"绕过编译器保护"的部分。**mneme 把 `unsafe` 压缩到全库仅两处**
+(L0 `src/core/simd.rs` 的 arch 内联与 L2 `src/persist/source.rs` 的 `MmapSource`),
+每处都附 `// SAFETY:` 证明,是学习"如何负责任地使用 unsafe"的范本。
 
 ---
 
@@ -179,8 +180,8 @@ SIMD 加载分两种:`_mm256_loadu_ps`(u = unaligned)不要求地址按 32 字�
 
 `.add(i)` 是**按元素**移动指针(不是按字节):`a.as_ptr().add(i)` 指向第 `i` 个 `f32`。指针算术
 越界即使不解引用也是 UB,所以循环条件 `i + 8 <= n` 是安全证明的核心。裸指针不携带生命周期,
-`unsafe` 块里的正确性完全由程序员用 `// SAFETY:` 论证——这正是 mneme 把 `unsafe` 限制在
-`simd.rs` 一个文件、且每处必写证明的原因。
+`unsafe` 块里的正确性完全由程序员用 `// SAFETY:` 论证——这正是 mneme 把 `unsafe` 压缩到
+全库仅两处(L0 `simd.rs` 与 L2 `persist/source.rs` 的 `MmapSource`)、且每处必写证明的原因。
 
 ---
 
@@ -230,7 +231,8 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 - `unsafe` 只解锁底层操作,不关闭借用/类型检查;每处必须写 `// SAFETY:` 证明。
 - `#[target_feature]` 为函数启用指令集,因此函数必须 `unsafe` 且调用前检测。
 - SIMD 用一条指令处理多个数据;mneme 对外统一 `dot`,内部按架构分发,`dot_scalar` 作参照。
-- mneme 把 `unsafe` 限制在 `simd.rs`,配合 `#![deny(unsafe_op_in_unsafe_fn)]` 强制显式。
+- mneme 把 `unsafe` 限制在全库两处(`simd.rs` 与 `persist/source.rs` 的 `MmapSource`),
+  配合 `#![deny(unsafe_op_in_unsafe_fn)]` 强制显式。
 
 ## 动手练习
 

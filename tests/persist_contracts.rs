@@ -1096,6 +1096,10 @@ fn missing_hidx_degrades_or_rejects() {
         .expect("degrade open");
     let stats = db.stats().expect("stats");
     assert_eq!(stats.segments[0].index_nodes, 0, "缺 hidx 应降级暴力");
+    assert!(
+        db.namespace("demo").get("a").expect("get").is_some(),
+        "降级后库必须仍可读"
+    );
     assert!(!db.check().expect("check").ok, "缺 hidx 应被 check 报告");
 }
 
@@ -1130,5 +1134,9 @@ fn corrupt_hidx_degrades_or_rejects() {
         .build()
         .expect("degrade open");
     assert_eq!(db.stats().expect("stats").segments[0].index_nodes, 0);
+    assert!(
+        db.namespace("demo").get("a").expect("get").is_some(),
+        "降级后库必须仍可读"
+    );
     assert!(!db.check().expect("check").ok, "坏 hidx 应被 check 报告");
 }

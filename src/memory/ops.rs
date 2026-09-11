@@ -24,13 +24,17 @@ const HISTOGRAM_MAX_MS: f64 = 1000.0;
 const HISTOGRAM_MAX_INDEX: usize = HISTOGRAM_BUCKETS - 1;
 
 /// 单个段的统计。
+///
+/// 标记 `#[non_exhaustive]`:字段随层落地会继续扩展(如 L5 compaction 统计),
+/// 下游不得依赖穷尽构造或穷尽匹配(设计 16 §1.6)。
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub struct SegmentStat {
     /// 段编号。
     pub id: SegmentId,
-    /// 行数。
+    /// 行数(含墓碑与历史版本)。
     pub rows: u64,
-    /// 字节数。
+    /// 段文件字节数(vsec + 已落盘 hidx;不含 msec,口径见设计 16 §1.6)。
     pub bytes: u64,
     /// 墓碑/过期占比。
     pub dead_ratio: f32,

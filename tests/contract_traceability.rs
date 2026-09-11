@@ -37,9 +37,13 @@ const HNSW_TESTS: &str = include_str!("hnsw_contracts.rs");
 const SRC_SEARCH: &str = include_str!("../src/memory/search.rs");
 const SRC_TABLE: &str = include_str!("../src/memory/table/state.rs");
 const SRC_LIFECYCLE: &str = include_str!("../src/memory/lifecycle.rs");
+/// L1 双时态视图源码(`snapshot_at` 保留索引句柄单测被契约引用)。
+const SRC_TEMPORAL: &str = include_str!("../src/memory/temporal.rs");
 /// L3 索引源码(HNSW 操作计数与图不变量单测被契约引用)。
 const SRC_INDEX_HNSW: &str = include_str!("../src/index/hnsw.rs");
 const SRC_INDEX_HIDX: &str = include_str!("../src/index/hidx.rs");
+/// L3 过滤三档源码(档位选择单测被契约引用)。
+const SRC_INDEX_FILTERED: &str = include_str!("../src/index/filtered.rs");
 /// L2 编解码源码(片级损坏/版本拒绝单测被契约引用)。
 const SRC_VSEC: &str = include_str!("../src/persist/vsec.rs");
 const SRC_MSEC: &str = include_str!("../src/persist/msec/mod.rs");
@@ -63,7 +67,7 @@ const CONTRACT_TEST_FILES: [(&str, &str); 7] = [
 ];
 
 /// 契约引用的测试可能落在的全部文件(路径必须与 `contracts.md` 中书写一致)。
-const SOURCES: [(&str, &str); 19] = [
+const SOURCES: [(&str, &str); 21] = [
     ("tests/core_contracts.rs", CORE_TESTS),
     ("tests/memory_contracts.rs", MEMORY_TESTS),
     ("tests/query_contracts.rs", QUERY_TESTS),
@@ -74,8 +78,10 @@ const SOURCES: [(&str, &str); 19] = [
     ("src/memory/search.rs", SRC_SEARCH),
     ("src/memory/table/state.rs", SRC_TABLE),
     ("src/memory/lifecycle.rs", SRC_LIFECYCLE),
+    ("src/memory/temporal.rs", SRC_TEMPORAL),
     ("src/index/hnsw.rs", SRC_INDEX_HNSW),
     ("src/index/hidx.rs", SRC_INDEX_HIDX),
+    ("src/index/filtered.rs", SRC_INDEX_FILTERED),
     ("src/persist/vsec.rs", SRC_VSEC),
     ("src/persist/msec/mod.rs", SRC_MSEC),
     ("src/persist/wal/mod.rs", SRC_WAL),

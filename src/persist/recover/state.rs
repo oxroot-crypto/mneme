@@ -80,30 +80,58 @@ pub(crate) fn load_segments(
     }
     versions.sort_by_key(|(row, _)| (row.rowid, row.seqno));
 
-    // 单段场景:第 k 个被应用的版本落入全局槽位 k(槽位从空开始),
-    // 故 remap[段内槽位] = 该版本在有序链中的位置。用于 hidx 节点 id 重映射。
-    let remap = if segments.len() == 1 && skipped.is_empty() && parsed.len() == 1 {
-        let row_count = parsed[0].0.row_count() as usize;
-        let mut remap = vec![0_u32; row_count];
-        let mut occupied = vec![false; row_count];
-        for (position, (row, _)) in versions.iter().enumerate() {
-            let index = row.slot_id as usize;
-            if index >= remap.len() || occupied[index] {
-                return Err(crate::core::error::MnemeError::Corrupted {
-                    segment: None,
-                    reason: "recover: 版本槽位越界或重复".to_string(),
-                });
-            }
-            occupied[index] = true;
-            remap[index] = position as u32;
-        }
-        Some(remap)
-    } else {
-        None
-    };
+    // 单段且有 hidx 时才需要"段内槽位 → 全局槽位"重排映射(见 [`build_remap`])。
+    let row_count = parsed
+        .first()
+        .map_or(0, |(view, _)| view.row_count() as usize);
+    let remap = build_remap(&versions, segments, &skipped, row_count)?;
 
     apply_versions(state, &versions, &parsed)?;
     apply_relations(state, &parsed)?;
     state.pending.clear();
     Ok(RecoveredSegments { skipped, remap })
+}
+
+/// 构建单段 hidx 所需的"段内槽位 → 全局槽位"重排映射。
+///
+/// 第 k 个被应用的版本落入全局槽位 k(槽位从空开始),故
+/// `remap[段内槽位] = 该版本在 `(rowid, seqno)` 有序链中的位置`。
+/// 无 hidx、多段或存在跳过段时返回 `None`(调用方降级暴力)。
+///
+/// # Errors
+/// 版本槽位越界/重复,或存在未被版本行引用的段内槽位(vsec/msec 行数不一致)时
+/// 返回 [`MnemeError::Corrupted`]——继续使用会把未引用槽位静默映射到槽位 0。
+fn build_remap(
+    versions: &[(VersionRow, usize)],
+    segments: &[SegmentBytes],
+    skipped: &[u32],
+    row_count: usize,
+) -> Result<Option<Vec<u32>>> {
+    let has_hidx = segments
+        .first()
+        .is_some_and(|segment| segment.hidx.is_some());
+    // 无 hidx 的库不需要该映射,避免为百万级槽位白分配两份 O(N) 向量。
+    if !has_hidx || segments.len() != 1 || !skipped.is_empty() {
+        return Ok(None);
+    }
+    let mut remap = vec![0_u32; row_count];
+    let mut occupied = vec![false; row_count];
+    for (position, (row, _)) in versions.iter().enumerate() {
+        let index = row.slot_id as usize;
+        if index >= remap.len() || occupied[index] {
+            return Err(crate::core::error::MnemeError::Corrupted {
+                segment: None,
+                reason: "recover: 版本槽位越界或重复".to_string(),
+            });
+        }
+        occupied[index] = true;
+        remap[index] = position as u32;
+    }
+    if occupied.iter().any(|&used| !used) {
+        return Err(crate::core::error::MnemeError::Corrupted {
+            segment: None,
+            reason: "recover: 存在未被版本行引用的段内槽位".to_string(),
+        });
+    }
+    Ok(Some(remap))
 }

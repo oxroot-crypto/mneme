@@ -1,8 +1,9 @@
 //! 段读取后端抽象(`source.rs`)。
 //!
 //! 索引层与恢复层只依赖 [`SegmentSource`];`mmap` 是**优化**而非功能依赖
-//! (设计 04 §11)。按依赖白名单(01 §5),`memmap2`/`MmapSource` 自 L3 引入,
-//! 本层只提供基于 `std`(`Read + Seek`)的 [`FileSource`]——功能完整,吞吐稍低。
+//! (设计 04 §11)。按依赖白名单(01 §5),`memmap2`/`MmapSource` 自 L3 引入:
+//! feature `mmap`(默认开)经 [`MmapSource`] 零拷贝映射,关闭时回退本层基于
+//! `std`(`Read + Seek`)的 [`FileSource`]——功能完整,吞吐稍低。
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -103,7 +104,10 @@ impl SegmentSource for MmapSource {
     }
 
     fn read_at(&self, off: u64, buf: &mut [u8]) -> std::io::Result<()> {
-        let start = off as usize;
+        // 32 位平台上 usize 装不下超过 4 GiB 的偏移;显式报错而非静默截断。
+        let start = usize::try_from(off).map_err(|_| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "偏移超出平台字长")
+        })?;
         let end = start
             .checked_add(buf.len())
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "偏移溢出"))?;
@@ -147,7 +151,7 @@ mod tests {
     use super::*;
     use std::io::Write;
 
-    /// FileSource 按偏移读取与底层文件内容一致。
+    /// FileSource 按偏移读取与底层文件内容一致,越界返回 `UnexpectedEof`。
     #[test]
     fn file_source_reads_at_offset() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -162,7 +166,10 @@ mod tests {
         let mut buf = [0_u8; 4];
         source.read_at(3, &mut buf).expect("read_at");
         assert_eq!(buf, [4, 5, 6, 7]);
-        assert!(source.read_at(6, &mut buf).is_err());
+        assert_eq!(
+            source.read_at(6, &mut buf).expect_err("越界应报错").kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
     }
 
     /// `read_whole` 读取整段字节:开启 `mmap` 时经映射,关闭时经 `FileSource`。
@@ -185,7 +192,8 @@ mod tests {
         assert_eq!(super::read_whole(&path).expect("read_whole"), payload);
     }
 
-    /// **FC-PERSIST-POST-007**:`MmapSource` 整段切片与文件一致,越界读取报错。
+    /// **FC-PERSIST-POST-007**:`MmapSource` 整段切片与文件一致,越界读取返回
+    /// `UnexpectedEof`(而非静默短读)。
     #[cfg(feature = "mmap")]
     #[test]
     fn mmap_source_slice_and_bounds() {
@@ -197,6 +205,9 @@ mod tests {
         let mut buf = [0_u8; 4];
         source.read_at(2, &mut buf).expect("read_at");
         assert_eq!(buf, *b"cdef");
-        assert!(source.read_at(6, &mut buf).is_err(), "越界应报错");
+        assert_eq!(
+            source.read_at(6, &mut buf).expect_err("越界应报错").kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
     }
 }

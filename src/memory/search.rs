@@ -66,9 +66,9 @@ pub(crate) struct SearchParams<'a> {
     pub(crate) parallelism: usize,
     /// 段行数低于此值恒暴力扫描(设计 05 §11)。
     pub(crate) brute_force_max_rows: usize,
-    /// 过滤三档:后过滤 / 约束遍历分界。
+    /// 过滤三档:后过滤 / 放大后过滤分界。
     pub(crate) filter_post_threshold: f32,
-    /// 过滤三档:约束遍历 / 候选暴力分界。
+    /// 过滤三档:放大后过滤 / 候选暴力分界。
     pub(crate) filter_brute_threshold: f32,
 }
 
@@ -147,7 +147,6 @@ fn ann_search(
         query_norm,
         ef: params.ef,
         k,
-        metric: params.metric,
         alive: &alive,
         filter: filter.as_ref(),
         post_threshold: params.filter_post_threshold,

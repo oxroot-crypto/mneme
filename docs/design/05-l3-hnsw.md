@@ -191,6 +191,10 @@ $$T_{\text{build}}(N) = O(N \cdot d \cdot ef_c \cdot M_0), \qquad S_{\text{graph
 Mneme 用 scoped threads 按批并行。50k 向量/秒的目标依赖批内并行 + 常见维度(768–1536)
 的 SIMD 吞吐,基准验证见 [14 §4](14-testing.md)。
 
+> **L3 落地状态**:当前 `HnswIndex::build` 为**串行**构建(固定种子,同输入同图便于复现);
+> 批内并行随 L5 compaction 引入(见 §9 落地状态)。1M×1536 的吞吐/延迟基准尚未接入 CI,
+> `benches/hnsw.rs` 当前只是微缩趋势样本。
+
 ---
 
 ## 5. 查询算法
@@ -241,9 +245,13 @@ $ef_c=4$。
 
 ### 6.2 召回率
 
-无严格闭式(图搜索是概率过程);保证方式是**属性测试 + 基准门槛**:
-Recall@10 ≥ 0.95(ef=128,随机+簇状数据,见 [14 §3](14-testing.md))。
+无严格闭式(图搜索是概率过程);保证方式是**门槛验收 + 边界/属性测试**:
+Recall@10 ≥ 0.95(ef=128,随机均匀 + 8 簇合成数据两套固定种子数据,见 [14 §3](14-testing.md))。
 调参方向:$ef \uparrow$ → 召回↑延迟↑;$M \uparrow$ → 召回↑,空间/构建时间↑。
+
+> **L3 落地口径**:当前 CI 档验收为微缩规模(2500 条 × 32 维、默认 `HnswParams`,
+> 两套分布分别达标,见 `tests/hnsw_contracts.rs`);设计规模(64 维 10 万条 × 2 套)
+> 属 heavy/夜间档,尚未接线(设计规模不改变门槛语义,只提高统计置信度)。
 
 > **确定性边界**:HNSW 的构建(并行插入)与 compaction 重建都会改变图的邻接结构,
 > 因此**同一逻辑数据集在 compaction 前后、或两次重建之间,近似结果可能不同**。
@@ -297,7 +305,7 @@ HNSW 的剪枝只依赖**向量距离**;而 [10](10-scoring.md) 的综合排序�
 | 墓碑位图 | 段级 `dead` 位图(vsec 内,[04 §2.1](04-l2-persist.md));O(1) 判定 |
 | 搜索期 | **遍历可以穿过死节点**(保持图连通性),**结果**只收活节点(`W.push` 前查位图) |
 | 版本可见性 | 每个保留的物理版本(含历史版本)都是一个 HNSW 节点;搜索传入的 **alive 位图**决定可见版本:当前搜索 = 每个 RowId 的最新可见版本,`as_of(T)` = 每个 RowId 中 `tx_ms ≤ T` 的最新可见版本([04 §2.2](04-l2-persist.md))。历史版本可穿越、仅当被 alive 位图选中才可入选 |
-| 入口点死亡 | 每段在 MANIFEST 的 `SegmentEntry.entry_*` 与 hidx 头部各存一个段内入口([04 §2.4](04-l2-persist.md)、[§10](05-l3-hnsw.md)):flush 时若入口死亡,就近改选其活邻居;彻底失效则从最高活层重建入口 |
+| 入口点死亡 | 每段在 MANIFEST 的 `SegmentEntry.entry_*` 与 hidx 头部各存一个段内入口([04 §2.4](04-l2-persist.md)、[§10](05-l3-hnsw.md))。**L3 落地**:入口节点不保证存活,搜索靠"可穿死节点"仍正确;死亡入口的就近改选/重建留待 L5 compaction 整体重建,MANIFEST 的 `entry_*` 当前只是信息登记,载入以 hidx 头部为准 |
 | 图修复 | **不做单点重连**(易碎且贵);物理清理交给 compaction 时的整体重建([07 §4](07-l5-life.md)),重建即重新执行 §4 构建,并行化 |
 
 失效模式分析:死节点比例 $t$ 时,搜索多走的"废路"以 $O(t \cdot ef)$ 计,
@@ -320,14 +328,21 @@ $s = |\text{cand}| / N_{\text{alive}}$ 自适应三档:
 
 | 档 | 条件 | 策略 | ef 调整 |
 |---|---|---|---|
-| ① 后过滤 | $s > 0.10$ | 正常 HNSW,结果集过滤 | $ef' = ef \cdot \min(8,\ 1/s)$ |
-| ② 放大后过滤 | $0.001 < s \le 0.10$(且候选数 ≥ `max(ef,1024)`) | **全图遍历**(保连通)+ 结果限候选 | $ef' = ef \cdot 4$ |
+| ① 后过滤 | $s > 0.10$ | 正常 HNSW,结果集过滤 | $ef' = \max(ef,k) \cdot \min(8,\ 1/s)$ |
+| ② 放大后过滤 | $0.001 < s \le 0.10$(且候选数 ≥ `max(ef,1024)`) | **全图遍历**(保连通)+ 结果限候选 | $ef' = \max(ef,k) \cdot 4$ |
 | ③ 候选暴力 | $s \le 0.001$ 或候选数 < `max(ef, 1024)` | 直接对候选位图暴力扫描 | — |
 
 > **实现注**:原设计档②为"约束遍历(只展开过滤内节点)",但过滤稀疏时图会被候选位图
 > 切断,`ef` 再放大也探不到足够候选,召回近乎归零(已由候选数阈值兜底)。落地改为
 > **全图遍历、结果限候选**——遍历不受限(保持图连通),最终 `TopK` 只收候选位图内节点,
 > 仍严格满足"结果 ⊆ alive ∩ 过滤位图"且统计等价于候选暴力。档①②的区别仅剩 `ef'` 放大倍数。
+
+> **召回与探查密度的关系(档①②的后过滤口径)**:遍历 `ef'` 个节点中期望命中候选
+> ≈ `ef' · s`(探查优先靠近查询,实际略优于随机期望)。要让 top-k 的统计等价成立,
+> 应满足 `ef' · s ≳ 4k`(经验系数,验收测试 `tests/hnsw_contracts.rs::filter_amplified_tier_matches_candidate_bruteforce`
+> 在 `s=0.05, ef'=2048` 下验证 Recall@10 ≥ 0.95)。`ef' · s` 过小时(大 N × 极低 s)
+> 后过滤召回必然下降——此时应提高 `ef`,或依赖档③候选暴力(其代价 `O(s·N)` 仍远低于
+> 全量扫描)。本节的"统计等价"均以该条件为口径;这也是 §11.1 "召回不够先加 ef" 的量化依据。
 
 - 候选位图来自 L4 的 zone map/bloom 下推([06 §2](06-l4-query.md)),位图本身
   $O(N/8)$ 字节、popcount 求 $s$ 为 $O(N/64)$ 字操作——亚微秒;
@@ -380,12 +395,14 @@ adj_blob:   逐点逐层 u32 邻居槽位数组(层0 ≤ M0 个,上层按 level 
 尾部 payload_crc32
 ```
 
-> 上图为**简图**:真实 hidx 头部与 [04 §2.1](04-l2-persist.md) 一致,含 `header_len` 与
-> 可选 feature 扩展区(`key_id`/`codec`);同一段三文件(vsec/msec/hidx)的 `key_id`/`codec`
-> 必须一致([04 §2.5](04-l2-persist.md))。
+> 上图为**简图**:真实 hidx 头部为定长 64 B,含 `header_len`(6..8)、头部 CRC(36..40)
+> 与 `0..64` 的对齐 padding(`src/index/hidx.rs` 模块文档为逐字节权威)。
+> `key_id`/`codec` 可选扩展区随加密/压缩(L11,设计 [04 §2.5](04-l2-persist.md))落地,
+> 当前恒为 0("同一段三文件必须一致"的约束自 L11 生效);版本号与 vsec/msec 同代
+> (`FORMAT_VERSION`),主版本过新一律拒读(I18)。
 
-mmap 惰性加载:打开段只读头部与 node_table,邻接 blob 由缺页按需载入
-——"1M 条冷启动 < 1s"的主要支撑点([01 §1.1](01-overview.md))。
+**目标形态(尚未兑现)**:mmap 惰性加载——打开段只读头部与 node_table,邻接 blob
+由缺页按需载入,是"1M 条冷启动 < 1s"的主要支撑点([01 §1.1](01-overview.md))。
 
 > **L3 现状**:`MmapSource`(feature `mmap`,默认开)已落地并统一用于段字节读取,
 > 但当前仍**整段载入内存**后解码;真正"只读头部 + 邻接缺页惰性驻留"需让
@@ -407,8 +424,13 @@ mmap 惰性加载:打开段只读头部与 node_table,邻接 blob 由缺页按�
 > **默认值与召回门槛**:`ef=64` 是延迟优先的默认值;要达到
 > [14 §4](14-testing.md) 的 Recall@10 ≥ 0.95 门槛,基准与验收显式使用 `ef=128`
 > (文档算例与示例亦如此)。调用方按"召回/延迟"需求在 [64, 512] 区间自调。
-> 段内行数低于 `Tuning::brute_force_max_rows`(默认 2048)时恒走暴力扫描
-> ([16 §2](16-api-reference.md)),不建/不用图。
+> 段内行数低于 `Tuning::brute_force_max_rows`(默认 2048)时查询恒走暴力扫描
+> ([16 §2](16-api-reference.md));**图可能仍随 flush 预建**(节省首次查询的构建停顿),
+> 但查询路径不读它,`stats().segments[*].index_nodes` 因此可能非 0(设计 05 §11)。
+>
+> **建库校验**:`HnswParams` 在 `Builder::build` 入口强制 `m ≥ 2`、`m0 ≥ m`、
+> `ef_construction ≥ 1`、`1 ≤ ef_search ≤ Limits.ef_max`、`m`/`m0 ≤ 4096`
+> (`FC-INDEX-PRE-001`);越界返回 `Config`/`LimitExceeded`,绝不静默。
 
 ### 11.1 调参决策与常见误区
 
@@ -436,16 +458,20 @@ mmap 惰性加载:打开段只读头部与 node_table,邻接 blob 由缺页按�
 
 1. `HnswIndex::build(nodes, params, metric) -> Self`(构建;compaction 复用,见 `rebuild.rs`);
 2. `VectorIndex::search(&IndexSearch) -> TopK<(RowId, SlotId)>`
-   (`alive` / 过滤位图 / `ef` 由调用方传入,三档策略内聚于 `filtered.rs`);
-3. `serialize` / `load`(hidx 编解码,布局 §10;无增量 `insert`,compaction 整体重建);
+   (`alive` / 过滤位图 / `ef` 由调用方传入,度量取自索引自身,三档策略内聚于 `filtered.rs`);
+3. `serialize() -> Result<Vec<u8>>` / `load`(hidx 编解码,布局 §10;长度字段超限返回结构化
+   错误而非截断;无增量 `insert`,compaction 整体重建);
 4. 段内入口点与统计(节点数/层数)经 `stats()` 暴露(`SegmentStat.index_nodes/index_levels`)。
 
-**依赖**:仅 L0(`simd` 距离、`TopK`、`bitset`、标识类型)与 L1 的索引抽象
-`memory::index::{VectorIndex, IndexFactory}`(L1 只依赖 L0;L3 依赖 L1 不构成反向穿透);
-hidx 字节经 `SegmentSource` 读入,`MmapSource`(feature `mmap`,默认开)为读路径优化。
+**依赖**:L0(`simd` 距离、`TopK`、`bitset`、标识类型)、L1 的索引抽象
+`memory::index::{VectorIndex, IndexFactory}`(L1 只依赖 L0;L3 依赖 L1 不构成反向穿透),
+以及 L2 `persist` 的帧编解码原语(`Cursor`/`crc32`/`FORMAT_VERSION`,hidx 布局与 vsec/msec
+同代)与 `SegmentSource` 读入(方向仍 L3 → L2 → L1 → L0);`MmapSource`(feature `mmap`,
+默认开)为读路径优化。
 **不变量**:同一段内,搜索结果 ⊆ alive 位图 ∩ 过滤位图(alive 由可见性规则生成,含 `as_of`);
-死节点与未被 alive 选中的历史版本只可穿越、不可入选;
-`ef → ∞` 时结果收敛于段内暴力扫描(属性测试断言,见 [14 §3](14-testing.md))。
+死节点与未被 alive 选中的历史版本只可穿越、不可入选;图与入口的结构约束
+(每层度数 ≤ M0/M、入口 = 最高层、无自环)在构建与 hidx 载入两条路径恒成立(`FC-INDEX-INV-007`);
+`ef → ∞` 时结果收敛于段内暴力扫描(见 [14 §3](14-testing.md))。
 
 ## 本章小结
 

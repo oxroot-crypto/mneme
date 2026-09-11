@@ -33,6 +33,7 @@ pub(crate) struct IndexNode {
 /// 一次索引搜索的全部输入。
 ///
 /// `alive` / `filter` 按**全局 `SlotId`** 索引;索引内部经 `slot_of` 映射到图节点。
+/// 距离度量取自索引自身(建库即锁定),不在此重复传入以避免不一致。
 pub(crate) struct IndexSearch<'a> {
     /// 查询向量。
     pub(crate) query: &'a [f32],
@@ -42,15 +43,13 @@ pub(crate) struct IndexSearch<'a> {
     pub(crate) ef: usize,
     /// 返回条数。
     pub(crate) k: usize,
-    /// 距离度量。
-    pub(crate) metric: Metric,
     /// 可见版本位图(全局槽位)。
     pub(crate) alive: &'a BitSet,
     /// 过滤候选位图(全局槽位;`None` = 无过滤)。
     pub(crate) filter: Option<&'a BitSet>,
-    /// 过滤三档:后过滤 / 约束遍历分界。
+    /// 过滤三档:后过滤 / 放大后过滤分界。
     pub(crate) post_threshold: f32,
-    /// 过滤三档:约束遍历 / 候选暴力分界。
+    /// 过滤三档:放大后过滤 / 候选暴力分界。
     pub(crate) brute_threshold: f32,
 }
 
@@ -69,7 +68,10 @@ pub(crate) trait VectorIndex: Send + Sync {
     fn entry(&self) -> (SlotId, u8);
 
     /// 编码为 hidx 字节(设计 05 §10)。
-    fn serialize(&self) -> Vec<u8>;
+    ///
+    /// # Errors
+    /// 图规模超过 hidx 格式的 `u32` 长度上限时返回结构化错误(绝不静默截断)。
+    fn serialize(&self) -> Result<Vec<u8>>;
 
     /// 在索引上搜索,返回按 `Metric::better` 排序的 top-k 载荷 `(RowId, SlotId)`。
     ///

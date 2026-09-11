@@ -13,7 +13,7 @@ use crate::core::heap::TopK;
 use crate::core::metric::{Metric, Score};
 use crate::core::options::HnswParams;
 use crate::core::types::{RowId, SlotId};
-use crate::memory::index::{IndexNode, IndexSearch, VectorIndex};
+use crate::memory::index::{IndexNode, IndexSearch, MAX_INDEX_DEGREE, VectorIndex};
 
 use super::filtered;
 use super::graph::Graph;
@@ -23,6 +23,15 @@ use super::hidx;
 const BUILD_SEED: u64 = 0x4D4E_454D_4500_0001;
 /// 层级骰子上限(防 `-ln(u)` 极端值导致层级爆炸)。
 const MAX_ROLL_LEVEL: usize = 31;
+
+/// 查询向量及其预计算范数平方;打包传参以避免在层搜索接口上堆叠参数。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct QueryRef<'a> {
+    /// 查询向量。
+    pub(crate) vector: &'a [f32],
+    /// 查询向量范数平方(度量需要时)。
+    pub(crate) norm_sq: f32,
+}
 
 // 单测操作计数:统计距离计算次数(线程局部,避免测试间干扰)。
 #[cfg(test)]
@@ -120,9 +129,12 @@ fn roll_level(rng: &mut Rng, ml: f32) -> u8 {
 
 impl HnswIndex {
     /// 由节点构建 HNSW 图。
+    ///
+    /// 参数防御性钳制到 `[1, MAX_INDEX_DEGREE]`:`Builder` 已在入口校验
+    /// (FC-INDEX-PRE-001),此处保证内部构造与 `u16` 序列化永不失真。
     pub(crate) fn build(nodes: &[IndexNode], params: HnswParams, metric: Metric) -> Self {
-        let m = params.m.max(2) as usize;
-        let m0 = params.m0.max(params.m.max(2)) as usize;
+        let m = (params.m.max(2) as usize).min(MAX_INDEX_DEGREE as usize);
+        let m0 = (params.m0 as usize).max(m).min(MAX_INDEX_DEGREE as usize);
         let ef_construction = params.ef_construction.max(1) as usize;
         let ml = 1.0 / (m as f32).ln();
         let mut index = Self {
@@ -182,6 +194,11 @@ impl HnswIndex {
         self.slot_of[node as usize]
     }
 
+    /// 建库时锁定的距离度量(查询与索引用同一度量,避免调用方重复传入而不一致)。
+    pub(crate) fn metric(&self) -> Metric {
+        self.metric
+    }
+
     /// 节点 id 对应的稳定 `RowId`。
     pub(crate) fn rowid(&self, node: u32) -> RowId {
         self.nodes[node as usize].rowid
@@ -192,29 +209,26 @@ impl HnswIndex {
         self.graph.entry
     }
 
-    /// 以给定谓词搜索一层,返回按优劣排序的 `(score, node)`(best-first)。
+    /// 以给定入口搜索一层,返回按优劣排序的 `(score, node)`(best-first)。
     ///
-    /// `traverse(node) == false` 的节点被标记已访问但不展开(过滤三档的约束遍历)。
+    /// 遍历不受过滤位图限制(死节点/历史版本可穿越以保连通),结果取舍由
+    /// [`super::filtered`] 在返回后按 alive/过滤位图完成。
     pub(crate) fn search_layer(
         &self,
-        query: &[f32],
-        query_norm: f32,
-        entries: &[u32],
+        query: QueryRef<'_>,
+        start: u32,
         ef: usize,
         level: usize,
-        traverse: &dyn Fn(u32) -> bool,
     ) -> Vec<(Score, u32)> {
         let ef = ef.max(1);
         let mut visited: HashSet<u32> = HashSet::new();
         let mut frontier: BinaryHeap<Cand> = BinaryHeap::new();
         let mut results: BinaryHeap<std::cmp::Reverse<Cand>> = BinaryHeap::new();
-        for &entry in entries.iter().take(ef) {
-            if visited.insert(entry) {
-                let score = self.score_query(query, query_norm, entry);
-                let cand = self.cand(score, entry);
-                frontier.push(cand);
-                results.push(std::cmp::Reverse(cand));
-            }
+        if visited.insert(start) {
+            let score = self.score_query(query, start);
+            let cand = self.cand(score, start);
+            frontier.push(cand);
+            results.push(std::cmp::Reverse(cand));
         }
         while let Some(current) = frontier.pop() {
             if results.len() >= ef {
@@ -228,10 +242,7 @@ impl HnswIndex {
                 if !visited.insert(neighbor) {
                     continue;
                 }
-                if !traverse(neighbor) {
-                    continue;
-                }
-                let score = self.score_query(query, query_norm, neighbor);
+                let score = self.score_query(query, neighbor);
                 let cand = self.cand(score, neighbor);
                 if results.len() < ef {
                     frontier.push(cand);
@@ -253,18 +264,12 @@ impl HnswIndex {
     }
 
     /// 在给定层做贪心下降,返回距查询最优的节点(best-first 单步)。
-    pub(crate) fn greedy_query(
-        &self,
-        query: &[f32],
-        query_norm: f32,
-        mut node: u32,
-        level: usize,
-    ) -> u32 {
-        let mut best = self.score_query(query, query_norm, node);
+    pub(crate) fn greedy_query(&self, query: QueryRef<'_>, mut node: u32, level: usize) -> u32 {
+        let mut best = self.score_query(query, node);
         loop {
             let mut improved = false;
             for &neighbor in self.graph.neighbors(node, level) {
-                let score = self.score_query(query, query_norm, neighbor);
+                let score = self.score_query(query, neighbor);
                 if self.metric.better(score, best) {
                     node = neighbor;
                     best = score;
@@ -279,12 +284,12 @@ impl HnswIndex {
     }
 
     /// 节点-查询距离。
-    pub(crate) fn score_query(&self, query: &[f32], query_norm: f32, node: u32) -> Score {
+    pub(crate) fn score_query(&self, query: QueryRef<'_>, node: u32) -> Score {
         #[cfg(test)]
         bump_dist_calls();
         let target = &self.nodes[node as usize];
         self.metric
-            .score(query, &target.vector, query_norm, target.norm_sq)
+            .score(query.vector, &target.vector, query.norm_sq, target.norm_sq)
     }
 
     /// 节点-节点距离。
@@ -313,27 +318,23 @@ impl HnswIndex {
             self.graph.entry_level = level;
             return;
         }
-        let query = Arc::clone(&self.nodes[node as usize].vector);
-        let query_norm = self.nodes[node as usize].norm_sq;
+        // 克隆 `Arc` 以免 `query` 借用 `self.nodes` 与后续 `&mut self` 冲突。
+        let vector = Arc::clone(&self.nodes[node as usize].vector);
+        let query = QueryRef {
+            vector: &vector,
+            norm_sq: self.nodes[node as usize].norm_sq,
+        };
         let target = level as usize;
         let top = self.graph.entry_level as usize;
         let mut entry = self.graph.entry;
         if target < top {
             for layer in ((target + 1)..=top).rev() {
-                entry = self.greedy_query(&query, query_norm, entry, layer);
+                entry = self.greedy_query(query, entry, layer);
             }
         }
-        let always = |_node: u32| true;
         let start = target.min(top);
         for layer in (0..=start).rev() {
-            let candidates = self.search_layer(
-                &query,
-                query_norm,
-                &[entry],
-                self.ef_construction,
-                layer,
-                &always,
-            );
+            let candidates = self.search_layer(query, entry, self.ef_construction, layer);
             let max_conn = if layer == 0 { self.m0 } else { self.m };
             let selected = self.select_neighbors(node, &candidates, max_conn);
             for &neighbor in &selected {
@@ -434,13 +435,15 @@ impl VectorIndex for HnswIndex {
         )
     }
 
-    fn serialize(&self) -> Vec<u8> {
+    fn serialize(&self) -> Result<Vec<u8>> {
         hidx::encode(
             &self.graph,
-            self.m as u16,
-            self.m0 as u16,
-            self.ef_construction as u16,
-            self.ml,
+            hidx::GraphParams {
+                m: self.m as u16,
+                m0: self.m0 as u16,
+                ef_construction: self.ef_construction as u16,
+                ml: self.ml,
+            },
         )
     }
 
@@ -488,11 +491,21 @@ mod tests {
         DIST_CALLS.with(std::cell::Cell::get)
     }
 
-    /// FC-INDEX-INV-007:每层度数 ≤ M0/M、无自环、邻居 id 有效。
+    /// FC-INDEX-INV-007:每层度数 ≤ M0/M、无自环、邻居 id 有效;
+    /// 入口节点必须是全图最高层节点(构建路径同口径)。
     #[test]
     fn graph_degree_and_self_loop_invariants() {
         let index = build_with(300);
         assert_eq!(index.node_count(), 300);
+        assert_eq!(
+            index.graph.levels[index.graph.entry as usize], index.graph.entry_level,
+            "入口节点的存储层级与入口层级不一致"
+        );
+        assert_eq!(
+            index.graph.entry_level,
+            index.max_level(),
+            "入口必须是全图最高层节点"
+        );
         for node in 0..index.graph.node_count() as u32 {
             let level = index.graph.levels[node as usize] as usize;
             for layer in 0..=level {
@@ -535,7 +548,6 @@ mod tests {
             query_norm: simd::dot(query, query),
             ef,
             k: 10,
-            metric: Metric::Dot,
             alive,
             filter: None,
             post_threshold: 0.1,
@@ -613,7 +625,6 @@ mod tests {
             query_norm: simd::dot(&query, &query),
             ef: 64,
             k: 16,
-            metric: Metric::Dot,
             alive: &alive,
             filter: None,
             post_threshold: 0.1,

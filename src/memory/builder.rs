@@ -134,8 +134,9 @@ impl Builder {
         Ok(())
     }
 
-    /// 校验 HNSW 参数:`m ≥ 2`、`m0 ≥ m`、`ef_construction ≥ 1`、度数不超硬上限
-    /// (FC-INDEX-PRE-001;越限会使自产 hidx 无法读回)。
+    /// 校验 HNSW 参数:`m ≥ 2`、`m0 ≥ m`、`ef_construction ≥ 1`、`ef_search ∈ [1, ef_max]`、
+    /// 度数不超硬上限(FC-INDEX-PRE-001;越限会使自产 hidx 无法读回,或让默认查询宽度
+    /// 绕过查询期上限)。
     fn validate_hnsw(&self) -> Result<()> {
         let params = self.hnsw;
         if params.m < 2 || params.m0 < params.m {
@@ -146,6 +147,19 @@ impl Builder {
         if params.ef_construction < 1 {
             return Err(MnemeError::Config {
                 reason: "HNSW ef_construction 必须 ≥ 1",
+            });
+        }
+        if params.ef_search < 1 {
+            return Err(MnemeError::Config {
+                reason: "HNSW ef_search 必须 ≥ 1",
+            });
+        }
+        let ef_max = self.limits.ef_max as usize;
+        if params.ef_search as usize > ef_max {
+            return Err(MnemeError::LimitExceeded {
+                field: "ef_search",
+                limit: ef_max,
+                got: params.ef_search as usize,
             });
         }
         let max = crate::memory::index::MAX_INDEX_DEGREE as usize;

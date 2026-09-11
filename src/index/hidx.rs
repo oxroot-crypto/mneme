@@ -42,49 +42,104 @@ pub(crate) struct Decoded {
     pub(crate) ml: f32,
 }
 
+/// hidx 头部携带的图构建参数(`ef_search` 不入文件,见设计 05 §10)。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GraphParams {
+    /// 上层度数上限。
+    pub(crate) m: u16,
+    /// 第 0 层度数上限。
+    pub(crate) m0: u16,
+    /// 构建期探查宽度。
+    pub(crate) ef_construction: u16,
+    /// 层级骰子系数。
+    pub(crate) ml: f32,
+}
+
+/// 编码时已确定的长度字段(节点数 / 节点表字节数 / 邻接区字节数,均 `u32`)。
+#[derive(Clone, Copy)]
+struct EncodedLengths {
+    nodes: u32,
+    node_table: u32,
+    adj: u32,
+}
+
 /// 编码邻接图为 hidx 字节。
-pub(crate) fn encode(graph: &Graph, m: u16, m0: u16, ef_construction: u16, ml: f32) -> Vec<u8> {
+///
+/// # Errors
+/// 节点数/邻接区超过格式的 `u32` 长度上限,或单层度数超过 `u16` 时返回结构化错误
+/// (绝不静默截断;`Builder` 校验下正常构建不可达)。
+pub(crate) fn encode(graph: &Graph, params: GraphParams) -> Result<Vec<u8>> {
     let count = graph.node_count();
     let mut node_table = Vec::with_capacity(count * NODE_TABLE_ENTRY);
     let mut adj_blob: Vec<u8> = Vec::new();
     for node in 0..count {
         let level = graph.levels[node];
         node_table.push(level);
-        put_u32(&mut node_table, adj_blob.len() as u32);
+        put_u32(
+            &mut node_table,
+            u32::try_from(adj_blob.len())
+                .map_err(|_| encode_too_large("hidx 邻接区字节数", adj_blob.len()))?,
+        );
         for layer in 0..=level as usize {
             let neighbors = graph.neighbors(node as u32, layer);
-            put_u16(&mut adj_blob, neighbors.len() as u16);
+            let degree = u16::try_from(neighbors.len()).map_err(|_| MnemeError::Inconsistent {
+                reason: "hidx: 单层度数超过 u16(违反度数上界不变量)",
+            })?;
+            put_u16(&mut adj_blob, degree);
             for &neighbor in neighbors {
                 put_u32(&mut adj_blob, neighbor);
             }
         }
     }
 
-    let mut header = [0_u8; HEADER_LEN as usize];
-    header[0..4].copy_from_slice(&MAGIC);
-    header[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
-    header[6..8].copy_from_slice(&HEADER_LEN.to_le_bytes());
-    header[8..10].copy_from_slice(&m.to_le_bytes());
-    header[10..12].copy_from_slice(&m0.to_le_bytes());
-    header[12..14].copy_from_slice(&ef_construction.to_le_bytes());
-    header[14] = graph.entry_level;
-    header[16..20].copy_from_slice(&ml.to_le_bytes());
-    header[20..24].copy_from_slice(&(count as u32).to_le_bytes());
-    header[24..28].copy_from_slice(&graph.entry.to_le_bytes());
-    header[28..32].copy_from_slice(&(node_table.len() as u32).to_le_bytes());
-    header[32..36].copy_from_slice(&(adj_blob.len() as u32).to_le_bytes());
-    let crc = crc32(&header[0..36]);
-    header[36..40].copy_from_slice(&crc.to_le_bytes());
+    let lengths = EncodedLengths {
+        nodes: u32::try_from(count).map_err(|_| encode_too_large("hidx 节点数", count))?,
+        node_table: u32::try_from(node_table.len())
+            .map_err(|_| encode_too_large("hidx 节点表字节数", node_table.len()))?,
+        adj: u32::try_from(adj_blob.len())
+            .map_err(|_| encode_too_large("hidx 邻接区字节数", adj_blob.len()))?,
+    };
+    let header = encode_header(graph, params, lengths);
 
     let mut out = Vec::with_capacity(HEADER_LEN as usize + node_table.len() + adj_blob.len() + 4);
     out.extend_from_slice(&header);
     out.extend_from_slice(&node_table);
     out.extend_from_slice(&adj_blob);
-    let mut payload = Vec::with_capacity(node_table.len() + adj_blob.len());
-    payload.extend_from_slice(&node_table);
-    payload.extend_from_slice(&adj_blob);
-    out.extend_from_slice(&crc32(&payload).to_le_bytes());
-    out
+    out.extend_from_slice(&crc32(&out[HEADER_LEN as usize..]).to_le_bytes());
+    Ok(out)
+}
+
+/// 组装 hidx 定长头部(含头部 CRC)。
+fn encode_header(
+    graph: &Graph,
+    params: GraphParams,
+    lengths: EncodedLengths,
+) -> [u8; HEADER_LEN as usize] {
+    let mut header = [0_u8; HEADER_LEN as usize];
+    header[0..4].copy_from_slice(&MAGIC);
+    header[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+    header[6..8].copy_from_slice(&HEADER_LEN.to_le_bytes());
+    header[8..10].copy_from_slice(&params.m.to_le_bytes());
+    header[10..12].copy_from_slice(&params.m0.to_le_bytes());
+    header[12..14].copy_from_slice(&params.ef_construction.to_le_bytes());
+    header[14] = graph.entry_level;
+    header[16..20].copy_from_slice(&params.ml.to_le_bytes());
+    header[20..24].copy_from_slice(&lengths.nodes.to_le_bytes());
+    header[24..28].copy_from_slice(&graph.entry.to_le_bytes());
+    header[28..32].copy_from_slice(&lengths.node_table.to_le_bytes());
+    header[32..36].copy_from_slice(&lengths.adj.to_le_bytes());
+    let crc = crc32(&header[0..36]);
+    header[36..40].copy_from_slice(&crc.to_le_bytes());
+    header
+}
+
+/// 构造"长度字段超出格式上限"的结构化错误(拒绝静默截断)。
+fn encode_too_large(what: &'static str, got: usize) -> MnemeError {
+    MnemeError::LimitExceeded {
+        field: what,
+        limit: u32::MAX as usize,
+        got,
+    }
 }
 
 /// hidx 定长头部字段(解码中间态)。
@@ -111,14 +166,7 @@ pub(crate) fn decode(bytes: &[u8]) -> Result<Decoded> {
     let node_table = &bytes[body_start..adj_start];
     let adj_blob = &bytes[adj_start..payload_end];
     let (levels, offsets) = read_node_table(node_table, header.count)?;
-    let graph = build_graph(
-        adj_blob,
-        &levels,
-        &offsets,
-        header.count,
-        header.entry_slot,
-        header.entry_level,
-    )?;
+    let graph = build_graph(&header, adj_blob, &levels, &offsets)?;
     Ok(Decoded {
         graph,
         m: header.m,
@@ -165,6 +213,9 @@ fn parse_header(bytes: &[u8]) -> Result<HidxHeader> {
     // 否则自产文件与手改文件口径不一致。
     if m < 2 || m0 < m || m as usize > MAX_DEGREE || m0 as usize > MAX_DEGREE {
         return Err(corrupt("头部度数参数越界"));
+    }
+    if ef_construction < 1 {
+        return Err(corrupt("ef_construction 必须 ≥ 1"));
     }
     if !ml.is_finite() || ml <= 0.0 {
         return Err(corrupt("ml 非正有限值"));
@@ -239,10 +290,13 @@ fn read_node_table(node_table: &[u8], count: usize) -> Result<(Vec<u8>, Vec<usiz
 }
 
 /// 校验入口点与层级一致性。
+///
+/// 自产图的不变量:入口节点即全图最高层节点(`link_node` 仅在更高层出现时替换入口),
+/// 载入路径必须同口径强制(FC-INDEX-INV-007);层级不等一律拒绝。
 fn validate_entry(levels: &[u8], count: usize, entry_slot: u32, entry_level: u8) -> Result<()> {
     let max_level = levels.iter().copied().max().unwrap_or(0);
-    if entry_level > max_level {
-        return Err(corrupt("入口层级超过最高层"));
+    if entry_level != max_level {
+        return Err(corrupt("入口层级不等于全图最高层"));
     }
     if count > 0 {
         if entry_slot as usize >= count {
@@ -257,43 +311,32 @@ fn validate_entry(levels: &[u8], count: usize, entry_slot: u32, entry_level: u8)
 
 /// 校验入口并解码邻接区为图。
 fn build_graph(
+    header: &HidxHeader,
     adj_blob: &[u8],
     levels: &[u8],
     offsets: &[usize],
-    count: usize,
-    entry_slot: u32,
-    entry_level: u8,
 ) -> Result<Graph> {
-    validate_entry(levels, count, entry_slot, entry_level)?;
+    validate_entry(levels, header.count, header.entry_slot, header.entry_level)?;
     let mut graph = Graph::new();
     for &level in levels {
         graph.push_node(level);
     }
-    graph.entry = entry_slot;
-    graph.entry_level = entry_level;
+    graph.entry = header.entry_slot;
+    graph.entry_level = header.entry_level;
 
     let mut cursor = Cursor::new(adj_blob, "hidx 邻接区");
-    for node in 0..count {
+    for node in 0..header.count {
         if offsets[node] != cursor_position(&cursor, adj_blob.len()) {
             return Err(corrupt("adj_off 与逐节点布局不符"));
         }
         let level = levels[node];
         for layer in 0..=level as usize {
-            let degree = cursor.u16()? as usize;
-            if degree > MAX_DEGREE {
-                return Err(corrupt("度数越界"));
-            }
-            let mut neighbors = Vec::with_capacity(degree.min(NEIGHBOR_PREALLOC));
-            for _ in 0..degree {
-                let neighbor = cursor.u32()?;
-                if count > 0 && neighbor as usize >= count {
-                    return Err(corrupt("邻居 id 越界"));
-                }
-                if neighbor as usize == node {
-                    return Err(corrupt("存在自环"));
-                }
-                neighbors.push(neighbor);
-            }
+            let bound = if layer == 0 {
+                header.m0 as usize
+            } else {
+                header.m as usize
+            };
+            let neighbors = read_neighbors(&mut cursor, node, header.count, bound)?;
             graph.set_neighbors(node as u32, layer, neighbors);
         }
     }
@@ -301,6 +344,31 @@ fn build_graph(
         return Err(corrupt("邻接区存在多余字节"));
     }
     Ok(graph)
+}
+
+/// 读取一个节点在一层的邻接表:度数 ≤ 该层上界(`M0`/`M`)、邻居 id 合法且无自环。
+fn read_neighbors(
+    cursor: &mut Cursor<'_>,
+    node: usize,
+    count: usize,
+    bound: usize,
+) -> Result<Vec<u32>> {
+    let degree = cursor.u16()? as usize;
+    if degree > bound {
+        return Err(corrupt("该层度数超过 M0/M 上界"));
+    }
+    let mut neighbors = Vec::with_capacity(degree.min(NEIGHBOR_PREALLOC));
+    for _ in 0..degree {
+        let neighbor = cursor.u32()?;
+        if neighbor as usize >= count {
+            return Err(corrupt("邻居 id 越界"));
+        }
+        if neighbor as usize == node {
+            return Err(corrupt("存在自环"));
+        }
+        neighbors.push(neighbor);
+    }
+    Ok(neighbors)
 }
 
 /// 邻接区每层预分配的保守上界(仅用于 `Vec::with_capacity`)。
@@ -323,6 +391,15 @@ fn corrupt(reason: &str) -> MnemeError {
 mod tests {
     use super::*;
     use crate::index::graph::Graph;
+    use proptest::prelude::*;
+
+    /// 常规图参数(m=16/m0=32/efc=200/ml=0.5),供往返与损坏测试复用。
+    const GRAPH_PARAMS: GraphParams = GraphParams {
+        m: 16,
+        m0: 32,
+        ef_construction: 200,
+        ml: 0.5,
+    };
 
     fn sample_graph() -> Graph {
         let mut graph = Graph::new();
@@ -340,11 +417,26 @@ mod tests {
         graph
     }
 
+    /// 节点 0 在第 0 层连 3 个邻居的"超上界"图(m0=2 时违反度数上界)。
+    fn hub_graph(layer: usize) -> Graph {
+        let mut graph = Graph::new();
+        for _ in 0..4 {
+            graph.push_node(layer as u8);
+        }
+        for neighbor in 1..4u32 {
+            graph.add_neighbor(0, layer, neighbor);
+            graph.add_neighbor(neighbor, layer, 0);
+        }
+        graph.entry = 0;
+        graph.entry_level = layer as u8;
+        graph
+    }
+
     /// FC-INDEX-POST-007:hidx 编解码往返恢复同一图(层级/邻接/入口/参数)。
     #[test]
     fn hidx_roundtrip_restores_graph() {
         let graph = sample_graph();
-        let bytes = encode(&graph, 16, 32, 200, 0.5);
+        let bytes = encode(&graph, GRAPH_PARAMS).expect("encode");
         let decoded = decode(&bytes).expect("decode");
         assert_eq!(decoded.graph.node_count(), 3);
         assert_eq!(decoded.graph.entry, 0);
@@ -366,7 +458,7 @@ mod tests {
     /// FC-INDEX-ERR-001:魔数不符 → `Corrupted`。
     #[test]
     fn hidx_rejects_bad_magic() {
-        let mut bytes = encode(&sample_graph(), 16, 32, 200, 0.5);
+        let mut bytes = encode(&sample_graph(), GRAPH_PARAMS).expect("encode");
         bytes[0] = b'X';
         assert!(matches!(decode(&bytes), Err(MnemeError::Corrupted { .. })));
     }
@@ -374,7 +466,7 @@ mod tests {
     /// FC-INDEX-ERR-001:负载 CRC 翻转 → `Corrupted`。
     #[test]
     fn hidx_detects_payload_corruption() {
-        let mut bytes = encode(&sample_graph(), 16, 32, 200, 0.5);
+        let mut bytes = encode(&sample_graph(), GRAPH_PARAMS).expect("encode");
         let last = bytes.len() - 5;
         bytes[last] ^= 0x01;
         assert!(matches!(decode(&bytes), Err(MnemeError::Corrupted { .. })));
@@ -383,7 +475,7 @@ mod tests {
     /// FC-INDEX-ERR-001:更高主版本 → `UnsupportedVersion`(I18)。
     #[test]
     fn hidx_rejects_higher_major() {
-        let mut bytes = encode(&sample_graph(), 16, 32, 200, 0.5);
+        let mut bytes = encode(&sample_graph(), GRAPH_PARAMS).expect("encode");
         bytes[4..6].copy_from_slice(&0x0100_u16.to_le_bytes());
         let crc = crc32(&bytes[0..36]);
         bytes[36..40].copy_from_slice(&crc.to_le_bytes());
@@ -391,6 +483,61 @@ mod tests {
             decode(&bytes),
             Err(MnemeError::UnsupportedVersion { .. })
         ));
+    }
+
+    /// FC-INDEX-ERR-001:头部 `ef_construction = 0` → `Corrupted`(与建库校验同口径)。
+    #[test]
+    fn hidx_rejects_zero_ef_construction() {
+        let bytes = encode(
+            &sample_graph(),
+            GraphParams {
+                ef_construction: 0,
+                ..GRAPH_PARAMS
+            },
+        )
+        .expect("encode");
+        assert!(matches!(decode(&bytes), Err(MnemeError::Corrupted { .. })));
+    }
+
+    /// FC-INDEX-INV-007:第 0 层度数超过 `M0` 或上层超过 `M` → `Corrupted`。
+    #[test]
+    fn hidx_rejects_degree_above_layer_bound() {
+        // 第 0 层度 3 > M0 = 2。
+        let layer0 = encode(
+            &hub_graph(0),
+            GraphParams {
+                m: 2,
+                m0: 2,
+                ef_construction: 1,
+                ..GRAPH_PARAMS
+            },
+        )
+        .expect("encode");
+        assert!(matches!(decode(&layer0), Err(MnemeError::Corrupted { .. })));
+        // 第 1 层度 3 > M = 2。
+        let layer1 = encode(
+            &hub_graph(1),
+            GraphParams {
+                m: 2,
+                m0: 2,
+                ef_construction: 1,
+                ..GRAPH_PARAMS
+            },
+        )
+        .expect("encode");
+        assert!(matches!(decode(&layer1), Err(MnemeError::Corrupted { .. })));
+    }
+
+    /// FC-INDEX-INV-007:入口层级低于全图最高层 → `Corrupted`(入口必须是最高活层节点)。
+    #[test]
+    fn hidx_rejects_entry_level_below_max() {
+        let mut graph = Graph::new();
+        graph.push_node(1);
+        graph.push_node(0);
+        graph.entry = 1;
+        graph.entry_level = 0;
+        let bytes = encode(&graph, GRAPH_PARAMS).expect("encode");
+        assert!(matches!(decode(&bytes), Err(MnemeError::Corrupted { .. })));
     }
 
     /// FC-INDEX-CPLX-004:带边图的编解码规模随节点数近似线性。
@@ -407,13 +554,23 @@ mod tests {
             }
             graph
         }
-        let small_len = encode(&chain(50), 16, 32, 200, 0.5).len();
-        let large_len = encode(&chain(200), 16, 32, 200, 0.5).len();
-        let decoded = decode(&encode(&chain(200), 16, 32, 200, 0.5)).expect("decode");
+        let small_len = encode(&chain(50), GRAPH_PARAMS).expect("encode").len();
+        let large_len = encode(&chain(200), GRAPH_PARAMS).expect("encode").len();
+        let decoded = decode(&encode(&chain(200), GRAPH_PARAMS).expect("encode")).expect("decode");
         assert_eq!(decoded.graph.node_count(), 200);
         // 邻接也被完整恢复(链中间的节点有左右两条边)。
         assert_eq!(decoded.graph.neighbors(100, 0).len(), 2);
         let ratio = large_len as f64 / small_len as f64;
         assert!(ratio < 6.0, "hidx 长度增长过快(疑似超线性):{ratio}");
+    }
+
+    proptest! {
+        /// FC-INDEX-ERR-001:任意字节输入不 panic,解析失败一律结构化 `Err`。
+        #[test]
+        fn hidx_decode_never_panics_on_arbitrary_bytes(
+            bytes in proptest::collection::vec(any::<u8>(), 0..4096)
+        ) {
+            let _ = decode(&bytes);
+        }
     }
 }

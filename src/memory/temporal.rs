@@ -64,3 +64,32 @@ pub(crate) fn snapshot_at(view: &ReaderView, tx_ms: i64) -> ReaderView {
         closed: view.closed,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::metric::Metric;
+    use crate::core::options::HnswParams;
+    use crate::index::HnswIndex;
+    use crate::memory::table::WriterState;
+
+    /// FC-INDEX-POST-005:`as_of` 重建的历史视图必须保留索引句柄,
+    /// 否则会静默退化为全量暴力(性能回退不可见)。
+    #[test]
+    fn snapshot_at_preserves_index_handle() {
+        let mut ws = WriterState::new();
+        ws.index = Some(Arc::new(HnswIndex::build(
+            &[],
+            HnswParams::default(),
+            Metric::Dot,
+        )));
+        let view = ws.snapshot();
+        assert!(view.index.is_some(), "构造的视图应携带索引");
+
+        let snapshot = snapshot_at(&view, i64::MAX);
+        assert!(
+            snapshot.index.is_some(),
+            "as_of 历史视图必须保留索引句柄(不得静默降级为暴力)"
+        );
+    }
+}

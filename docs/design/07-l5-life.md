@@ -287,7 +287,7 @@ neighbors / iter`)见 [16 §1.6](16-api-reference.md);二者均 `Send + Sync`,�
 
 ```rust
 db.stats()?  -> Stats {
-    segments: Vec<SegmentStat{ id, rows, bytes, dead_ratio, created }>,
+    segments: Vec<SegmentStat{ id, rows, bytes, dead_ratio, created, index_nodes, index_levels }>,
     wal_bytes, memory_est, trash_bytes,
     query_latency: Histogram(固定桶: 1ms..1s, 32 桶),
     per_namespace: HashMap<String, NsStat>,   // 键为命名空间路径(经 MANIFEST 注册表解析)

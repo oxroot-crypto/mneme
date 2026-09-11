@@ -6,13 +6,15 @@
 > **本章你将学到**:API 语义细则 → 内存表结构 → 暴力扫描 → 过滤 AST → 去重预检。
 
 模块:`memory/{engine.rs, engine_ops.rs, builder.rs, namespace/, snapshot.rs, snapshot_scan.rs,
-search_builder.rs, search_exec.rs, expand.rs, rerank.rs, table/(mod,handle,state,view,write_op).rs, bitset.rs, search.rs, pred.rs,
+search_builder.rs, search_exec.rs, expand.rs, rerank.rs, table/(mod,handle,state,view,write_op).rs, index.rs, search.rs, pred.rs,
 pred_eval.rs, record.rs, write_helpers.rs, mutate_helpers.rs, dedup.rs, relation.rs,
 temporal.rs, score.rs, lifecycle.rs, ops.rs, config.rs}`——`engine.rs` 承载库句柄 `Mneme`
 (统计/fsck/落盘门面在 `engine_ops.rs`),`namespace/` 承载 `Namespace` 的写/读/访问/
 生命周期/关系方法(过滤遍历与计数在 `namespace/scan.rs`),`snapshot.rs`/`snapshot_scan.rs`
 承载快照只读视图;`search_builder.rs`、`search_exec.rs` 与 `expand.rs` 承载 `SearchBuilder`
-执行流程及联想扩展/结果去重;本章 §2 的语义即其行为规约,其余小节逐个展开数据结构与算法。
+执行流程及联想扩展/结果去重;`index.rs` 是 L3 索引替换缝(内部 trait,公开 API 不变);
+原 `bitset.rs` 已上移 L0 `core/bitset.rs`(构建期/查询期共用位图);本章 §2 的语义即其
+行为规约,其余小节逐个展开数据结构与算法。
 
 ---
 
