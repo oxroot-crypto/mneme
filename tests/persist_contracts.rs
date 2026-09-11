@@ -12,7 +12,8 @@
 //! `FC-PERSIST-STA-001`、`FC-PERSIST-STA-002`、`FC-PERSIST-STA-003`、
 //! `FC-PERSIST-ERR-002`、`FC-PERSIST-ERR-003`、`FC-PERSIST-ERR-004`、
 //! `FC-PERSIST-ERR-005`、`FC-PERSIST-ERR-006`、`FC-PERSIST-ERR-007`、`FC-PERSIST-CPLX-001`、`FC-PERSIST-CPLX-007`、
-//! `FC-PERSIST-CPLX-008`、`FC-PERSIST-CPLX-009`、`FC-PERSIST-CPLX-010`、`FC-INDEX-ERR-002`。
+//! `FC-PERSIST-CPLX-008`、`FC-PERSIST-CPLX-009`、`FC-PERSIST-CPLX-010`、`FC-INDEX-ERR-002`、
+//! `FC-LIFE-INV-011`(备份独立打开 + 校验)、`FC-LIFE-CPLX-005`(backup/check 哨兵)。
 //!
 //! 片级编解码的损坏检出与版本拒绝见各 `src/persist/*.rs` 单元测试。
 
@@ -547,6 +548,8 @@ fn backup_is_independently_openable() {
         db.stats().expect("stats").segments[0].index_nodes > 0,
         "备份应包含并可载入 hidx"
     );
+    // FC-LIFE-INV-011:备份目录不仅可独立 open,还必须通过 check。
+    assert!(db.check().expect("check").ok, "备份目录 check 必须通过");
     db.close().expect("close");
 }
 

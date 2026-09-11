@@ -54,6 +54,12 @@ const SRC_RECOVER_REPLAY: &str = include_str!("../src/persist/recover/replay.rs"
 const SRC_STORAGE: &str = include_str!("../src/persist/storage.rs");
 /// 段读取后端源码(`read_whole`/`MmapSource` 单测被契约引用)。
 const SRC_SOURCE: &str = include_str!("../src/persist/source.rs");
+/// L0 SIMD 源码(逐元素乘加计数单测被 CPLX 契约引用)。
+const SRC_CORE_SIMD: &str = include_str!("../src/core/simd.rs");
+/// L0 TopK 源码(堆操作计数单测被 CPLX 契约引用)。
+const SRC_CORE_HEAP: &str = include_str!("../src/core/heap.rs");
+/// L2 恢复重排映射源码(槽位一致性单测被 ERR 契约引用)。
+const SRC_RECOVER_STATE: &str = include_str!("../src/persist/recover/state.rs");
 
 /// 契约测试文件(孤立检查与覆盖声明检查的范围)。
 const CONTRACT_TEST_FILES: [(&str, &str); 7] = [
@@ -67,7 +73,7 @@ const CONTRACT_TEST_FILES: [(&str, &str); 7] = [
 ];
 
 /// 契约引用的测试可能落在的全部文件(路径必须与 `contracts.md` 中书写一致)。
-const SOURCES: [(&str, &str); 21] = [
+const SOURCES: [(&str, &str); 24] = [
     ("tests/core_contracts.rs", CORE_TESTS),
     ("tests/memory_contracts.rs", MEMORY_TESTS),
     ("tests/query_contracts.rs", QUERY_TESTS),
@@ -89,6 +95,9 @@ const SOURCES: [(&str, &str); 21] = [
     ("src/persist/recover/replay.rs", SRC_RECOVER_REPLAY),
     ("src/persist/storage.rs", SRC_STORAGE),
     ("src/persist/source.rs", SRC_SOURCE),
+    ("src/core/simd.rs", SRC_CORE_SIMD),
+    ("src/core/heap.rs", SRC_CORE_HEAP),
+    ("src/persist/recover/state.rs", SRC_RECOVER_STATE),
 ];
 
 /// 契约编号的类型段(五维 + CPLX,见 `contracts.md` §0)。

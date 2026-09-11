@@ -244,6 +244,7 @@ F  = { Reclaimed }
 | 元数据过滤求值 | $O(N \cdot \|E\|)$,$\|E\|$ = AST 节点数 | $O(N/8)$ 位图 |
 | 向量打分 | $O(N_c \cdot d)$,$N_c$ = 候选数(无过滤则 $N$) | $O(C_{\text{block}} \cdot k)$ |
 | 归并 | $O(C_{\text{block}} \cdot k \log k)$ | $O(C_{\text{block}} \cdot k)$ |
+| 快照 `snapshot` | $O(1)$(clone `Arc` 视图,不复制记录体) | $O(1)$ |
 
 **带宽视角**(并行扩展性的物理上限):每查询读 $4 d$ 字节/行,
 1M×1536 维 ≈ 6 GB;双通道内存 ~50 GB/s → **纯暴力下限约 120ms**。

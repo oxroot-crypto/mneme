@@ -14,6 +14,18 @@
 #[cfg(target_arch = "x86_64")]
 const SHUFFLE_TAKE_HIGHEST: i32 = 0x1;
 
+#[cfg(test)]
+thread_local! {
+    /// 最近一次 `dot_scalar` 的逐元素乘加次数(操作计数,验证 $O(d)$)。
+    static MUL_ADDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 取出最近一次 `dot_scalar` 的乘加计数(仅测试,读后不清零)。
+#[cfg(test)]
+fn take_mul_adds() -> usize {
+    MUL_ADDS.with(std::cell::Cell::get)
+}
+
 /// 计算两个等长 f32 向量的点积。
 ///
 /// # Arguments
@@ -72,6 +84,8 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// assert_eq!(dot_scalar(&[1.0, 2.0], &[3.0, 4.0]), 11.0);
 /// ```
 pub fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(test)]
+    MUL_ADDS.with(|count| count.set(a.len().min(b.len())));
     a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
 }
 
@@ -211,6 +225,19 @@ mod tests {
             let a: Vec<f32> = (0..len).map(|i| i as f32).collect();
             let b: Vec<f32> = (0..len).map(|i| (i + 1) as f32).collect();
             assert!((dot(&a, &b) - dot_scalar(&a, &b)).abs() < 1e-4);
+        }
+    }
+
+    /// FC-CORE-CPLX-001:逐元素乘加次数恰为 `min(len)`(时间 $O(d)$ 的操作计数;
+    /// `dot` 为同复杂度的 SIMD 实现,等价性由 FC-CORE-INV-001 保证)。
+    #[test]
+    fn dot_scalar_per_element_cost_is_linear() {
+        for len in [0_usize, 1, 7, 64, 1_024] {
+            let a = vec![1.0_f32; len];
+            let b = vec![2.0_f32; len];
+            let result = dot_scalar(&a, &b);
+            assert_eq!(result, 2.0 * len as f32);
+            assert_eq!(take_mul_adds(), len, "乘加次数必须恰为 min(len)");
         }
     }
 }

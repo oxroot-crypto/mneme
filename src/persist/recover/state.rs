@@ -135,3 +135,81 @@ fn build_remap(
     }
     Ok(Some(remap))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::error::MnemeError;
+    use crate::persist::msec::VersionRow;
+
+    /// 构造一条版本行(仅 `rowid`/`slot_id` 对本模块测试有意义)。
+    fn version(rowid: u64, slot_id: u32) -> VersionRow {
+        VersionRow {
+            rowid,
+            seqno: rowid,
+            tx_ms: 0,
+            slot_id,
+            doc_offset: 0,
+        }
+    }
+
+    /// 带 `hidx` 的空段占位(字节内容不参与重排映射测试)。
+    fn segment_with_hidx() -> SegmentBytes {
+        SegmentBytes {
+            segment_id: 0,
+            vsec: Vec::new(),
+            msec: Vec::new(),
+            hidx: Some(Vec::new()),
+        }
+    }
+
+    /// FC-PERSIST-ERR-009:映射按"(rowid, seqno) 有序链位置"重排(非恒等);
+    /// 无 `hidx` 时返回 `None`(调用方降级暴力,非错误)。
+    #[test]
+    fn build_remap_maps_slots_in_version_chain_order() {
+        let segments = [segment_with_hidx()];
+        // 段内槽位 1 的版本排在链首、槽位 0 排在其后 → 映射必须非恒等。
+        let versions = [(version(1, 1), 0), (version(2, 0), 0)];
+        let remap = build_remap(&versions, &segments, &[], 2)
+            .expect("合法布局不得报错")
+            .expect("带 hidx 的单段必须产生映射");
+        assert_eq!(remap, vec![1, 0], "remap[段内槽位] = 有序链位置");
+
+        let without_hidx = [SegmentBytes {
+            hidx: None,
+            ..segment_with_hidx()
+        }];
+        assert_eq!(
+            build_remap(&versions, &without_hidx, &[], 2).expect("无 hidx 不是错误"),
+            None
+        );
+    }
+
+    /// FC-PERSIST-ERR-009:槽位越界、重复、存在未被版本行引用的槽位
+    /// (vsec/msec 行数不一致)→ `Corrupted`,绝不静默映射到槽位 0。
+    #[test]
+    fn build_remap_rejects_out_of_range_duplicate_or_unreferenced_slots() {
+        let segments = [segment_with_hidx()];
+
+        // 槽位越界:slot 2 不在 [0, row_count)。
+        let out_of_range = [(version(1, 2), 0)];
+        assert!(matches!(
+            build_remap(&out_of_range, &segments, &[], 2),
+            Err(MnemeError::Corrupted { .. })
+        ));
+
+        // 槽位重复:两条版本行同占 slot 0。
+        let duplicate = [(version(1, 0), 0), (version(2, 0), 0)];
+        assert!(matches!(
+            build_remap(&duplicate, &segments, &[], 2),
+            Err(MnemeError::Corrupted { .. })
+        ));
+
+        // 未被引用:row_count = 2 但只有 slot 0 出现。
+        let unreferenced = [(version(1, 0), 0)];
+        assert!(matches!(
+            build_remap(&unreferenced, &segments, &[], 2),
+            Err(MnemeError::Corrupted { .. })
+        ));
+    }
+}

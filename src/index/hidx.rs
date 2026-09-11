@@ -540,6 +540,17 @@ mod tests {
         assert!(matches!(decode(&bytes), Err(MnemeError::Corrupted { .. })));
     }
 
+    /// FC-INDEX-ERR-003:单层度数超过 `u16` 表示范围 → `Inconsistent`(编码拒绝
+    /// 静默截断;`Builder` 校验下正常构建不可达,此处直接构造超界图证伪)。
+    #[test]
+    fn hidx_encode_rejects_degree_above_u16() {
+        let mut graph = Graph::new();
+        graph.push_node(0);
+        graph.set_neighbors(0, 0, (0..65_536_u32).collect());
+        let error = encode(&graph, GRAPH_PARAMS).expect_err("度数超 u16 必须拒绝编码");
+        assert!(matches!(error, MnemeError::Inconsistent { .. }));
+    }
+
     /// FC-INDEX-CPLX-004:带边图的编解码规模随节点数近似线性。
     #[test]
     fn hidx_encode_decode_scale_linearly() {

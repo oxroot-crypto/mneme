@@ -26,6 +26,18 @@ struct Candidate<'a, T> {
 /// `TopK` 初始预分配容量的上限:避免 `k` 极大时一次性占用过多内存。
 const TOPK_MAX_PREALLOC: usize = 1024;
 
+#[cfg(test)]
+thread_local! {
+    /// `is_better` 调用次数(操作计数,验证 push/merge/排序的复杂度界)。
+    static COMPARES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 取出并清零 `is_better` 调用计数(仅测试)。
+#[cfg(test)]
+fn take_compares() -> usize {
+    COMPARES.with(std::cell::Cell::take)
+}
+
 /// 只保留最优 k 个元素的有界堆。
 ///
 /// 载荷类型 `T` 需实现 [`Ord`]:同分时以载荷升序作为稳定的次级排序键。
@@ -90,6 +102,12 @@ impl<T: Ord> TopK<T> {
     /// 构造时传入的保留个数 `k`(语义容量,非内部缓冲区分配量)。
     pub fn capacity(&self) -> usize {
         self.k
+    }
+
+    /// 内部缓冲区的实际分配容量(单测验证 `new` 的预分配上界,不属公开 API)。
+    #[cfg(test)]
+    fn allocated(&self) -> usize {
+        self.heap.capacity()
     }
 
     /// 推入一个候选;超出容量且不优于当前最差者时直接丢弃。
@@ -196,6 +214,8 @@ impl<T: Ord> TopK<T> {
 
     /// `a` 是否优于 `b`:先比分数方向,同分比载荷升序。
     fn is_better(metric: Metric, a: Candidate<'_, T>, b: Candidate<'_, T>) -> bool {
+        #[cfg(test)]
+        COMPARES.with(|count| count.set(count.get() + 1));
         if metric.better(a.score, b.score) {
             true
         } else if metric.better(b.score, a.score) {
@@ -312,5 +332,80 @@ mod tests {
         top.push(1.0, 1_u32);
         top.push(3.0, 3_u32);
         assert_eq!(top.into_sorted_vec(), vec![3, 2, 1]);
+    }
+
+    /// FC-CORE-CPLX-003:`TopK::new` 预分配 ≤ `min(k, 1024)`(上界/紧邻越界点/零).
+    #[test]
+    fn topk_prealloc_bounded_by_min_k_1024() {
+        assert_eq!(TopK::<u32>::new(0, Metric::Dot).allocated(), 0);
+        assert_eq!(TopK::<u32>::new(10, Metric::Dot).allocated(), 10);
+        assert_eq!(TopK::<u32>::new(1_024, Metric::Dot).allocated(), 1_024);
+        assert_eq!(TopK::<u32>::new(1_025, Metric::Dot).allocated(), 1_024);
+        assert_eq!(TopK::<u32>::new(4_096, Metric::Dot).allocated(), 1_024);
+    }
+
+    /// FC-CORE-CPLX-003:未满上浮 ≤ ⌈log₂ n⌉;已满拒绝恰 1 次比较;
+    /// 已满替换 ≤ 1 + 2⌈log₂ k⌉(与扫描规模无关)。
+    #[test]
+    fn topk_push_outside_k_costs_constant_or_log_k() {
+        let k = 64_usize;
+        let mut top = TopK::new(k, Metric::Dot);
+        for i in 0..k {
+            let _ = take_compares();
+            top.push(i as f32, i as u32);
+            let compares = take_compares();
+            let bound = (i.max(1) as f64).log2().ceil() as usize + 1;
+            assert!(
+                compares <= bound,
+                "第 {i} 次未满 push 比较 {compares} 次,超上界 {bound}"
+            );
+        }
+
+        // 已满且不如守门员:O(1) 拒绝,恰好 1 次比较。
+        let _ = take_compares();
+        top.push(-1.0, u32::MAX);
+        assert_eq!(take_compares(), 1, "已满拒绝路径必须恰 1 次比较");
+
+        // 已满且优于守门员:1 次根比较 + 下沉 ≤ 2⌈log₂ k⌉。
+        let _ = take_compares();
+        top.push(1_000.0, u32::MAX);
+        let replaces = take_compares();
+        let bound = 1 + 2 * (k as f64).log2().ceil() as usize;
+        assert!(
+            replaces <= bound,
+            "已满替换比较 {replaces} 次,超上界 {bound}"
+        );
+    }
+
+    /// FC-CORE-CPLX-004:`merge` / `into_sorted_vec` 只触及 ≤ `k` 个元素,
+    /// 比较次数以 $k\log k$ 为界,与扫描规模 $N$ 无关。
+    #[test]
+    fn topk_merge_and_sort_cost_bounded_by_k() {
+        let k = 64_usize;
+        let mut left = TopK::new(k, Metric::Dot);
+        let mut right = TopK::new(k, Metric::Dot);
+        for i in 0..(k * 16) {
+            left.push((i % 997) as f32, i as u32);
+            right.push(((i * 7) % 997) as f32, (i + 1) as u32);
+        }
+
+        let _ = take_compares();
+        left.merge(right);
+        let merge_compares = take_compares();
+        let merge_bound = k * (1 + 2 * (k as f64).log2().ceil() as usize);
+        assert!(
+            merge_compares <= merge_bound,
+            "merge 比较 {merge_compares} 次,超上界 {merge_bound}"
+        );
+
+        let _ = take_compares();
+        let sorted = left.into_sorted_vec();
+        let sort_compares = take_compares();
+        assert_eq!(sorted.len(), k);
+        let sort_bound = 2 * k * (k as f64).log2().ceil() as usize;
+        assert!(
+            sort_compares <= sort_bound,
+            "排序比较 {sort_compares} 次,超上界 {sort_bound}"
+        );
     }
 }

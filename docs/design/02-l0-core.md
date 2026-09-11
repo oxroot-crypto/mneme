@@ -316,6 +316,10 @@ pub fn as_f64(v: &Meta) -> Option<f64>;   // as_i64 / as_bool / as_str / as_ts �
   [04 §5](04-l2-persist.md)),查询不解析整条 JSON;
 - 替换性:若未来要换自研 JSON,只改此文件。
 
+**复杂度**(FC-CORE-CPLX-006):`get_path` 按 `.` 分段逐级下降,每级一次
+`Value::get`(map/数组索引,平均 $O(1)$),时间 $O(p)$($p$ = 分段数);
+`as_f64/as_i64/as_bool/as_str/as_ts` 为单次类型匹配,时间 $O(1)$、空间 $O(1)$。
+
 ---
 
 ## 8. options 模块:全局参数

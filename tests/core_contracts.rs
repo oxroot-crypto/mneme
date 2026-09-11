@@ -14,7 +14,9 @@
 //! * FC-CORE-INV-002  —— 公开 API 不 panic
 //! * FC-CORE-ERR-001  —— varint 畸形输入结构化报错
 //! * FC-CORE-ERR-002  —— 余弦零向量返回 0
+//! * FC-CORE-CPLX-002 —— `Metric::better` / `needs_norm` O(1)(解析证明哨兵)
 //! * FC-CORE-CPLX-005 —— varint 编解码 10 字节上界与最小编码(§9.2.1)
+//! * FC-CORE-CPLX-006 —— `meta::get_path` / 访问器复杂度(解析证明哨兵)
 
 use std::cmp::Ordering;
 
