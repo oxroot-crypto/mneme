@@ -103,6 +103,10 @@ const SRC_LIFE_COMPACT: &str = include_str!("../src/life/compact.rs");
 const SRC_PERSIST_EDGES: &str = include_str!("../src/persist/edges.rs");
 /// L1 谓词求值源码(保留字段清单同步单测被 POST 契约引用)。
 const SRC_PRED_EVAL: &str = include_str!("../src/memory/pred_eval.rs");
+/// L5 运维源码(compaction 状态机转移单测被 STA 契约引用)。
+const SRC_MEMORY_OPS: &str = include_str!("../src/memory/ops.rs");
+/// L2 增量 flush/备份源码(硬链接回退单测被 POST 契约引用)。
+const SRC_STORE_SNAPSHOT: &str = include_str!("../src/persist/store/snapshot.rs");
 
 /// 契约测试文件(孤立检查与覆盖声明检查的范围)。
 const CONTRACT_TEST_FILES: [(&str, &str); 9] = [
@@ -118,7 +122,7 @@ const CONTRACT_TEST_FILES: [(&str, &str); 9] = [
 ];
 
 /// 契约引用的测试可能落在的全部文件(路径必须与 `contracts.md` 中书写一致)。
-const SOURCES: [(&str, &str); 46] = [
+const SOURCES: [(&str, &str); 48] = [
     ("tests/core_contracts.rs", CORE_TESTS),
     ("tests/memory_contracts.rs", MEMORY_TESTS),
     ("tests/query_contracts.rs", QUERY_TESTS),
@@ -165,6 +169,8 @@ const SOURCES: [(&str, &str); 46] = [
     ("src/persist/store/wal_writer.rs", SRC_WAL_WRITER),
     ("src/life/compact.rs", SRC_LIFE_COMPACT),
     ("src/persist/edges.rs", SRC_PERSIST_EDGES),
+    ("src/memory/ops.rs", SRC_MEMORY_OPS),
+    ("src/persist/store/snapshot.rs", SRC_STORE_SNAPSHOT),
 ];
 
 /// 契约编号的类型段(五维 + CPLX,见 `contracts.md` §0)。

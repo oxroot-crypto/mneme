@@ -29,6 +29,9 @@ const COMPACT_INTERVAL: Duration = Duration::from_secs(1);
 /// 单次自动遗忘报告保留的抽样上限(聚合多个命名空间后截断)。
 const MAX_SAMPLED_IDS: usize = 1024;
 
+/// 自动遗忘默认扫描周期相对半衰期的分母(半衰期 / 4,设计 07 §3.4)。
+const RETAIN_INTERVAL_DIVISOR: u32 = 4;
+
 /// 后台维护句柄:停止信号 + 唤醒条件变量 + 线程 join 句柄(克隆共享)。
 #[derive(Clone)]
 pub(crate) struct MaintenanceHandle {
@@ -50,6 +53,8 @@ impl MaintenanceHandle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         if let Some(handle) = handle {
+            // reason: 维护线程内部的 panic 由 `run` 隔离(线程异常终止不代表库损坏),
+            // join 结果仅用于等待退出,无可执行的恢复动作。
             let _ = handle.join();
         }
     }
@@ -64,14 +69,18 @@ impl MaintenanceHandle {
     }
 
     /// 是否为最后一个维护句柄(所有 `Mneme` 克隆已释放)。
+    ///
+    /// 运行期 `stop` 至少有 2 个强引用:本句柄 + 维护线程内 `run` 持有的句柄;
+    /// 线程退出后降为 1。故 `<= 2` 表示"本句柄是最后一个库侧句柄"。
     pub(crate) fn is_last_handle(&self) -> bool {
-        Arc::strong_count(&self.stop) == 1
+        Arc::strong_count(&self.stop) <= 2
     }
 
     /// 等待被唤醒或超时。
     fn wait(&self, timeout: Duration) {
         let (lock, cvar) = &*self.stop;
         let guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // reason: 超时返回属正常路径;锁 poison 已在上一行恢复,无需再检查返回值。
         let _ = cvar.wait_timeout(guard, timeout);
     }
 }
@@ -121,9 +130,7 @@ fn run(context: MaintenanceContext, stop: Arc<(Mutex<bool>, Condvar)>) {
         stop,
         join: Arc::new(Mutex::new(None)),
     };
-    let mut last_access_ms = context.config.clock.now_unix_ms();
-    let mut last_retain_ms = last_access_ms;
-    let mut last_compact_ms = last_access_ms;
+    let mut timers = Timers::new(context.config.clock.now_unix_ms());
     let compact_interval = context
         .config
         .retain_interval
@@ -132,46 +139,74 @@ fn run(context: MaintenanceContext, stop: Arc<(Mutex<bool>, Condvar)>) {
         if handle.is_stopped() {
             break;
         }
-        // 强引用只在单轮工作内持有,随后立即释放并进入等待:
-        // 库句柄全部释放后 `upgrade` 失败即退出,不阻止 Drop 与锁释放。
-        {
-            let Some(table) = context.table.upgrade() else {
-                break;
-            };
-            let now_ms = context.config.clock.now_unix_ms();
-            if elapsed(now_ms, last_access_ms) >= context.config.access_flush_interval {
-                table.flush_access(now_ms);
-                last_access_ms = now_ms;
-            }
-            if let Some(policy) = &context.config.retention {
-                let interval = context
-                    .config
-                    .retain_interval
-                    .unwrap_or(policy.half_life / 4);
-                if elapsed(now_ms, last_retain_ms) >= interval {
-                    run_retain(&table, &context.config, policy);
-                    last_retain_ms = now_ms;
-                }
-            }
-            if !context.control.is_paused()
-                && elapsed(now_ms, last_compact_ms) >= compact_interval
-                && let Some(store) = context.store.as_ref().and_then(Weak::upgrade)
-            {
-                let mneme = Mneme {
-                    table: Arc::clone(&table),
-                    config: Arc::clone(&context.config),
-                    control: context.control.clone(),
-                    store: Some(store),
-                    maintenance: None,
-                };
-                // reason: 后台 compaction 为尽力而为;失败由下一轮重试,已提交状态不变
-                // (FC-LIFE-ERR-001),不影响前台读写的正确性。
-                let _ = mneme.compact();
-                last_compact_ms = now_ms;
-            }
+        if !run_tick(&context, &mut timers, compact_interval) {
+            break;
         }
         handle.wait(tick_interval(&context.config));
     }
+}
+
+/// 三个维护周期的上次执行时刻(Unix 毫秒)。
+struct Timers {
+    /// 访问攒批上次落盘时刻。
+    access_ms: i64,
+    /// 自动遗忘上次扫描时刻。
+    retain_ms: i64,
+    /// 自动 compaction 上次检查时刻。
+    compact_ms: i64,
+}
+
+impl Timers {
+    /// 以当前时刻初始化全部计时器。
+    fn new(now_ms: i64) -> Self {
+        Self {
+            access_ms: now_ms,
+            retain_ms: now_ms,
+            compact_ms: now_ms,
+        }
+    }
+}
+
+/// 执行一轮维护工作;弱引用失效(库已释放)时返回 `false` 请求退出。
+///
+/// 强引用只在单轮工作内持有,随后立即释放并进入等待:库句柄全部释放后
+/// `upgrade` 失败即退出,不阻止 Drop 与锁释放。
+fn run_tick(context: &MaintenanceContext, timers: &mut Timers, compact_interval: Duration) -> bool {
+    let Some(table) = context.table.upgrade() else {
+        return false;
+    };
+    let now_ms = context.config.clock.now_unix_ms();
+    if elapsed(now_ms, timers.access_ms) >= context.config.access_flush_interval {
+        table.flush_access(now_ms);
+        timers.access_ms = now_ms;
+    }
+    if let Some(policy) = &context.config.retention {
+        let interval = context
+            .config
+            .retain_interval
+            .unwrap_or(policy.half_life / RETAIN_INTERVAL_DIVISOR);
+        if elapsed(now_ms, timers.retain_ms) >= interval {
+            run_retain(&table, &context.config, policy);
+            timers.retain_ms = now_ms;
+        }
+    }
+    if !context.control.is_paused()
+        && elapsed(now_ms, timers.compact_ms) >= compact_interval
+        && let Some(store) = context.store.as_ref().and_then(Weak::upgrade)
+    {
+        let mneme = Mneme {
+            table,
+            config: Arc::clone(&context.config),
+            control: context.control.clone(),
+            store: Some(store),
+            maintenance: None,
+        };
+        // reason: 后台 compaction 为尽力而为;失败由下一轮重试,已提交状态不变
+        // (FC-LIFE-ERR-001),不影响前台读写的正确性。
+        let _ = mneme.compact();
+        timers.compact_ms = now_ms;
+    }
+    true
 }
 
 /// 对全部已注册命名空间执行一轮自动遗忘并记录聚合报告(I23 审计)。

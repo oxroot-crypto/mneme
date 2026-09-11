@@ -191,11 +191,16 @@ impl Mneme {
             let now = config.clock.now_unix_ms();
             let mut rows = 0_usize;
             for ns_id in &victims {
+                // 每个 RowId 只取其最新版本一次:历史版本不进列表,避免重复烧
+                // `seqno` 与对已墓碑行做无效 tombstone。
                 let rowids: Vec<RowId> = ws
-                    .slots
+                    .latest
                     .iter()
-                    .filter(|slot| slot.ns_id == *ns_id && !slot.deleted)
-                    .map(|slot| slot.rowid)
+                    .filter(|(_, slot)| {
+                        let data = &ws.slots[slot.get() as usize];
+                        data.ns_id == *ns_id && !data.deleted
+                    })
+                    .map(|(rowid, _)| *rowid)
                     .collect();
                 for rowid in rowids {
                     let seqno = ws.alloc_seqno();

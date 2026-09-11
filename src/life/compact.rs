@@ -44,11 +44,12 @@ pub(crate) fn plan(
         return None;
     }
     // 死比率触发:选比率最高且超线的段单独重写(段数不变,空间回收)。
+    // 同比率时以段号小者优先,保证选段确定性。
     let active: HashSet<u32> = segments.iter().map(|segment| segment.id).collect();
     if let Some((id, _ratio)) = dead
         .iter()
         .filter(|(id, ratio)| active.contains(id) && **ratio > policy.dead_ratio)
-        .max_by(|left, right| left.1.total_cmp(right.1))
+        .max_by(|left, right| left.1.total_cmp(right.1).then_with(|| right.0.cmp(left.0)))
     {
         return Some(CompactionPlan {
             segments: vec![*id],
@@ -95,8 +96,22 @@ fn level_of(rows: u64, policy: &CompactionPolicy) -> u32 {
     level
 }
 
-/// 统计每段"墓碑 + 逻辑过期"占比(计划触发用)。
-pub(crate) fn segment_dead_ratios(ws: &WriterState, now_ms: i64) -> HashMap<u32, f32> {
+/// 统计每段"可回收死行"占比(计划触发用)。
+///
+/// 只计 `history_horizon` 窗口外、本层真正能回收的版本:
+/// - `horizon = None`(默认永久保留)时没有任何可回收死行,返回空表——否则死比率
+///   触发会反复重写却不减死行,形成无限写放大;
+/// - 窗口内的墓碑/过期与窗口内的历史版本均不计。
+pub(crate) fn segment_dead_ratios(
+    ws: &WriterState,
+    now_ms: i64,
+    horizon: Option<Duration>,
+) -> HashMap<u32, f32> {
+    let Some(cutoff) = horizon
+        .map(|window| now_ms.saturating_sub(i64::try_from(window.as_millis()).unwrap_or(i64::MAX)))
+    else {
+        return HashMap::new();
+    };
     let mut dead: HashMap<u32, u64> = HashMap::new();
     let mut total: HashMap<u32, u64> = HashMap::new();
     for (index, segment) in ws.slot_segment.iter().enumerate() {
@@ -105,7 +120,18 @@ pub(crate) fn segment_dead_ratios(ws: &WriterState, now_ms: i64) -> HashMap<u32,
         };
         *total.entry(*id).or_insert(0) += 1;
         let slot = &ws.slots[index];
-        if ws.dead.get(index) || slot.deleted || !slot.is_live(now_ms) {
+        let is_latest = ws
+            .latest
+            .get(&slot.rowid)
+            .is_some_and(|latest| latest.get() as usize == index);
+        // 整链回收条件与 `select_survivors` 一致:最新版本为窗口外墓碑/逻辑过期。
+        let reclaimable = if is_latest {
+            (slot.deleted || slot.expires_at.is_some_and(|expires| expires <= now_ms))
+                && slot.tx_ms < cutoff
+        } else {
+            slot.tx_ms < cutoff
+        };
+        if reclaimable {
             *dead.entry(*id).or_insert(0) += 1;
         }
     }
@@ -143,59 +169,133 @@ pub(crate) fn select_survivors(
         if !in_plan.contains(id) {
             continue;
         }
-        let slot = &ws.slots[index];
-        let rowid = slot.rowid;
-        let chain = ws
-            .versions
-            .get(&rowid)
-            .map(Vec::as_slice)
-            .unwrap_or_default();
-        // 整链都在本轮段组内才允许整链回收;否则旧版本可能存活于其他段而复活。
-        let all_in_group = chain.iter().all(|chain_slot| {
-            ws.slot_segment
-                .get(chain_slot.get() as usize)
-                .and_then(|segment| *segment)
-                .is_some_and(|segment_id| in_plan.contains(&segment_id))
-        });
-        let latest = ws
-            .latest
-            .get(&rowid)
-            .map(|slot| &ws.slots[slot.get() as usize]);
-        let chain_reclaimable = all_in_group
-            && cutoff.is_some()
-            && latest.is_some_and(|latest| {
-                let expired = latest.expires_at.is_some_and(|expires| expires <= now_ms);
-                latest.deleted || expired
-            });
-        let is_latest = ws
-            .latest
-            .get(&rowid)
-            .is_some_and(|latest| latest.get() as usize == index);
-        if chain_reclaimable
-            && let Some(cutoff) = cutoff
-            && slot.tx_ms < cutoff
-        {
-            survivors.reclaim.push(index);
-            continue;
-        }
-        if is_latest {
-            survivors.keep.push(index);
-            continue;
-        }
-        match cutoff {
-            Some(cutoff) if slot.tx_ms < cutoff => survivors.reclaim.push(index),
-            _ => survivors.keep.push(index),
+        match classify_slot(ws, &in_plan, cutoff, now_ms, index) {
+            SurvivorDecision::Reclaim => survivors.reclaim.push(index),
+            SurvivorDecision::Keep => survivors.keep.push(index),
         }
     }
     survivors
 }
 
+/// 单个槽位在本轮 compaction 中的去留。
+#[derive(PartialEq)]
+enum SurvivorDecision {
+    /// 写入新段。
+    Keep,
+    /// 提交后从版本链剪除并标死。
+    Reclaim,
+}
+
+/// 判定单个槽位的去留(计划段组已确认包含其所属段)。
+fn classify_slot(
+    ws: &WriterState,
+    in_plan: &HashSet<u32>,
+    cutoff: Option<i64>,
+    now_ms: i64,
+    index: usize,
+) -> SurvivorDecision {
+    let slot = &ws.slots[index];
+    let rowid = slot.rowid;
+    let latest = ws
+        .latest
+        .get(&rowid)
+        .map(|slot| &ws.slots[slot.get() as usize]);
+    let is_latest = ws
+        .latest
+        .get(&rowid)
+        .is_some_and(|latest| latest.get() as usize == index);
+    // 整链回收:本轮段组覆盖全链,且最新版本为**窗口外**的墓碑/逻辑过期。
+    // latest 与历史版本必须同进退——只回收 latest 会把旧活版本留在链上,
+    // 造成被删记录"复活"或 `latest` 悬挂(FC-MODEL-POST-004;时钟回拨场景)。
+    let chain_reclaimable = chain_all_in_group(ws, rowid, in_plan)
+        && cutoff.is_some()
+        && latest.is_some_and(|latest| {
+            let window_expired = cutoff.is_some_and(|cutoff| latest.tx_ms < cutoff);
+            let dead = latest.deleted || latest.expires_at.is_some_and(|expires| expires <= now_ms);
+            dead && window_expired
+        });
+    if chain_reclaimable {
+        return SurvivorDecision::Reclaim;
+    }
+    if is_latest {
+        return SurvivorDecision::Keep;
+    }
+    match cutoff {
+        Some(cutoff) if slot.tx_ms < cutoff => SurvivorDecision::Reclaim,
+        _ => SurvivorDecision::Keep,
+    }
+}
+
+/// 该 RowId 的整条版本链是否都落在计划段组内(否则回收会令旧版本在别段复活)。
+fn chain_all_in_group(
+    ws: &WriterState,
+    rowid: crate::core::types::RowId,
+    in_plan: &HashSet<u32>,
+) -> bool {
+    let chain = ws
+        .versions
+        .get(&rowid)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    chain.iter().all(|chain_slot| {
+        ws.slot_segment
+            .get(chain_slot.get() as usize)
+            .and_then(|segment| *segment)
+            .is_some_and(|segment_id| in_plan.contains(&segment_id))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::core::meta::Meta;
+    use crate::core::types::{NsId, RowId, SeqNo, SlotId};
+    use crate::memory::table::SlotData;
 
     fn policy() -> CompactionPolicy {
         CompactionPolicy::default()
+    }
+
+    /// 构造一个带指定字段的物理槽位(仅本模块测试用)。
+    fn slot(rowid: u64, seqno: u64, tx_ms: i64, deleted: bool) -> Arc<SlotData> {
+        Arc::new(SlotData {
+            rowid: RowId::new(rowid),
+            ns_id: NsId::new(1),
+            ns_path: Arc::from("n"),
+            seqno: SeqNo::new(seqno),
+            key: None,
+            vector: Arc::from(vec![0.0_f32, 1.0].into_boxed_slice()),
+            norm_sq: 1.0,
+            text: None,
+            text_hash: None,
+            meta: Meta::Null,
+            created_at: tx_ms,
+            expires_at: None,
+            importance: 0.5,
+            confidence: 1.0,
+            valid_from: tx_ms,
+            valid_to: None,
+            provenance: None,
+            tx_ms,
+            deleted,
+        })
+    }
+
+    /// 组装写状态:每个槽位都属于 `segments[index]` 段,`latest` 为指定下标。
+    fn state_with(slots: Vec<Arc<SlotData>>, latest: usize, segments: u32) -> WriterState {
+        let mut ws = WriterState::new();
+        for (index, data) in slots.iter().enumerate() {
+            Arc::make_mut(&mut ws.slots).push(Arc::clone(data));
+            Arc::make_mut(&mut ws.slot_segment).push(Some(segments));
+            Arc::make_mut(&mut ws.versions)
+                .entry(data.rowid)
+                .or_default()
+                .push(SlotId::new(index as u32));
+        }
+        Arc::make_mut(&mut ws.latest).insert(slots[latest].rowid, SlotId::new(latest as u32));
+        ws
     }
 
     /// FC-LIFE-CPLX-004:同层攒够 `tier_count` 即选最小的一组。
@@ -242,5 +342,53 @@ mod tests {
         assert_eq!(level_of(8_192, &policy), 1);
         assert_eq!(level_of(8_192 * 4 - 1, &policy), 1);
         assert_eq!(level_of(8_192 * 4, &policy), 2);
+    }
+
+    /// FC-MODEL-POST-004:时钟回拨下最新墓碑在窗口外时,整链一并回收,
+    /// 不得只回收墓碑而把旧活版本留在链上(latest 悬挂/删除复活)。
+    #[test]
+    fn reclaims_whole_chain_when_latest_tombstone_outside_window() {
+        // 先写活版本(tx=280),后写墓碑(tx=100,模拟时钟回拨)。
+        let live = slot(7, 2, 280, false);
+        let tomb = slot(7, 3, 100, true);
+        let ws = state_with(vec![live, tomb], 1, 0);
+        let plan = CompactionPlan { segments: vec![0] };
+        let survivors = select_survivors(&ws, &plan, 300, Some(Duration::from_millis(50)));
+        assert!(
+            survivors.keep.is_empty(),
+            "latest 回收必须整链回收,实际 keep={:?}",
+            survivors.keep
+        );
+        assert_eq!(survivors.reclaim, vec![0, 1]);
+    }
+
+    /// FC-MODEL-POST-004:窗口内墓碑保留、窗口外历史版本回收(二者同链也不误伤)。
+    #[test]
+    fn keeps_latest_tombstone_inside_window_and_reclaims_history() {
+        let live = slot(7, 1, 100, false);
+        let tomb = slot(7, 2, 280, true);
+        let ws = state_with(vec![live, tomb], 1, 0);
+        let plan = CompactionPlan { segments: vec![0] };
+        let survivors = select_survivors(&ws, &plan, 300, Some(Duration::from_millis(50)));
+        assert_eq!(survivors.keep, vec![1], "窗口内墓碑必须保留");
+        assert_eq!(survivors.reclaim, vec![0], "窗口外历史版本回收");
+    }
+
+    /// FC-LIFE-INV-008:死比率只计可回收版本;`horizon = None` 时无回收收益。
+    #[test]
+    fn dead_ratio_counts_only_reclaimable_versions() {
+        let live = slot(7, 1, 100, false);
+        let tomb = slot(7, 2, 280, true);
+        let ws = state_with(vec![live, tomb], 1, 0);
+        assert!(
+            segment_dead_ratios(&ws, 300, None).is_empty(),
+            "默认 horizon=None 时不得报告死比率(否则无限重写)"
+        );
+        let ratios = segment_dead_ratios(&ws, 300, Some(Duration::from_millis(50)));
+        let ratio = ratios.get(&0).copied().expect("段 0 应有统计");
+        assert!(
+            (ratio - 0.5).abs() < 1e-6,
+            "cutoff=250:历史活版本可回收、窗口内墓碑不可回收,实际 {ratio}"
+        );
     }
 }

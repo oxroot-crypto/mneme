@@ -13,7 +13,7 @@ use crate::memory::engine::Mneme;
 use crate::memory::ops::{
     CheckReport, CompactionControl, HistoryStat, NsStat, QuantStat, Stats, StorageStat,
 };
-use crate::memory::table::ReaderView;
+use crate::memory::table::{ReaderView, WriterState};
 
 /// 持久后端的段/WAL/trash 统计。
 #[derive(Default)]
@@ -172,7 +172,6 @@ impl Mneme {
         let now = self.config.clock.now_unix_ms();
         let mut suggestions = Vec::new();
         let mut corrupted = Vec::new();
-        let mut inconsistent = false;
         // L2:逐段校验头部/payload CRC 与版本链(设计 16 §1.6)。
         if let Some(store) = &self.store {
             for id in store.verify_segments() {
@@ -180,46 +179,64 @@ impl Mneme {
                 corrupted.push(id);
             }
         }
-        for ((ns_id, key), rowid) in view.key_index.iter() {
-            // 按最新物理版本对账(墓碑/逻辑过期不算不一致):key 索引指向不存在的
-            // 版本,或最新版本 ns/key 与索引不符,才是真正的不一致(FC-MEM-POST-008)。
-            match view.latest.get(rowid) {
-                Some(slot) => {
-                    let slot_data = &view.slots[slot.get() as usize];
-                    if slot_data.ns_id != *ns_id || slot_data.key.as_ref() != Some(key) {
-                        inconsistent = true;
-                        suggestions.push(format!("key 索引不一致:{key}"));
-                    }
-                }
-                None => {
-                    inconsistent = true;
-                    suggestions.push(format!("key 索引指向不存在的版本:{key}"));
-                }
-            }
-        }
-        // 运维建议:死比率超线的段与可合并段数(仅提示,不影响 `ok`)。
-        let ratios = dead_ratios(&view, now);
-        for (id, ratio) in &ratios {
-            if *ratio > self.config.compaction.dead_ratio {
-                suggestions.push(format!(
-                    "段 {id} 墓碑/过期占比 {:.0}%,建议合并回收",
-                    ratio * 100.0
-                ));
-            }
-        }
-        if let Some(store) = &self.store {
-            let total = store.total_segments();
-            if total >= self.config.compaction.tier_count.max(2) as usize {
-                suggestions.push(format!("建议合并 {total} 个段"));
-            }
-        }
+        let inconsistent = check_key_index(&view, &mut suggestions);
+        append_fsck_suggestions(self, &view, now, &mut suggestions);
         Ok(CheckReport {
             ok: corrupted.is_empty() && !inconsistent,
             corrupted,
             suggestions,
         })
     }
+}
 
+/// 按最新物理版本对账 key 索引;发现不一致时追加建议并返回 `true`。
+///
+/// 墓碑/逻辑过期不算不一致(FC-MEM-POST-008)。
+fn check_key_index(view: &ReaderView, suggestions: &mut Vec<String>) -> bool {
+    let mut inconsistent = false;
+    for ((ns_id, key), rowid) in view.key_index.iter() {
+        match view.latest.get(rowid) {
+            Some(slot) => {
+                let slot_data = &view.slots[slot.get() as usize];
+                if slot_data.ns_id != *ns_id || slot_data.key.as_ref() != Some(key) {
+                    inconsistent = true;
+                    suggestions.push(format!("key 索引不一致:{key}"));
+                }
+            }
+            None => {
+                inconsistent = true;
+                suggestions.push(format!("key 索引指向不存在的版本:{key}"));
+            }
+        }
+    }
+    inconsistent
+}
+
+/// 运维建议:死比率超线的段与可合并段数(仅提示,不影响 `ok`)。
+fn append_fsck_suggestions(
+    engine: &Mneme,
+    view: &ReaderView,
+    now: i64,
+    suggestions: &mut Vec<String>,
+) {
+    let ratios = dead_ratios(view, now);
+    for (id, ratio) in &ratios {
+        if *ratio > engine.config.compaction.dead_ratio {
+            suggestions.push(format!(
+                "段 {id} 墓碑/过期占比 {:.0}%,建议合并回收",
+                ratio * 100.0
+            ));
+        }
+    }
+    if let Some(store) = &engine.store {
+        let total = store.total_segments();
+        if total >= engine.config.compaction.tier_count.max(2) as usize {
+            suggestions.push(format!("建议合并 {total} 个段"));
+        }
+    }
+}
+
+impl Mneme {
     /// 返回后台合并控制句柄(与库共享同一状态)。
     ///
     /// # Returns
@@ -228,9 +245,10 @@ impl Mneme {
         self.control.clone()
     }
 
-    /// 显式落盘:把可变表物化为新段并提交 MANIFEST。
+    /// 显式落盘:把未落盘槽位与自上次 flush 的 delta 物化为新段并提交 MANIFEST。
     ///
-    /// 纯内存库为空操作;持久库执行全量快照 flush 并重置 WAL(设计 04 §3.2)。
+    /// 纯内存库为空操作;持久库执行增量段 flush + WAL Checkpoint(设计 04 §3.2、
+    /// 07 §4);无新增且无 delta 时为空操作。
     ///
     /// # Errors
     /// 库已关闭时返回 [`MnemeError::Closed`];只读模式返回
@@ -256,7 +274,8 @@ impl Mneme {
     ///
     /// 选段与幸存版本筛选由 L5 完成;合并段写盘与 MANIFEST 替换由持久层完成。
     /// 无触发条件、已暂停或纯内存库时为空操作。合并期间 `stats().compaction`
-    /// 反映 `Running`;`pause()` 在提交前生效,中止时不改动任何已提交状态。
+    /// 反映 `Running`(运行中暂停则为 `Paused`);`pause()` 在提交前生效,中止时
+    /// 不改动任何已提交状态。
     ///
     /// # Errors
     /// 库已关闭时返回 [`MnemeError::Closed`];只读模式返回
@@ -288,6 +307,15 @@ impl Mneme {
         if self.control.is_paused() {
             return Ok(());
         }
+        self.run_compaction(&mut ws, store)
+    }
+
+    /// 选计划并执行一轮 compaction(调用方持写锁)。
+    fn run_compaction(
+        &self,
+        ws: &mut WriterState,
+        store: &Arc<crate::persist::store::Store>,
+    ) -> Result<()> {
         let now_ms = self.config.clock.now_unix_ms();
         let manifest = store.manifest_snapshot();
         let infos: Vec<SegmentInfo> = manifest
@@ -298,7 +326,7 @@ impl Mneme {
                 rows: segment.row_count,
             })
             .collect();
-        let dead = compact::segment_dead_ratios(&ws, now_ms);
+        let dead = compact::segment_dead_ratios(ws, now_ms, self.config.compaction.history_horizon);
         let Some(plan) = compact::plan(&infos, &dead, &self.config.compaction) else {
             return Ok(());
         };
@@ -309,8 +337,13 @@ impl Mneme {
             return Ok(());
         }
         let survivors =
-            compact::select_survivors(&ws, &plan, now_ms, self.config.compaction.history_horizon);
-        match store.compact(&mut ws, &self.config, &plan, &survivors.keep, &self.control) {
+            compact::select_survivors(ws, &plan, now_ms, self.config.compaction.history_horizon);
+        let input = crate::persist::store::CompactInput {
+            plan: &plan,
+            keep_slots: &survivors.keep,
+            control: &self.control,
+        };
+        match store.compact(ws, &self.config, &input) {
             Ok(false) => {
                 // 暂停中止:段集与内存状态都不动。
                 self.control.mark_idle();
@@ -324,7 +357,7 @@ impl Mneme {
                     let rowid = ws.slots[index].rowid;
                     Arc::make_mut(&mut ws.access_dirty).remove(&rowid);
                 }
-                self.table.publish(&ws);
+                self.table.publish(ws);
                 self.control.mark_idle();
                 Ok(())
             }

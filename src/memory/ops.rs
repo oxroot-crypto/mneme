@@ -140,6 +140,13 @@ pub enum CompactionState {
         /// 参与合并的段。
         segments: Vec<SegmentId>,
     },
+    /// 运行中被 `pause()` 挂起;`resume()` 后回到 `Running`(FC-LIFE-STA-001)。
+    Paused {
+        /// 暂停时已完成的进度,`[0,1]`。
+        progress: f32,
+        /// 参与合并的段。
+        segments: Vec<SegmentId>,
+    },
 }
 
 /// `db.stats()` 的运行统计(字段为稳定契约)。
@@ -224,6 +231,9 @@ impl CompactionControl {
 
     /// 暂停后台合并。
     ///
+    /// 运行中调用时状态转 `Paused`;空闲时调用只置暂停标志,状态保持 `Idle`
+    /// (非法转移不改变状态,FC-LIFE-STA-001)。
+    ///
     /// # Examples
     /// ```
     /// use mneme::CompactionControl;
@@ -235,11 +245,33 @@ impl CompactionControl {
     /// ```
     pub fn pause(&self) {
         self.inner.paused.store(true, Ordering::Relaxed);
+        let mut guard = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let CompactionState::Running { progress, segments } = &*guard {
+            *guard = CompactionState::Paused {
+                progress: *progress,
+                segments: segments.clone(),
+            };
+        }
     }
 
-    /// 恢复后台合并。
+    /// 恢复后台合并;`Paused` 时状态转回 `Running`,其余状态不变。
     pub fn resume(&self) {
         self.inner.paused.store(false, Ordering::Relaxed);
+        let mut guard = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let CompactionState::Paused { progress, segments } = &*guard {
+            *guard = CompactionState::Running {
+                progress: *progress,
+                segments: segments.clone(),
+            };
+        }
     }
 
     /// 是否处于暂停状态。
@@ -300,4 +332,38 @@ impl CompactionControl {
 pub(crate) struct CompactionPlan {
     /// 参与本轮合并的段编号(按 MANIFEST 顺序)。
     pub(crate) segments: Vec<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FC-LIFE-STA-001:`pause` 在 `Running` 上转 `Paused`、`resume` 转回;
+    /// 非法转移(`Idle` 上 `Pause`/`Resume`)不改变状态。
+    #[test]
+    fn compaction_state_transitions_follow_spec() {
+        let control = CompactionControl::new();
+        assert_eq!(control.state(), CompactionState::Idle);
+        // Idle 上 pause:非法转移,状态保持 Idle,只置标志。
+        control.pause();
+        assert_eq!(control.state(), CompactionState::Idle);
+        assert!(control.is_paused());
+        control.resume();
+        assert_eq!(control.state(), CompactionState::Idle);
+
+        control.mark_running(vec![SegmentId::new(3), SegmentId::new(4)]);
+        control.mark_progress(0.5);
+        control.pause();
+        assert_eq!(
+            control.state(),
+            CompactionState::Paused {
+                progress: 0.5,
+                segments: vec![SegmentId::new(3), SegmentId::new(4)],
+            }
+        );
+        control.resume();
+        assert!(matches!(control.state(), CompactionState::Running { .. }));
+        control.mark_idle();
+        assert_eq!(control.state(), CompactionState::Idle);
+    }
 }

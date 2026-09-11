@@ -143,7 +143,7 @@ impl Store {
             ws.install_segment(segment_id, &slot_indices, encoded.index);
         }
         ws.clear_flush_dirty();
-        self.publish(&new_manifest)?;
+        self.publish(&new_manifest);
         Ok(())
     }
 
@@ -247,14 +247,16 @@ impl Store {
     }
 
     /// 发布新 MANIFEST 快照并重置 WAL(Checkpoint)。
-    fn publish(&self, new_manifest: &Manifest) -> Result<()> {
+    fn publish(&self, new_manifest: &Manifest) {
         self.publish_manifest(new_manifest);
         let mut wal = self
             .wal
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        wal.reset()?;
-        Ok(())
+        // reason: Checkpoint 为空间回收;旧帧均 ≤ watermark,恢复时跳过。段与
+        // MANIFEST 已提交,重置失败不阻断 flush(句柄安全由 `WalWriter::reset`
+        // 内部重建/停用保证,FC-PERSIST-INV-005)。
+        let _ = wal.reset();
     }
 
     /// 只发布 MANIFEST 快照(不重置 WAL;compaction 用,未落盘尾部仍在 WAL 中)。
@@ -322,4 +324,41 @@ fn namespace_registry_changed(previous: &Manifest, ws: &WriterState) -> bool {
             .get(&crate::core::types::NsId::new(entry.ns_id))
             .is_none_or(|path| path.as_ref() != entry.path.as_ref())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FC-LIFE-POST-008:硬链接失败(目标已存在/跨盘)时回退逐文件复制,
+    /// `hardlinked` 如实置 `false`,产物内容正确。
+    #[test]
+    fn hardlink_failure_falls_back_to_copy() {
+        let root = tempfile::tempdir().expect("root");
+        let target = tempfile::tempdir().expect("target");
+        let rel = format!("{SEGMENTS_DIR}/seg_000001.vsec");
+        let source = storage::resolve(root.path(), &rel).expect("source path");
+        storage::ensure_dir(source.parent().expect("parent")).expect("segments dir");
+        let target_dir = storage::resolve(target.path(), &rel).expect("target path");
+        storage::ensure_dir(target_dir.parent().expect("parent")).expect("target dir");
+        let content = b"fake segment bytes";
+        std::fs::write(&source, content).expect("write source");
+        // 目标已存在同名文件 → `hard_link` 失败 → 走复制回退。
+        std::fs::write(&target_dir, b"stale").expect("write stale");
+
+        let mut counts = CopyCounts::default();
+        let mut hardlinked = true;
+        link_or_copy_required(
+            root.path(),
+            target.path(),
+            &rel,
+            &mut counts,
+            &mut hardlinked,
+        )
+        .expect("copy fallback");
+        assert!(!hardlinked, "硬链接失败必须如实报告回退");
+        assert_eq!(counts.files, 1);
+        assert_eq!(counts.bytes, content.len() as u64);
+        assert_eq!(std::fs::read(&target_dir).expect("read"), content);
+    }
 }

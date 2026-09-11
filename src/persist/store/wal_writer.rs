@@ -74,6 +74,9 @@ pub(super) struct WalWriter {
     dimension: u32,
     metric: Metric,
     hook: Option<Arc<dyn FsyncHook>>,
+    /// 重置失败且重建失败后停用:后续写入报 `Io`,绝不向状态可疑的文件追加
+    /// (否则重启截断会丢已确认帧)。
+    poisoned: bool,
 }
 
 impl WalWriter {
@@ -164,6 +167,7 @@ impl WalWriter {
             dimension: config.dimension,
             metric: config.metric,
             hook: config.hook,
+            poisoned: false,
         }
     }
 
@@ -172,8 +176,13 @@ impl WalWriter {
         wal_name(self.active_index)
     }
 
-    /// 打开可写句柄;只读实例返回 `Unsupported`。
+    /// 打开可写句柄;只读实例返回 `Unsupported`,已停用句柄返回 `Io`。
     fn writable(&mut self) -> Result<&mut std::fs::File> {
+        if self.poisoned {
+            return Err(MnemeError::Io(std::io::Error::other(
+                "WAL 重置失败,句柄已停用",
+            )));
+        }
         self.file.as_mut().ok_or(MnemeError::Unsupported {
             feature: "只读模式写入",
         })
@@ -271,35 +280,89 @@ impl WalWriter {
     /// # Errors
     /// 只读实例返回 [`MnemeError::Unsupported`];I/O 失败返回 [`MnemeError::Io`]。
     pub(super) fn rollback_to(&mut self, len: u64) -> Result<()> {
+        let active = self.active_rel();
+        let hook = self.hook.clone();
         let file = self.writable()?;
         file.set_len(len)?;
         use std::io::{Seek, SeekFrom};
         file.seek(SeekFrom::Start(len))?;
+        if let Some(hook) = &hook {
+            hook.before(IoAction::Fsync { file: &active })?;
+        }
         file.sync_all()?;
         Ok(())
     }
 
-    /// 重置/Checkpoint:截断活动文件并重写文件头,删除已轮转旧文件。
+    /// 重置/Checkpoint:重写文件头、截断活动文件并删除已轮转旧文件。
     ///
     /// 调用方保证所有 `seqno ≤ manifest.watermark` 的帧已被段/delta 覆盖;
     /// 旧文件即使残留,恢复时也会因 `seqno ≤ watermark` 被跳过。
     ///
+    /// 实现按"先写头、后截断"顺序,任何时刻文件头都完整;任一步失败时尝试原地
+    /// 重建,重建仍失败才停用句柄——绝不向可疑文件继续追加(否则重启截断会丢
+    /// 已确认帧,FC-PERSIST-INV-005)。
+    ///
     /// # Errors
     /// 只读实例返回 [`MnemeError::Unsupported`];I/O 失败返回 [`MnemeError::Io`]。
     pub(super) fn reset(&mut self) -> Result<()> {
-        let (dimension, metric) = (self.dimension, self.metric);
-        let file = self.writable()?;
-        file.set_len(0)?;
-        use std::io::{Seek, SeekFrom, Write as _};
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(&wal::encode_file_header(dimension, metric))?;
-        file.sync_all()?;
+        if let Err(error) = self.rewrite_header_and_truncate() {
+            if self.recreate().is_err() {
+                self.poisoned = true;
+            }
+            return Err(error);
+        }
         let active = self.active_rel();
         for rel in wal_files(&self.root)? {
             if rel != active {
-                storage::remove_if_exists(&storage::resolve(&self.root, &rel)?)?;
+                // reason: 旧轮转文件即使残留,恢复时也因 seqno ≤ watermark 被跳过,
+                // 删除失败不影响正确性。
+                let _ = storage::remove_if_exists(&storage::resolve(&self.root, &rel)?);
             }
         }
+        Ok(())
+    }
+
+    /// 重置的第一步:覆盖文件头并把文件截到头部长度。
+    fn rewrite_header_and_truncate(&mut self) -> Result<()> {
+        use std::io::{Seek, SeekFrom, Write as _};
+        let active = self.active_rel();
+        let header = wal::encode_file_header(self.dimension, self.metric);
+        let hook = self.hook.clone();
+        let file = self.writable()?;
+        if let Some(hook) = &hook {
+            hook.before(IoAction::Write {
+                file: &active,
+                offset: 0,
+                len: header.len(),
+            })?;
+        }
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&header)?;
+        file.set_len(wal::FILE_HEADER_LEN as u64)?;
+        file.seek(SeekFrom::Start(wal::FILE_HEADER_LEN as u64))?;
+        if let Some(hook) = &hook {
+            hook.before(IoAction::Fsync { file: &active })?;
+        }
+        file.sync_all()?;
+        Ok(())
+    }
+
+    /// 重置失败后的兜底:截断重建当前活动文件(写新头 + fsync)。
+    fn recreate(&mut self) -> Result<()> {
+        let path = storage::resolve(&self.root, &self.active_rel())?;
+        let writer = create_new(
+            &path,
+            self.active_index,
+            WalConfig {
+                dimension: self.dimension,
+                metric: self.metric,
+                policy: self.policy,
+                max_file_bytes: self.max_file_bytes,
+                hook: self.hook.clone(),
+                read_only: false,
+            },
+        )?;
+        self.file = writer.file;
         Ok(())
     }
 }
@@ -338,5 +401,68 @@ mod tests {
         assert_eq!(wal_index_of("wal_0000001.log"), None);
         assert_eq!(wal_index_of("seg_000001.log"), None);
         assert_eq!(wal_index_of("wal_00000a.log"), None);
+    }
+
+    /// 首次建文件放行,之后所有 WAL 头写入都拒绝。
+    struct DenyAfterFirst {
+        seen: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FsyncHook for DenyAfterFirst {
+        fn before(&self, action: IoAction<'_>) -> std::io::Result<()> {
+            if let IoAction::Write {
+                file, offset: 0, ..
+            } = action
+                && file.starts_with("wal/")
+                && self.seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 1
+            {
+                return Err(std::io::Error::other("injected wal header failure"));
+            }
+            Ok(())
+        }
+    }
+
+    fn config(hook: Option<Arc<dyn FsyncHook>>) -> WalConfig {
+        WalConfig {
+            dimension: 4,
+            metric: Metric::Cosine,
+            policy: FsyncPolicy::default(),
+            max_file_bytes: 0,
+            hook,
+            read_only: false,
+        }
+    }
+
+    /// FC-PERSIST-INV-005:重置失败且重建失败时停用句柄,绝不向状态可疑的文件追加。
+    #[test]
+    fn failed_reset_poisons_writer() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let hook = Arc::new(DenyAfterFirst {
+            seen: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let mut writer =
+            WalWriter::open_or_create(dir.path(), config(Some(hook))).expect("create wal");
+        assert!(writer.reset().is_err(), "注入的头写入失败必须上报");
+        let result = writer.append(1, wal::FrameKind::DeleteRow, &[]);
+        assert!(
+            matches!(result, Err(MnemeError::Io(_))),
+            "停用后写入必须报 Io,实际 {result:?}"
+        );
+    }
+
+    /// FC-PERSIST-POST-002:成功重置后文件只剩完整文件头(先写头、后截断)。
+    #[test]
+    fn reset_keeps_complete_header() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut writer = WalWriter::open_or_create(dir.path(), config(None)).expect("create wal");
+        writer
+            .append(1, wal::FrameKind::DeleteRow, &[])
+            .expect("append");
+        writer.reset().expect("reset");
+        let bytes = std::fs::read(dir.path().join("wal/wal_000001.log")).expect("read wal");
+        assert_eq!(bytes.len(), wal::FILE_HEADER_LEN);
+        let header = wal::parse_file_header(&bytes).expect("reset 后头必须完整可解析");
+        assert_eq!(header.dimension, 4);
+        assert_eq!(header.metric, Metric::Cosine);
     }
 }

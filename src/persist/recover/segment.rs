@@ -175,15 +175,23 @@ pub(super) fn apply_relations(
 }
 
 /// 从单个段的 delta 区回放跨段访问统计与关系变更(设计 04 §2.2a)。
+///
+/// 访问统计按"版本行累计快照"语义恢复:delta 的 `seqno` 早于该 RowId 最新版本行
+/// 的 `seqno` 时,说明后续版本行的 `access` 列已包含该增量,必须跳过,否则重开后
+/// 计数虚高(FC-PERSIST-POST-010)。关系边是操作语义(upsert/remove),不参与该判定。
 pub(super) fn apply_delta(state: &mut WriterState, msec_view: &msec::MsecView<'_>) -> Result<()> {
     for entry in msec::decode_delta(msec_view.delta_bytes())? {
         match entry {
             msec::DeltaEntry::Access {
+                seqno,
                 rowid,
                 last_access_ms,
                 access_delta,
                 ..
             } => {
+                if superseded_by_latest_version(state, rowid, seqno) {
+                    continue;
+                }
                 let stat = Arc::make_mut(&mut state.access)
                     .entry(RowId::new(rowid))
                     .or_default();
@@ -225,6 +233,18 @@ pub(super) fn apply_delta(state: &mut WriterState, msec_view: &msec::MsecView<'_
         }
     }
     Ok(())
+}
+
+/// `Access` delta 是否已被该 RowId 更晚的版本行覆盖。
+///
+/// 版本行的 `access` 列是写入时刻的累计快照;delta 的 `seqno` 早于最新版本行的
+/// `seqno` 时,该增量已计入版本行,不可再累加(FC-PERSIST-POST-010)。
+/// RowId 无版本行(例如版本被回收)时返回 `false`,delta 必须照常应用。
+fn superseded_by_latest_version(state: &WriterState, rowid: u64, delta_seqno: u64) -> bool {
+    state
+        .latest
+        .get(&RowId::new(rowid))
+        .is_some_and(|slot| state.slots[slot.get() as usize].seqno.get() > delta_seqno)
 }
 
 /// 由记录体 + 向量构造一个活槽位。

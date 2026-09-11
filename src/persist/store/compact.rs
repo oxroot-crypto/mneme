@@ -10,7 +10,7 @@ use crate::core::error::{MnemeError, Result};
 use crate::memory::config::Config;
 use crate::memory::ops::{CompactionControl, CompactionPlan};
 use crate::memory::table::WriterState;
-use crate::persist::flush::{self, SegmentBuildInput};
+use crate::persist::flush::{self, EncodedSegment, SegmentBuildInput};
 use crate::persist::manifest::{Manifest, NsEntry, SegmentEntry};
 use crate::persist::storage::{self, SEGMENTS_DIR, hidx_name, msec_name, vsec_name};
 use crate::persist::trash;
@@ -19,8 +19,47 @@ use crate::persist::{FORMAT_VERSION, crc32};
 use super::Store;
 use super::manifest_io;
 
+/// 新段文件全部写完、MANIFEST 提交之前的进度。
+const MERGE_PROGRESS_WRITTEN: f32 = 0.5;
+
+/// [`Store::compact`] 的输入(参数收敛,rust 规范 §5)。
+pub(crate) struct CompactInput<'a> {
+    /// 本轮合并的段组计划。
+    pub(crate) plan: &'a CompactionPlan,
+    /// 写入新段的幸存槽位(升序)。
+    pub(crate) keep_slots: &'a [usize],
+    /// 后台合并控制句柄。
+    pub(crate) control: &'a CompactionControl,
+}
+
+/// 已写完三件套、尚未提交的新段。
+struct MergedSegment {
+    /// 新段编号。
+    segment_id: u32,
+    /// 段字节与内存索引。
+    encoded: EncodedSegment,
+}
+
+/// [`next_manifest_after_merge`] 的输入。
+struct MergeManifestInput<'a> {
+    /// 提交前的 MANIFEST。
+    previous: &'a Manifest,
+    /// 写状态(注册表与水位)。
+    ws: &'a WriterState,
+    /// 新段编号。
+    segment_id: u32,
+    /// 新段包含的幸存槽位。
+    keep_slots: &'a [usize],
+    /// 被替换的旧段组。
+    group: &'a [SegmentEntry],
+    /// 新段创建时刻(Unix 毫秒)。
+    created_ms: i64,
+    /// 新段编码产物。
+    encoded: &'a EncodedSegment,
+}
+
 impl Store {
-    /// 执行一次 compaction:把 `plan` 组内段合并为只含 `keep_slots` 的新段。
+    /// 执行一次 compaction:把 `input.plan` 组内段合并为只含 `keep_slots` 的新段。
     ///
     /// 提交成功后替换 MANIFEST 段集并把旧段移入 `trash/`;`control` 处于暂停
     /// 时在提交前中止(删除已写新段,活跃段集不变)并返回 `Ok(false)`。
@@ -35,9 +74,7 @@ impl Store {
         &self,
         ws: &mut WriterState,
         config: &Config,
-        plan: &CompactionPlan,
-        keep_slots: &[usize],
-        control: &CompactionControl,
+        input: &CompactInput<'_>,
     ) -> Result<bool> {
         if self.read_only {
             return Err(MnemeError::Unsupported {
@@ -45,130 +82,159 @@ impl Store {
             });
         }
         let previous = self.manifest_snapshot();
-        // 计划段必须在当前 MANIFEST 中且不重复(Builder 校验下正常不可达)。
-        let mut group: Vec<SegmentEntry> = Vec::new();
-        for id in &plan.segments {
-            let Some(segment) = previous
-                .segments
-                .iter()
-                .find(|segment| segment.segment_id == *id)
-            else {
-                return Err(MnemeError::Inconsistent {
-                    reason: "compaction 计划包含非活跃段",
-                });
-            };
-            group.push(*segment);
-        }
-        if group.is_empty() {
-            return Err(MnemeError::Inconsistent {
-                reason: "compaction 计划为空",
-            });
-        }
-
+        let group = resolve_group(&previous, input.plan)?;
         let now_ms = config.clock.now_unix_ms();
+        let Some(merged) = self.build_merged(ws, config, &previous, input, now_ms)? else {
+            return Ok(false);
+        };
+        let new_manifest = next_manifest_after_merge(&MergeManifestInput {
+            previous: &previous,
+            ws,
+            segment_id: merged.segment_id,
+            keep_slots: input.keep_slots,
+            group: &group,
+            created_ms: now_ms,
+            encoded: &merged.encoded,
+        });
+        manifest_io::commit_manifest(&self.root, &new_manifest, self.hook.as_deref())?;
+        self.install_merge(ws, input, &merged, &new_manifest);
+        self.cleanup_old_segments(&input.plan.segments);
+        Ok(true)
+    }
+
+    /// 写新段三件套;运行中暂停时删除孤儿并返回 `None`。
+    fn build_merged(
+        &self,
+        ws: &WriterState,
+        config: &Config,
+        previous: &Manifest,
+        input: &CompactInput<'_>,
+        now_ms: i64,
+    ) -> Result<Option<MergedSegment>> {
         let segment_id = previous.next_segment_id;
         let encoded = flush::build_segment(
             ws,
             config,
             now_ms,
             &SegmentBuildInput {
-                slots: keep_slots,
+                slots: input.keep_slots,
                 delta: &[],
                 full_relations: true,
             },
         )?;
-
-        let names = [
-            format!("{SEGMENTS_DIR}/{}", vsec_name(segment_id)),
-            format!("{SEGMENTS_DIR}/{}", msec_name(segment_id)),
-        ];
-        self.write_file(&names[0], &encoded.vsec)?;
-        self.write_file(&names[1], &encoded.msec)?;
-        if let Some(hidx) = &encoded.hidx {
-            self.write_file(&format!("{SEGMENTS_DIR}/{}", hidx_name(segment_id)), hidx)?;
-        }
-        control.mark_progress(0.5);
-        if control.is_paused() {
+        let names = segment_file_names(segment_id);
+        self.write_merged_files(&names, &encoded)?;
+        input.control.mark_progress(MERGE_PROGRESS_WRITTEN);
+        if input.control.is_paused() {
             // 提交前中止:删除刚写的孤儿新段,活跃段集与数据不变。
             for name in &names {
                 storage::remove_if_exists(&storage::resolve(&self.root, name)?)?;
             }
-            let hidx = format!("{SEGMENTS_DIR}/{}", hidx_name(segment_id));
-            storage::remove_if_exists(&storage::resolve(&self.root, &hidx)?)?;
-            return Ok(false);
+            return Ok(None);
         }
-
-        let new_manifest = next_manifest_after_merge(
-            &previous,
-            ws,
-            self.dimension,
-            self.metric,
+        Ok(Some(MergedSegment {
             segment_id,
-            keep_slots,
-            &group,
-            now_ms,
-            &encoded,
-        );
-        manifest_io::commit_manifest(&self.root, &new_manifest, self.hook.as_deref())?;
+            encoded,
+        }))
+    }
 
-        // 旧段移入 trash 并清理(读者持内存视图,不持段句柄)。
-        let old_names: Vec<String> = plan
-            .segments
+    /// 写入新段的 vsec/msec(以及可选的 hidx)文件。
+    fn write_merged_files(&self, names: &[String; 3], encoded: &EncodedSegment) -> Result<()> {
+        self.write_file(&names[0], &encoded.vsec)?;
+        self.write_file(&names[1], &encoded.msec)?;
+        if let Some(hidx) = &encoded.hidx {
+            self.write_file(&names[2], hidx)?;
+        }
+        Ok(())
+    }
+
+    /// MANIFEST 提交后:对齐内存视图并尽力清理旧段。
+    ///
+    /// 清理失败不返回错误——旧段已不在活跃 MANIFEST 中,成为孤儿文件,由下次
+    /// 启动清理;绝不留下"磁盘已换、内存未换"的半同步(I10/FC-LIFE-ERR-001)。
+    fn install_merge(
+        &self,
+        ws: &mut WriterState,
+        input: &CompactInput<'_>,
+        merged: &MergedSegment,
+        new_manifest: &Manifest,
+    ) {
+        Arc::make_mut(&mut ws.indexes).retain(|index| {
+            index.segment_id != merged.segment_id
+                && !input.plan.segments.contains(&index.segment_id)
+        });
+        ws.install_segment(
+            merged.segment_id,
+            input.keep_slots,
+            merged.encoded.index.clone(),
+        );
+        ws.clear_edge_dirty();
+        self.publish_manifest(new_manifest);
+    }
+
+    /// 把旧段移入 `trash/` 并清理;失败仅遗留孤儿文件。
+    fn cleanup_old_segments(&self, segments: &[u32]) {
+        let old_names: Vec<String> = segments
             .iter()
             .flat_map(|id| [vsec_name(*id), msec_name(*id), hidx_name(*id)])
             .collect();
-        trash::move_to_trash(&self.root, &old_names)?;
-        trash::purge(&self.root)?;
-
-        // 写状态登记新段并替换旧段索引;关系表已全量重写,清空关系 delta。
-        Arc::make_mut(&mut ws.indexes).retain(|index| {
-            index.segment_id != segment_id && !plan.segments.contains(&index.segment_id)
-        });
-        ws.install_segment(segment_id, keep_slots, encoded.index);
-        ws.clear_edge_dirty();
-        self.publish_manifest(&new_manifest);
-        Ok(true)
+        // reason: 提交已生效;移动/清理失败只遗留孤儿文件,不影响正确性与可读性。
+        if trash::move_to_trash(&self.root, &old_names).is_ok() {
+            // reason: purge 失败同样只遗留 trash 垃圾,不影响数据集正确性。
+            let _ = trash::purge(&self.root);
+        }
     }
 }
 
+/// 新段三件套的相对路径(顺序:`vsec`、`msec`、`hidx`)。
+fn segment_file_names(segment_id: u32) -> [String; 3] {
+    [
+        format!("{SEGMENTS_DIR}/{}", vsec_name(segment_id)),
+        format!("{SEGMENTS_DIR}/{}", msec_name(segment_id)),
+        format!("{SEGMENTS_DIR}/{}", hidx_name(segment_id)),
+    ]
+}
+
+/// 从当前 MANIFEST 解析计划段组;空计划或含非活跃段 → `Inconsistent`。
+fn resolve_group(previous: &Manifest, plan: &CompactionPlan) -> Result<Vec<SegmentEntry>> {
+    let mut group: Vec<SegmentEntry> = Vec::new();
+    for id in &plan.segments {
+        let Some(segment) = previous
+            .segments
+            .iter()
+            .find(|segment| segment.segment_id == *id)
+        else {
+            return Err(MnemeError::Inconsistent {
+                reason: "compaction 计划包含非活跃段",
+            });
+        };
+        group.push(*segment);
+    }
+    if group.is_empty() {
+        return Err(MnemeError::Inconsistent {
+            reason: "compaction 计划为空",
+        });
+    }
+    Ok(group)
+}
+
 /// 构造"段组替换为新段"的 MANIFEST(watermark 不变,WAL 不重置)。
-#[allow(clippy::too_many_arguments)]
-fn next_manifest_after_merge(
-    previous: &Manifest,
-    ws: &WriterState,
-    dimension: u32,
-    metric: crate::core::metric::Metric,
-    segment_id: u32,
-    keep_slots: &[usize],
-    group: &[SegmentEntry],
-    created_ms: i64,
-    encoded: &flush::EncodedSegment,
-) -> Manifest {
-    let mut segments: Vec<SegmentEntry> = previous
+fn next_manifest_after_merge(input: &MergeManifestInput<'_>) -> Manifest {
+    let mut segments: Vec<SegmentEntry> = input
+        .previous
         .segments
         .iter()
         .filter(|segment| {
-            !group
+            !input
+                .group
                 .iter()
                 .any(|held| held.segment_id == segment.segment_id)
         })
         .cloned()
         .collect();
-    let (min_seqno, max_seqno) = seqno_range(ws, keep_slots);
-    segments.push(SegmentEntry {
-        segment_id,
-        format_version: FORMAT_VERSION,
-        row_count: keep_slots.len() as u64,
-        min_seqno,
-        max_seqno,
-        created_ms,
-        vsec_crc: crc32(&encoded.vsec),
-        msec_crc: crc32(&encoded.msec),
-        hidx_crc: encoded.hidx.as_deref().map_or(0, crc32),
-        entry_slot: encoded.entry_slot,
-        entry_level: encoded.entry_level,
-    });
-    let mut namespaces: Vec<NsEntry> = ws
+    segments.push(merged_segment_entry(input));
+    let mut namespaces: Vec<NsEntry> = input
+        .ws
         .ns_registry
         .iter()
         .map(|(id, path)| NsEntry {
@@ -178,18 +244,36 @@ fn next_manifest_after_merge(
         .collect();
     namespaces.sort_by_key(|entry| entry.ns_id);
     Manifest {
-        dimension,
-        metric,
-        stopwords: previous.stopwords,
-        next_rel_kind: previous.next_rel_kind,
-        manifest_version: previous.manifest_version + 1,
-        watermark_seqno: previous.watermark_seqno,
-        next_rowid: ws.next_rowid,
-        next_segment_id: segment_id + 1,
-        next_ns_id: ws.next_ns_id,
+        dimension: input.previous.dimension,
+        metric: input.previous.metric,
+        stopwords: input.previous.stopwords,
+        next_rel_kind: input.previous.next_rel_kind,
+        manifest_version: input.previous.manifest_version + 1,
+        watermark_seqno: input.previous.watermark_seqno,
+        next_rowid: input.ws.next_rowid,
+        next_segment_id: input.segment_id + 1,
+        next_ns_id: input.ws.next_ns_id,
         namespaces,
-        rel_kinds: previous.rel_kinds.clone(),
+        rel_kinds: input.previous.rel_kinds.clone(),
         segments,
+    }
+}
+
+/// 新合并段的 MANIFEST 条目。
+fn merged_segment_entry(input: &MergeManifestInput<'_>) -> SegmentEntry {
+    let (min_seqno, max_seqno) = seqno_range(input.ws, input.keep_slots);
+    SegmentEntry {
+        segment_id: input.segment_id,
+        format_version: FORMAT_VERSION,
+        row_count: input.keep_slots.len() as u64,
+        min_seqno,
+        max_seqno,
+        created_ms: input.created_ms,
+        vsec_crc: crc32(&input.encoded.vsec),
+        msec_crc: crc32(&input.encoded.msec),
+        hidx_crc: input.encoded.hidx.as_deref().map_or(0, crc32),
+        entry_slot: input.encoded.entry_slot,
+        entry_level: input.encoded.entry_level,
     }
 }
 

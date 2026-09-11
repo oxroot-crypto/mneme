@@ -30,5 +30,6 @@ mod open;
 mod snapshot;
 mod wal_writer;
 
+pub(crate) use compact::CompactInput;
 pub(crate) use handle::{ManifestState, Store};
 pub(crate) use open::OpenOptions;

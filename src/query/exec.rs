@@ -53,7 +53,8 @@ impl SearchBuilder<'_> {
     /// * 查询向量维度不符 → [`MnemeError::DimensionMismatch`];
     /// * `top_k`/`ef` 超上限 → [`MnemeError::LimitExceeded`];
     /// * MMR `lambda` 含非有限值 → [`MnemeError::Config`](`clamp` 对 NaN 失效会静默退化);
-    /// * 库已关闭 → [`MnemeError::Closed`]。
+    /// * `Scoring::bias_routing = true`(依赖 HNSW 启发式路由,尚未落地)
+    ///   → [`MnemeError::Unsupported`]:设置即拒绝,绝不静默忽略;    /// * 库已关闭 → [`MnemeError::Closed`]。
     ///
     /// # Examples
     /// ```
@@ -142,6 +143,17 @@ impl SearchBuilder<'_> {
                 field: "ef",
                 limit: self.config.limits.ef_max as usize,
                 got: ef,
+            });
+        }
+        // `bias_routing` 依赖 HNSW 遍历期启发式路由,尚未落地;设置即拒绝,
+        // 绝不静默忽略(FC-MEM-ERR-002、设计 10 §2.3)。
+        if self
+            .scoring
+            .as_ref()
+            .is_some_and(|scoring| scoring.bias_routing)
+        {
+            return Err(MnemeError::Unsupported {
+                feature: "Scoring::bias_routing",
             });
         }
         Ok(())

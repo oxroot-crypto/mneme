@@ -413,10 +413,11 @@ pub struct HistoryStat {
 /// `recall_est` 为抽样查询的粗/精排名一致率估计(见 [08 §4.3](08-l6-quant.md))。
 pub struct QuantStat { pub configured: VectorFormat, pub active: VectorFormat, pub recall_est: Option<f32> }
 
-/// 后台合并状态(`stats()` 的 `compaction` 字段)。
+/// 后台合并状态(`stats()` 的 `compaction` 字段);运行中 `pause()` 转 `Paused`。
 pub enum CompactionState {
     Idle,
     Running { progress: f32, segments: Vec<SegmentId> },
+    Paused { progress: f32, segments: Vec<SegmentId> },
 }
 impl CompactionControl {
     pub fn pause(&self);
@@ -533,7 +534,7 @@ pub struct RelationKind(pub u16);
 impl RelationKind {
     pub const DERIVED_FROM: Self; pub const SUPPORTS: Self;
     pub const CONTRADICTS: Self;  pub const RELATED: Self;
-    pub fn custom(name: &str) -> Result<Self>;   // 名称→稳定编号(注册表见 09 §2;耗尽返回 TooLarge;L2 注册表落地前无此 API)
+    pub fn custom(name: &str) -> Result<Self>;   // 名称→稳定编号(注册表见 09 §2;未落地,当前不提供)
 }
 /// 一条关系边。
 pub struct Edge { pub from: RowId, pub to: RowId, pub kind: RelationKind, pub weight: f32, pub metadata: Meta }
@@ -791,14 +792,14 @@ Mneme 提供引擎级支撑——命名空间隔离、去重、TTL/遗忘、混�
 ### 7.1 常规备份
 
 ```rust
-db.backup_to("./backup")?;   // 一致性快照:先 flush,再复制段/MANIFEST/WAL(不做硬链接)
+db.backup_to("./backup")?;   // 一致性快照:先 flush,再复制/硬链接段、MANIFEST 与 WAL
 ```
 
 **目标目录语义**:目标必须不存在或为空;若已含库内容则返回 `Busy`(不合并、不覆盖),
 避免把两次备份混在一起。备份写入是"先写全部文件、最后写 `current`"的顺序,
 中途失败会留下一个不含合法 `current` 的目录——它无法被打开,重新备份即可(不污染源库)。
-`BackupReport.hardlinked` 标记是否走硬链接;L2 始终**复制**文件,故恒为 `false`
-(硬链接是 L5 优化)。
+`BackupReport.hardlinked` 标记是否走硬链接:L5 起同盘优先硬链接,失败/跨盘回退逐文件复制,
+任一文件回退即置 `false`(见 [07 §6](07-l5-life.md))。
 
 备份目录是一个**可独立打开**的完整库;验证:
 
@@ -850,7 +851,7 @@ b.check()?;                  // 全绿 = 备份有效(写进 CI,见 14 §6)
 | metadata 嵌套深度 | 32 层 | 防解析栈溢出 |
 | `top_k` | 4096 | [03 §2.2](03-l1-memory.md) |
 | `ef` | 4096 | 仅 L3+ |
-| WAL 单帧 payload | 16 MiB | 撕裂写检测与内存上界;**L2 保留限额,尚未在写路径强制** |
+| WAL 单帧 payload | 16 MiB | 撕裂写检测与内存上界;**当前保留限额,尚未在写路径强制** |
 | 命名空间深度 | 32 级 | `a/b/c/...`,对应 `Limits.ns_depth` |
 | 自定义关系类型 | 65520 个 | u16 编号空间,内置占用 0..=15;超限 `TooLarge` |
 

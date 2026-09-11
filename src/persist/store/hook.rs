@@ -1,7 +1,7 @@
 //! [`PersistHook`] 实现:WAL-before-visible 落盘(`store/hook.rs`)。
 //!
-//! 内存引擎的每个写事务经此追加 WAL;WAL 达到阈值时触发全量快照 flush,
-//! 保证 WAL 有界。
+//! 内存引擎的每个写事务经此追加 WAL;WAL 达容量上限时触发增量段 flush,
+//! 保证 WAL 有界(设计 04 §3.2、07 §4)。
 
 use crate::core::error::{MnemeError, Result};
 use crate::memory::config::Config;

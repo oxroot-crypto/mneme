@@ -8,7 +8,8 @@
 >
 > `Scoring`/`Diversity`/`expand` 默认关闭,不改变默认行为。
 
-模块:`score/{formula.rs, expand.rs, feedback.rs, diversify.rs}`
+模块(`memory/` 下):`score.rs`(综合打分公式与归一化)、`expand.rs`(联想扩展)、
+`rerank.rs`(MMR 多样性/去重/精排钩子);`Feedback` 闭环经 `namespace` 写路径落地。
 
 ---
 
@@ -78,11 +79,17 @@ $$
 ② 综合重排:对候选集计算 S(d),取 top-k。
 ```
 
+> **落地状态**:① 的候选放大(`ef' = max(ef, 4k)`)与下方 `bias_routing`
+> **尚未落地**——放大逻辑未接线,`Scoring::bias_routing = true` 会在查询入口
+> 返回 `Unsupported`(拒绝静默忽略,FC-MEM-ERR-002),不按未兑现语义静默运行;
+> ② 综合重排已落地。放大与偏置路由的召回门槛见 [14 §4](14-testing.md)。
+
 - 放大 $ef$ 是为了让"向量相似度略低、但综合分高"的记忆进入候选池:经验上
   `ef' = max(ef, 4k)` 时综合排序的相对召回损失 ≤ 2%(门槛见 [14 §4](14-testing.md));
-- **可选的重要性偏置路由**(`Scoring::bias_routing=true`):HNSW 遍历时用
+- **可选的重要性偏置路由**(`Scoring::bias_routing=true`,设计目标):HNSW 遍历时用
   `dist/√(1 + β·imp + β·acc)` 作为启发式优先级(β 为实现内部固定系数,默认 1.0;
   仅改候选访问顺序,不改最终打分)。它能在保持召回的同时减少探查量;默认关闭;
+  **当前设置即返回 `Unsupported`**(未落地,绝不静默无效);
 - **可解释性**:`Hit` 可经 `Hit::explain()` 返回各因子贡献(调试/审计用,不影响主路径)。
 
 ### 2.4 【算例】

@@ -41,7 +41,11 @@ pub(crate) struct EdgeData {
 }
 
 /// 编码关系区;`reverse = true` 时追加反向邻接表。
-pub(crate) fn encode(edges: &[EdgeData], reverse: bool) -> Vec<u8> {
+///
+/// # Errors
+/// 正向/反向边数超过 `u32::MAX` 时返回 [`MnemeError::LimitExceeded`],绝不静默
+/// 截断计数(截断会让解析端把多余边判为尾部残留)。
+pub(crate) fn encode(edges: &[EdgeData], reverse: bool) -> Result<Vec<u8>> {
     let mut forward: Vec<&EdgeData> = edges.iter().collect();
     forward.sort_by_key(|edge| (edge.from, edge.kind, edge.to));
     let mut reverse_edges: Vec<&EdgeData> = Vec::new();
@@ -51,20 +55,31 @@ pub(crate) fn encode(edges: &[EdgeData], reverse: bool) -> Vec<u8> {
         reverse_edges.sort_by_key(|edge| (edge.to, edge.kind, edge.from));
         reverse_edges.dedup_by_key(|edge| (edge.to, edge.kind, edge.from));
     }
+    let forward_count = u32::try_from(forward.len()).map_err(|_| MnemeError::LimitExceeded {
+        field: "relations forward",
+        limit: u32::MAX as usize,
+        got: forward.len(),
+    })?;
+    let reverse_count =
+        u32::try_from(reverse_edges.len()).map_err(|_| MnemeError::LimitExceeded {
+            field: "relations reverse",
+            limit: u32::MAX as usize,
+            got: reverse_edges.len(),
+        })?;
 
     let mut out = Vec::new();
     out.extend_from_slice(&MAGIC);
     put_u16(&mut out, FORMAT_VERSION);
     put_u16(&mut out, if reverse { FLAG_REVERSE } else { 0 });
-    put_u32(&mut out, forward.len() as u32);
-    put_u32(&mut out, reverse_edges.len() as u32);
+    put_u32(&mut out, forward_count);
+    put_u32(&mut out, reverse_count);
     for edge in forward {
         encode_edge(&mut out, edge);
     }
     for edge in reverse_edges {
         encode_edge(&mut out, edge);
     }
-    out
+    Ok(out)
 }
 
 /// 追加一条边(含 meta 长度前缀)。
@@ -124,6 +139,12 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<EdgeView> {
     } else {
         Vec::new()
     };
+    if !cursor.is_empty() {
+        return Err(MnemeError::Corrupted {
+            segment: None,
+            reason: "relations: 区尾有残留字节".to_string(),
+        });
+    }
     Ok(EdgeView { forward, reverse })
 }
 
@@ -163,7 +184,7 @@ mod tests {
     #[test]
     fn edges_roundtrip_with_reverse() {
         let edges = vec![edge(2, 1, 3), edge(1, 2, 0), edge(1, 3, 0)];
-        let bytes = encode(&edges, true);
+        let bytes = encode(&edges, true).expect("encode");
         let view = parse(&bytes).expect("parse");
         assert_eq!(view.forward.len(), 3);
         // 正向按 (from,kind,to):(1,0,2),(1,0,3),(2,3,1)。
@@ -186,8 +207,16 @@ mod tests {
     /// 魔数损坏被检出。
     #[test]
     fn edges_detects_bad_magic() {
-        let mut bytes = encode(&[edge(1, 2, 0)], false);
+        let mut bytes = encode(&[edge(1, 2, 0)], false).expect("encode");
         bytes[0] = b'X';
+        assert!(matches!(parse(&bytes), Err(MnemeError::Corrupted { .. })));
+    }
+
+    /// FC-PERSIST-ERR-011(口径一致):区尾残留字节 → `Corrupted`,绝不静默忽略。
+    #[test]
+    fn edges_reject_trailing_bytes() {
+        let mut bytes = encode(&[edge(1, 2, 0)], false).expect("encode");
+        bytes.push(0xAB);
         assert!(matches!(parse(&bytes), Err(MnemeError::Corrupted { .. })));
     }
 }

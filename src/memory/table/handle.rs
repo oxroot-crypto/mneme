@@ -14,6 +14,10 @@ use super::PersistHook;
 use super::state::WriterState;
 use super::view::ReaderView;
 
+/// 访问缓冲条目数上限(约 100 万条):维护线程停止/panic 时缓冲不会无界增长;
+/// 超限后新 `RowId` 被丢弃(只影响遗忘速度估计,FC-LIFE-POST-004)。
+const MAX_ACCESS_BUFFER_ENTRIES: usize = 1 << 20;
+
 /// 内存表:写状态 + 已发布读视图 + 配置 + 可选持久钩子。
 pub(crate) struct Table {
     pub(crate) writer: Mutex<WriterState>,
@@ -150,12 +154,19 @@ impl Table {
     }
 
     /// 记录一批读路径命中到访问缓冲(热路径仅一次内存追加,零写放大)。
+    ///
+    /// 缓冲条目数有上限(见 [`MAX_ACCESS_BUFFER_ENTRIES`]):达到上限后新的
+    /// `RowId` 被丢弃(已有键继续累加)。维护线程停止/panic 时缓冲不会无界增长;
+    /// 丢弃只影响遗忘速度估计,不影响可见性与检索正确性(FC-LIFE-POST-004)。
     pub(crate) fn record_hits(&self, rowids: impl IntoIterator<Item = RowId>) {
         let mut buffer = self
             .access_buffer
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for rowid in rowids {
+            if !buffer.contains_key(&rowid) && buffer.len() >= MAX_ACCESS_BUFFER_ENTRIES {
+                continue;
+            }
             let entry = buffer.entry(rowid).or_insert(0);
             *entry = entry.saturating_add(1);
         }

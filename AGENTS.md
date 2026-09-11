@@ -24,8 +24,9 @@ L6 尚无代码。L2 依赖 `crc32fast`;L3 经 feature `mmap`(默认开)引入 `
 ## 分层与代码边界
 
 - L0→L6 只允许向下依赖;新代码必须落在正确的层,不能让下层依赖上层。
-  **已文档化例外**:门面/组合根(`memory::Builder`/`Mneme`)为装配需要可引用 `persist`
-  与 `index`(`Builder` 注入 `Store` 与 `IndexFactory`),不改变 L0→L6 的业务依赖方向。
+  **已文档化例外**:门面/组合根(`memory::Builder`/`Mneme`)为装配需要可引用 `persist`、
+  `index` 与 `life`(`Builder` 注入 `Store` 与 `IndexFactory`,`Mneme` 持有维护句柄与
+  compaction 门面),不改变 L0→L6 的业务依赖方向。
 - `src/core/`(L0)无 I/O、无全局状态、无锁,只有类型与纯函数。
 - `unsafe` 只允许两处:`src/core/simd.rs` 的 arch 内联与 `src/persist/source.rs` 的 `MmapSource`
   (mmap 固有 unsafe);每处必须附 `// SAFETY:` 证明。

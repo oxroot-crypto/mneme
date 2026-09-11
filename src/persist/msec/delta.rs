@@ -132,62 +132,76 @@ impl DeltaEntry {
 }
 
 /// 编码 delta 区(按 `(target, seqno, kind)` 排序;空条目返回空 `Vec`)。
-pub(crate) fn encode_delta(entries: &[DeltaEntry]) -> Vec<u8> {
+///
+/// # Errors
+/// 条目数超过 `u16::MAX` 时返回 [`MnemeError::LimitExceeded`],绝不静默截断计数
+/// (截断会产出解码端判为"尾部残留"的损坏段,FC-PERSIST-ERR-011)。
+pub(crate) fn encode_delta(entries: &[DeltaEntry]) -> Result<Vec<u8>> {
     if entries.is_empty() {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     let mut sorted: Vec<&DeltaEntry> = entries.iter().collect();
     sorted.sort_by_key(|entry| (entry.target(), entry.common().1, entry.kind_rank()));
+    let count = u16::try_from(sorted.len()).map_err(|_| MnemeError::LimitExceeded {
+        field: "delta entries",
+        limit: u16::MAX as usize,
+        got: sorted.len(),
+    })?;
 
     let mut body = Vec::new();
     for entry in &sorted {
-        let (kind, seqno, tx_ms, ns_id) = entry.common();
-        body.push(kind);
-        put_u64(&mut body, seqno);
-        put_i64(&mut body, tx_ms);
-        put_u32(&mut body, ns_id);
-        match entry {
-            DeltaEntry::Access {
-                rowid,
-                last_access_ms,
-                access_delta,
-                importance_delta,
-                ..
-            } => {
-                put_u64(&mut body, *rowid);
-                put_i64(&mut body, *last_access_ms);
-                put_u32(&mut body, *access_delta);
-                body.extend_from_slice(&importance_delta.to_le_bytes());
-            }
-            DeltaEntry::Relate {
-                from,
-                to,
-                kind,
-                weight,
-                meta,
-                ..
-            } => {
-                put_u64(&mut body, *from);
-                put_u64(&mut body, *to);
-                put_u16(&mut body, *kind);
-                body.extend_from_slice(&weight.to_le_bytes());
-                put_bytes_u32(&mut body, &meta::to_bytes(meta));
-            }
-            DeltaEntry::Unrelate { from, to, kind, .. } => {
-                put_u64(&mut body, *from);
-                put_u64(&mut body, *to);
-                put_u16(&mut body, *kind);
-            }
-        }
+        encode_entry(&mut body, entry);
     }
 
     let mut out = Vec::with_capacity(HEADER_LEN + body.len());
     out.extend_from_slice(&MAGIC);
     put_u16(&mut out, FORMAT_VERSION);
-    put_u16(&mut out, u16::try_from(sorted.len()).unwrap_or(u16::MAX));
+    put_u16(&mut out, count);
     put_u32(&mut out, crc32(&body));
     out.extend_from_slice(&body);
-    out
+    Ok(out)
+}
+
+/// 编码单条 delta 条目(公共前缀 + 按 kind 的载荷)。
+fn encode_entry(out: &mut Vec<u8>, entry: &DeltaEntry) {
+    let (kind, seqno, tx_ms, ns_id) = entry.common();
+    out.push(kind);
+    put_u64(out, seqno);
+    put_i64(out, tx_ms);
+    put_u32(out, ns_id);
+    match entry {
+        DeltaEntry::Access {
+            rowid,
+            last_access_ms,
+            access_delta,
+            importance_delta,
+            ..
+        } => {
+            put_u64(out, *rowid);
+            put_i64(out, *last_access_ms);
+            put_u32(out, *access_delta);
+            out.extend_from_slice(&importance_delta.to_le_bytes());
+        }
+        DeltaEntry::Relate {
+            from,
+            to,
+            kind,
+            weight,
+            meta,
+            ..
+        } => {
+            put_u64(out, *from);
+            put_u64(out, *to);
+            put_u16(out, *kind);
+            out.extend_from_slice(&weight.to_le_bytes());
+            put_bytes_u32(out, &meta::to_bytes(meta));
+        }
+        DeltaEntry::Unrelate { from, to, kind, .. } => {
+            put_u64(out, *from);
+            put_u64(out, *to);
+            put_u16(out, *kind);
+        }
+    }
 }
 
 /// 解码 delta 区;空区返回空 `Vec`。
@@ -213,58 +227,66 @@ pub(crate) fn decode_delta(bytes: &[u8]) -> Result<Vec<DeltaEntry>> {
     if crc32(body) != stored_crc {
         return Err(corrupted("delta: 条目区 CRC 不符"));
     }
-    let mut body_cursor = Cursor::new(body, "msec delta 条目");
+    decode_entries(body, count)
+}
+
+/// 解码条目区并拒绝尾部残留。
+fn decode_entries(body: &[u8], count: usize) -> Result<Vec<DeltaEntry>> {
+    let mut cursor = Cursor::new(body, "msec delta 条目");
     let mut entries = Vec::with_capacity(count.min(body.len() / COMMON_BYTES));
     for _ in 0..count {
-        let kind = body_cursor.u8()?;
-        let seqno = body_cursor.u64()?;
-        let tx_ms = body_cursor.i64()?;
-        let ns_id = body_cursor.u32()?;
-        entries.push(match kind {
-            KIND_ACCESS => DeltaEntry::Access {
-                seqno,
-                tx_ms,
-                ns_id,
-                rowid: body_cursor.u64()?,
-                last_access_ms: body_cursor.i64()?,
-                access_delta: body_cursor.u32()?,
-                importance_delta: f32::from_le_bytes(
-                    body_cursor.take(4)?.try_into().unwrap_or([0; 4]),
-                ),
-            },
-            KIND_RELATE => {
-                let from = body_cursor.u64()?;
-                let to = body_cursor.u64()?;
-                let kind = body_cursor.u16()?;
-                let weight = f32::from_le_bytes(body_cursor.take(4)?.try_into().unwrap_or([0; 4]));
-                let meta_len = body_cursor.u32()? as usize;
-                let meta = meta::from_bytes(body_cursor.take(meta_len)?)?;
-                DeltaEntry::Relate {
-                    seqno,
-                    tx_ms,
-                    ns_id,
-                    from,
-                    to,
-                    kind,
-                    weight,
-                    meta,
-                }
-            }
-            KIND_UNRELATE => DeltaEntry::Unrelate {
-                seqno,
-                tx_ms,
-                ns_id,
-                from: body_cursor.u64()?,
-                to: body_cursor.u64()?,
-                kind: body_cursor.u16()?,
-            },
-            _ => return Err(corrupted("delta: 未知条目种类")),
-        });
+        entries.push(decode_entry(&mut cursor)?);
     }
-    if !body_cursor.is_empty() {
+    if !cursor.is_empty() {
         return Err(corrupted("delta: 条目区尾部有残留字节"));
     }
     Ok(entries)
+}
+
+/// 解码单条 delta 条目。
+fn decode_entry(cursor: &mut Cursor<'_>) -> Result<DeltaEntry> {
+    let kind = cursor.u8()?;
+    let seqno = cursor.u64()?;
+    let tx_ms = cursor.i64()?;
+    let ns_id = cursor.u32()?;
+    Ok(match kind {
+        KIND_ACCESS => DeltaEntry::Access {
+            seqno,
+            tx_ms,
+            ns_id,
+            rowid: cursor.u64()?,
+            last_access_ms: cursor.i64()?,
+            access_delta: cursor.u32()?,
+            importance_delta: f32::from_le_bytes(cursor.take(4)?.try_into().unwrap_or([0; 4])),
+        },
+        KIND_RELATE => {
+            let from = cursor.u64()?;
+            let to = cursor.u64()?;
+            let kind = cursor.u16()?;
+            let weight = f32::from_le_bytes(cursor.take(4)?.try_into().unwrap_or([0; 4]));
+            let meta_len = cursor.u32()? as usize;
+            let meta = meta::from_bytes(cursor.take(meta_len)?)?;
+            DeltaEntry::Relate {
+                seqno,
+                tx_ms,
+                ns_id,
+                from,
+                to,
+                kind,
+                weight,
+                meta,
+            }
+        }
+        KIND_UNRELATE => DeltaEntry::Unrelate {
+            seqno,
+            tx_ms,
+            ns_id,
+            from: cursor.u64()?,
+            to: cursor.u64()?,
+            kind: cursor.u16()?,
+        },
+        _ => return Err(corrupted("delta: 未知条目种类")),
+    })
 }
 
 /// 构造 delta 区损坏错误。
@@ -315,7 +337,7 @@ mod tests {
     /// FC-PERSIST-POST-010(往返一致 + 按 `(target, seqno)` 排序)
     #[test]
     fn delta_roundtrip_is_sorted_and_lossless() {
-        let bytes = encode_delta(&sample());
+        let bytes = encode_delta(&sample()).expect("encode");
         let decoded = decode_delta(&bytes).expect("decode");
         // 排序键 (target, seqno):(1,6) Relate,(3,5) Access,(3,9) Unrelate。
         assert_eq!(decoded.len(), 3);
@@ -329,22 +351,47 @@ mod tests {
             }
         ));
         assert!(matches!(decoded[2], DeltaEntry::Unrelate { from: 3, .. }));
-        let mut reencoded = encode_delta(&decoded);
+        let reencoded = encode_delta(&decoded).expect("reencode");
         assert_eq!(bytes, reencoded, "解码后重编码必须逐字节一致");
-        reencoded.clear();
     }
 
     /// FC-PERSIST-POST-010(空区兼容)
     #[test]
     fn empty_delta_is_valid() {
         assert!(decode_delta(&[]).expect("空区").is_empty());
-        assert!(encode_delta(&[]).is_empty());
+        assert!(encode_delta(&[]).expect("空编码").is_empty());
     }
 
-    /// FC-PERSIST-ERR-011(魔数/CRC/未知 kind/尾部残留/截断 → Corrupted)
+    /// FC-PERSIST-ERR-011(条目数超 `u16::MAX` → `LimitExceeded`,绝不静默截断计数)
+    #[test]
+    fn delta_count_overflow_is_rejected() {
+        let entry = |rowid: u64| DeltaEntry::Access {
+            seqno: 1,
+            tx_ms: 1,
+            ns_id: 0,
+            rowid,
+            last_access_ms: 1,
+            access_delta: 1,
+            importance_delta: 0.0,
+        };
+        let boundary: Vec<DeltaEntry> = (0..u16::MAX as u64).map(entry).collect();
+        let bytes = encode_delta(&boundary).expect("u16::MAX 条必须可编码");
+        assert_eq!(
+            decode_delta(&bytes).expect("decode").len(),
+            u16::MAX as usize
+        );
+
+        let overflow: Vec<DeltaEntry> = (0..u16::MAX as u64 + 1).map(entry).collect();
+        assert!(matches!(
+            encode_delta(&overflow),
+            Err(MnemeError::LimitExceeded { .. })
+        ));
+    }
+
+    /// FC-PERSIST-ERR-011(魔数/CRC/未知 kind/尾部残留/截断/长度越界 → Corrupted)
     #[test]
     fn malformed_delta_is_rejected() {
-        let bytes = encode_delta(&sample());
+        let bytes = encode_delta(&sample()).expect("encode");
         let mut bad_magic = bytes.clone();
         bad_magic[0] = b'X';
         assert!(matches!(
@@ -374,6 +421,28 @@ mod tests {
         unknown[8..12].copy_from_slice(&crc.to_le_bytes());
         assert!(matches!(
             decode_delta(&unknown),
+            Err(MnemeError::Corrupted { .. })
+        ));
+
+        // 尾部残留:在合法条目区后追加一个字节并重算 CRC。
+        let mut residual = bytes.clone();
+        residual.push(0xAB);
+        let crc = crc32(&residual[HEADER_LEN..]);
+        residual[8..12].copy_from_slice(&crc.to_le_bytes());
+        assert!(matches!(
+            decode_delta(&residual),
+            Err(MnemeError::Corrupted { .. })
+        ));
+
+        // 长度越界:Relate 的 meta 长度字段改成超大值(挑 kinds 里的 Relate 条目)。
+        let relate_bytes = encode_delta(&[sample().remove(2)]).expect("单条 Relate");
+        let mut oversized = relate_bytes.clone();
+        let meta_len_offset = HEADER_LEN + COMMON_BYTES + 8 + 8 + 2 + 4;
+        oversized[meta_len_offset..meta_len_offset + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        let crc = crc32(&oversized[HEADER_LEN..]);
+        oversized[8..12].copy_from_slice(&crc.to_le_bytes());
+        assert!(matches!(
+            decode_delta(&oversized),
             Err(MnemeError::Corrupted { .. })
         ));
 

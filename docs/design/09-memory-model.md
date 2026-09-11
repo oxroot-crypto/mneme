@@ -49,7 +49,7 @@ impl RelationKind {
     pub const SUPPORTS: Self;              // =1 支持
     pub const CONTRADICTS: Self;           // =2 矛盾
     pub const RELATED: Self;               // =3 弱相关
-    pub fn custom(name: &str) -> Result<Self>;  // 名称→稳定编号(≥16;已注册则返回既有编号;L2 注册表落地前无此 API)
+    pub fn custom(name: &str) -> Result<Self>;  // 名称→稳定编号(≥16;名称注册表未落地,当前不提供此 API)
 }
 pub struct Edge { pub from: RowId, pub to: RowId, pub kind: RelationKind, pub weight: f32, pub metadata: Meta }
 
@@ -65,12 +65,13 @@ let in_edges: Vec<Edge> = ns.predecessors(to, &[RelationKind::SUPPORTS])?;  // �
 
 - 关系边以 `(from, to, kind)` 为唯一键,重复 `relate` 为 upsert;
 - 边可携带 `weight ∈ [0,1]`(影响联想扩展的传播强度,[10 §3](10-scoring.md))与任意 metadata;
-- **自定义关系**的 `custom(name)` 经名称注册表映射为稳定 u16:内置固定占用 `0..=3`,
-  `4..=15` 预留给未来内置类型,自定义从 **16** 起分配;同一名称全局唯一,编号空间耗尽
-  (约 65520 个自定义类型)时返回 `TooLarge`。注册经 WAL
+- **自定义关系**(`custom(name)`,尚未落地):设计为经名称注册表映射为稳定 u16:内置固定
+  占用 `0..=3`,`4..=15` 预留给未来内置类型,自定义从 **16** 起分配;同一名称全局唯一,编号
+  空间耗尽(约 65520 个自定义类型)时返回 `TooLarge`。注册计划经 WAL
   `RelKindRegister` 帧落盘([04 §2.3](04-l2-persist.md)),并由 MANIFEST 的关系类型注册表
   持久化(`RelKindEntry` + `next_rel_kind` 水位,[04 §2.4](04-l2-persist.md)),
   不同进程/重启后编号一致(与 `NsRegister` 同一恢复机制,[04 §3.3](04-l2-persist.md))。
+  **当前实现不提供 `custom`**(内置 `0..=3` 可用),落地前不承诺语义。
 
 ### 2.3 存储与一致性
 

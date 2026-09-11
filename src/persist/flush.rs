@@ -83,9 +83,9 @@ pub(crate) fn build_segment(
         Vec::new()
     };
     let write_reverse = config.relation_index == crate::core::options::RelationIndex::Both;
-    let relations_bytes = crate::persist::edges::encode(&relations, write_reverse);
+    let relations_bytes = crate::persist::edges::encode(&relations, write_reverse)?;
     let indexes = build_indexes(ws, config, input.slots)?;
-    let delta_bytes = msec::encode_delta(input.delta);
+    let delta_bytes = msec::encode_delta(input.delta)?;
     let msec_bytes = msec::encode(&MsecInput {
         slots: &built.slots,
         ns_stats: &ns_stats,
