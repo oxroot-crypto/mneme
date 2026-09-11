@@ -10,6 +10,13 @@ readme = "README.md"
 keywords = ["vector", "embedding", "database", "hnsw", "memory"]
 categories = ["database"]
 
+[features]
+# 默认开启 mmap(L3 起,见 docs/design/01-overview.md §5.1);关闭后段文件走
+# `FileSource`(`Read + Seek`)兜底,功能不变、稍慢。
+default = ["mmap"]
+# 段文件 mmap 零拷贝读取(L3):引入 `memmap2`。
+mmap = ["dep:memmap2"]
+
 [dependencies]
 # 元数据与后续 DSL 序列化的基础;L0 阶段仅经 serde_json 使用,直接声明以对齐依赖白名单
 # (docs/design/01-overview.md §5),避免 L4 引入时再改依赖清单。
@@ -18,11 +25,19 @@ serde_json = "1"
 thiserror = "2"
 # L2 持久层的 CRC-32 校验(帧/文件头/payload);传递依赖极少,白名单内(docs/design/01-overview.md §5)。
 crc32fast = "1"
+# L3 索引层的 mmap 零拷贝读(设计 04 §11);feature `mmap` 默认开启,关闭即回退 FileSource。
+memmap2 = { version = "0.9", optional = true }
 
 [dev-dependencies]
 proptest = "1"
 # 持久层测试用临时目录(白名单内,见 docs/design/01-overview.md §5)。
 tempfile = "3"
+# L3 起的 criterion 基准(设计 14 §4);仅 dev-dependency,不进入发布产物。
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "hnsw"
+harness = false
 
 [profile.release]
 # L0 为纯函数库,lto 收益有限;thin LTO 在跨 crate 内联与编译时间间折中,

@@ -19,7 +19,8 @@
    [spec/contracts.md](docs/spec/contracts.md) 的 `FC-*` 编号,测试代码注释引用编号,
    防止"测了个寂寞";`tests/contract_traceability.rs` 在 `cargo test` 中校验契约↔测试双向映射。
 5. **无 panic 契约**:L0 所有函数返回 `Result` 或数学上可证明不 panic;
-   `unsafe` 仅允许出现在 `simd.rs` 的 arch 内联中。
+   `unsafe` 仅允许出现在全库两处白名单:`src/core/simd.rs` 的 arch 内联与
+   `src/persist/source.rs` 的 `MmapSource`(均须 `// SAFETY:`)。
 
 ## 提交前检查
 

@@ -383,11 +383,20 @@ pub struct Stats {
     pub history: HistoryStat,                     // 版本链/历史保留统计(见 07 §4.2a)
     pub storage: StorageStat,                     // 加密/压缩生效状态(见 11)
 }
-pub struct SegmentStat { pub id: SegmentId, pub rows: u64, pub bytes: u64, pub dead_ratio: f32, pub created: i64 }
+// `SegmentStat` 标注 #[non_exhaustive](字段随层扩展,下游不得穷尽构造/匹配);
+// `bytes` = 段内 vsec + 已落盘 hidx 字节数(不含 msec);`rows` 含墓碑与历史版本。
+pub struct SegmentStat { pub id: SegmentId, pub rows: u64, pub bytes: u64, pub dead_ratio: f32, pub created: i64, pub index_nodes: u64, pub index_levels: u8 }  // index_* 为 L3 HNSW 图统计(无索引段为 0;小段可能预建但查询恒暴力)
 pub struct NsStat      { pub doc_count: u64, pub total_doc_len: u64 }
 pub struct Histogram   { /* 固定 32 桶边界与计数,详见 07 §7 */ }
 pub struct StorageStat { pub encryption: bool, pub compression: Compression, pub migrated_segments: usize, pub total_segments: usize }
+```
 
+> **API 变更记录(L3,破坏性)**:`SegmentStat` 新增 `index_nodes`/`index_levels` 两个公开字段,
+> 并标注 `#[non_exhaustive]`(统计字段随层扩展;外部可读但不得再以结构体字面量构造或穷尽匹配)。
+> 兼容口径:v0.1.0 未发布,下游无既有构造点;后续新增字段不再构成破坏性变更。正式 RFC
+> 流程(`CONTRIBUTING.md` §3)落地前,以本记录作为变更登记。
+
+```rust
 /// 版本链/历史保留统计(见 [07 §4.2a](07-l5-life.md))。
 pub struct HistoryStat {
     pub retained_versions: u64,     // 当前保留的物理版本总数(含历史版本与墓碑)
@@ -594,11 +603,12 @@ pub struct ConsolidateReport {
 
 ```rust
 pub struct HnswParams {
-    pub m: u16,              // 默认 16  上层度数上限
-    pub m0: u16,             // 默认 32  第 0 层度数上限
-    pub ef_construction: u16,// 默认 200 构建探查宽度
-    pub ef_search: u16,      // 默认 64  查询探查宽度
+    pub m: u16,              // 默认 16  上层度数上限;建库校验 ≥ 2 且 ≤ 4096
+    pub m0: u16,             // 默认 32  第 0 层度数上限;建库校验 ≥ m 且 ≤ 4096
+    pub ef_construction: u16,// 默认 200 构建探查宽度;建库校验 ≥ 1
+    pub ef_search: u16,      // 默认 64  查询探查宽度;建库校验 ∈ [1, Limits.ef_max]
 }
+// 违反上述域 → Config/LimitExceeded(FC-INDEX-PRE-001),绝不静默。
 // 层级骰子系数 m_L = 1/ln(m) 为派生量,不单独暴露(见 05 §3.2、05 §11)。
 
 pub struct CompactionPolicy {
@@ -618,8 +628,8 @@ pub struct Tuning {
     pub field_dict_max: u16,            // 默认 16    每段可索引字段上限(04 §5.1)
     pub bloom_fpp: f32,                 // 默认 0.01  布隆过滤器目标误判率(04 §5.3)
     pub brute_force_max_rows: u32,      // 默认 2048  段行数低于此值恒用暴力(05 §9)
-    pub filter_post_threshold: f32,     // 默认 0.10  过滤三档:后过滤/约束遍历分界(05 §8)
-    pub filter_brute_threshold: f32,    // 默认 0.001 过滤三档:约束遍历/候选暴力分界(05 §8)
+    pub filter_post_threshold: f32,     // 默认 0.10  过滤三档:后过滤/放大后过滤分界(05 §8)
+    pub filter_brute_threshold: f32,    // 默认 0.001 过滤三档:放大后过滤/候选暴力分界(05 §8)
     pub stopwords: bool,                // 默认 true  启用内置停用词表(06 §3.5)
 }
 ```

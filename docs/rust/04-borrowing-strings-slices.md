@@ -5,7 +5,8 @@
 > **前置**:[02](02-values-and-ownership.md)、[03](03-structs-enums-impl.md) 章。
 > **对应源码**:[`src/core/types.rs`](../../src/core/types.rs)、[`src/core/simd.rs`](../../src/core/simd.rs)、
 > [`src/core/meta.rs`](../../src/core/meta.rs)、[`src/core/options/clock.rs`](../../src/core/options/clock.rs)、
-> [`src/memory/table/state.rs`](../../src/memory/table/state.rs)。
+> [`src/memory/table/state.rs`](../../src/memory/table/state.rs)、[`src/index/hnsw.rs`](../../src/index/hnsw.rs)、
+> [`src/index/hidx.rs`](../../src/index/hidx.rs)、[`src/index/graph.rs`](../../src/index/graph.rs)。
 
 [02 章](02-values-and-ownership.md)说,把值传给函数会**移动所有权**。但大多数时候我们只想"看一眼"
 数据,不想把所有权交出去。这就是**借用(borrowing)**:用引用 `&` 借用,用完还回去。
@@ -122,6 +123,70 @@ takes_slice(&a);               // &[f32; 4] → &[f32]
 **要点**:deref coercion 只在**引用层面**发生,不会把 `String` 值本身悄悄转成 `&str`;
 `&s` 里的 `&` 是必须的。这也是 mneme 的距离函数签名写成 `&[f32]` 而不是 `&Vec<f32>` 的原因:
 调用方传什么容器都行,且不复制数据。
+
+### 2.3 字节数组与切片操作:L3 文件格式的读写基础
+
+L3 的 hidx 文件是"定长头部 + 字节数据区"的二进制格式,全程在 `&[u8]` / `Vec<u8>` 上操作,
+需要一组"字节级"惯用法。
+
+**① 字节串字面量与定长数组**:`b"HID1"` 的类型是 `&[u8; 4]`(字节串),前面加 `*` 解引用
+得到 `[u8; 4]`,可以当编译期常量:
+
+```rust
+/// hidx 魔数。
+pub(crate) const MAGIC: [u8; 4] = *b"HID1";
+
+// 切片与数组可以直接比较(标准库提供 [u8] 与 [u8; 4] 的 PartialEq)
+if bytes[0..4] != MAGIC {
+    return Err(corrupt("魔数不符"));
+}
+```
+
+见 [`src/index/hidx.rs:20-21`](../../src/index/hidx.rs) 与
+[`src/index/hidx.rs:184-186`](../../src/index/hidx.rs)。`bytes[0..4]` 是对切片做范围索引,
+得到的是 `[u8]`(不定长);比较运算符会自动借成两边引用,所以 `&[u8]` 与 `&[u8; 4]` 能比。
+
+**② 小端整数与字节互转**:格式规定整数小端存储,`to_le_bytes` 把整数变成 `[u8; N]`,
+`from_le_bytes` 反过来:
+
+```rust
+header[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
+// 解码:
+let version = u16::from_le_bytes([bytes[4], bytes[5]]);
+```
+
+见 [`src/index/hidx.rs:120`](../../src/index/hidx.rs) 与
+[`src/index/hidx.rs:187`](../../src/index/hidx.rs)。
+
+- `slice.copy_from_slice(&src)`:把源切片拷进**已经就位**的目标切片,要求两边长度完全相等,
+  否则 panic——长度已知的定长头部用它最合适;
+- `Vec::extend_from_slice(&src)`:追加到 `Vec` 末尾、自动增长,用于变长的数据区;
+- `Vec::with_capacity(n)`:按预估长度预留容量,避免反复扩容(见
+  [`src/index/hidx.rs:73-74`](../../src/index/hidx.rs))。
+
+**③ 空切片与函数指针**:`Graph::neighbors` 在节点/层级越界时返回一个**空切片**而不是
+`Option`,让上层循环无须判空:
+
+```rust
+pub(crate) fn neighbors(&self, node: u32, level: usize) -> &[u32] {
+    self.nodes
+        .get(node as usize)
+        .and_then(|links| links.neighbors.get(level))
+        .map_or(&[][..], Vec::as_slice)
+}
+```
+
+见 [`src/index/graph.rs:57-62`](../../src/index/graph.rs)。两个细节:
+
+- `&[][..]` 是"空数组的切片",类型是 `&[u32]`(元素类型由 `map_or` 的另一分支推断);
+  `[..]` 把"数组引用"显式转成"切片引用",避免某些位置推断不出元素类型。
+- `Vec::as_slice` 是一个**函数指针**,签名 `fn(&Vec<T>) -> &[T]` 正好吻合 `map_or` 需要的
+  `FnOnce(&Vec<u32>) -> &[u32]`,所以不必写 `|v| v.as_slice()`。凡是签名对得上的关联函数
+  都能这样直接当参数传(函数指针不能捕获环境,见 [06 §4.2](06-generics-traits.md))。
+
+> 为什么越界返回空切片、而不是报错?`neighbors` 是搜索热路径上的内部查询:节点 id 来自
+> 图自身、层级来自节点,越界只在防御性场景出现。返回空切片让调用方(遍历邻接的循环)自然
+> 什么也不做,比每层 `Option` 解包更简洁——这是"边界情况退化到空集"的惯用设计。
 
 ---
 
@@ -244,7 +309,36 @@ fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result
 `'_` 表示"这里有个生命周期,但我不关心它叫什么,交给编译器"。见
 [`src/core/types.rs:49`](../../src/core/types.rs)。
 
-### 4.4 一个实用的记忆法
+### 4.4 结构体也能借用:`QueryRef<'a>`
+
+引用不只出现在函数参数里,结构体字段也可以存引用——这时结构体必须带生命周期参数:
+
+```rust
+/// 查询向量及其预计算范数平方;打包传参以避免在层搜索接口上堆叠参数。
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct QueryRef<'a> {
+    /// 查询向量。
+    pub(crate) vector: &'a [f32],
+    /// 查询向量范数平方(度量需要时)。
+    pub(crate) norm_sq: f32,
+}
+```
+
+见 [`src/index/hnsw.rs:27-34`](../../src/index/hnsw.rs)。含义:
+
+- `QueryRef<'a>` 读作"借用寿命为 `'a` 的查询视图";`<'a>` 虽是类型参数,泛化的却是生命周期;
+- 它**不拥有**向量(字段类型是 `&'a [f32]`),所以实例不能活得比被借用的向量久——编译器保证;
+- 函数签名里用 `QueryRef<'_>`(省略具体名字)或 `QueryRef<'a>` 都行:
+  `search_layer(&self, query: QueryRef<'_>, ...)`,见
+  [`src/index/hnsw.rs:224-230`](../../src/index/hnsw.rs);
+- 字段都是 `Copy`(引用与 `f32` 都 `Copy`),所以 `QueryRef` 自己也能 `derive(Copy)`,
+  按值传递十分廉价——它像一个"带数据的借用凭证"。
+
+> 为什么要打包成结构体?层搜索接口本来要分别传 `vector` 和 `norm_sq` 两个参数,打包后
+> 只传一个;查询期间字段不变,按值复制一份即可,不必反复向上层借用。这是"用类型把相关
+> 数据绑在一起"的小例子。
+
+### 4.5 一个实用的记忆法
 
 > 生命周期标注**不改变任何运行时代码**,它只是向编译器"承诺"引用之间的关系。
 > 如果承诺错了,编译失败,而不是运行时出错。
@@ -333,8 +427,11 @@ pub(crate) fn write(&self) -> MutexGuard<'_, WriterState> {
 
 - `&T` 共享引用(可多个)、`&mut T` 可变引用(唯一),二者互斥;借用规则在编译期消灭数据竞争。
 - `&[T]` 是切片借用,可接收数组、`Vec`、子切片;mneme 的距离函数因此不复制向量。
+- 字节级操作:`*b"..."` 是定长字节数组;`to_le_bytes`/`from_le_bytes` 做整数与字节互转;
+  `copy_from_slice` 要求等长,`extend_from_slice` 自动增长;空切片可作"退化结果"。
 - `String` 拥有且可变,`&str` 借用且不可变,`Arc<str>` 拥有且共享、克隆廉价;mneme 的 `Key` 用 `Arc<str>`。
-- 生命周期标注只描述引用之间的存活关系,多数情况可省略;`'_` 是占位符。
+- 生命周期标注只描述引用之间的存活关系,多数情况可省略;`'_` 是占位符;
+  结构体字段存引用时,结构体自身要带生命周期参数(如 `QueryRef<'a>`)。
 - `&self` 只读,`&mut self` 可写。
 
 ## 动手练习

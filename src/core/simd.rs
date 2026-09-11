@@ -1,6 +1,7 @@
 //! L0 SIMD 点积内核与运行时分发。
 //!
-//! 本模块是全库**唯一允许出现 `unsafe`** 的位置,且每处均附 `// SAFETY:` 证明。
+//! 本模块是全库两处 `unsafe` 白名单之一(另一处为 L2 `persist::source` 的
+//! `MmapSource`),且每处均附 `// SAFETY:` 证明。
 //! 对外只暴露 [`dot`] 与可移植参考实现 [`dot_scalar`]。
 //!
 //! # 运行时分发
@@ -12,6 +13,18 @@
 /// `_mm_shuffle_ps` 立即数:取每对 32 位元素中的高元素(即 `imm[1:0] = 0b01`)。
 #[cfg(target_arch = "x86_64")]
 const SHUFFLE_TAKE_HIGHEST: i32 = 0x1;
+
+#[cfg(test)]
+thread_local! {
+    /// 累计的 `dot_scalar` 逐元素乘加次数(操作计数,验证 $O(d)$;测试需自行清零)。
+    static MUL_ADDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 取出当前累计的 `dot_scalar` 乘加计数(仅测试;计数跨调用累加,测试需自行清零)。
+#[cfg(test)]
+fn take_mul_adds() -> usize {
+    MUL_ADDS.with(std::cell::Cell::get)
+}
 
 /// 计算两个等长 f32 向量的点积。
 ///
@@ -71,7 +84,16 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 /// assert_eq!(dot_scalar(&[1.0, 2.0], &[3.0, 4.0]), 11.0);
 /// ```
 pub fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| {
+            // 计数在闭包内逐元素累加(与 `heap.rs::COMPARES` 同口径),
+            // 而不是预先写入预期值——否则测试无法证伪"循环被改写/短路"。
+            #[cfg(test)]
+            MUL_ADDS.with(|count| count.set(count.get() + 1));
+            x * y
+        })
+        .sum()
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -210,6 +232,20 @@ mod tests {
             let a: Vec<f32> = (0..len).map(|i| i as f32).collect();
             let b: Vec<f32> = (0..len).map(|i| (i + 1) as f32).collect();
             assert!((dot(&a, &b) - dot_scalar(&a, &b)).abs() < 1e-4);
+        }
+    }
+
+    /// FC-CORE-CPLX-001:逐元素乘加次数恰为 `min(len)`(时间 $O(d)$ 的操作计数;
+    /// `dot` 为同复杂度的 SIMD 实现,等价性由 FC-CORE-INV-001 保证)。
+    #[test]
+    fn dot_scalar_per_element_cost_is_linear() {
+        for len in [0_usize, 1, 7, 64, 1_024] {
+            let a = vec![1.0_f32; len];
+            let b = vec![2.0_f32; len];
+            MUL_ADDS.with(|count| count.set(0));
+            let result = dot_scalar(&a, &b);
+            assert_eq!(result, 2.0 * len as f32);
+            assert_eq!(take_mul_adds(), len, "乘加次数必须恰为 min(len)");
         }
     }
 }

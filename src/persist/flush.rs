@@ -5,9 +5,11 @@
 //! 追加 WAL,故 flush 只是把已确认状态转成段文件、推进水位并重置 WAL。
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::core::error::Result;
 use crate::memory::config::Config;
+use crate::memory::index::{IndexNode, VectorIndex};
 use crate::memory::table::{SlotData, WriterState};
 use crate::persist::edges::EdgeData;
 use crate::persist::msec::{self, EntryData, MsecInput, NsStatRow, SlotMeta};
@@ -21,15 +23,31 @@ struct SegmentSlots<'a> {
     dead: Vec<bool>,
 }
 
-/// 把一个写状态编码为 `(vsec 字节, msec 字节)`。
+/// 一次段编码的产物:vsec/msec/hidx 字节与内存索引(供 flush 安装到写状态)。
+pub(crate) struct EncodedSegment {
+    /// 向量段字节。
+    pub(crate) vsec: Vec<u8>,
+    /// 元数据段字节。
+    pub(crate) msec: Vec<u8>,
+    /// HNSW 图段字节(节点为空或未配置索引工厂时为 `None`)。
+    pub(crate) hidx: Option<Vec<u8>>,
+    /// 内存索引(供 flush 安装到写状态;与 `hidx` 对应)。
+    pub(crate) index: Option<Arc<dyn VectorIndex>>,
+    /// 段内入口槽位(无索引时为 0)。
+    pub(crate) entry_slot: u32,
+    /// 段内入口层级(无索引时为 0)。
+    pub(crate) entry_level: u8,
+}
+
+/// 把一个写状态编码为 `vsec`/`msec`/`hidx` 与内存索引。
 ///
 /// # Errors
-/// 任一编解码或长度限额失败时返回结构化错误。
+/// 任一编解码、限额或索引构建失败时返回结构化错误。
 pub(crate) fn build_segment(
     ws: &WriterState,
     config: &Config,
     created_unix_ms: i64,
-) -> Result<(Vec<u8>, Vec<u8>)> {
+) -> Result<EncodedSegment> {
     let built = build_slots(ws);
     let vsec_bytes = vsec::encode(&VsecInput {
         dimension: config.dimension.get(),
@@ -49,7 +67,65 @@ pub(crate) fn build_segment(
         delta: &[],
         relations: &relations_bytes,
     })?;
-    Ok((vsec_bytes, msec_bytes))
+
+    let built_index = build_index(ws, config)?;
+    Ok(EncodedSegment {
+        vsec: vsec_bytes,
+        msec: msec_bytes,
+        hidx: built_index.bytes,
+        index: built_index.index,
+        entry_slot: built_index.entry_slot,
+        entry_level: built_index.entry_level,
+    })
+}
+
+/// 一次索引构建的产物(hidx 字节、内存索引与入口)。
+struct BuiltIndex {
+    bytes: Option<Vec<u8>>,
+    index: Option<Arc<dyn VectorIndex>>,
+    entry_slot: u32,
+    entry_level: u8,
+}
+
+/// 构建 HNSW 图并序列化为 hidx(无工厂或空表时各字段为空/零)。
+///
+/// # Errors
+/// 图序列化失败(hidx 长度字段超出格式上限)时返回结构化错误。
+fn build_index(ws: &WriterState, config: &Config) -> Result<BuiltIndex> {
+    let Some(factory) = config.index_factory.as_ref() else {
+        return Ok(BuiltIndex {
+            bytes: None,
+            index: None,
+            entry_slot: 0,
+            entry_level: 0,
+        });
+    };
+    if ws.slots.is_empty() {
+        return Ok(BuiltIndex {
+            bytes: None,
+            index: None,
+            entry_slot: 0,
+            entry_level: 0,
+        });
+    }
+    let nodes: Vec<IndexNode> = ws
+        .slots
+        .iter()
+        .map(|slot| IndexNode {
+            rowid: slot.rowid,
+            vector: Arc::clone(&slot.vector),
+            norm_sq: slot.norm_sq,
+        })
+        .collect();
+    let index = factory.build(&nodes, config.hnsw, config.metric);
+    let entry = index.entry();
+    let bytes = index.serialize()?;
+    Ok(BuiltIndex {
+        bytes: Some(bytes),
+        index: Some(index),
+        entry_slot: entry.0.get(),
+        entry_level: entry.1,
+    })
 }
 
 /// 由写状态构造段内槽位与 vsec 输入列。

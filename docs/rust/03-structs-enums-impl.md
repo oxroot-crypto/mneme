@@ -5,7 +5,8 @@
 > **前置**:[02 章](02-values-and-ownership.md)。
 > **对应源码**:[`src/core/types.rs`](../../src/core/types.rs)、[`src/core/metric.rs`](../../src/core/metric.rs)、
 > [`src/core/error.rs`](../../src/core/error.rs)、[`src/core/options/`](../../src/core/options)、
-> [`src/memory/builder.rs`](../../src/memory/builder.rs)。
+> [`src/memory/builder.rs`](../../src/memory/builder.rs)、[`src/index/hnsw.rs`](../../src/index/hnsw.rs)、
+> [`src/index/hidx.rs`](../../src/index/hidx.rs)。
 
 Rust 没有"类(class)",而是把数据和行为分开:
 
@@ -36,6 +37,30 @@ let p = HnswParams { m: 16, m0: 32, ef_construction: 200, ef_search: 64 };
 ```
 
 见 [`src/core/options/index.rs:8-17`](../../src/core/options/index.rs)。
+
+只想改几个字段、其余沿用另一份值时,用**结构体更新语法(struct update syntax)** `..`:
+
+```rust
+/// hidx 测试使用的一组基准图参数(m=16/m0=32/efc=200/ml=0.5)。
+const GRAPH_PARAMS: GraphParams = GraphParams {
+    m: 16,
+    m0: 32,
+    ef_construction: 200,
+    ml: 0.5,
+};
+
+// 只改 m,其余字段照抄 GRAPH_PARAMS:
+let fast = GraphParams { m: 4, ..GRAPH_PARAMS };
+```
+
+见 [`src/index/hidx.rs:401-407`](../../src/index/hidx.rs) 与
+[`src/index/hidx.rs:519-526`](../../src/index/hidx.rs)。要点:
+
+- `..` 后面的表达式必须与目标类型相同,可以是变量、常量,也可以是 `T::default()`;
+- 更新语法按字段依次构造,`..` 表达式里**未被显式覆盖的字段会被移动**进新值;
+  本例字段全是 `u16`/`f32`(`Copy`),所以 `GRAPH_PARAMS` 反复使用也不会失效——
+  这正是它能当共享常量基底的原因;
+- 与 `#[derive(Default)]` 搭配是常见组合:`Config { timeout_ms: 500, ..Config::default() }`。
 
 ### 1.2 元组结构体(tuple struct)与 newtype
 
@@ -285,6 +310,71 @@ pub struct Scoring {                         // 字段含 f32
 `derive` 也能用在枚举上,见 [`src/core/options/index.rs:64`](../../src/core/options/index.rs)
 的 `VectorFormat`。
 
+### 4.2 手写比较 trait:字段含 `f32` 又要排序时(L3 的 `Cand`)
+
+`derive` 不是唯一出路。L3 的 HNSW 搜索要维护两个堆:候选前沿按"越近键越大"取最大、
+结果堆要随时丢掉最差候选。这要求候选实现完整的 `Ord`(见 [07 §5](07-iterators-closures.md)),
+而排序键 `key` 是 `f32`,`derive(Ord)` 用不了(原因见 §4.1)。于是**手写四个 impl**:
+
+```rust
+use std::cmp::Ordering;
+
+/// 分数与节点组成的可比较候选(按"越近键越大"排序)。
+#[derive(Debug, Clone, Copy)]
+struct Cand {
+    key: f32,
+    score: Score,
+    node: u32,
+}
+
+impl PartialEq for Cand {
+    fn eq(&self, other: &Self) -> bool {
+        self.key.total_cmp(&other.key) == Ordering::Equal && self.node == other.node
+    }
+}
+
+impl Eq for Cand {}
+
+impl PartialOrd for Cand {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Cand {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.key
+            .total_cmp(&other.key)
+            .then(self.node.cmp(&other.node))
+    }
+}
+```
+
+见 [`src/index/hnsw.rs:59-87`](../../src/index/hnsw.rs)。逐条解释:
+
+- **`f32::total_cmp` 提供全序**:`partial_cmp` 遇 `NaN` 返回 `None`,而 `Ord::cmp` 必须
+  **永远**给出 `Less`/`Equal`/`Greater` 之一。`total_cmp` 按 IEEE-754 位模式定义了一个
+  确定的全序(连 `NaN`、`-0.0` 与 `+0.0` 也有先后),所以能作为 `Ord` 的地基。
+- **`impl Eq for Cand {}` 是空实现**:`Eq` 没有任何方法,它只是一句"承诺":`==` 满足自反、
+  对称、传递。编译器不允许 `derive(Eq)`(字段含 `f32`),但手写空 impl 表示"我来担保"。
+- **`PartialOrd` 必须转发 `Ord`**:契约要求 `partial_cmp(a, b) == Some(cmp(a, b))`,
+  两个 trait 对同一对值必须给出一致顺序,标准写法就是 `Some(self.cmp(other))`。
+- **`cmp` 末尾的 `.then(...)`**:`Ordering::then` 表示"若前面的比较相等,再用后面的
+  比较兜底"。`Ord` 要求全序:两个不同候选不能判为 `Equal`,所以 key 相同的同分节点再按
+  `node`(`u32`,本身全序)比较。没有这一步,堆里会出现"`a != b` 但 `a.cmp(b) == Equal`"
+  的矛盾状态。
+- **`PartialEq` 必须与 `cmp == Equal` 对齐**:即 `a == b` 当且仅当 `a.cmp(b) == Equal`。
+  否则 `Ord` 与 `Eq` 互相矛盾,放进 `BinaryHeap`、`sort` 会得到不可预测的结果。
+
+现在 `Cand` 是完整全序类型,可以放进 `BinaryHeap<Cand>`(最大堆)与
+`BinaryHeap<Reverse<Cand>>`(最小堆):前者让"最有希望"的候选浮到堆顶,后者让**最差**
+候选浮到堆顶方便淘汰。堆的用法见 [07 §5](07-iterators-closures.md)。
+
+> **什么时候手写比较 trait?** ① 字段含 `f32` 但要用于 `sort`/堆/`BTreeMap`;
+> ② 需要自定义排序语义(如"按优先级降序、再按时间升序");③ 需要与 `Eq`/`Hash`
+> 保持严格一致。手写时永远记住两条一致性规则:`PartialEq` ↔ `Eq` 一致、
+> `PartialOrd` ↔ `Ord`(以及 `PartialEq`)一致。
+
 ---
 
 ## 5. `Default`:默认值
@@ -389,7 +479,10 @@ pub struct UpdatePatch {
 
 - 数据用 `struct`(具名/元组/单元)和 `enum`(变体可带数据)描述;行为用 `impl` 挂载。
 - `impl` 里:关联函数不带 `self`,方法带 `self`/`&self`/`&mut self`;还能定义关联常量。
-- `#[derive(...)]` 自动生成 `Debug`/`Clone`/`Copy`/比较/`Default` 等;`Default` 也可手写或给枚举变体加 `#[default]`。
+- `#[derive(...)]` 自动生成 `Debug`/`Clone`/`Copy`/比较/`Default` 等;`Default` 也可手写或给枚举变体加 `#[default]`;
+  构造时可用结构体更新语法 `..base` 只覆盖部分字段。
+- 含 `f32` 的结构体不能 `derive(Eq)`/`Ord`;需要排序时改用 `f32::total_cmp` 手写
+  `PartialEq`/`Eq`/`PartialOrd`/`Ord`,并保证 `PartialOrd` 转发 `Ord`、`PartialEq` 与 `cmp == Equal` 一致。
 - `match` 必须穷尽所有变体;`Display` 需手写;`#[non_exhaustive]` 给库的公共枚举留演化空间。
 - 组合类型(如 `Option<Option<T>>`)能精确表达状态,优于布尔标志。
 
@@ -398,6 +491,8 @@ pub struct UpdatePatch {
 1. 在 `examples/hello.rs` 里定义 `struct Point { x: f32, y: f32 }`,派生 `Debug, Clone, Copy`,并打印它。
 2. 定义一个 `enum Shape { Circle(f32), Rect { w: f32, h: f32 } }`,写一个 `area(&self)` 方法用 `match` 计算面积。
 3. 给 `Point` 实现 `Display`,输出形如 `(1.0, 2.0)`。
+4. 去掉 `Point` 的 `PartialEq` 派生,手写 `PartialEq`/`Eq`/`PartialOrd`/`Ord`:先比 `x` 再比 `y`(用
+   `f32::total_cmp` 与 `.then(...)`),并建立一个 `Point { x: 1.0, ..p }` 的副本验证比较结果。
 
 ## 下一章
 

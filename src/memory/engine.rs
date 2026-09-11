@@ -265,12 +265,13 @@ impl Mneme {
         };
         // 持写锁跨 flush 与复制:阻止并发写触发阈值 flush 把正在复制的段移入 trash,
         // 保证备份的段集合与 MANIFEST 一致(FC-PERSIST-POST-004)。
-        let ws = self.table.write();
+        let mut ws = self.table.write();
         if ws.closed {
             return Err(MnemeError::Closed);
         }
         if !self.config.read_only {
-            store.flush(&ws, &self.config)?;
+            store.flush(&mut ws, &self.config)?;
+            self.table.publish(&ws);
         }
         store.backup_to(dir.as_ref())
     }
@@ -288,10 +289,10 @@ impl Mneme {
     /// ```
     pub fn close(self) -> Result<()> {
         if let Some(store) = &self.store {
-            let ws = self.table.write();
+            let mut ws = self.table.write();
             // 只读库不写盘;可写库在关闭前把全部已确认写入落成段(I16)。
             if !ws.closed && !self.config.read_only {
-                store.flush(&ws, &self.config)?;
+                store.flush(&mut ws, &self.config)?;
             }
             drop(ws);
             store.release_lock();
