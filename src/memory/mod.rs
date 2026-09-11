@@ -13,13 +13,13 @@
 //!   生命周期(`life`)/关系(`relation`)方法。
 //! * `snapshot` —— `SnapshotHandle` 与快照只读视图。
 //! * `snapshot_scan` —— 快照视图的遍历/关系读取方法。
-//! * `search_builder` —— `SearchBuilder` 链式配置与公开入口 `execute()`。
-//! * `search_exec` —— `execute()` 内部执行流水线(视图/扫描/扩展/排序/去重)。
+//! * `search_builder` —— `SearchBuilder` 链式配置与公开入口(执行见 L4 `query`)。
+//! * `search` —— 过滤先行的暴力扫描与并行归并。
+//! * `analysis` —— 检索加速结构:倒排 / zone map / bloom(写路径增量维护)。
 //! * `rerank` —— 融合器 `Fusion` 与精排钩子 `Reranker`。
 //! * `expand` —— 关系联想扩展与结果级去重。
 //! * `table` —— 内存表、写状态与不可变读视图。
 //! * `index` —— 向量索引抽象(暴力 → HNSW 的替换缝;HNSW 实现见 crate::index)。
-//! * `search` —— 过滤先行的暴力扫描与并行归并。
 //! * `pred` / `pred_eval` —— 过滤 AST 与三值求值。
 //! * `dedup` —— 写入期两级去重。
 //! * `record` —— 记录与写入/更新结果值类型。
@@ -34,29 +34,29 @@
 mod builder;
 // `config`/`dedup`/`relation`/`search`/`table` 供 L2 `persist` 读取内存表结构
 // (flush/recover 需要),故以 `pub(crate)` 暴露给同 crate 的兄弟模块。
+pub(crate) mod analysis;
 pub(crate) mod config;
 pub(crate) mod dedup;
 mod engine;
 mod engine_ops;
-mod expand;
+pub(crate) mod expand;
 pub(crate) mod index;
 mod lifecycle;
 mod mutate_helpers;
 mod namespace;
 pub(crate) mod ops;
-mod pred;
+pub(crate) mod pred;
 mod pred_eval;
-mod record;
+pub(crate) mod record;
 pub(crate) mod relation;
 mod rerank;
-mod score;
+pub(crate) mod score;
 pub(crate) mod search;
-mod search_builder;
-mod search_exec;
+pub(crate) mod search_builder;
 mod snapshot;
 mod snapshot_scan;
 pub(crate) mod table;
-mod temporal;
+pub(crate) mod temporal;
 mod write_helpers;
 
 pub use builder::Builder;

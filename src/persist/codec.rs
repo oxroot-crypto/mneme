@@ -6,7 +6,9 @@
 use crate::core::error::{MnemeError, Result};
 
 /// 当前支持的文件格式版本:高 8 位主版本、低 8 位次版本(设计 04 §2、§12)。
-pub(crate) const FORMAT_VERSION: u16 = 0x0001;
+///
+/// 次版本 2:L4 起 msec 的 field_dict / zone map / bloom / 倒排四区实际写入。
+pub(crate) const FORMAT_VERSION: u16 = 0x0002;
 
 /// 库支持的最大主版本;`major(found) > MAX_MAJOR` 时拒绝打开(I18)。
 pub(crate) const MAX_MAJOR: u8 = 0x00;
@@ -64,6 +66,16 @@ impl<'a> Cursor<'a> {
     /// 剩余未消费字节数。
     pub(crate) const fn remaining(&self) -> usize {
         self.bytes.len() - self.pos
+    }
+
+    /// 剩余未消费字节切片(供 varint 等连续解码用)。
+    pub(crate) fn rest(&self) -> &'a [u8] {
+        &self.bytes[self.pos..]
+    }
+
+    /// 前移 `len` 字节并丢弃;越界返回 `Corrupted`。
+    pub(crate) fn advance(&mut self, len: usize) -> Result<()> {
+        self.take(len).map(|_| ())
     }
 
     /// 是否已读到末尾。

@@ -4,13 +4,17 @@
 > 写代码的人。你不需要任何 Rust 基础,也不需要 AI 或数据库背景。
 >
 > **本套文档想解决什么**:让你能**独立读懂 `mneme` 的源码**。本套以 L0 原语层
-> `src/core/` 为教材,并把 L1 内存引擎 `src/memory/` 与 L3 索引层 `src/index/`
-> 新引入的 Rust 知识(`Arc` 共享所有权、写时复制、`Mutex`/`RwLock` 守卫、
-> `move` 闭包写事务、`dyn` 策略与函数指针、构建者模式,以及手写 `Ord` 与
-> `BinaryHeap`、`TryFrom`/受检运算、字节切片操作、`let` 链与 `let...else`、
+> `src/core/` 为教材,并把 L1 内存引擎 `src/memory/`、L3 索引层 `src/index/` 与
+> L4 检索层 `src/query/` 新引入的 Rust 知识(`Arc` 共享所有权、写时复制、
+> `Mutex`/`RwLock` 守卫与原子类型、`move` 闭包写事务、`dyn` 策略与函数指针、
+> 构建者模式,手写 `Ord` 与 `BinaryHeap`、`TryFrom`/受检运算、字节切片操作、
+> `let` 链与 `let...else`、递归枚举与 `Box`、带生命周期的解析器与切片借用、
+> `HashMap` entry API、运算符重载、`Option` 组合子、`fmt::Write`、
 > `thread_local!` 测试探针、`proptest` 自定义策略)**回填到各章对应小节**
-> (见 §4 对照表);L1 与 L3 的业务语义与分文件阅读路线见
-> [设计 03 L1 内存引擎](../design/03-l1-memory.md) 与 [设计 05 L3 HNSW](../design/05-l3-hnsw.md)。
+> (见 §4 对照表);L1、L3 与 L4 的业务语义与分文件阅读路线见
+> [设计 03 L1 内存引擎](../design/03-l1-memory.md)、
+> [设计 05 L3 HNSW](../design/05-l3-hnsw.md) 与
+> [设计 06 L4 检索层](../design/06-l4-query.md)。
 > 所有语法点都锚定在 mneme 的真实代码上,不讲"为了教语法而教语法"的空例子。
 >
 > **预计阅读**:6–10 小时(边读边敲会更快掌握)。建议**开着源码对照阅读**。
@@ -36,7 +40,7 @@ Rust 的通用教材很多(见 §5),但它们有两个问题:
 
 - **顺序读**:01 → 10。每章只依赖前面章节,不跳步。
 - **边读边跑**:每章末尾有「动手练习」,在 `examples/` 下新建一个文件敲一遍(或用临时 crate)。
-  **不要直接改 `src/core/`、`src/memory/` 与 `src/index/`**:库里的公开项受 `#![deny(missing_docs)]` 约束,乱加还会污染源码。
+  **不要直接改 `src/core/`、`src/memory/`、`src/index/` 与 `src/query/`**:库里的公开项受 `#![deny(missing_docs)]` 约束,乱加还会污染源码。
   光看不敲,Rust 的所有权和借用是学不会的。
 - **对照源码**:遇到 `文件:行号` 就跳过去看完整上下文。
 - **不要背语法**:Rust 编译器报错信息极其友好,学会"看报错 → 改代码"比背规则更重要。
@@ -114,10 +118,42 @@ L3(`src/index/`)新引入的 Rust 特性同样已**回填到对应章节**:
 | `proptest` 自定义 `Strategy`/`prop_oneof!`/变异策略 | [10 §4.5](10-testing.md) |
 | `thread_local!`+`Cell` 操作计数探针(复杂度验证) | [10 §4.6](10-testing.md) |
 
-> L1 的业务语义(命名空间、写事务、去重、双时态等)与 L3 的业务语义(HNSW 构建/查询、
-> 过滤三档、hidx 字节布局)不属于语言教学,分别见
-> [设计 03 L1 内存引擎](../design/03-l1-memory.md) 与
-> [设计 05 L3 HNSW](../design/05-l3-hnsw.md)。
+L4(`src/query/`)新引入的 Rust 特性同样已**回填到对应章节**:
+
+| L4 新特性 | 落在哪一节 |
+|---|---|
+| 递归枚举与 `Box<Expr>`/`Box<[Expr]>` | [03 §3.4](03-structs-enums-impl.md) |
+| 固有 `Expr::from_str` 与 `#[allow(clippy::…)]` | [03 §2.1.2](03-structs-enums-impl.md) |
+| 字段初始化简写、`match` 守卫、元组变体 `(..)` 模式 | [03 §1.1](03-structs-enums-impl.md)、[03 §3.3](03-structs-enums-impl.md)、[05 §4.4](05-errors.md) |
+| `div_euclid`/`rem_euclid`/`div_ceil`/`unsigned_abs` | [02 §2.1.3](02-values-and-ownership.md) |
+| `char` 的 Unicode 判定与 `len_utf8`、`chars().next()` | [02 §2.3](02-values-and-ownership.md) |
+| `f64::INFINITY`/`NEG_INFINITY`(融合中间量)、`f32::EPSILON`、`f64` 精确整数上限 | [02 §2.2](02-values-and-ownership.md) |
+| `[u8]::strip_prefix`、字节字面量 `b'0'`、`is_ascii_digit` | [04 §2.4](04-borrowing-strings-slices.md) |
+| 原始字符串 `r#"..."#`、`str` 模式 API(闭包/字符数组)、`trim_start`、`String::push`/`push_str` | [04 §3](04-borrowing-strings-slices.md)、[04 §3.4](04-borrowing-strings-slices.md) |
+| `AsRef`(`.as_ref()` 借出 `&str`)、`Arc<str>` 与 `str` 直接比较 | [04 §3.3](04-borrowing-strings-slices.md) |
+| `impl<'a> Parser<'a>`、`fn rest(&self) -> &'a str` | [04 §4.5](04-borrowing-strings-slices.md) |
+| 原子类型(`AtomicU64` + `fetch_add`) | [04 §5.2](04-borrowing-strings-slices.md) |
+| `then_some`/`is_some_and`/`filter`/`as_deref`/`as_ref`/`cloned`/`copied`/`or_else`/`unwrap_or_default`/`map_or_else` | [05 §1.2](05-errors.md) |
+| 默认绑定模式(匹配 `&T` 免写 `&`)、let 链混普通条件 | [05 §4.2](05-errors.md)、[05 §4.7](05-errors.md) |
+| `collect` 收成 `Result<Vec<_>>` | [05 §2.4](05-errors.md) |
+| 枚举变体构造器转函数指针、`Option::map` 接构造器 | [06 §4.2](06-generics-traits.md) |
+| 运算符重载(`std::ops::BitAnd`/`BitOr`)与关联类型 | [06 §5](06-generics-traits.md) |
+| `HashMap` entry API、`keys()`/`map[key]` 索引、`sort` + `dedup` | [07 §5.2](07-iterators-closures.md) |
+| `Iterator::find_map`、`Vec::extend`/`truncate` | [07 §3](07-iterators-closures.md) |
+| `fold` 配 `f64::min`/`f64::max` 函数指针求极值 | [07 §3.3](07-iterators-closures.md) |
+| `fmt::Write` 与 `write_char`/`write_str`(trait 须在作用域)、`use` 组里的 `self` | [08 §4](08-modules-docs.md) |
+| `pub(super)` 子模块受限方法 | [08 §3](08-modules-docs.md) |
+| `pub use` 重导出第三方宏(`mneme::json`) | [08 §1](08-modules-docs.md) |
+| 测试替身 `FakeClock`(`AtomicI64`,可注入时钟) | [10 §1.4](10-testing.md) |
+| 集成测试共享助手(`tests/common/mod.rs`) | [10 §2](10-testing.md) |
+| proptest 字符串正则策略(`".{0,200}"`) | [10 §4](10-testing.md) |
+| `format!("{month:02}")` 宽度与补零 | [01 §6](01-toolchain.md) |
+
+> L1 的业务语义(命名空间、写事务、去重、双时态等)、L3 的业务语义(HNSW 构建/查询、
+> 过滤三档、hidx 字节布局)与 L4 的业务语义(DSL 文法、BM25、RRF 融合、计划器)不属于
+> 语言教学,分别见 [设计 03 L1 内存引擎](../design/03-l1-memory.md)、
+> [设计 05 L3 HNSW](../design/05-l3-hnsw.md) 与
+> [设计 06 L4 检索层](../design/06-l4-query.md)。
 
 ---
 

@@ -4,7 +4,8 @@
 //!
 //! 1. 契约引用的每个 `<path>.rs::<test>` 必须真实存在,且测试名必须定义在该路径
 //!    指向的文件中(路径级匹配,无悬空引用、无跨文件误配、无未纳管路径);
-//! 2. 各契约测试文件中的每个 `#[test]` 必须被至少一条契约引用(无孤立测试);
+//! 2. 各契约测试文件中的每个 `#[test]` 必须在契约矩阵「对应测试」列中被引用
+//!    (无孤立测试;只看表格行,防止正文随意提及放水);
 //! 3. 状态列为 `Passed` 的契约条目必须登记至少一个真实测试路径(禁止
 //!    「已通过却无测试证明」的自由文本);
 //! 4. 各契约测试文件 doc 注释声明的 `FC-*` 编号(展开 `/002` 复用与 `001..003`
@@ -33,6 +34,8 @@ const LIFE_TESTS: &str = include_str!("life_contracts.rs");
 const PERSIST_TESTS: &str = include_str!("persist_contracts.rs");
 /// L3 契约验收测试(HNSW 召回/收敛/过滤/hidx)。
 const HNSW_TESTS: &str = include_str!("hnsw_contracts.rs");
+/// L4 契约验收测试(DSL/BM25/融合/计划器/四区落盘)。
+const L4_TESTS: &str = include_str!("l4_contracts.rs");
 /// 承载操作计数单测的源码文件。
 const SRC_SEARCH: &str = include_str!("../src/memory/search.rs");
 const SRC_TABLE: &str = include_str!("../src/memory/table/state.rs");
@@ -62,9 +65,37 @@ const SRC_CORE_HEAP: &str = include_str!("../src/core/heap.rs");
 const SRC_RECOVER_STATE: &str = include_str!("../src/persist/recover/state.rs");
 /// L2 打开路径源码(载入期重排越界二次校验单测被 ERR 契约引用)。
 const SRC_STORE_OPEN: &str = include_str!("../src/persist/store/open.rs");
+/// L4 计划器源码(块级剪枝等价性单测被契约引用)。
+const SRC_QUERY_PLAN: &str = include_str!("../src/query/plan.rs");
+/// L4 解析器源码(越界/位置错误单测被契约引用)。
+const SRC_QUERY_PARSE: &str = include_str!("../src/query/parse/mod.rs");
+/// L4 BM25 源码(公式/可见性单测被契约引用)。
+const SRC_QUERY_BM25: &str = include_str!("../src/query/bm25.rs");
+/// L4 融合源码(RRF/加权单测被契约引用)。
+const SRC_QUERY_FUSION: &str = include_str!("../src/query/fusion.rs");
+/// L2 倒排区源码(畸形结构拒绝单测被契约引用)。
+const SRC_MSEC_INVERTED: &str = include_str!("../src/persist/msec/inverted.rs");
+const SRC_MSEC_INDEX: &str = include_str!("../src/persist/msec/index.rs");
+/// L1 bloom 源码(极值 fpp 夹紧单测被 CPLX 契约引用)。
+const SRC_ANALYSIS_BLOOM: &str = include_str!("../src/memory/analysis/bloom.rs");
+/// L1 zone map 源码(类型冲突退出剪枝单测被查询契约引用)。
+const SRC_ANALYSIS_ZONES: &str = include_str!("../src/memory/analysis/zones.rs");
+/// L4 打印/JSON 往返源码(空列表规约单测被 POST 契约引用)。
+const SRC_QUERY_DISPLAY: &str = include_str!("../src/query/display.rs");
+const SRC_QUERY_JSON: &str = include_str!("../src/query/json.rs");
+/// L0 分词源码(切词/bigram/停用词单测被 POST 契约引用)。
+const SRC_CORE_TEXT: &str = include_str!("../src/core/text.rs");
+/// L4 ISO 8601 源码(毫秒补零/往返单测被 POST 契约引用)。
+const SRC_QUERY_ISO: &str = include_str!("../src/query/iso.rs");
+/// L1 内存倒排源码(NS 隔离/词频累计单测被 INV 契约引用)。
+const SRC_ANALYSIS_INV: &str = include_str!("../src/memory/analysis/inv.rs");
+/// L2 flush 段编码源码(字段字典 `key` 去重单测被 POST 契约引用)。
+const SRC_PERSIST_FLUSH: &str = include_str!("../src/persist/flush.rs");
+/// L1 谓词求值源码(保留字段清单同步单测被 POST 契约引用)。
+const SRC_PRED_EVAL: &str = include_str!("../src/memory/pred_eval.rs");
 
 /// 契约测试文件(孤立检查与覆盖声明检查的范围)。
-const CONTRACT_TEST_FILES: [(&str, &str); 7] = [
+const CONTRACT_TEST_FILES: [(&str, &str); 8] = [
     ("tests/core_contracts.rs", CORE_TESTS),
     ("tests/memory_contracts.rs", MEMORY_TESTS),
     ("tests/query_contracts.rs", QUERY_TESTS),
@@ -72,10 +103,11 @@ const CONTRACT_TEST_FILES: [(&str, &str); 7] = [
     ("tests/life_contracts.rs", LIFE_TESTS),
     ("tests/persist_contracts.rs", PERSIST_TESTS),
     ("tests/hnsw_contracts.rs", HNSW_TESTS),
+    ("tests/l4_contracts.rs", L4_TESTS),
 ];
 
 /// 契约引用的测试可能落在的全部文件(路径必须与 `contracts.md` 中书写一致)。
-const SOURCES: [(&str, &str); 25] = [
+const SOURCES: [(&str, &str); 41] = [
     ("tests/core_contracts.rs", CORE_TESTS),
     ("tests/memory_contracts.rs", MEMORY_TESTS),
     ("tests/query_contracts.rs", QUERY_TESTS),
@@ -83,6 +115,7 @@ const SOURCES: [(&str, &str); 25] = [
     ("tests/life_contracts.rs", LIFE_TESTS),
     ("tests/persist_contracts.rs", PERSIST_TESTS),
     ("tests/hnsw_contracts.rs", HNSW_TESTS),
+    ("tests/l4_contracts.rs", L4_TESTS),
     ("src/memory/search.rs", SRC_SEARCH),
     ("src/memory/table/state.rs", SRC_TABLE),
     ("src/memory/lifecycle.rs", SRC_LIFECYCLE),
@@ -101,6 +134,21 @@ const SOURCES: [(&str, &str); 25] = [
     ("src/core/heap.rs", SRC_CORE_HEAP),
     ("src/persist/recover/state.rs", SRC_RECOVER_STATE),
     ("src/persist/store/open.rs", SRC_STORE_OPEN),
+    ("src/query/plan.rs", SRC_QUERY_PLAN),
+    ("src/query/parse/mod.rs", SRC_QUERY_PARSE),
+    ("src/query/bm25.rs", SRC_QUERY_BM25),
+    ("src/query/fusion.rs", SRC_QUERY_FUSION),
+    ("src/persist/msec/inverted.rs", SRC_MSEC_INVERTED),
+    ("src/persist/msec/index.rs", SRC_MSEC_INDEX),
+    ("src/memory/analysis/bloom.rs", SRC_ANALYSIS_BLOOM),
+    ("src/memory/analysis/zones.rs", SRC_ANALYSIS_ZONES),
+    ("src/query/display.rs", SRC_QUERY_DISPLAY),
+    ("src/query/json.rs", SRC_QUERY_JSON),
+    ("src/core/text.rs", SRC_CORE_TEXT),
+    ("src/query/iso.rs", SRC_QUERY_ISO),
+    ("src/memory/analysis/inv.rs", SRC_ANALYSIS_INV),
+    ("src/persist/flush.rs", SRC_PERSIST_FLUSH),
+    ("src/memory/pred_eval.rs", SRC_PRED_EVAL),
 ];
 
 /// 契约编号的类型段(五维 + CPLX,见 `contracts.md` §0)。
@@ -116,17 +164,25 @@ fn test_fns(source: &str) -> Vec<String> {
             pending = true;
             continue;
         }
-        if pending && let Some(name) = fn_name(trimmed) {
-            names.push(name);
-            pending = false;
+        if !pending {
+            continue;
         }
+        // 跳过 `#[test]` 与声明之间可能出现的注释/其它属性行,
+        // 防止 `// fn foo` 之类注释被误当成测试名(也会让真孤立测试逃逸)。
+        if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("#[") {
+            continue;
+        }
+        if let Some(name) = fn_name(trimmed) {
+            names.push(name);
+        }
+        pending = false;
     }
     names
 }
 
-/// 从形如 `fn foo(...)` 的行提取 `foo`。
+/// 从形如 `fn foo(...)` 的行提取 `foo`;支持 `pub` / `async` / `pub(crate)` 等前缀。
 fn fn_name(line: &str) -> Option<String> {
-    let rest = line.strip_prefix("fn ")?;
+    let rest = line.rsplit_once("fn ")?.1;
     let end = rest.find(['(', '<', ' ']).unwrap_or(rest.len());
     Some(rest[..end].to_string())
 }
@@ -218,14 +274,11 @@ fn fc_ids(text: &str) -> Vec<String> {
 }
 
 /// 解析契约矩阵条目行 `| FC-... | 类型 | 规范 | 对应测试 | 状态 |`,
-/// 返回 (编号, 对应测试列, 状态列)。
+/// 返回 (编号, 对应测试列, 状态列)。编号列允许带反引号包裹。
 fn contract_rows() -> Vec<(String, String, String)> {
     let mut rows = Vec::new();
     for line in CONTRACTS.lines() {
         let trimmed = line.trim();
-        if !trimmed.starts_with("| FC-") {
-            continue;
-        }
         // 规范列的 KaTeX 公式含 `\|`(转义竖线),先替换占位再按列切分。
         let normalized = trimmed.replace("\\|", "\u{0}");
         let cells: Vec<&str> = normalized.split('|').collect();
@@ -233,8 +286,12 @@ fn contract_rows() -> Vec<(String, String, String)> {
         if cells.len() < 6 {
             continue;
         }
+        let id = cells[1].trim().trim_matches('`');
+        if !id.starts_with("FC-") {
+            continue;
+        }
         rows.push((
-            cells[1].trim().to_string(),
+            id.to_string(),
             cells[4].trim().replace('\u{0}', "\\|"),
             cells[5].trim().to_string(),
         ));
@@ -242,9 +299,9 @@ fn contract_rows() -> Vec<(String, String, String)> {
     rows
 }
 
-/// 提取 `contracts.md` 中所有 `<path>.rs::<name>` 引用(路径级,去重排序)。
-fn referenced_test_refs() -> Vec<(String, String)> {
-    let bytes = CONTRACTS.as_bytes();
+/// 提取文本中所有 `<path>.rs::<name>` 引用(路径级,去重排序)。
+fn referenced_test_refs(text: &str) -> Vec<(String, String)> {
+    let bytes = text.as_bytes();
     let needle = b".rs::";
     let mut refs = Vec::new();
     let mut index = 0;
@@ -289,6 +346,20 @@ fn referenced_test_refs() -> Vec<(String, String)> {
     refs
 }
 
+/// 提取契约矩阵**「对应测试」列**中的全部引用(孤立测试判定口径)。
+///
+/// 只认表格行,不认变更记录或说明文字——否则正文里随便提一句测试名
+/// 就能让一个无 FC 映射的测试免于被检出。
+fn row_test_refs() -> Vec<(String, String)> {
+    let mut refs: Vec<(String, String)> = contract_rows()
+        .into_iter()
+        .flat_map(|(_, tests, _)| referenced_test_refs(&tests))
+        .collect();
+    refs.sort();
+    refs.dedup();
+    refs
+}
+
 /// 契约引用的每个测试都必须存在于其路径指向的文件中(路径级匹配)。
 #[test]
 fn every_referenced_test_exists() {
@@ -296,7 +367,7 @@ fn every_referenced_test_exists() {
         .iter()
         .map(|(path, source)| (*path, test_fns(source)))
         .collect();
-    let dangling: Vec<String> = referenced_test_refs()
+    let dangling: Vec<String> = referenced_test_refs(CONTRACTS)
         .into_iter()
         .filter(|(path, name)| {
             !defined
@@ -311,17 +382,19 @@ fn every_referenced_test_exists() {
     );
 }
 
-/// 契约测试文件中的每个测试都必须可追溯到某条 FC。
+/// 契约测试文件中的每个测试都必须可追溯到某条 FC(按路径 + 测试名配对,
+/// 防止跨文件同名测试互相顶替)。
 #[test]
 fn no_orphan_contract_tests() {
-    let referenced: HashSet<String> = referenced_test_refs()
-        .into_iter()
-        .map(|(_, name)| name)
-        .collect();
+    let referenced: HashSet<(String, String)> = row_test_refs().into_iter().collect();
     let orphans: Vec<String> = CONTRACT_TEST_FILES
         .iter()
-        .flat_map(|(_, source)| test_fns(source))
-        .filter(|name| !referenced.contains(name))
+        .flat_map(|(path, source)| {
+            test_fns(source).into_iter().filter_map(|name| {
+                let key = ((*path).to_string(), name);
+                (!referenced.contains(&key)).then(|| format!("{}::{}", key.0, key.1))
+            })
+        })
         .collect();
     assert!(
         orphans.is_empty(),
@@ -334,7 +407,7 @@ fn no_orphan_contract_tests() {
 fn passed_contracts_register_real_tests() {
     let unproven: Vec<String> = contract_rows()
         .into_iter()
-        .filter(|(_, tests, status)| status == "Passed" && !tests.contains(".rs::"))
+        .filter(|(_, tests, status)| status == "Passed" && referenced_test_refs(tests).is_empty())
         .map(|(id, tests, _)| format!("{id}: 对应测试 = {tests:?}"))
         .collect();
     assert!(
@@ -372,4 +445,30 @@ fn declared_fcs_match_contract_coverage() {
             "{path} 的 FC 覆盖声明与 contracts.md 不一致——多报: {over:?} 少报: {under:?}"
         );
     }
+}
+
+/// `tests/` 下每个 `*_contracts.rs` 都必须登记进门禁清单,防新文件逃逸出追溯。
+#[test]
+fn every_contract_test_file_is_registered() {
+    let registered: HashSet<String> = CONTRACT_TEST_FILES
+        .iter()
+        .map(|(path, _)| path.strip_prefix("tests/").unwrap_or(*path).to_string())
+        .collect();
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests");
+    let mut unregistered = Vec::new();
+    for entry in std::fs::read_dir(dir).expect("读取 tests 目录") {
+        let name = entry
+            .expect("目录项")
+            .file_name()
+            .to_string_lossy()
+            .to_string();
+        if name.ends_with("_contracts.rs") && !registered.contains(&name) {
+            unregistered.push(name);
+        }
+    }
+    unregistered.sort();
+    assert!(
+        unregistered.is_empty(),
+        "tests/ 下存在未登记进 CONTRACT_TEST_FILES 的契约测试文件: {unregistered:?}"
+    );
 }

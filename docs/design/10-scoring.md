@@ -177,7 +177,7 @@ $$
 \text{MMR} = \arg\max_{d \in C \setminus R}\Big[\lambda \cdot \text{rel}(d) - (1-\lambda)\cdot \max_{r \in R}\text{sim}(d, r)\Big]
 $$
 
-- `λ ∈ [0,1]`,默认 0.7(偏相关);`λ=1` 等价于不启用;
+- `λ ∈ [0,1]`,设计推荐 0.7(偏相关),须显式构造(`Diversity::default()` 为 `Off`);`λ=1` 等价于不启用;
 - `rel(d)` 用 [§2](#2-综合打分scoring) 的综合分;`sim(d,r)` 用向量相似度;
 - 贪心 $O(k^2)$(k = 返回条数),k 通常 ≤ 50,可忽略。
 

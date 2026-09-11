@@ -155,8 +155,9 @@ flowchart LR
 
 **渐进式的两个关键手段**:
 
-> **落地状态**:L0–L3 已实现(L3 = `src/index/` 自研 HNSW + `hidx` 持久化 + 过滤三档,
-> 验收 `tests/hnsw_contracts.rs`);L4–L6 尚无代码。
+> **落地状态**:L0–L4 已实现(L3 = `src/index/` 自研 HNSW + `hidx` 持久化 + 过滤三档,
+> 验收 `tests/hnsw_contracts.rs`;L4 = `src/query/` 过滤 DSL + zone map/bloom 计划器 +
+> BM25/RRF 融合 + msec 四区落盘,验收 `tests/l4_contracts.rs`);L5–L6 尚无代码。
 
 1. **接口先于实现**:公开 API 在 L1 冻结(暴力与 HNSW 同签名),L3 **引入内部 trait
    `memory::index::{VectorIndex, IndexFactory}`** 作为暴力→HNSW 的替换缝;L2 的段文件头从第一天就带 `format_version` 字段。
@@ -178,11 +179,11 @@ flowchart LR
 mneme/
 ├── src/
 │   ├── lib.rs          # 门面:Mneme / Namespace / Builder;pub use 公开类型
-│   ├── core/           # L0:types.rs error.rs metric.rs simd.rs varint.rs meta.rs heap.rs bitset.rs options/
-│   ├── memory/         # L1:engine.rs engine_ops.rs builder/ namespace/ snapshot.rs snapshot_scan.rs search_builder.rs search_exec.rs expand.rs rerank.rs table/ index.rs search.rs pred.rs pred_eval.rs record.rs write_helpers.rs mutate_helpers.rs dedup.rs relation.rs temporal.rs score.rs lifecycle.rs ops.rs config.rs
+│   ├── core/           # L0:types.rs error.rs metric.rs simd.rs varint.rs meta.rs heap.rs bitset.rs text.rs options/
+│   ├── memory/         # L1:engine.rs engine_ops.rs builder/ namespace/ analysis/ table/ snapshot.rs snapshot_scan.rs search_builder.rs expand.rs rerank.rs index.rs search.rs pred.rs pred_eval.rs record.rs write_helpers.rs mutate_helpers.rs dedup.rs relation.rs temporal.rs score.rs lifecycle.rs ops.rs config.rs
 │   ├── persist/        # L2:mod.rs codec.rs hook.rs wal/ msec/ recover/ store/ vsec.rs manifest.rs edges.rs flush.rs source.rs storage.rs trash.rs
 │   ├── index/          # L3:hnsw.rs graph.rs filtered.rs rebuild.rs hidx.rs factory.rs
-│   ├── query/          # L4:parse.rs plan.rs zmap.rs bm25.rs fusion.rs result_dedup.rs exec.rs
+│   ├── query/          # L4:parse/{mod,literal}.rs display.rs json.rs iso.rs plan.rs zmap.rs bm25.rs fusion.rs exec.rs
 │   ├── life/           # L5:ttl.rs retain.rs access.rs namespace.rs compact.rs backup.rs stats.rs
 │   ├── quant/          # L6:scalar_i8.rs f16.rs rescore.rs
 │   ├── model/          # 记忆模型:relation.rs temporal.rs provenance.rs consolidate.rs   (09)
@@ -368,7 +369,7 @@ db.close()?;                // flush + 释放文件锁;Drop 只尽力 flush
 | `AsyncNamespace` | async 门面(feature `async`),共享同一底层句柄 |
 | `Reranker` / `QueryCtx` | 精排回调钩子及其查询上下文 |
 | `Stats` / `SegmentStat` / `NsStat` / `Histogram` / `QuantStat` / `StorageStat` / `HistoryStat` | 运行统计(段/WAL/延迟/每命名空间/量化/合并/存储安全/版本链) |
-| `CheckReport` / `BackupReport` / `RetainReport` / `SnapshotStats` | 运维报告 |
+| `CheckReport` / `BackupReport` / `RetainReport` / `SnapshotStats`(L5 规划) | 运维报告(前三者已落地,`backup_to` 持久库自 L2 可用、纯内存库 `Unsupported`;`SnapshotStats` 待 L5) |
 | `CompactionState` / `CompactionControl` | 后台合并状态与 pause/resume 控制 |
 | `AccessStat` | 单条记录的访问统计(`last_access_ms` / `access_count`) |
 | `MnemeError` | 统一错误(见 [02 §2](02-l0-core.md)) |

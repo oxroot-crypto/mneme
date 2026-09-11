@@ -5,7 +5,9 @@
 > **前置**:[03 章](03-structs-enums-impl.md)(`impl`)、[05 章](05-errors.md)。
 > **对应源码**:[`src/core/heap.rs`](../../src/core/heap.rs)、[`src/core/options/clock.rs`](../../src/core/options/clock.rs)、
 > [`src/core/types.rs`](../../src/core/types.rs)、[`src/core/metric.rs`](../../src/core/metric.rs)、
-> [`src/memory/score.rs`](../../src/memory/score.rs)、[`src/memory/dedup.rs`](../../src/memory/dedup.rs)。
+> [`src/memory/score.rs`](../../src/memory/score.rs)、[`src/memory/dedup.rs`](../../src/memory/dedup.rs)、
+> [`src/memory/pred.rs`](../../src/memory/pred.rs)、[`src/query/json.rs`](../../src/query/json.rs)、
+> [`src/query/parse/literal.rs`](../../src/query/parse/literal.rs)。
 
 **泛型(generics)** 让一套代码适配多种类型;**trait** 定义"一个类型能做什么";
 **trait bound** 给泛型参数加上"必须能做什么"的限制。三者合起来,是 Rust 的抽象与复用机制。
@@ -22,7 +24,7 @@ pub struct TopK<T: Ord> {
 }
 ```
 
-见 [`src/core/heap.rs:27-31`](../../src/core/heap.rs)。
+见 [`src/core/heap.rs:45-49`](../../src/core/heap.rs)。
 
 - `T` 是**类型参数**,占位符;用 `TopK<u32>` 时 `T = u32`。
 - 可以实例化成 `TopK<u32>`、`TopK<RowId>`……同一份代码复用。
@@ -48,7 +50,7 @@ pub trait Clock: Send + Sync {
 }
 ```
 
-见 [`src/core/options/clock.rs:9-16`](../../src/core/options/clock.rs)。
+见 [`src/core/options/clock.rs:10-19`](../../src/core/options/clock.rs)。
 
 - `Clock` 是 trait 名,里面声明了方法 `now_unix_ms`(只有签名,没有实现)。
 - `: Send + Sync` 是 **supertrait(父 trait)约束**:任何 `Clock` 的实现者还必须满足 `Send + Sync`。
@@ -86,7 +88,7 @@ impl<T: Ord> TopK<T> {
 `T: Ord` 读作"T 必须实现 `Ord` trait"。为什么需要?因为 `TopK` 在分数相同时要按载荷
 `a_payload < b_payload` 排序,`<` 来自 `Ord`。没有这个约束,编译器不知道 `T` 能否比较大小。
 
-见 [`src/core/heap.rs:33`](../../src/core/heap.rs) 与 [`src/core/heap.rs:193`](../../src/core/heap.rs)。
+见 [`src/core/heap.rs:51`](../../src/core/heap.rs) 与 [`src/core/heap.rs:193`](../../src/core/heap.rs)。
 
 等价写法(更复杂时用 `where`):
 
@@ -159,6 +161,19 @@ let b: RowId = 42_u64.into();  // Into(自动获得)
 > **孤儿规则(orphan rule)**:你只能为自己的类型实现外部 trait,或为外部类型实现自己的 trait,
 > 不能给外部类型实现外部 trait(比如给 `Vec<u8>` 实现 `Display`)。`Key` 是本地类型,所以
 > `impl From<&str> for Key` 合法。
+
+标准库还有一个与 `From` 对称的**字符串解析** trait:`FromStr`(`str::parse` 背后就是它)。
+
+```rust
+let n: i64 = "42".parse()?;          // 走 <i64 as FromStr>::from_str
+let f = "1.5".parse::<f64>()?;       // turbofish 指定目标类型
+```
+
+L4 的字面量解析用它把数字文本转成 `i64`/`f64`,失败返回 `Result`(见
+[`src/query/parse/literal.rs:60-66`](../../src/query/parse/literal.rs))。反过来,L4 **故意不**给
+`Expr` 实现 `FromStr`,而用固有方法 `Expr::from_str`(见 [03 §2.1.2](03-structs-enums-impl.md)):
+宿主不必 `use std::str::FromStr` 就能调用。`parse` 的返回类型由类型标注或 turbofish 决定,
+`parse::<i64>()` 里的 `::<...>` 就是 §2.3 提到的 turbofish。
 
 ### 3.2 `Display`
 
@@ -246,11 +261,37 @@ Merge(fn(&RecordRef<'_>, &RecordRef<'_>) -> Option<Record>),
 > | `Arc<dyn Trait>` / `Box<dyn Trait>` | 动态(虚表) | 依赖实现类型 | `Summarizer`、`Reranker` |
 > | 泛型 `<T: Trait>` | 静态(单态化) | 不适用 | 热路径(`TopK<T: Ord>`) |
 
+L4 还展示了函数指针的一个漂亮用法:**枚举变体的构造器本身就是函数**。`Expr` 的
+`Exists` 变体写全了就是 `fn(String) -> Expr`,于是 JSON 解码能把"构造哪个节点"当参数传:
+
+```rust
+fn decode_path(name: &str, value: &Meta, build: fn(String) -> Expr) -> Result<Expr> { ... }
+
+// 同一个函数复用给多种节点:
+decode_path("exists", value, Expr::Exists);
+decode_field_str(value, Expr::StartsWith);
+decode_field_val(value, Expr::Contains);
+```
+
+见 [`src/query/json.rs:171-192`](../../src/query/json.rs) 与
+[`src/query/json.rs:278-283`](../../src/query/json.rs)。要点:
+
+- `Expr::Exists` 不是方法调用,而是把**变体构造器**当函数指针值传递:元组变体的构造器
+  签名就是它的参数列表。
+- 需要显式类型时写 `Expr::Exists as fn(String) -> Expr` 强转(见
+  [`src/query/parse/mod.rs:249`](../../src/query/parse/mod.rs));
+- 构造器**不能捕获环境**,天然满足 `fn` 指针签名,所以适合当"无状态工厂"传来传去;
+- 同一个构造器也能喂给泛型方法:`Option::map` / `Result::map` 要的正是 `FnOnce(T) -> U`,
+  于是 JSON 解码里直接写 `value.as_bool().map(Val::Bool)`、
+  `value.as_f64().filter(...).map(Val::Num)`,不必包闭包、也不必 `as` 强转
+  (见 [`src/query/json.rs:96-112`](../../src/query/json.rs))。编译器会从 `map` 的泛型参数
+  反推出构造器的具体签名。
+
 ---
 
-## 5. 关联类型(了解即可)
+## 5. 关联类型与运算符重载
 
-trait 可以带**关联类型**:
+trait 可以带**关联类型(associated type)**:由实现者指定的"占位类型"。
 
 ```rust
 trait Iterator {
@@ -260,6 +301,34 @@ trait Iterator {
 ```
 
 [07 章](07-iterators-closures.md)会大量用到 `Iterator`,届时 `Item` 会自然出现。
+过滤 AST 里另一个例子是**运算符重载**:`std::ops` 里的每个运算符都是一个 trait,
+`&` 是 `BitAnd`、`|` 是 `BitOr`,它们的关联类型 `Output` 声明运算结果类型:
+
+```rust
+impl std::ops::BitAnd for Expr {
+    type Output = Expr;
+
+    fn bitand(self, rhs: Expr) -> Expr {
+        Expr::And(vec![self, rhs].into_boxed_slice())
+    }
+}
+```
+
+见 [`src/memory/pred.rs:243-257`](../../src/memory/pred.rs)。有了它,过滤条件就能像布尔式一样写:
+
+```rust
+let expr = Expr::field("importance").gt(0.5_f32) & Expr::field("rank").lt(1028_i64);
+```
+
+见 [`src/query/plan.rs:152`](../../src/query/plan.rs)。要点:
+
+- `a & b` 只是 `a.bitand(b)` 的**语法糖**,`|` 同理;重载不改变优先级,也不能凭空造运算符。
+- **关联类型 vs 泛型参数**:`Output` 由 `Self` 唯一决定,所以用关联类型;如果要允许同一个类型
+  对多种右侧类型分别实现(如 `Add<Rhs>`),才把 `Rhs` 写成泛型参数。
+- 只能为**本地类型**实现外部运算符 trait(孤儿规则,见 §3.1):标准库不允许你给
+  `Vec<u8>` 重载 `+`。
+- 其他常用运算符 trait:`Add`(`+`)、`Sub`(`-`)、`Neg`(一元 `-`)、`Not`(`!`)、
+  `Index`(`[]`);不要滥用,重载后的含义必须直观。
 
 ---
 
@@ -281,7 +350,11 @@ trait Iterator {
 - 泛型用 `<T>` 让代码复用,编译期单态化、零运行时开销。
 - trait 定义"能做什么",`impl Trait for Type` 实现;trait 可带默认实现和 supertrait 约束。
 - trait bound(`T: Ord` 或 `where T: Ord`)给泛型加能力要求;`impl Trait` 是简写。
-- `From`/`Into` 互推、`Display` 手写、`Send`/`Sync` 是线程安全标记。
+- `From`/`Into` 互推、`Display` 手写、`Send`/`Sync` 是线程安全标记;
+  `FromStr`/`str::parse` 是标准解析入口,固有 `from_str` 可免去调用者 `use` trait
+  (取舍见 [03 §2.1.2](03-structs-enums-impl.md))。
+- 运算符重载 = 为本地类型实现 `std::ops` trait;`BitAnd`/`BitOr` 的关联类型 `Output`
+  声明结果类型,过滤 AST 因此能写 `a & b`。
 - 动态分发用 `dyn Trait`(常配 `Box`/`Arc`),适合运行期注入策略;函数指针 `fn(...)` 零分配但不能捕获环境。
 - mneme 的 `TopK<T: Ord>` 依赖 `Ord` 做同分排序;`Clock: Send + Sync` 保证跨线程安全;
   L1 的 `Summarizer`/`Reranker` 是 trait 对象,`Dedup::Merge` 是函数指针。
@@ -291,6 +364,8 @@ trait Iterator {
 1. 写一个泛型函数 `fn largest<T: PartialOrd + Copy>(list: &[T]) -> T`,返回最大元素。
 2. 给 [03 章练习](03-structs-enums-impl.md)的 `Point` 实现 `Default`(全 0)和 `From<(f32, f32)>`。
 3. 把 `Point` 作为 `TopK<Point>` 的载荷——需要给 `Point` 派生什么 trait?为什么?
+4. 定义 `struct Vec2 { x: f32, y: f32 }`,实现 `std::ops::Add` 与 `std::ops::Neg`,
+   再写 `let v = -Vec2 { x: 1.0, y: 2.0 } + Vec2 { x: 3.0, y: 4.0 };` 验证结果。
 
 ## 下一章
 

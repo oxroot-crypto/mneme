@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use crate::core::error::Result;
+use crate::core::error::{MnemeError, Result};
 use crate::core::types::{NsId, SeqNo};
 use crate::memory::table::WriterState;
 use crate::persist::manifest::Manifest;
@@ -62,6 +62,8 @@ pub(crate) fn load_segments(
     verify_payload: bool,
     fail_fast: bool,
 ) -> Result<RecoveredSegments> {
+    // 恢复期间暂停索引增量维护:段载入完成后由磁盘索引或全量重建接管。
+    state.is_indexing_paused = true;
     // 收集全部版本并按 (rowid, seqno) 全局排序,保证同一 RowId 的版本链有序。
     let mut versions: Vec<(VersionRow, usize)> = Vec::new();
     let mut parsed: Vec<(vsec::VsecView<'_>, msec::MsecView<'_>)> = Vec::new();
@@ -80,7 +82,7 @@ pub(crate) fn load_segments(
     }
     versions.sort_by_key(|(row, _)| (row.rowid, row.seqno));
 
-    // 单段且有 hidx 时才需要"段内槽位 → 全局槽位"重排映射(见 [`build_remap`])。
+    // 单段时构建"段内槽位 → 全局槽位"重排映射(倒排载入与 hidx 均需要)。
     let row_count = parsed
         .first()
         .map_or(0, |(view, _)| view.row_count() as usize);
@@ -89,14 +91,97 @@ pub(crate) fn load_segments(
     apply_versions(state, &versions, &parsed)?;
     apply_relations(state, &parsed)?;
     state.pending.clear();
+    apply_indexes(state, &parsed, remap.as_deref(), fail_fast)?;
+    state.is_indexing_paused = false;
     Ok(RecoveredSegments { skipped, remap })
 }
 
-/// 构建单段 hidx 所需的"段内槽位 → 全局槽位"重排映射。
+/// 载入或重建检索加速结构(倒排 / zone map / bloom)。
+///
+/// 单段且存在重排映射时优先用段内四区装载倒排(免重新分词);结构不合法时
+/// `fail_fast` 报错,否则降级为从槽位全量重建——两条路径产生等价的索引。
+fn apply_indexes(
+    state: &mut WriterState,
+    parsed: &[(vsec::VsecView<'_>, msec::MsecView<'_>)],
+    remap: Option<&[u32]>,
+    fail_fast: bool,
+) -> Result<()> {
+    if let (Some(remap), [(_, msec_view)]) = (remap, parsed) {
+        match load_disk_indexes(state, msec_view, remap) {
+            // 新段四区完整:直接复用磁盘索引。
+            Ok(true) => return Ok(()),
+            // 旧版段未写四区:显式降级全量重建,不是损坏。
+            Ok(false) => {}
+            Err(error) if fail_fast => return Err(error),
+            // 索引是查询加速器而非数据来源:损坏时降级全量重建仍然正确。
+            Err(_) => {}
+        }
+    }
+    if !parsed.is_empty() {
+        state.rebuild_indexes();
+    }
+    Ok(())
+}
+
+/// 由段内四区装载索引:字段字典/zone map 校验,倒排经重排映射,bloom 直接复用。
+///
+/// # Returns
+/// `Ok(false)` 表示该段为旧格式(未写四区),调用方应走全量重建;
+/// `Ok(true)` 表示磁盘索引已装载。
+fn load_disk_indexes(
+    state: &mut WriterState,
+    msec_view: &msec::MsecView<'_>,
+    remap: &[u32],
+) -> Result<bool> {
+    if msec_view.field_dict_bytes().is_empty() {
+        // 旧版段四区全空:显式跳过磁盘索引,交由重建路径。
+        let others_empty = msec_view.zmap_bytes().is_empty()
+            && msec_view.bloom_bytes().is_empty()
+            && msec_view.inverted_bytes().is_empty();
+        if !others_empty {
+            // 半新半旧(字段字典缺失但其它索引区非空)属结构不一致,按损坏拒绝。
+            return Err(MnemeError::Corrupted {
+                segment: None,
+                reason: "msec: field_dict 为空但其它索引区非空".to_string(),
+            });
+        }
+        return Ok(false);
+    }
+    let fields = msec::decode_field_dict(msec_view.field_dict_bytes())?;
+    let block_count = state
+        .slots
+        .len()
+        .div_ceil(crate::memory::analysis::ZONE_BLOCK_ROWS);
+    msec::validate_zmap(msec_view.zmap_bytes(), &fields, block_count)?;
+    let str_ids: Vec<u16> = fields
+        .iter()
+        .filter(|field| field.kind == msec::FieldKind::Str)
+        .map(|field| field.id)
+        .collect();
+    let blooms = msec::decode_bloom(msec_view.bloom_bytes())?;
+    let Some(key_bloom) = blooms
+        .into_iter()
+        .find_map(|(id, bloom)| str_ids.contains(&id).then_some(bloom))
+    else {
+        return Err(MnemeError::Corrupted {
+            segment: None,
+            reason: "msec: bloom 区缺少 key 字段".to_string(),
+        });
+    };
+    let inv = if msec_view.inverted_bytes().is_empty() {
+        crate::memory::analysis::InvertedIndex::default()
+    } else {
+        msec::decode_inverted(msec_view.inverted_bytes(), remap)?
+    };
+    state.load_disk_indexes(inv, key_bloom);
+    Ok(true)
+}
+
+/// 构建单段的"段内槽位 → 全局槽位"重排映射。
 ///
 /// 第 k 个被应用的版本落入全局槽位 k(槽位从空开始),故
 /// `remap[段内槽位] = 该版本在 `(rowid, seqno)` 有序链中的位置`。
-/// 无 hidx、多段或存在跳过段时返回 `None`(调用方降级暴力)。
+/// 多段或存在跳过段时返回 `None`(调用方降级重建索引)。
 ///
 /// # Errors
 /// 版本槽位越界/重复,或存在未被版本行引用的段内槽位(vsec/msec 行数不一致)时
@@ -107,11 +192,7 @@ fn build_remap(
     skipped: &[u32],
     row_count: usize,
 ) -> Result<Option<Vec<u32>>> {
-    let has_hidx = segments
-        .first()
-        .is_some_and(|segment| segment.hidx.is_some());
-    // 无 hidx 的库不需要该映射,避免为百万级槽位白分配两份 O(N) 向量。
-    if !has_hidx || segments.len() != 1 || !skipped.is_empty() {
+    if segments.len() != 1 || !skipped.is_empty() {
         return Ok(None);
     }
     let mut remap = vec![0_u32; row_count];
@@ -142,6 +223,86 @@ mod tests {
     use crate::core::error::MnemeError;
     use crate::persist::msec::VersionRow;
 
+    /// 构造旧格式(0x0001)空段:头部合法、四区全部为空。
+    fn empty_legacy_msec() -> Vec<u8> {
+        let mut bytes = vec![0_u8; crate::persist::msec::HEADER_LEN as usize];
+        bytes[0..4].copy_from_slice(b"MSC1");
+        bytes[4..6].copy_from_slice(&0x0001_u16.to_le_bytes());
+        bytes[6..8].copy_from_slice(&crate::persist::msec::HEADER_LEN.to_le_bytes());
+        let crc = crate::persist::crc32(&bytes[0..160]);
+        bytes[160..164].copy_from_slice(&crc.to_le_bytes());
+        bytes.extend_from_slice(&crate::persist::crc32(&[]).to_le_bytes());
+        bytes
+    }
+
+    /// FC-PERSIST-POST-008(旧格式段四区为空 → 跳过磁盘索引,绝不误判损坏)
+    #[test]
+    fn empty_region_section_falls_back_to_rebuild() {
+        let bytes = empty_legacy_msec();
+        let view = msec::parse(&bytes).expect("旧格式段必须可解析");
+        assert!(view.field_dict_bytes().is_empty());
+        let mut state = WriterState::new();
+        let loaded = load_disk_indexes(&mut state, &view, &[]).expect("空四区不是损坏");
+        assert!(!loaded, "旧格式段应显式走全量重建");
+    }
+
+    /// FC-PERSIST-ERR-010(新区段四区结构畸形且 fail-fast → `Corrupted`)
+    #[test]
+    fn malformed_region_section_is_error() {
+        // 非空 field_dict + 空 zmap:decode 阶段必然失败,调用方 fail-fast 时应上报。
+        let fields = msec::encode_field_dict(&[(Arc::from("key"), msec::FieldKind::Str)]);
+        let dict_offset = crate::persist::msec::HEADER_LEN as u64;
+        let mut bytes = vec![0_u8; crate::persist::msec::HEADER_LEN as usize];
+        bytes[0..4].copy_from_slice(b"MSC1");
+        bytes[4..6].copy_from_slice(&crate::persist::FORMAT_VERSION.to_le_bytes());
+        bytes[6..8].copy_from_slice(&crate::persist::msec::HEADER_LEN.to_le_bytes());
+        // field_dict 指向紧随头部的数据区。
+        bytes[16..24].copy_from_slice(&dict_offset.to_le_bytes());
+        bytes[24..32].copy_from_slice(&(fields.len() as u64).to_le_bytes());
+        let crc = crate::persist::crc32(&bytes[0..160]);
+        bytes[160..164].copy_from_slice(&crc.to_le_bytes());
+        bytes.extend_from_slice(&fields);
+        bytes.extend_from_slice(&crate::persist::crc32(&fields).to_le_bytes());
+
+        let view = msec::parse(&bytes).expect("段头本身合法");
+        assert!(!view.field_dict_bytes().is_empty());
+        let mut state = WriterState::new();
+        let result = load_disk_indexes(&mut state, &view, &[]);
+        assert!(
+            matches!(result, Err(MnemeError::Corrupted { .. })),
+            "畸形区结构必须报 Corrupted"
+        );
+    }
+
+    /// FC-PERSIST-ERR-010(半新半旧:field_dict 空但其它索引区非空 → `Corrupted`)
+    #[test]
+    fn half_indexed_legacy_section_is_rejected() {
+        let zmap = [0_u8; 8];
+        let zmap_offset = crate::persist::msec::HEADER_LEN as u64;
+        let mut bytes = vec![0_u8; crate::persist::msec::HEADER_LEN as usize];
+        bytes[0..4].copy_from_slice(b"MSC1");
+        bytes[4..6].copy_from_slice(&crate::persist::FORMAT_VERSION.to_le_bytes());
+        bytes[6..8].copy_from_slice(&crate::persist::msec::HEADER_LEN.to_le_bytes());
+        // zmap 的 offset/len 对在头部偏移 96/104(见 `encode_header`)。
+        bytes[96..104].copy_from_slice(&zmap_offset.to_le_bytes());
+        bytes[104..112].copy_from_slice(&(zmap.len() as u64).to_le_bytes());
+        let crc = crate::persist::crc32(&bytes[0..160]);
+        bytes[160..164].copy_from_slice(&crc.to_le_bytes());
+        bytes.extend_from_slice(&zmap);
+        bytes.extend_from_slice(&crate::persist::crc32(&zmap).to_le_bytes());
+
+        let view = msec::parse(&bytes).expect("段头本身合法");
+        assert!(view.field_dict_bytes().is_empty());
+        let mut state = WriterState::new();
+        assert!(
+            matches!(
+                load_disk_indexes(&mut state, &view, &[]),
+                Err(MnemeError::Corrupted { .. })
+            ),
+            "半新半旧段必须按损坏拒绝,不得静默跳过校验"
+        );
+    }
+
     /// 构造一条版本行(仅 `rowid`/`slot_id` 对本模块测试有意义)。
     fn version(rowid: u64, slot_id: u32) -> VersionRow {
         VersionRow {
@@ -164,7 +325,7 @@ mod tests {
     }
 
     /// FC-PERSIST-ERR-009:映射按"(rowid, seqno) 有序链位置"重排(非恒等);
-    /// 无 `hidx` 时返回 `None`(调用方降级暴力,非错误)。
+    /// 无 hidx 同样构建(倒排载入需要);多段或存在跳过段时返回 `None`。
     #[test]
     fn build_remap_maps_slots_in_version_chain_order() {
         let segments = [segment_with_hidx()];
@@ -172,7 +333,7 @@ mod tests {
         let versions = [(version(1, 1), 0), (version(2, 0), 0)];
         let remap = build_remap(&versions, &segments, &[], 2)
             .expect("合法布局不得报错")
-            .expect("带 hidx 的单段必须产生映射");
+            .expect("单段必须产生映射");
         assert_eq!(remap, vec![1, 0], "remap[段内槽位] = 有序链位置");
 
         let without_hidx = [SegmentBytes {
@@ -181,6 +342,13 @@ mod tests {
         }];
         assert_eq!(
             build_remap(&versions, &without_hidx, &[], 2).expect("无 hidx 不是错误"),
+            Some(vec![1, 0]),
+            "无 hidx 也需映射(倒排载入用)"
+        );
+
+        let multi = [segment_with_hidx(), segment_with_hidx()];
+        assert_eq!(
+            build_remap(&versions, &multi, &[], 2).expect("多段返回 None,非错误"),
             None
         );
     }

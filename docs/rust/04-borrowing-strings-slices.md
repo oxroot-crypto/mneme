@@ -6,7 +6,9 @@
 > **对应源码**:[`src/core/types.rs`](../../src/core/types.rs)、[`src/core/simd.rs`](../../src/core/simd.rs)、
 > [`src/core/meta.rs`](../../src/core/meta.rs)、[`src/core/options/clock.rs`](../../src/core/options/clock.rs)、
 > [`src/memory/table/state.rs`](../../src/memory/table/state.rs)、[`src/index/hnsw.rs`](../../src/index/hnsw.rs)、
-> [`src/index/hidx.rs`](../../src/index/hidx.rs)、[`src/index/graph.rs`](../../src/index/graph.rs)。
+> [`src/index/hidx.rs`](../../src/index/hidx.rs)、[`src/index/graph.rs`](../../src/index/graph.rs)、
+> [`src/query/parse/`](../../src/query/parse)、[`src/query/iso.rs`](../../src/query/iso.rs)、
+> [`src/query/exec.rs`](../../src/query/exec.rs)、[`src/query/display.rs`](../../src/query/display.rs)。
 
 [02 章](02-values-and-ownership.md)说,把值传给函数会**移动所有权**。但大多数时候我们只想"看一眼"
 数据,不想把所有权交出去。这就是**借用(borrowing)**:用引用 `&` 借用,用完还回去。
@@ -77,7 +79,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 ```
 
-见 [`src/core/simd.rs:33`](../../src/core/simd.rs)。
+见 [`src/core/simd.rs:50`](../../src/core/simd.rs)。
 
 - `&[f32]` 可以接收 `&[f32; 4]`(数组的引用)、`&Vec<f32>`、或 `&v[1..3]`(子切片)。
   **函数只依赖"能当切片用",不关心底层是数组还是 Vec**——这是很好的解耦。
@@ -188,6 +190,37 @@ pub(crate) fn neighbors(&self, node: u32, level: usize) -> &[u32] {
 > 图自身、层级来自节点,越界只在防御性场景出现。返回空切片让调用方(遍历邻接的循环)自然
 > 什么也不做,比每层 `Option` 解包更简洁——这是"边界情况退化到空集"的惯用设计。
 
+### 2.4 字节切片解析惯用法:L4 的 `Parser` 用到的
+
+L4 的 DSL 解析器完全在 `&str` / `&[u8]` 上推进,再用下面这组字面量与切片方法:
+
+```rust
+// ① 字节字面量:b'x' 的类型是 u8,不是 char
+if byte == b'-' || byte == b'+' { ... }
+let digit = i64::from(byte - b'0');   // ASCII 数字转数值
+
+// ② 切片版 strip_prefix:匹配则返回去掉前缀的剩余切片,否则 None
+fn strip(bytes: &[u8], expected: u8) -> Option<&[u8]> {
+    bytes
+        .strip_prefix(&[expected])
+        .or_else(|| bytes.strip_prefix(&[expected.to_ascii_lowercase()]))
+}
+
+// ③ 整段数字的判定:方法当谓词传(签名对得上)
+if bytes.len() < 4 || !bytes[..4].iter().all(u8::is_ascii_digit) { return None; }
+```
+
+- `b'0'` / `b'-'` / `b'.'` 是 **ASCII 字节字面量**,类型 `u8`,只能写 ASCII;
+  与 `b"..."` 字节串(见 §2.3 ①)配套使用。`byte - b'0'` 就是 C 语言里
+  `c - '0'` 的 Rust 写法,前提是已确认 `byte` 是数字。
+- `[u8]::strip_prefix` 与 §3.4 要讲的 `str::strip_prefix` 同名同语义,
+  只是元素从 `char` 换成 `u8`;`[T]` 与 `str` 都有这组"前缀/后缀"方法。
+- `iter().all(u8::is_ascii_digit)`:函数指针当谓词,等价于 `|b| b.is_ascii_digit()`——
+  凡是签名能对上就能直接传给迭代器方法(和 §2.3 的 `Vec::as_slice`、[10 §4.6](10-testing.md)
+  的 `Cell::get` 是同一个原理)。
+
+见 [`src/query/iso.rs:31-56`](../../src/query/iso.rs) 与 [`src/query/iso.rs:59-63`](../../src/query/iso.rs)。
+
 ---
 
 ## 3. 字符串家族:`str` / `String` / `&str` / `Arc<str>`
@@ -206,6 +239,10 @@ Rust 的字符串是初学者最容易晕的地方。记住两条轴:
 - 字符串字面量 `"hello"` 的类型是 `&'static str`(静态生命周期的借用)。
 - `String` 可以通过 `&s` 或 `s.as_str()` 变成 `&str`。
 - `&str` 通过 `.to_string()` 或 `String::from(...)` 变成 `String`。
+- `String` 是可增长的:`.push(c)` 追加一个 `char`、`.push_str(s)` 追加一段 `&str`。
+  L4 打印浮点常量时用 `push_str(".0")` 补小数点,解码转义序列时用 `push(char)` 逐字符装配
+  (见 [`src/query/display.rs:133-140`](../../src/query/display.rs) 与
+  [`src/query/parse/literal.rs:209-218`](../../src/query/parse/literal.rs))。
 
 ### 3.1 mneme 的 `Key`:为什么用 `Arc<str>`
 
@@ -267,6 +304,70 @@ impl From<String> for Key {
 
 见 [`src/core/types.rs:219-259`](../../src/core/types.rs)。
 
+**`.as_ref()` 借出 `&str`:`AsRef` trait。** 除了 `&*arc`(解引用)和 `Key::as_str()`,
+还可以用 `.as_ref()`——它来自标准库的 **`AsRef`** trait(含义是"把 `&self` 转成另一种引用",
+零成本)。`Arc<str>`、`String` 都实现了 `AsRef<str>`,所以 JSON 编码 `Val::Str` 里的 `Arc<str>`
+时直接写 `value.as_ref()` 就得到 `&str`,见 [`src/query/json.rs:90`](../../src/query/json.rs)。
+注意 `Option<T>` 也有一个同名的**固有方法** `as_ref()`(见 [05 §1.2](05-errors.md)),
+两者同名不同源,按接收者是不是 `Option` 区分。
+
+**`Arc<str>` 能直接和 `str` 比较。** 标准库提供了跨类型 `PartialEq`,所以比较字符串内容时不必
+先转成 `String`、也不依赖 `Arc` 指针地址。L4 查命名空间就利用了这点:
+
+```rust
+fn resolve_ns_id(&self, view: &ReaderView) -> Option<NsId> {
+    view.ns_registry.iter().find_map(|(id, path)| {
+        if **path == *self.ns_path {
+            Some(*id)
+        } else {
+            None
+        }
+    })
+}
+```
+
+见 [`src/query/exec.rs:168-176`](../../src/query/exec.rs)。`ns_registry` 的值类型是 `Arc<str>`,
+迭代给出 `path: &Arc<str>`,所以 `**path` 一路解到 `str`;`self.ns_path: Arc<str>`,`*self.ns_path`
+同样解到 `str`——两边比较的是字符内容。测试里 `**path == *"n"` 的 `*"n"` 也是把字面量 `&str`
+解一层得到 `str`(见 [`src/query/plan.rs:114-117`](../../src/query/plan.rs))。
+
+### 3.4 原始字符串与"模式" API:L4 解析器的字符串日常
+
+L4 的过滤 DSL 本身含双引号(如 `kind == "preference"`),所以测试与 doctest 里满是
+**原始字符串(raw string)**:
+
+```rust
+r#"kind == "preference" && importance > 0.5"#   // 引号不用转义
+```
+
+- `r"..."` 里的 `\` 不再是转义符;字符串内含 `"` 时改用 `r#"..."#`(井号可叠加),
+  直到 `"#` 才结束。DSL 测试因此省去一堆 `\"`。
+- 普通字符串里的转义(`\"`、`\\`、`\n`、`\t`)要手写代码解码——L4 的 `parse_quoted`
+  就逐个处理这些序列(见 [`src/query/parse/literal.rs:188-226`](../../src/query/parse/literal.rs));
+  原始字符串省掉的正是这层。
+
+字符串查找方法接受的不只是 `&str`,而是各种**模式(pattern)**:`&str`、`char`、
+`char` 数组、以及 `fn(char) -> bool` 的闭包/函数指针:
+
+```rust
+after.starts_with(|c: char| c.is_alphanumeric() || c == '_')   // 闭包当模式
+text.contains(['.', 'e', 'E'])                                  // 字符数组当模式
+trimmed.starts_with(')')
+rest.strip_prefix(keyword)                                      // Option<&str>,不是"剩余切片"
+```
+
+见 [`src/query/parse/mod.rs:110-121`](../../src/query/parse/mod.rs) 与
+[`src/query/display.rs:133-140`](../../src/query/display.rs)。常用成员:
+`starts_with`/`ends_with`/`contains`/`find`/`split`/`trim_start_matches` 等。
+不带模式的 `trim_start()` / `trim_end()` / `trim()` 则去掉开头 / 结尾 / 两端的全部 Unicode 空白
+(与 `trim_start_matches` 要传模式不同);L4 解析器用它跳过关键字后面的空格,如
+`after.trim_start().starts_with('(')`,见 [`src/query/parse/mod.rs:123-133`](../../src/query/parse/mod.rs)。
+
+> `str::strip_prefix` 返回 `Option<&str>`:匹配时是"去掉前缀后的借用",不匹配是 `None`,
+> 所以常配 `let ... else`(见 [05 §4.6](05-errors.md))做"匹配失败就早退"。L4 解析器
+> 用它判定 `true`/`now`/`ts`/`exists` 等关键字,既完成比较又顺手吃掉输入
+> (见 [`src/query/parse/mod.rs:111-121`](../../src/query/parse/mod.rs))。
+
 ---
 
 ## 4. 生命周期(lifetime):引用能活多久
@@ -282,7 +383,7 @@ pub fn get_path<'v>(value: &'v Meta, path: &str) -> Option<&'v Meta> {
 }
 ```
 
-见 [`src/core/meta.rs:37`](../../src/core/meta.rs)。
+见 [`src/core/meta.rs:39`](../../src/core/meta.rs)。
 
 - `'v` 读作"生命周期 v",是一个**泛型参数**,但泛化的是"存活时间"而不是类型。
 - 签名含义:**返回的引用活得和 `value` 的引用一样久**;`path` 的生命周期无关紧要。
@@ -338,7 +439,42 @@ pub(crate) struct QueryRef<'a> {
 > 只传一个;查询期间字段不变,按值复制一份即可,不必反复向上层借用。这是"用类型把相关
 > 数据绑在一起"的小例子。
 
-### 4.5 一个实用的记忆法
+### 4.5 方法返回借"输入"而不是 `&self` 的引用:解析器的 `rest`
+
+L4 的递归下降解析器一边读字符串一边"报字节位置",于是把输入存进结构体:
+
+```rust
+struct Parser<'a> {
+    input: &'a str,
+    pos: usize,
+    now_ms: i64,
+    depth: usize,
+}
+
+impl<'a> Parser<'a> {
+    fn rest(&self) -> &'a str {
+        &self.input[self.pos..]
+    }
+}
+```
+
+见 [`src/query/parse/mod.rs:61-82`](../../src/query/parse/mod.rs)。三个新知识点:
+
+- **`impl<'a> Parser<'a>`**:为带生命周期参数的类型实现方法时,`impl` 块也要引入 `'a`;
+  如果方法不返回 `'a`,也可以写 `impl Parser<'_>` 省去命名(见
+  [`src/query/parse/literal.rs:29`](../../src/query/parse/literal.rs))。
+- **为什么返回 `&'a str` 而不是省写**:按 §4.2 的省略规则 3,方法返回的引用若省略生命周期,
+  会被绑到 `&self`——意思是"解析器还活着,切片才有效"。但这里想要的不是那样:`rest()`
+  返回的切片指向**构造解析器时的输入字符串**(字段 `input: &'a str`),与这一次 `&self`
+  借用的长短无关;解析器本身随后被丢掉,切片仍应可用。所以必须显式写 `&'a str`。
+- **对比 `Key::as_str(&self) -> &str`**:它返回的确实指向 `self` 内部,省略规则给出
+  `&'a self` 是正解。要不要显式标注,取决于"返回值借的是**字段**还是 `self`"。
+
+> 这也解释了 `parse_at` 为什么可以建一个临时 `Parser`、拿完结果就丢:AST 里的
+> `String` / `Arc<str>` 都是拥有型(见 §3),不借解析器;真正借用输入的返回值都被
+> 限制在 `'a` 之内(见 [`src/query/parse/mod.rs:50-59`](../../src/query/parse/mod.rs))。
+
+### 4.6 一个实用的记忆法
 
 > 生命周期标注**不改变任何运行时代码**,它只是向编译器"承诺"引用之间的关系。
 > 如果承诺错了,编译失败,而不是运行时出错。
@@ -355,7 +491,7 @@ impl<T: Ord> TopK<T> {
 }
 ```
 
-见 [`src/core/heap.rs:107`](../../src/core/heap.rs)。调用方必须先拥有 `let mut top = ...`。
+见 [`src/core/heap.rs:131`](../../src/core/heap.rs)。调用方必须先拥有 `let mut top = ...`。
 
 `Clock` trait 的方法用 `&self` 而非 `&mut self`,因为它只是"读时间",不修改自身:
 
@@ -365,7 +501,7 @@ pub trait Clock: Send + Sync {
 }
 ```
 
-见 [`src/core/options/clock.rs:9-16`](../../src/core/options/clock.rs)。
+见 [`src/core/options/clock.rs:10-19`](../../src/core/options/clock.rs)。
 
 > **那"用 `&self` 却要改内部状态"怎么办?** 这就是**内部可变性(interior mutability)**:
 > 用 `Cell`/`RefCell`(单线程)或 `Mutex`/`RwLock`/原子类型(多线程)把"可变性"藏进类型内部,
@@ -409,6 +545,36 @@ pub(crate) fn write(&self) -> MutexGuard<'_, WriterState> {
 - 推论:持锁期间尽量只做必要工作。L1 的读路径克隆一个 `Arc<ReaderView>` 后**立刻释放读锁**,
   真正的扫描在锁外进行(见 [02 §3.7](02-values-and-ownership.md))。
 
+### 5.2 原子类型:不用锁的共享计数器
+
+L4 需要一个"全局查询 id 分配器":每次 `execute()` 没显式给 `QueryId`,就取一个**不重复**的
+新编号,跨线程也要成立。用锁太重,标准库给了原子类型:
+
+```rust
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_QUERY_ID: AtomicU64 = AtomicU64::new(1);
+
+let id = NEXT_QUERY_ID.fetch_add(1, Ordering::Relaxed);
+```
+
+见 [`src/query/exec.rs:35`](../../src/query/exec.rs) 与
+[`src/query/exec.rs:262-265`](../../src/query/exec.rs)。要点:
+
+- `static` 是**整个程序唯一**的变量(比 `const` 多一个固定地址);普通 `static mut` 的读写
+  是 `unsafe`,而 `AtomicU64` 提供安全的原子读写,`&self` 也能改内部值——这是它版本的
+  "内部可变性"。
+- `fetch_add(1, ...)` 原子地"返回旧值,再加 1":两个线程同时调用会拿到不同旧值,不会重号。
+  `load`(读)、`store`(写)、`compare_exchange`(比较并交换)是另外几个常用操作。
+- `Ordering::Relaxed` 只保证**这个操作自身**的原子性,不建立跨线程的先后可见性;
+  计数器只要求"不重号",所以够用。真正的"一个线程写、另一个线程必须看到"要用
+  `Acquire`/`Release`/`SeqCst`,并写注释说明理由。
+- **与锁的取舍**:单个整数用原子(无阻塞、无守卫、无中毒问题);一组相关状态仍用
+  `Mutex`/`RwLock`(§5.1)——原子一次只保护"一个值"。
+- 测试里的**假时钟**也是原子:`struct FakeClock(AtomicI64)` 用 `load`/`store` 在 `&self`
+  下推进时间,既满足 `Clock` 签名,又能注入并发测试(见
+  [`tests/l4_contracts.rs:31-38`](../../tests/l4_contracts.rs))。
+
 ---
 
 ## 6. 你会遇到的编译器报错
@@ -429,16 +595,25 @@ pub(crate) fn write(&self) -> MutexGuard<'_, WriterState> {
 - `&[T]` 是切片借用,可接收数组、`Vec`、子切片;mneme 的距离函数因此不复制向量。
 - 字节级操作:`*b"..."` 是定长字节数组;`to_le_bytes`/`from_le_bytes` 做整数与字节互转;
   `copy_from_slice` 要求等长,`extend_from_slice` 自动增长;空切片可作"退化结果"。
+- 字节字面量 `b'0'` 是 `u8`;`[u8]::strip_prefix` 返回 `Option<&[u8]>`,常配合 `let...else` 早退。
+- 原始字符串 `r#"..."#` 免转义;`str` 的前缀/子串方法接受字符、闭包、字符数组等"模式"。
 - `String` 拥有且可变,`&str` 借用且不可变,`Arc<str>` 拥有且共享、克隆廉价;mneme 的 `Key` 用 `Arc<str>`。
+- `String` 用 `push`/`push_str` 增长;从 `Arc<str>`/`String` 借 `&str` 可用 `.as_ref()`(`AsRef` trait);
+  `Arc<str>` 与 `str`/`&str` 能直接 `==`,比较的是内容而不是指针。
 - 生命周期标注只描述引用之间的存活关系,多数情况可省略;`'_` 是占位符;
   结构体字段存引用时,结构体自身要带生命周期参数(如 `QueryRef<'a>`)。
-- `&self` 只读,`&mut self` 可写。
+- 方法返回借"字段"的引用时要显式写字段的生命周期(`fn rest(&self) -> &'a str`);
+  `impl<'a> Parser<'a>` 为带生命周期参数的类型实现方法。
+- `&self` 只读,`&mut self` 可写;`static` + `AtomicU64` 则是无锁的共享计数器
+  (`fetch_add` 返回旧值,`Ordering` 决定可见性强度)。
 
 ## 动手练习
 
 1. 写一个函数 `fn first<'a>(xs: &'a [u32]) -> Option<&'a u32>`,返回第一个元素。思考 `'a` 能不能省。
 2. 在 `examples/hello.rs` 里把 `String` 传给 `&str` 参数(用 `&s`),再用 `.to_string()` 转回 `String`。
 3. 试着同时创建两个 `&mut` 引用,读报错,用花括号缩小作用域修好。
+4. 定义 `struct Word<'a> { text: &'a str }`,实现 `fn tail(&self) -> &'a str`(返回去掉首字符的切片),
+   并解释返回类型为什么不能省写 `'a`。
 
 ## 下一章
 
