@@ -37,6 +37,9 @@ pub(super) fn load_segment_views<'a>(
         Err(error) if fail_fast || is_version_rejection(&error) => return Err(error),
         Err(_) => return Ok(None),
     };
+    // f16 段在未开 `quant-f16` 的构建上拒绝打开,绝不静默按 f32 服务
+    // (FC-QUANT-ERR-002);该判断先于 fail-fast 降级,数据仍完整可读也须显式报错。
+    crate::quant::ensure_format_supported(vsec_view.quant())?;
     let mut msec_view = match msec::parse(&segment.msec) {
         Ok(view) => view,
         Err(error) if fail_fast || is_version_rejection(&error) => return Err(error),

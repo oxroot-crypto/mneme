@@ -146,7 +146,7 @@ flowchart LR
 | L3 | `index/` | 自研 HNSW、hidx 持久化、过滤三档搜索 | 同一 API 下暴力→ANN 无感升级;mmap 引入(可关) | Recall@10 ≥ 0.95 |
 | L4 | `query/` | 过滤 DSL 解析、zone map 下推、BM25+RRF、去重 | 混合检索可用 | 混合检索集成测试 |
 | L5 | `life/` | TTL、遗忘曲线、size-tiered compaction、命名空间、快照/备份、stats | **超长期闭环**:段数有界、安全遗忘 | 24h 长跑测试 |
-| L6 | `quant/` | i8/f16 量化+重打分、async 门面完善、基准、fuzz | 达到全部性能目标 | 基准达标 |
+| L6 | `quant/` | i8/f16 量化+两阶段重打分、建段抽样回退、async 门面、基准、fuzz | 查询带宽 i8 ÷4;async 门面可用 | 召回损失 ≤2%、基准达标 |
 
 > **产品能力层(09–12)** 不改变 L0–L6 的建造顺序,而是横切其上:
 > 记忆模型/排序在 L1 冻结的 API 上追加类型与语义([09](09-memory-model.md)/[10](10-scoring.md)),
@@ -155,11 +155,13 @@ flowchart LR
 
 **渐进式的两个关键手段**:
 
-> **落地状态**:L0–L5 已实现(L3 = `src/index/` 自研 HNSW + `hidx` 持久化 + 过滤三档,
+> **落地状态**:L0–L6 已实现(L3 = `src/index/` 自研 HNSW + `hidx` 持久化 + 过滤三档,
 > 验收 `tests/hnsw_contracts.rs`;L4 = `src/query/` 过滤 DSL + zone map/bloom 计划器 +
 > BM25/RRF 融合 + msec 四区落盘,验收 `tests/l4_contracts.rs`;L5 = `src/life/` 多段
 > size-tiered compaction + 后台维护 + TTL 块剪枝 + 命名空间/快照/备份/统计运维面,
-> 验收 `tests/l5_contracts.rs`);L6 尚无代码。
+> 验收 `tests/l5_contracts.rs`;L6 = `src/quant/` i8/f16 量化副本 + 两阶段检索 +
+> 建段抽样回退 + `feature = "async"` 门面 + `benches/quant.rs` + `fuzz/` 骨架,
+> 验收 `tests/l6_contracts.rs`)。1M×1536 性能门槛与 fuzz 长跑仍属 CI 收尾。
 
 1. **接口先于实现**:公开 API 在 L1 冻结(暴力与 HNSW 同签名),L3 **引入内部 trait
    `memory::index::{VectorIndex, IndexFactory}`** 作为暴力→HNSW 的替换缝;L2 的段文件头从第一天就带 `format_version` 字段。
@@ -187,15 +189,16 @@ mneme/
 │   ├── index/          # L3:hnsw.rs graph.rs filtered.rs rebuild.rs hidx.rs factory.rs
 │   ├── query/          # L4:parse.rs parse/literal.rs display.rs json.rs iso.rs plan.rs zmap.rs bm25.rs fusion.rs exec.rs
 │   ├── life/           # L5:compact.rs(选段/幸存版本)maintenance.rs(后台维护)
-│   ├── (L6 规划) quant/    # 量化:scalar_i8.rs f16.rs rescore.rs(当前无此目录)
+│   ├── quant/          # L6(纯原语,依赖等级同 L0):scalar_i8.rs f16.rs(quant-f16) rescore.rs
+│   ├── fuzzing.rs      # feature fuzzing:cargo-fuzz 专用解析入口(不参与运行时)
 │   ├── (规划) model/       # 记忆模型;当前实现见 memory/{relation,temporal}.rs、score.rs、namespace/life.rs (09)
 │   ├── (规划) score/       # 排序层;当前实现见 memory/{score,expand,rerank}.rs               (10)
 │   ├── (规划) crypto/      # feature encrypt:aead.rs keyring.rs                               (11)
 │   ├── (规划) compress/    # feature compress:codec.rs lz4.rs                                 (11)
 │   ├── (规划) deploy/      # readonly.rs                                                      (12)
 │   └── (规划) obs/         # observer.rs                                                      (12)
-├── benches/            # criterion 基准(L3 起)
-├── fuzz/               # cargo-fuzz 目标(L6 起;当前无此目录)
+├── benches/            # criterion 基准(L3 起;L6 增 quant.rs)
+├── fuzz/               # cargo-fuzz 五目标(L6 起;需 nightly + cargo-fuzz)
 ├── tests/              # 契约验收 + contract_traceability.rs 追溯门禁
 ├── docs/               # 本文档
 │   └── spec/           # FC-Matrix 形式化契约
@@ -241,13 +244,12 @@ dev-dependencies(不进入发布产物):`proptest`、`tempfile`、`criterion`。
 | feature | 默认 | 引入 | 说明 |
 |---|---|---|---|
 | `mmap` | ✅ 开 | `memmap2` | 关闭后段文件走 `FileSource`(`Read + Seek`),功能不变、稍慢 |
-
-> **当前 `Cargo.toml` 仅定义 `mmap`**;下表其余 feature 为规划项(对应层落地时才引入依赖),`cargo` 暂不识别。
+| `quant-f16` | ❌ 关 | `half` | f16 量化副本;关闭时 `VectorFormat::F16` 构造期/打开期报 `Unsupported` |
+| `async` | ❌ 关 | `tokio`(`rt`) | `AsyncNamespace`(spawn_blocking 薄包装);核心零 tokio |
+| `fuzzing` | ❌ 关 | 无 | 暴露 `fuzz/` 专用解析入口,不改变运行时行为 |
 
 | feature(规划) | 默认 | 引入 | 说明 |
 |---|---|---|---|
-| `async` | ❌ 关 | `tokio` | 提供 `insert().await` 等 async API |
-| `quant-f16` | ❌ 关 | `half` | 提供 f16 量化副本;关闭时只有 f32/i8 |
 | `encrypt` | ❌ 关 | `aes-gcm` | 静态加密([11 §2](11-security-storage.md)) |
 | `compress` | ❌ 关 | 无 | 内置 LZ4 风格压缩([11 §3](11-security-storage.md)) |
 | `compress-zstd` | ❌ 关 | `zstd` | 可选更强压缩 |
@@ -369,12 +371,13 @@ db.close()?;                // flush + 停后台维护 + 释放文件锁;Drop �
 | `ConsolidationPolicy` / `Summarizer` / `ConsolidateReport` | 记忆沉淀(见 09) |
 | `Encryption` / `KeyProvider` / `Cipher` / `Compression` / `Codec` | 静态加密与压缩(见 11;**L11 规划**,`Compression` 配置已接线、实现未落地) |
 | `Storage` / `Observer` / `Event` / `WriteOp` | 存储抽象与可观测(见 12;**L12 规划**,当前无此 API) |
-| `VectorFormat` | `F32 / F16 / I8Rescored`(**L6 未落地**,当前仅记录配置、不生效) |
+| `VectorFormat` | `F32 / F16 / I8Rescored`;持久库才可配量化(纯内存库构造期 `Unsupported`) |
 | `HnswParams` / `CompactionPolicy` / `Tuning` / `Limits` | 索引 / 合并 / 进阶调参 / 数据限额配置 |
 | `Clock` | 时间源注入(测试确定性) |
 | `SnapshotHandle` | 钉住某 ReaderView(段集 + 可变表快照)的只读句柄;经 `namespace()` 取命名空间视图(时间旅行读) |
 | `SnapshotNamespace` | 快照上的命名空间只读视图,提供 `search`/`get`/`iter` 等读取面 |
-| `AsyncNamespace` | async 门面(**L6 规划**,feature `async` 尚未定义),共享同一底层句柄 |
+| `AsyncNamespace` | async 门面(feature `async`),共享同一底层句柄;点读返回 owned `StoredRecord` |
+| `StoredRecord` | 点读的 owned 快照(含 `RowId`),跨线程/async 门面用;`into_record` 转回可写记录 |
 | `Reranker` / `QueryCtx` | 精排回调钩子及其查询上下文 |
 | `Stats` / `SegmentStat` / `NsStat` / `Histogram` / `QuantStat` / `StorageStat` / `HistoryStat` | 运行统计(段/WAL/延迟/每命名空间/量化/合并/存储安全/版本链) |
 | `CheckReport` / `BackupReport` / `RetainReport` / `SnapshotStats` | 运维报告(`SnapshotStats` 为快照钉住视图的段数/行数/水位) |

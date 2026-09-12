@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::core::bitset::BitSet;
 use crate::core::error::{MnemeError, Result};
 use crate::core::meta::Meta;
-use crate::core::options::RelationKind;
+use crate::core::options::{RelationKind, VectorFormat};
 use crate::core::types::{Key, NsId, RowId, SeqNo, SlotId};
 use crate::memory::analysis::{BLOOM_INITIAL_CAPACITY, BloomSet, InvertedIndex, ZoneIndex};
 use crate::memory::index::{SegmentIndex, VectorIndex};
@@ -442,11 +442,14 @@ impl WriterState {
     ///
     /// `slot_indices` 为该段包含的全局槽位(升序);`index = None` 表示该段无
     /// `hidx`(或未配置索引工厂),其槽位由查询期暴力覆盖。
+    /// `quant`/`recall_est` 为该段实际生效的量化格式与建段抽样召回估计。
     pub(crate) fn install_segment(
         &mut self,
         segment_id: u32,
         slot_indices: &[usize],
         index: Option<Arc<dyn VectorIndex>>,
+        quant: VectorFormat,
+        recall_est: Option<f32>,
     ) {
         {
             let slot_segment = Arc::make_mut(&mut self.slot_segment);
@@ -464,7 +467,9 @@ impl WriterState {
                     SlotId::new(u32::try_from(idx).expect("槽位下标必可转入 u32(FC-MEM-INV-004)"))
                 })
                 .collect();
-            Arc::make_mut(&mut self.indexes).push(SegmentIndex::new(segment_id, index, slots));
+            Arc::make_mut(&mut self.indexes).push(SegmentIndex::new(
+                segment_id, index, slots, quant, recall_est,
+            ));
         }
     }
 

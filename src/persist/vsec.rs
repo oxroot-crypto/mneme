@@ -1,22 +1,30 @@
-//! 向量段(`vsec`)编解码(设计 04 §2.1)。
+//! 向量段(`vsec`)编解码(设计 04 §2.1、08 §5)。
 //!
-//! 文件 = 64 字节定长头 + 数据区(向量区 / norm 区 / 删除位图)+ 尾部 payload CRC。
-//! 整数一律小端;定长字段按自然对齐摆放,便于 mmap 后零拷贝读取。
+//! 文件 = 64 字节定长头 + 数据区(向量区 / norm 区 / 量化副本区 / 删除位图)
+//! + 尾部 payload CRC。整数一律小端;定长字段按自然对齐摆放,便于 mmap 后零拷贝读取。
 //!
 //! ```text
 //! 0   magic "VSC1" | 4 u16 ver | 6 u16 header_len | 8 u32 dimension
 //! 12  u8 metric | 13 u8 quant | 14 u8 norm_col | 15 u8 reserved
 //! 16  u64 row_count | 24 i64 created_unix_ms | 32 u32 header_crc32 | 36..64 pad
-//! 数据区: vec(每行补齐到 32B) → norm(可选) → del_bitmap(每 1024 行 128B)
+//! 数据区: vec(每行补齐到 32B) → norm(可选) → qvec(quant != F32 时)
+//!         → del_bitmap(每 1024 行 128B)
 //! 尾部:   u32 payload_crc32(覆盖整个数据区)
 //! ```
 //!
 //! 删除位图的 `1` 表示该物理槽位**当前不可见**(被遮蔽/删除);每个 1024 行块
-//! 用 16 个 `u64`(128 B)承载,末块未用槽恒置 `1`。量化副本(`quant != 0`)属 L6,
-//! 本层解码时显式返回 `Unsupported`,绝不静默忽略。
+//! 用 16 个 `u64`(128 B)承载,末块未用槽恒置 `1`。
+//!
+//! 量化副本区(`quant != F32`,L6)布局(FC-QUANT-POST-002):
+//! * i8: 段级逐维 `(v_min, v_max)` 交错表(`2d` 个 f32,LE) + `row_count × d` 字节码;
+//! * f16: `row_count × 2d` 字节码(IEEE 754 half,LE)。
+//!
+//! f32 原向量始终保留在 `vec` 区供精排;未知 `quant` 编码与畸形参数表在解析期
+//! 返回 `Corrupted`,绝不部分解析(FC-QUANT-ERR-003)。
 
 use crate::core::error::{MnemeError, Result};
 use crate::core::metric::Metric;
+use crate::core::options::VectorFormat;
 use crate::persist::{Cursor, FORMAT_VERSION, align_up, check_version, crc32};
 
 /// 向量段魔数。
@@ -31,6 +39,10 @@ const MAX_DIMENSION: u32 = 65536;
 const BITMAP_BLOCK_ROWS: usize = 1024;
 /// 删除位图单块字节数(16 × u64)。
 const BITMAP_BLOCK_BYTES: usize = 128;
+/// i8 逐维参数表单维字节数(`v_min` + `v_max`)。
+const I8_PARAMS_PER_DIM: usize = 8;
+/// f16 单分量字节数。
+const F16_BYTES_PER_ELEMENT: usize = 2;
 
 /// 向量段头部字段。
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -39,8 +51,8 @@ pub(crate) struct VsecHeader {
     pub(crate) dimension: u32,
     /// 距离度量。
     pub(crate) metric: Metric,
-    /// 量化副本格式(0 = F32;其余为 L6 量化副本)。
-    pub(crate) quant: u8,
+    /// 量化副本格式(`F32` = 无副本)。
+    pub(crate) quant: VectorFormat,
     /// 是否附带 norm 列。
     pub(crate) norm_col: bool,
     /// 行数。
@@ -63,6 +75,12 @@ pub(crate) struct VsecInput<'a> {
     pub(crate) norms: &'a [f32],
     /// 每行是否不可见(`true` = 删除位图置位)。
     pub(crate) dead: &'a [bool],
+    /// 量化副本格式(`F32` = 不写 qvec)。
+    pub(crate) quant: VectorFormat,
+    /// i8 的逐维 `(v_min, v_max)` 交错表;其余格式为空。
+    pub(crate) quant_params: &'a [f32],
+    /// 量化副本码流(按行;`F32` 时为空)。
+    pub(crate) quant_codes: &'a [&'a [u8]],
 }
 
 /// 行跨距:向量字节数向上对齐到 32B。
@@ -97,10 +115,53 @@ pub(crate) fn metric_from_u8(value: u8) -> Result<Metric> {
     }
 }
 
+/// 量化格式 → `quant` 字节编码(0=F32 1=i8 2=f16)。
+pub(crate) const fn quant_to_u8(format: VectorFormat) -> u8 {
+    match format {
+        VectorFormat::F32 => 0,
+        VectorFormat::I8Rescored => 1,
+        VectorFormat::F16 => 2,
+    }
+}
+
+/// `quant` 字节编码 → 量化格式;未知编码返回 `Corrupted`(FC-QUANT-ERR-003)。
+pub(crate) fn quant_from_u8(value: u8) -> Result<VectorFormat> {
+    match value {
+        0 => Ok(VectorFormat::F32),
+        1 => Ok(VectorFormat::I8Rescored),
+        2 => Ok(VectorFormat::F16),
+        _ => Err(MnemeError::Corrupted {
+            segment: None,
+            reason: format!("vsec: 未知量化编码 {value}"),
+        }),
+    }
+}
+
+/// qvec 区字节数(参数表 + 码流);`F32` 为 0。
+fn quant_len(header: &VsecHeader) -> Result<usize> {
+    let rows = header.row_count as usize;
+    let dimension = header.dimension as usize;
+    match header.quant {
+        VectorFormat::F32 => Ok(0),
+        VectorFormat::I8Rescored => dimension
+            .checked_mul(I8_PARAMS_PER_DIM)
+            .and_then(|params| {
+                rows.checked_mul(dimension)
+                    .and_then(|codes| params.checked_add(codes))
+            })
+            .ok_or_else(|| corrupt("qvec 区长度溢出")),
+        VectorFormat::F16 => rows
+            .checked_mul(dimension)
+            .and_then(|value| value.checked_mul(F16_BYTES_PER_ELEMENT))
+            .ok_or_else(|| corrupt("qvec 区长度溢出")),
+    }
+}
+
 /// 编码一个完整的向量段文件。
 ///
 /// # Errors
-/// 输入不一致(行数/维度不匹配、`quant` 非 F32)或维度非法时返回结构化错误。
+/// 输入不一致(行数/维度不匹配、qvec 长度不符)或维度非法时返回结构化错误;
+/// 未开 `quant-f16` feature 时拒绝编码 f16 副本(FC-QUANT-ERR-001)。
 pub(crate) fn encode(input: &VsecInput<'_>) -> Result<Vec<u8>> {
     let count = input.vectors.len();
     if input.norms.len() != count || input.dead.len() != count {
@@ -116,18 +177,22 @@ pub(crate) fn encode(input: &VsecInput<'_>) -> Result<Vec<u8>> {
             });
         }
     }
+    validate_quant_input(input, count)?;
 
-    let header = encode_header(&VsecHeader {
+    let header = VsecHeader {
         dimension: input.dimension,
         metric: input.metric,
-        quant: 0,
+        quant: input.quant,
         norm_col: true,
         row_count: count as u64,
         created_unix_ms: input.created_unix_ms,
-    })?;
+    };
+    let quant_bytes = quant_len(&header)?;
+    let header = encode_header(&header)?;
 
     let stride = row_stride(input.dimension);
-    let mut data = Vec::with_capacity(count * stride + count * 4 + bitmap_bytes(count as u64));
+    let mut data =
+        Vec::with_capacity(count * stride + count * 4 + quant_bytes + bitmap_bytes(count as u64));
     for vector in input.vectors {
         for value in *vector {
             data.extend_from_slice(&value.to_le_bytes());
@@ -137,12 +202,63 @@ pub(crate) fn encode(input: &VsecInput<'_>) -> Result<Vec<u8>> {
     for norm in input.norms {
         data.extend_from_slice(&norm.to_le_bytes());
     }
+    for param in input.quant_params {
+        data.extend_from_slice(&param.to_le_bytes());
+    }
+    for row in input.quant_codes {
+        data.extend_from_slice(row);
+    }
     data.extend_from_slice(&encode_bitmap(input.dead));
 
     let mut out = header.to_vec();
     out.extend_from_slice(&data);
     out.extend_from_slice(&crc32(&data).to_le_bytes());
     Ok(out)
+}
+
+/// 校验 qvec 输入与格式/行数匹配(FC-QUANT-ERR-001/003 的编码侧防线)。
+fn validate_quant_input(input: &VsecInput<'_>, count: usize) -> Result<()> {
+    let dimension = input.dimension as usize;
+    let codes_match = |stride: usize| {
+        input.quant_codes.len() == count && input.quant_codes.iter().all(|row| row.len() == stride)
+    };
+    match input.quant {
+        VectorFormat::F32 => {
+            if !input.quant_params.is_empty() || !input.quant_codes.is_empty() {
+                return Err(MnemeError::Config {
+                    reason: "vsec 编码:F32 不得携带量化副本",
+                });
+            }
+            Ok(())
+        }
+        VectorFormat::I8Rescored => {
+            if input.quant_params.len() != dimension * 2 || !codes_match(dimension) {
+                return Err(MnemeError::Config {
+                    reason: "vsec 编码:i8 副本长度与维度/行数不符",
+                });
+            }
+            Ok(())
+        }
+        VectorFormat::F16 => {
+            #[cfg(not(feature = "quant-f16"))]
+            {
+                let _ = (codes_match, dimension);
+                return Err(MnemeError::Unsupported {
+                    feature: "quant-f16",
+                });
+            }
+            #[cfg(feature = "quant-f16")]
+            {
+                if !input.quant_params.is_empty() || !codes_match(dimension * F16_BYTES_PER_ELEMENT)
+                {
+                    return Err(MnemeError::Config {
+                        reason: "vsec 编码:f16 副本长度与维度/行数不符",
+                    });
+                }
+                Ok(())
+            }
+        }
+    }
 }
 
 /// 编码 64 字节头部并计算 `header_crc32`(覆盖 `[0,32)`)。
@@ -153,7 +269,7 @@ fn encode_header(header: &VsecHeader) -> Result<[u8; HEADER_LEN as usize]> {
     out[6..8].copy_from_slice(&HEADER_LEN.to_le_bytes());
     out[8..12].copy_from_slice(&header.dimension.to_le_bytes());
     out[12] = metric_to_u8(header.metric);
-    out[13] = header.quant;
+    out[13] = quant_to_u8(header.quant);
     out[14] = u8::from(header.norm_col);
     out[16..24].copy_from_slice(&header.row_count.to_le_bytes());
     out[24..32].copy_from_slice(&header.created_unix_ms.to_le_bytes());
@@ -202,7 +318,8 @@ fn set_bit(bitmap: &mut [u8], row: usize) {
 /// 校验并解析向量段,返回对数据区的视图(不复制整个文件)。
 ///
 /// # Errors
-/// 魔数/版本/`header_len`/头部 CRC 不符、布局不一致或 `quant != 0` 时返回结构化错误。
+/// 魔数/版本/`header_len`/头部 CRC 不符、布局不一致、未知量化编码或
+/// i8 参数表畸形时返回结构化错误。
 pub(crate) fn parse(bytes: &[u8]) -> Result<VsecView<'_>> {
     let header = parse_header(bytes)?;
     // 维度必须落在建库定义域 [1, 65536](FC-CORE-PRE-001);损坏文件可能为 0/超大值。
@@ -227,16 +344,41 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<VsecView<'_>> {
         bytes[bytes.len() - 2],
         bytes[bytes.len() - 1],
     ]);
-    Ok(VsecView {
+    let dimension = header.dimension as usize;
+    let rows = header.row_count as usize;
+    let vec_len = rows * stride;
+    let norm_len = if header.norm_col { rows * 4 } else { 0 };
+    let params_len = if header.quant == VectorFormat::I8Rescored {
+        dimension * I8_PARAMS_PER_DIM
+    } else {
+        0
+    };
+    let code_stride = match header.quant {
+        VectorFormat::F32 => 0,
+        VectorFormat::I8Rescored => dimension,
+        VectorFormat::F16 => dimension * F16_BYTES_PER_ELEMENT,
+    };
+    let params_start = vec_len + norm_len;
+    let codes_offset = params_start + params_len;
+    let view = VsecView {
         header,
         data,
         stride,
         payload_crc,
         payload_crc_ok: None,
-    })
+        params_range: (params_start, params_len),
+        codes_offset,
+        code_stride,
+    };
+    // i8 参数表畸形(失序/非有限/长度不符)在解析期即拒绝(FC-QUANT-ERR-003)。
+    if header.quant == VectorFormat::I8Rescored {
+        let table = view.quant_params();
+        crate::quant::scalar_i8::I8Params::from_table(&table, dimension)?;
+    }
+    Ok(view)
 }
 
-/// 计算 vsec 文件的期望总长度:头 + 向量区 + norm 区 + 位图 + 尾 CRC。
+/// 计算 vsec 文件的期望总长度:头 + 向量区 + norm 区 + qvec 区 + 位图 + 尾 CRC。
 ///
 /// 全用 checked 运算:损坏的 `row_count`/`dimension` 不得让长度回绕而绕过校验。
 ///
@@ -253,9 +395,11 @@ fn expected_file_len(header: &VsecHeader) -> Result<usize> {
     } else {
         0
     };
+    let quant_len = quant_len(header)?;
     (HEADER_LEN as usize)
         .checked_add(vec_len)
         .and_then(|value| value.checked_add(norm_len))
+        .and_then(|value| value.checked_add(quant_len))
         .and_then(|value| value.checked_add(bitmap_bytes(header.row_count)))
         .and_then(|value| value.checked_add(4))
         .ok_or_else(|| corrupt("文件期望长度溢出"))
@@ -301,16 +445,11 @@ fn parse_header(bytes: &[u8]) -> Result<VsecHeader> {
     }
     let dimension = cursor.u32()?;
     let metric = metric_from_u8(cursor.u8()?)?;
-    let quant = cursor.u8()?;
+    let quant = quant_from_u8(cursor.u8()?)?;
     let norm_col = cursor.u8()? != 0;
     let _reserved = cursor.u8()?;
     let row_count = cursor.u64()?;
     let created_unix_ms = cursor.i64()?;
-    if quant != 0 {
-        return Err(MnemeError::Unsupported {
-            feature: "量化副本(vsec quant != 0, L6)",
-        });
-    }
     Ok(VsecHeader {
         dimension,
         metric,
@@ -328,6 +467,12 @@ pub(crate) struct VsecView<'a> {
     stride: usize,
     payload_crc: u32,
     payload_crc_ok: Option<bool>,
+    /// i8 参数表在 `data` 中的 `(起始, 字节长度)`;非 i8 为 `(0, 0)`。
+    params_range: (usize, usize),
+    /// 码流在 `data` 中的起始偏移。
+    codes_offset: usize,
+    /// 每行码流字节数;无副本为 0。
+    code_stride: usize,
 }
 
 impl VsecView<'_> {
@@ -337,9 +482,32 @@ impl VsecView<'_> {
         self.header
     }
 
+    /// 量化副本格式(`F32` = 无副本)。
+    pub(crate) const fn quant(&self) -> VectorFormat {
+        self.header.quant
+    }
+
     /// 行数。
     pub(crate) const fn row_count(&self) -> u64 {
         self.header.row_count
+    }
+
+    /// i8 逐维 `(v_min, v_max)` 交错表;非 i8 返回空表。
+    pub(crate) fn quant_params(&self) -> Vec<f32> {
+        let (start, len) = self.params_range;
+        self.data[start..start + len]
+            .chunks_exact(4)
+            .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+            .collect()
+    }
+
+    /// 第 `row` 行的量化码流;无副本或行越界返回 `None`。
+    pub(crate) fn quant_row(&self, row: usize) -> Option<&[u8]> {
+        if self.code_stride == 0 || row >= self.header.row_count as usize {
+            return None;
+        }
+        let start = self.codes_offset + row * self.code_stride;
+        Some(&self.data[start..start + self.code_stride])
     }
 
     /// 第 `row` 行的向量(逐元素小端解码);行越界返回 `None`。
@@ -371,7 +539,8 @@ impl VsecView<'_> {
         let rows = self.header.row_count as usize;
         let vec_len = rows * self.stride;
         let norm_len = if self.header.norm_col { rows * 4 } else { 0 };
-        let bitmap = &self.data[vec_len + norm_len..];
+        let bitmap =
+            &self.data[vec_len + norm_len + self.params_range.1 + rows * self.code_stride..];
         let block = row / BITMAP_BLOCK_ROWS;
         let within = row % BITMAP_BLOCK_ROWS;
         let word = within / 64;
@@ -435,6 +604,33 @@ mod tests {
             vectors: &refs,
             norms: &norms,
             dead: &dead,
+            quant: VectorFormat::F32,
+            quant_params: &[],
+            quant_codes: &[],
+        })
+        .expect("encode")
+    }
+
+    /// i8 qvec 样本:参数表按列统计构造,码流逐行编码。
+    fn encode_i8_sample(count: usize) -> Vec<u8> {
+        let (vectors, norms, dead) = sample(count);
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let params = crate::quant::scalar_i8::build_params(&refs, 4).expect("build_params");
+        let codes: Vec<Vec<u8>> = vectors
+            .iter()
+            .map(|vector| crate::quant::scalar_i8::encode_row(vector, &params))
+            .collect();
+        let code_refs: Vec<&[u8]> = codes.iter().map(Vec::as_slice).collect();
+        encode(&VsecInput {
+            dimension: 4,
+            metric: Metric::Cosine,
+            created_unix_ms: 1_700_000_000_000,
+            vectors: &refs,
+            norms: &norms,
+            dead: &dead,
+            quant: VectorFormat::I8Rescored,
+            quant_params: &params.table(),
+            quant_codes: &code_refs,
         })
         .expect("encode")
     }
@@ -445,6 +641,7 @@ mod tests {
         let bytes = encode_sample(3);
         let mut view = parse(&bytes).expect("parse");
         assert_eq!(view.row_count(), 3);
+        assert_eq!(view.quant(), VectorFormat::F32);
         assert_eq!(view.header().dimension, 4);
         assert_eq!(view.header().metric, Metric::Cosine);
         assert_eq!(view.header().created_unix_ms, 1_700_000_000_000);
@@ -455,6 +652,47 @@ mod tests {
         assert!(!view.is_dead(2));
         view.verify_payload().expect("payload crc");
         assert!(view.vector(3).is_none());
+    }
+
+    /// FC-QUANT-POST-002:i8 qvec 往返(参数表逐位一致、码流逐行一致)。
+    #[test]
+    fn vsec_i8_quantized_roundtrip() {
+        let bytes = encode_i8_sample(3);
+        let mut view = parse(&bytes).expect("parse");
+        assert_eq!(view.quant(), VectorFormat::I8Rescored);
+        let (vectors, _, _) = sample(3);
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let params = crate::quant::scalar_i8::build_params(&refs, 4).expect("build_params");
+        assert_eq!(view.quant_params(), params.table());
+        for (row, vector) in vectors.iter().enumerate() {
+            let expected = crate::quant::scalar_i8::encode_row(vector, &params);
+            assert_eq!(view.quant_row(row).expect("quant row"), expected.as_slice());
+        }
+        assert!(view.quant_row(3).is_none());
+        view.verify_payload().expect("payload crc");
+    }
+
+    /// FC-QUANT-ERR-003:未知 quant 编码 → `Corrupted`。
+    #[test]
+    fn vsec_rejects_unknown_quant_code() {
+        let mut bytes = encode_sample(1);
+        bytes[13] = 9;
+        let crc = crc32(&bytes[0..32]);
+        bytes[32..36].copy_from_slice(&crc.to_le_bytes());
+        assert!(matches!(parse(&bytes), Err(MnemeError::Corrupted { .. })));
+    }
+
+    /// FC-QUANT-ERR-003:i8 参数表非有限值 → `Corrupted`。
+    #[test]
+    fn vsec_rejects_malformed_i8_params() {
+        let mut bytes = encode_i8_sample(2);
+        // 参数表起始 = 64(头) + 2 行 × 32B(vec 区) + 2 行 × 4B(norm 区)。
+        let params_start = 64 + 2 * 32 + 2 * 4;
+        bytes[params_start..params_start + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+        let payload_crc = crc32(&bytes[64..bytes.len() - 4]);
+        let tail = bytes.len() - 4;
+        bytes[tail..].copy_from_slice(&payload_crc.to_le_bytes());
+        assert!(matches!(parse(&bytes), Err(MnemeError::Corrupted { .. })));
     }
 
     /// 跨块(> 1024 行)删除位图仍按位正确。
@@ -512,5 +750,63 @@ mod tests {
                 Err(MnemeError::UnsupportedVersion { .. })
             ));
         }
+    }
+
+    /// f16 副本(仅 feature `quant-f16`)往返;关闭 feature 时编码被拒绝。
+    #[cfg(feature = "quant-f16")]
+    #[test]
+    fn vsec_f16_quantized_roundtrip() {
+        let (vectors, norms, dead) = sample(2);
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let codes: Vec<Vec<u8>> = vectors
+            .iter()
+            .map(|vector| crate::quant::f16::encode_row(vector))
+            .collect();
+        let code_refs: Vec<&[u8]> = codes.iter().map(Vec::as_slice).collect();
+        let bytes = encode(&VsecInput {
+            dimension: 4,
+            metric: Metric::Cosine,
+            created_unix_ms: 0,
+            vectors: &refs,
+            norms: &norms,
+            dead: &dead,
+            quant: VectorFormat::F16,
+            quant_params: &[],
+            quant_codes: &code_refs,
+        })
+        .expect("encode");
+        let view = parse(&bytes).expect("parse");
+        assert_eq!(view.quant(), VectorFormat::F16);
+        assert_eq!(view.quant_row(0).expect("row0"), codes[0].as_slice());
+        assert_eq!(view.quant_row(1).expect("row1"), codes[1].as_slice());
+        assert!(view.quant_params().is_empty());
+    }
+
+    /// FC-QUANT-ERR-001:未开 feature 时编码 f16 副本必须报 `Unsupported`。
+    #[cfg(not(feature = "quant-f16"))]
+    #[test]
+    fn vsec_f16_encode_requires_feature() {
+        let (vectors, norms, dead) = sample(1);
+        let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+        let row = [0_u8; 8];
+        let codes: [&[u8]; 1] = [&row];
+        let error = encode(&VsecInput {
+            dimension: 4,
+            metric: Metric::Cosine,
+            created_unix_ms: 0,
+            vectors: &refs,
+            norms: &norms,
+            dead: &dead,
+            quant: VectorFormat::F16,
+            quant_params: &[],
+            quant_codes: &codes,
+        })
+        .expect_err("f16 编码应被 feature 门控拒绝");
+        assert!(matches!(
+            error,
+            MnemeError::Unsupported {
+                feature: "quant-f16"
+            }
+        ));
     }
 }

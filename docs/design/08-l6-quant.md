@@ -6,13 +6,29 @@
 > **本章你将学到**:为什么带宽是瓶颈 → i8 标量量化的公式与误差分析 → f16 →
 > 两阶段检索(粗排 + 重打分)→ 自动回退 → async 门面。
 >
-> **落地状态(2026-09)**:**本章尚未落地**——`src/` 无 `quant/` 模块,feature
-> `quant-f16` 尚未定义;`Builder::quantization` 仅记录用户配置,存储与检索实际恒为
-> f32,`stats().quant.active` 亦恒为 `F32`(绝不回显配置);`FC-QUANT-*` 契约(含
-> 「未开 feature 时构造期返回 `Unsupported`」)均为 `Planned`。本章描述的是 L6
-> 目标设计,实现与设计差异以本节为准。
+> **落地状态(2026-09)**:**本章已落地**——`src/quant/` 提供 i8 标量量化(段级
+> 每维 `(v_min,v_max)`)、f16(feature `quant-f16`)、两阶段候选预算与建段召回抽样;
+> `vsec` 段格式升 `0x0005`,qvec 区紧随 norm 区(布局见 04 §2.1 与
+> `FC-QUANT-POST-002`);两阶段检索、建段抽样回退(I13)、`stats().quant`、
+> `feature = "async"` 门面均已接线,`FC-QUANT-*` 全部转 `Passed`。
+> 与本章原文的三处实现取舍(以契约为准):
+>
+> 1. **图仍由 f32 构建,量化副本只服务查询期打分**——装配式 HNSW 的图结构在
+>    flush 期一次性构建,查询期 `score_query` 读 qvec 副本算粗排分;这样 f32 图
+>    天然作为建段召回抽样的对照基线,且构建期成本不变(带宽收益在查询期兑现);
+> 2. **i8 粗排内核用「u8 码位零扩展 + FMA」而不是 `maddubs`/VNNI**——每维独立
+>    scale 无法直接喂给整数点积指令;`core::simd::dot_u8_f32` 每行只读 `d` 字节
+>    (带宽 ÷4),AVX2 可用时走 `_mm256_cvtepu8_epi32` + FMA,否则回退标量;
+> 3. **每维参数表紧随 norm 区之后写入 qvec 区**(vsec 头仍是定长 64 B),而非
+>    扩长头部;`VsecView::quant_params`/`quant_row` 提供零拷贝视图。
+>
+> 量化副本属**持久段特性**:纯内存库配置量化在构造期返回 `Unsupported`
+> (`FC-QUANT-ERR-002`);`src/quant/` 为纯原语模块(无 I/O/锁/全局态,依赖等级同
+> L0),供 L2 段编码与 L3 索引打分直接复用。`benches/quant.rs` 给出 f32/i8 的
+> 微缩对照(4k×512);微缩规模下每查询的候选收集/位图等固定开销占比高,≥3×
+> 加速门槛需 1M×1536 heavy 档,与冷启动、fuzz 长跑同属 CI 收尾(14 §4/§5)。
 
-模块:`quant/{scalar_i8.rs, f16.rs, rescore.rs}`(规划)
+模块:`quant/{scalar_i8.rs, f16.rs, rescore.rs}`(已落地)、`memory::async_facade`(feature `async`)、`src/fuzzing.rs`(feature `fuzzing`)
 
 ---
 
@@ -79,23 +95,25 @@ $$\mathrm{RMS}(\text{dot-product error}) = \frac{\Delta}{\sqrt{12}}\cdot\|q\|_2
 
 ### 2.3 【工程】量化点积的 SIMD
 
-量化后分量是整数,查询向量按**每个段各自的 min/max 表**转换为 i8(不同段刻度不同,
-不能全局只转一次),用 `_mm256_maddubs`(SSSE3/AVX2)与 `_mm256_dpbusd`(AVX-VNNI)类指令做 i8 点积——
-**每条指令处理 32–64 个分量**,比 f32 再快 4–8 倍(经验值)。
-最终分数以 `(i8 点积结果 × Δ + 偏置)` 反归一到可比刻度;
-不同段的 min/max 不同,**跨段比较必须用反归一后的分数**。
+量化后分量是整数,查询向量按**每个段各自的 min/max 表**转换为粗排权重(不同段刻度
+不同,不能全局只算一次)。实现口径(落地状态 §1):查询侧保持 f32,逐维预计算
+`w_i = q_i·Δ_i` 与偏置 `b = Σ q_i·v_min_i`,每行只需 `b + Σ code_i·w_i`——
+码位零扩展到 f32 后 FMA(`core::simd::dot_u8_f32`,AVX2 下
+`_mm256_cvtepu8_epi32` + `_mm256_fmadd_ps`),读侧每行也只要 `d` 字节。
+之所以不用 `maddubs`/VNNI:每维独立 scale 无法直接喂给整数点积指令,
+零扩展 + FMA 保持了相同的带宽收益且可移植。不同段的 min/max 不同,
+**跨段比较必须用同一折算口径**(`Metric::score_from_dot`)。
 
-> **查询量化需钳制**:查询分量可能落在库侧 `[v_min, v_max]` 之外,量化前须
-> `clamp` 到该区间(否则溢出 i8 语义)。钳制引入的偏差与"查询侧也降精度"叠加,
-> 是 §4 必须用原始 f32 重打分的原因之一;对归一化查询该偏差通常远小于库侧量化误差。
+> **查询不落码位**:查询侧不重新编码为 u8,而是以 f32 参与逐维加权,避免钳制
+> 偏差叠加;粗排分数只用于选候选,精排仍回原始 f32(§4)。
 
 ### 2.4 复杂度与收益
 
 | 项 | f32 | i8 |
 |---|---|---|
 | 单次点积(读侧带宽) | $4d$ B | $d$ B(**4×**) |
-| 粗排副本存储 | 不单独存 | $d$ B/行 + 12KB/段 |
-| 段总存储(含 f32 原向量) | $4d$ B/行 | $5d$ B/行 + 12KB/段 |
+| 粗排副本存储 | 不单独存 | $d$ B/行 + $2d$ 个 f32/段 |
+| 段总存储(含 f32 原向量) | $4d$ B/行 | $5d$ B/行 + $2d$ 个 f32/段 |
 | 精度 | 基准 | RMS 误差 ≈ 0.09(1536 维、分量量级 1 即 ‖q‖₂≈39 时;归一化查询约 0.0023,经验值) |
 
 ---
@@ -108,11 +126,10 @@ IEEE 754 half:1 位符号 + 5 位指数 + 10 位尾数。相对精度 $2^{-11} \
 定位:i8 的**保守替代**(对误差敏感的库)。
 **F16 同样走两阶段重打分**([08 §4](08-l6-quant.md)):粗排用 f16 副本,精排回 f32——
 因此 `Hit.score` 的口径与 i8 一致(不变量 I12),不是"f16 分数直接返回"。
-`half` crate 只在 `quant-f16` 下编译(L6 目标设计)。**落地前**:`Builder::quantization`
-仅记录配置、不影响存储与检索(实际恒为 f32);待 L6 落地后,**未开启该 feature 时**
-`Builder::quantization(VectorFormat::F16)` 必须于构造期返回
-`Unsupported { feature: "quant-f16" }`,绝不静默降级(契约 `FC-QUANT-ERR-001`,当前
-`Planned`);`F32` 与 `I8Rescored` 不依赖任何 feature。
+`half` crate 只在 `quant-f16` 下编译;**未开启该 feature 时**
+`Builder::quantization(VectorFormat::F16)`(以及打开含 f16 段的库)返回
+`Unsupported { feature: "quant-f16" }`,绝不静默降级(`FC-QUANT-ERR-001/002`,
+已落地);`F32` 与 `I8Rescored` 不依赖任何 feature。
 
 ---
 
@@ -136,30 +153,39 @@ IEEE 754 half:1 位符号 + 5 位指数 + 10 位尾数。相对精度 $2^{-11} \
 精排带宽 $16kd$ 字节看似回到 f32——但只对 $4k$(≈40–80 个)候选,
 远小于搜索途中本要路过的千级节点;且 vsec 本就 mmap 常驻页缓存(刚被粗排 locality 洗过),
 实际读放大很小(经验值)。总收益:查询延迟 ~3–4×,召回损失 ≤ 2%(门槛,见下)。
+候选倍率由 `Tuning.rescore_oversample` 配置(默认 4,即 $4k$;需 ≥ 1),
+粗排候选数与候选总数取小。
 
 ### 4.3 召回门槛与自动回退
 
-- 建库/换量化时跑基准:随机 1 万查询,`Recall@10(量化两阶段) ≥ Recall@10(f32) − 2%`
-  才启用;超标 → 自动降级回 f32 模式(配置仍保留用户显式选择权,I13,验收见
-  [14 §3.2](14-testing.md));
-- 运行期监控:`stats()` 暴露"量化召回估计"(抽样查询的粗/精排名一致率)。
+- 落地口径:flush/compaction **建段时**抽样自查询(等距抽样 `RECALL_SAMPLE_QUERIES`
+  条),以同一 f32 图的 top-10 为参照计算"量化粗排 + f32 精排"的一致率;
+  低于 `Tuning.quant_recall_floor`(默认 0.98)即**该段不写 qvec、回退 f32**,
+  且 `stats().quant` 的 `configured`/`active`/`recall_est` 如实反映(I13,
+  验收见 [14 §3.2](14-testing.md));`quant_recall_floor = 0.0` 关闭回退,
+  `> 1` 恒回退(测试用)。离线 1 万查询基准与 1M×1536 门槛仍属 CI 收尾
+  ([14 §4](14-testing.md));
+- 运行期监控:`stats().quant.recall_est` 暴露建段抽样一致率(各段取最小值;
+  重开库后为 `None`,可用 `FC-QUANT-POST-004` 的回归测试补测)。
 
 > **常见误区**:① 以为开量化后磁盘变小——f32 原向量始终保留,省的只是**查询带宽**;
 > ② 以为 `Hit.score` 是量化分——始终是 f32 精排分(I12);
-> ③ 配置了 `VectorFormat::F16` 却未开 `quant-f16` feature——L6 落地后构造期即返回
-> `Unsupported`,不会静默降级(目标行为,见 §3 落地注)。
+> ③ 配置了 `VectorFormat::F16` 却未开 `quant-f16` feature——构造期或打开期即返回
+> `Unsupported`,不会静默降级(`FC-QUANT-ERR-001/002`)。
 
 ---
 
 ## 5. 副本生成与管理
 
-- **存储布局**:量化副本以 `qvec` 区追加在 vsec 数据区之后(`vsec` 头 `quant != 0`),
-  每行 `i8 × dim`(或 `f16 × dim`)+ 段级每维 `(v_min, v_max)` 表;f32 原向量保持在
-  `vec` 区,二者同一 `SegmentId`、同 CRC、同生同灭([04 §2.1](04-l2-persist.md));
+- **存储布局**:量化副本以 `qvec` 区追加在 norm 区之后、删除位图之前(`vsec` 头
+  `quant != 0`);i8 先写段级每维 `(v_min, v_max)` 交错表(`2d` 个 f32),再写每行
+  `d` 字节码;f16 只有每行 `2d` 字节码。f32 原向量保持在 `vec` 区,二者同一
+  `SegmentId`、同 CRC、同生同灭([04 §2.1](04-l2-persist.md)、`FC-QUANT-POST-002`);
 - flush 生成段时**同步**建量化副本(构建期一次性成本,与倒排同批);
-- 老段升级(用户中途开量化):后台线程逐段回填,MANIFEST 逐段原子登记;
-- compaction 合并时以**当前配置**的量化格式重写副本(格式迁移零特殊逻辑,
-  复用 [07 §4](07-l5-life.md) 流程)。
+- 旧段升级(用户中途开量化):当前实现不在后台回填,由下一轮 compaction 按当前
+  配置重写(格式迁移零特殊逻辑);未重写前旧段继续以 f32 服务,`stats()` 逐段可见;
+- compaction 合并时以**当前配置**的量化格式重写副本(复用 [07 §4](07-l5-life.md)
+  流程,`FC-QUANT-POST-003`)。
 
 ---
 
@@ -190,7 +216,9 @@ impl AsyncNamespace {
   同语义(I14);`AsyncNamespace` 亦 `Send + Sync`;
 - **覆盖范围**:`AsyncNamespace` 包装 `Namespace` 的阻塞入口(`insert` / `insert_batch` /
   `update` / `get` / `get_many` / `get_vector` / `exists` / `delete` / `touch` / `relate` /
-  `consolidate` 等);`search()` 构建器本身是轻量纯内存操作,而 `execute()` 是阻塞调用,
+  `consolidate` 等);点读方法返回 owned [`StoredRecord`](../design/16-api-reference.md)
+  (含 `RowId`,同步版借用 `RecordRef` 无法跨线程移动),`StoredRecord::into_record`
+  可转回可写 `Record`;`search()` 构建器本身是轻量纯内存操作,而 `execute()` 是阻塞调用,
   异步场景请对 `execute()` 用 `spawn_blocking` 包装(库不额外提供异步 `SearchBuilder`);
   `Mneme` 级操作(`flush` / `close` / `backup_to` / `snapshot`)同样不属于 `AsyncNamespace`,
   需要异步调用时由宿主用 `spawn_blocking` 包装或直接调同步版(它们本就是毫秒级或纯内存);

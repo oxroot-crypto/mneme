@@ -175,7 +175,7 @@
 | zone map 剪枝 | $O(\lceil N/1024\rceil \times \text{predicates})$ | 17B/块/字段 | [04 §5.2](04-l2-persist.md) |
 | bloom 判定 | $O(k) = O(7)$ | $1.44\log_2(1/p)$ bit/元素 | [04 §5.3](04-l2-persist.md) |
 | MANIFEST 提交 | $O(\text{segments})$ 写新文件 | 保留 2 版 | [04 §6](04-l2-persist.md) |
-| 恢复(open) | $O(\text{段总字节} + \text{WAL 字节})$(逐段读入校验 + 回放) | $O(\text{段总字节} + \text{WAL 字节})$;恢复期仍整段载入,mmap 读路径优化已在 L3,惰性驻留待 L6 | [04 §7](04-l2-persist.md) |
+| 恢复(open) | $O(\text{段总字节} + \text{WAL 字节})$(逐段读入校验 + 回放) | $O(\text{段总字节} + \text{WAL 字节})$;恢复期仍整段载入,mmap 读路径优化已在 L3,惰性驻留待段句柄重构(未落地) | [04 §7](04-l2-persist.md) |
 | HNSW 构建 | $O(N \cdot d \cdot ef_c \cdot M_0)$ | ≈$(8M+20)$ B/节点 | [05 §4/§6.3](05-l3-hnsw.md) |
 | HNSW 查询 | 上界 $O(d \cdot ef \cdot M_0)$;实测 ≈ (2–5)·ef 次点积 | — | [05 §6.1](05-l3-hnsw.md) |
 | 层级分布 | $P(\ge l) = (1/M)^l$;层高 $O(\log_M N)$ | — | [05 §3.2](05-l3-hnsw.md) |

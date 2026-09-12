@@ -12,7 +12,7 @@
 
 use crate::core::heap::TopK;
 use crate::core::types::{RowId, SlotId};
-use crate::memory::index::{IndexSearch, VectorIndex};
+use crate::memory::index::{IndexSearch, QuantQuery, VectorIndex};
 
 use super::hnsw::{HnswIndex, QueryRef};
 
@@ -75,6 +75,12 @@ pub(crate) fn search(index: &HnswIndex, params: &IndexSearch<'_>) -> TopK<(RowId
         .map_or(alive_count, |filter| filter.count_ones());
     let selectivity = filter_count as f32 / alive_count as f32;
 
+    // 量化粗排形式按段级参数预计算一次;无副本或关闭时退精确 f32(设计 08 §4)。
+    let prepared = params
+        .use_quant
+        .then(|| index.quantize_query(params.query))
+        .flatten();
+
     // 档③:候选暴力(精确)。仅当有过滤位图,且选择性极低或候选数低于
     // `max(ef, 1024)`;无过滤走档①/②全图遍历。
     let brute_cap = params.ef.max(BRUTE_CANDIDATE_CAP);
@@ -83,7 +89,7 @@ pub(crate) fn search(index: &HnswIndex, params: &IndexSearch<'_>) -> TopK<(RowId
     {
         #[cfg(test)]
         record_tier(3);
-        return brute_candidates(index, params, count);
+        return brute_candidates(index, params, count, prepared.as_ref());
     }
 
     // 档①/②唯一分派点:后过滤 or 放大后过滤。
@@ -94,7 +100,7 @@ pub(crate) fn search(index: &HnswIndex, params: &IndexSearch<'_>) -> TopK<(RowId
     };
     #[cfg(test)]
     record_tier(if tier == GraphTier::Post { 1 } else { 2 });
-    graph_candidates(index, params, selectivity, tier)
+    graph_candidates(index, params, selectivity, tier, prepared.as_ref())
 }
 
 /// 节点是否可选:全局槽位在 alive 位图内,且(无过滤或)命中过滤位图。
@@ -108,6 +114,7 @@ fn brute_candidates(
     index: &HnswIndex,
     params: &IndexSearch<'_>,
     count: usize,
+    prepared: Option<&QuantQuery>,
 ) -> TopK<(RowId, SlotId)> {
     let mut top = TopK::new(params.k, index.metric());
     for node in 0..count as u32 {
@@ -118,6 +125,7 @@ fn brute_candidates(
             QueryRef {
                 vector: params.query,
                 norm_sq: params.query_norm,
+                quant: prepared,
             },
             node,
         );
@@ -132,11 +140,13 @@ fn graph_candidates(
     params: &IndexSearch<'_>,
     selectivity: f32,
     tier: GraphTier,
+    prepared: Option<&QuantQuery>,
 ) -> TopK<(RowId, SlotId)> {
     let mut top = TopK::new(params.k, index.metric());
     let query = QueryRef {
         vector: params.query,
         norm_sq: params.query_norm,
+        quant: prepared,
     };
     let top_level = index.max_level() as usize;
     let mut entry = index.entry_node();
@@ -219,6 +229,7 @@ mod tests {
             filter,
             post_threshold: post,
             brute_threshold: brute,
+            use_quant: false,
         }
     }
 

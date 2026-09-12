@@ -110,7 +110,13 @@ impl Store {
 
         // 段文件已原子提交:登记槽位归属与索引,清空 delta 标记;WAL 重置(Checkpoint)。
         if let Some(encoded) = encoded {
-            ws.install_segment(segment_id, &slot_indices, encoded.index);
+            ws.install_segment(
+                segment_id,
+                &slot_indices,
+                encoded.index,
+                encoded.quant,
+                encoded.recall_est,
+            );
         }
         ws.clear_flush_dirty();
         self.publish(&new_manifest);

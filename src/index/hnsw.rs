@@ -11,9 +11,11 @@ use std::sync::Arc;
 use crate::core::error::Result;
 use crate::core::heap::TopK;
 use crate::core::metric::{Metric, Score};
-use crate::core::options::HnswParams;
+use crate::core::options::{HnswParams, VectorFormat};
 use crate::core::types::{RowId, SlotId};
-use crate::memory::index::{IndexNode, IndexSearch, MAX_INDEX_DEGREE, VectorIndex};
+use crate::memory::index::{
+    IndexNode, IndexSearch, MAX_INDEX_DEGREE, QuantCopy, QuantQuery, VectorIndex,
+};
 
 use super::filtered;
 use super::graph::Graph;
@@ -25,12 +27,16 @@ const BUILD_SEED: u64 = 0x4D4E_454D_4500_0001;
 const MAX_ROLL_LEVEL: usize = 31;
 
 /// 查询向量及其预计算范数平方;打包传参以避免在层搜索接口上堆叠参数。
+///
+/// `quant` 为段级量化查询形式(`Some` = 本次搜索走量化粗排;设计 08 §4)。
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct QueryRef<'a> {
     /// 查询向量。
     pub(crate) vector: &'a [f32],
     /// 查询向量范数平方(度量需要时)。
     pub(crate) norm_sq: f32,
+    /// 量化粗排预计算(`None` = 精确 f32)。
+    pub(crate) quant: Option<&'a QuantQuery>,
 }
 
 // 单测操作计数:统计距离计算次数(线程局部,避免测试间干扰)。
@@ -54,6 +60,8 @@ pub(crate) struct HnswIndex {
     ml: f32,
     ef_construction: usize,
     metric: Metric,
+    /// 段的量化副本(节点顺序与 `nodes` 对齐);`None` = 纯 f32。
+    quant: Option<QuantCopy>,
 }
 
 /// 分数与节点组成的可比较候选(按"越近键越大"排序)。
@@ -135,6 +143,34 @@ fn roll_level(rng: &mut Rng, ml: f32) -> u8 {
     }
 }
 
+/// 校验量化副本行数/单行长度与图节点、维度一致。
+///
+/// # Errors
+/// 副本格式为 `F32`、行数或单行长度不符、i8 参数表长度与维度不符时返回
+/// [`MnemeError::Corrupted`](crate::core::error::MnemeError::Corrupted)。
+fn validate_quant(quant: &Option<QuantCopy>, count: usize, dimension: usize) -> Result<()> {
+    let Some(copy) = quant else {
+        return Ok(());
+    };
+    let corrupt = |reason: &str| crate::core::error::MnemeError::Corrupted {
+        segment: None,
+        reason: format!("hnsw: {reason}"),
+    };
+    if copy.format == VectorFormat::F32 || copy.rows.len() != count {
+        return Err(corrupt("量化副本格式/行数与索引节点不符"));
+    }
+    let stride = copy.code_stride();
+    if copy.rows.iter().any(|row| row.len() != stride) {
+        return Err(corrupt("量化副本单行长度与维度不符"));
+    }
+    match copy.format {
+        VectorFormat::I8Rescored if copy.params.len() != dimension * 2 => {
+            Err(corrupt("i8 参数表长度与维度不符"))
+        }
+        _ => Ok(()),
+    }
+}
+
 impl HnswIndex {
     /// 由节点构建 HNSW 图(节点 id = 全局槽位 `0..nodes.len()` 的恒等映射)。
     ///
@@ -142,15 +178,18 @@ impl HnswIndex {
     #[cfg(test)]
     pub(crate) fn build(nodes: &[IndexNode], params: HnswParams, metric: Metric) -> Self {
         let slot_of: Vec<SlotId> = (0..nodes.len()).map(|id| SlotId::new(id as u32)).collect();
-        Self::build_with_slots(nodes, &slot_of, params, metric)
+        Self::build_with_slots(nodes, &slot_of, params, metric, None)
     }
 
     /// 由节点与显式槽位映射构建 HNSW 图(增量段用;`slot_of` 与 `nodes` 等长)。
+    ///
+    /// `quant` 只服务查询期粗排打分,图结构仍由 f32 向量构建(设计 08 §落地状态)。
     pub(crate) fn build_with_slots(
         nodes: &[IndexNode],
         slot_of: &[SlotId],
         params: HnswParams,
         metric: Metric,
+        quant: Option<QuantCopy>,
     ) -> Self {
         // 调用方(增量段装配)始终同源构造两个等长切片;取短边只是防御性兜底,
         // 保证 release 下绝不因内部装配失误越界 panic(FC-GLOBAL-ERR-001 口径)。
@@ -160,6 +199,8 @@ impl HnswIndex {
             "节点数与槽位映射必须等长(FC-INDEX-INV-007)"
         );
         let count = nodes.len().min(slot_of.len());
+        let dimension = nodes.first().map_or(0, |node| node.vector.len());
+        debug_assert!(validate_quant(&quant, count, dimension).is_ok());
         let m = (params.m.max(2) as usize).min(MAX_INDEX_DEGREE as usize);
         let m0 = (params.m0 as usize).max(m).min(MAX_INDEX_DEGREE as usize);
         let ef_construction = params.ef_construction.max(1) as usize;
@@ -173,6 +214,7 @@ impl HnswIndex {
             ml,
             ef_construction,
             metric,
+            quant,
         };
         let mut rng = Rng::new(BUILD_SEED);
         for position in 0..count {
@@ -187,15 +229,17 @@ impl HnswIndex {
 
     /// 由 hidx 字节载入图(节点顺序与 `nodes`/`slot_of` 对齐)。
     ///
-    /// 图参数以 hidx 头部为准;`metric` 取自库配置(建库即锁定)。
+    /// 图参数以 hidx 头部为准;`metric` 取自库配置(建库即锁定);`quant`
+    /// 为从 vsec qvec 区还原的段级副本。
     ///
     /// # Errors
-    /// hidx 解析失败或节点数不一致时返回结构化错误。
+    /// hidx 解析失败或节点数/量化副本不一致时返回结构化错误。
     pub(crate) fn load(
         bytes: &[u8],
         nodes: &[IndexNode],
         slot_of: &[SlotId],
         metric: Metric,
+        quant: Option<QuantCopy>,
     ) -> Result<Self> {
         let decoded = hidx::decode(bytes)?;
         if decoded.graph.node_count() != nodes.len() || slot_of.len() != nodes.len() {
@@ -204,6 +248,8 @@ impl HnswIndex {
                 reason: "hidx: 节点数与恢复槽位数不一致".to_string(),
             });
         }
+        let dimension = nodes.first().map_or(0, |node| node.vector.len());
+        validate_quant(&quant, nodes.len(), dimension)?;
         Ok(Self {
             nodes: nodes.to_vec(),
             slot_of: slot_of.to_vec(),
@@ -213,7 +259,34 @@ impl HnswIndex {
             ml: decoded.ml,
             ef_construction: decoded.ef_construction.max(1) as usize,
             metric,
+            quant,
         })
+    }
+
+    /// 为本次查询预计算段级量化形式;无副本或维度不符时返回 `None`(退 f32)。
+    pub(crate) fn quantize_query(&self, query: &[f32]) -> Option<QuantQuery> {
+        let copy = self.quant.as_ref()?;
+        match copy.format {
+            VectorFormat::F32 => None,
+            VectorFormat::I8Rescored => {
+                let params =
+                    crate::quant::scalar_i8::I8Params::from_table(&copy.params, copy.dimension())
+                        .ok()?;
+                crate::quant::scalar_i8::Query::new(query, &params)
+                    .ok()
+                    .map(QuantQuery::I8)
+            }
+            VectorFormat::F16 => {
+                #[cfg(feature = "quant-f16")]
+                {
+                    Some(QuantQuery::F16)
+                }
+                #[cfg(not(feature = "quant-f16"))]
+                {
+                    None
+                }
+            }
+        }
     }
 
     /// 节点 id 对应的全局槽位。
@@ -310,11 +383,22 @@ impl HnswIndex {
         node
     }
 
-    /// 节点-查询距离。
+    /// 节点-查询距离;量化副本存在且本次查询已预计算量化形式时走粗排。
     pub(crate) fn score_query(&self, query: QueryRef<'_>, node: u32) -> Score {
         #[cfg(test)]
         bump_dist_calls();
         let target = &self.nodes[node as usize];
+        if let (Some(prepared), Some(copy)) = (query.quant, self.quant.as_ref())
+            && let Some(codes) = copy.rows.get(node as usize)
+        {
+            return prepared.score(
+                self.metric,
+                query.vector,
+                query.norm_sq,
+                codes,
+                target.norm_sq,
+            );
+        }
         self.metric
             .score(query.vector, &target.vector, query.norm_sq, target.norm_sq)
     }
@@ -350,6 +434,7 @@ impl HnswIndex {
         let query = QueryRef {
             vector: &vector,
             norm_sq: self.nodes[node as usize].norm_sq,
+            quant: None,
         };
         let target = level as usize;
         let top = self.graph.entry_level as usize;
@@ -579,6 +664,7 @@ mod tests {
             filter: None,
             post_threshold: 0.1,
             brute_threshold: 0.001,
+            use_quant: false,
         });
         DIST_CALLS.with(std::cell::Cell::get)
     }
@@ -660,6 +746,7 @@ mod tests {
             filter: None,
             post_threshold: 0.1,
             brute_threshold: 0.001,
+            use_quant: false,
         });
         let hits = top.into_sorted_vec();
         assert_eq!(
@@ -693,7 +780,7 @@ mod tests {
         let bytes = index.serialize().expect("serialize");
         let slot_of: Vec<SlotId> = (0..3).map(SlotId::new).collect();
         // 图节点数 > 恢复槽位数。
-        let error = HnswIndex::load(&bytes, &nodes[..2], &slot_of[..2], Metric::Dot)
+        let error = HnswIndex::load(&bytes, &nodes[..2], &slot_of[..2], Metric::Dot, None)
             .err()
             .expect("节点数不一致必须拒绝载入");
         assert!(matches!(
@@ -701,7 +788,7 @@ mod tests {
             crate::core::error::MnemeError::Corrupted { .. }
         ));
         // `slot_of` 长度不一致同样拒绝。
-        let error = HnswIndex::load(&bytes, &nodes, &slot_of[..2], Metric::Dot)
+        let error = HnswIndex::load(&bytes, &nodes, &slot_of[..2], Metric::Dot, None)
             .err()
             .expect("槽位数不一致必须拒绝载入");
         assert!(matches!(
@@ -709,7 +796,7 @@ mod tests {
             crate::core::error::MnemeError::Corrupted { .. }
         ));
         // 边界对照:完全一致时可载入。
-        assert!(HnswIndex::load(&bytes, &nodes, &slot_of, Metric::Dot).is_ok());
+        assert!(HnswIndex::load(&bytes, &nodes, &slot_of, Metric::Dot, None).is_ok());
     }
 
     /// 构建确定性:同一输入两次构建产生逐字节相同的 hidx(设计 05 §4.4:固定种子串行构建,便于复现)。
@@ -739,7 +826,7 @@ mod tests {
         let empty = HnswIndex::build(&[], HnswParams::default(), Metric::Dot);
         assert_eq!(empty.node_count(), 0);
         let bytes = empty.serialize().expect("serialize empty");
-        assert!(HnswIndex::load(&bytes, &[], &[], Metric::Dot).is_ok());
+        assert!(HnswIndex::load(&bytes, &[], &[], Metric::Dot, None).is_ok());
         let alive = BitSet::default();
         let top = empty.search(&IndexSearch {
             query: &[1.0, 0.0],
@@ -750,6 +837,7 @@ mod tests {
             filter: None,
             post_threshold: 0.1,
             brute_threshold: 0.001,
+            use_quant: false,
         });
         assert!(top.into_sorted_vec().is_empty(), "空图不得返回任何命中");
 
@@ -769,6 +857,7 @@ mod tests {
                 filter: None,
                 post_threshold: 0.1,
                 brute_threshold: 0.001,
+                use_quant: false,
             })
             .into_sorted_vec();
         assert_eq!(hits.len(), 1, "单节点图必须返回唯一节点");

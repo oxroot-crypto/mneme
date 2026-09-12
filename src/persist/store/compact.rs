@@ -215,6 +215,8 @@ impl Store {
             merged.segment_id,
             input.keep_slots,
             merged.encoded.index.clone(),
+            merged.encoded.quant,
+            merged.encoded.recall_est,
         );
         ws.clear_edge_dirty();
         self.publish_manifest(new_manifest);

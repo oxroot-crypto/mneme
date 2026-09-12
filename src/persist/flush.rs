@@ -8,13 +8,16 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::core::bitset::BitSet;
-use crate::core::error::Result;
+use crate::core::error::{MnemeError, Result};
+use crate::core::heap::TopK;
+use crate::core::metric::Metric;
+use crate::core::options::VectorFormat;
 use crate::core::types::SlotId;
 use crate::memory::analysis::{
     BLOOM_INITIAL_CAPACITY, BloomSet, InvertedIndex, ZONE_BLOCK_ROWS, ZoneIndex,
 };
 use crate::memory::config::Config;
-use crate::memory::index::{IndexNode, VectorIndex};
+use crate::memory::index::{IndexNode, IndexSearch, QuantCopy, VectorIndex};
 use crate::memory::table::{SlotData, WriterState};
 use crate::persist::edges::EdgeData;
 use crate::persist::msec::{
@@ -54,9 +57,27 @@ pub(crate) struct EncodedSegment {
     pub(crate) entry_slot: u32,
     /// 段内入口层级(无索引时为 0)。
     pub(crate) entry_level: u8,
+    /// 段实际生效的量化格式(`F32` = 无副本或建段抽样已回退)。
+    pub(crate) quant: VectorFormat,
+    /// 建段抽样召回一致率估计(`None` = 无副本)。
+    pub(crate) recall_est: Option<f32>,
+}
+
+/// 量化建段决策:保留副本 / 回退 / 召回估计。
+struct QuantDecision {
+    /// 保留的副本(`None` = 无需量化或抽样不达标已回退)。
+    copy: Option<QuantCopy>,
+    /// 抽样一致率估计(仅保留副本时非空)。
+    recall_est: Option<f32>,
+    /// 是否因抽样不达标回退(调用方需重建无副本索引)。
+    fallback: bool,
 }
 
 /// 把写状态中指定槽位编码为 `vsec`/`msec`/`hidx` 与内存索引。
+///
+/// 量化开启时先建 f32 图再按当前配置生成副本,并以抽样一致率决定是否启用
+/// (不达标回退 f32,`FC-QUANT-INV-013`);图结构始终由 f32 构建,副本只服务
+/// 查询期粗排(设计 08 §落地状态)。
 ///
 /// # Errors
 /// 任一编解码、限额或索引构建失败时返回结构化错误。
@@ -67,6 +88,25 @@ pub(crate) fn build_segment(
     input: &SegmentBuildInput<'_>,
 ) -> Result<EncodedSegment> {
     let built = build_slots(ws, input.slots);
+    let planned = plan_quant(config, &built.vectors)?;
+    let mut built_index = build_index(ws, config, input.slots, planned.clone())?;
+    let decision = finalize_quant(config, ws, &built, input.slots, &built_index.index, planned)?;
+    if decision.fallback {
+        built_index = build_index(ws, config, input.slots, None)?;
+    }
+    let quant = decision
+        .copy
+        .as_ref()
+        .map_or(VectorFormat::F32, |copy| copy.format);
+    let quant_params: &[f32] = decision
+        .copy
+        .as_ref()
+        .map_or(&[][..], |copy| copy.params.as_slice());
+    let code_refs: Vec<&[u8]> = decision
+        .copy
+        .as_ref()
+        .map(|copy| copy.rows.iter().map(AsRef::as_ref).collect())
+        .unwrap_or_default();
     let vsec_bytes = vsec::encode(&VsecInput {
         dimension: config.dimension.get(),
         metric: config.metric,
@@ -74,6 +114,9 @@ pub(crate) fn build_segment(
         vectors: &built.vectors,
         norms: &built.norms,
         dead: &built.dead,
+        quant,
+        quant_params,
+        quant_codes: &code_refs,
     })?;
 
     let ns_stats = build_ns_stats(ws, config, input.slots);
@@ -98,7 +141,6 @@ pub(crate) fn build_segment(
         inverted: &indexes.inverted,
     })?;
 
-    let built_index = build_index(ws, config, input.slots)?;
     Ok(EncodedSegment {
         vsec: vsec_bytes,
         msec: msec_bytes,
@@ -106,7 +148,185 @@ pub(crate) fn build_segment(
         index: built_index.index,
         entry_slot: built_index.entry_slot,
         entry_level: built_index.entry_level,
+        quant,
+        recall_est: decision.recall_est,
     })
+}
+
+/// 按当前配置为段内向量生成量化副本;i8 逐维统计参数,`f32`/空段返回 `None`。
+fn plan_quant(config: &Config, vectors: &[&[f32]]) -> Result<Option<QuantCopy>> {
+    let format = config.quantization;
+    if format == VectorFormat::F32 || vectors.is_empty() {
+        return Ok(None);
+    }
+    let dimension = config.dimension.get() as usize;
+    match format {
+        VectorFormat::F32 => Ok(None),
+        VectorFormat::I8Rescored => {
+            let params = crate::quant::scalar_i8::build_params(vectors, dimension)?;
+            let table = params.table();
+            let rows = vectors
+                .iter()
+                .map(|vector| {
+                    Arc::<[u8]>::from(crate::quant::scalar_i8::encode_row(vector, &params))
+                })
+                .collect();
+            Ok(Some(QuantCopy {
+                format,
+                params: table,
+                rows,
+            }))
+        }
+        VectorFormat::F16 => {
+            #[cfg(feature = "quant-f16")]
+            {
+                let rows = vectors
+                    .iter()
+                    .map(|vector| Arc::<[u8]>::from(crate::quant::f16::encode_row(vector)))
+                    .collect();
+                Ok(Some(QuantCopy {
+                    format,
+                    params: Vec::new(),
+                    rows,
+                }))
+            }
+            #[cfg(not(feature = "quant-f16"))]
+            {
+                Err(MnemeError::Unsupported {
+                    feature: "quant-f16",
+                })
+            }
+        }
+    }
+}
+
+/// 抽样评估量化召回:一致率达标保留副本,不达标回退 f32(I13)。
+fn finalize_quant(
+    config: &Config,
+    ws: &WriterState,
+    built: &SegmentSlots<'_>,
+    included: &[usize],
+    index: &Option<Arc<dyn VectorIndex>>,
+    planned: Option<QuantCopy>,
+) -> Result<QuantDecision> {
+    let Some(copy) = planned else {
+        return Ok(QuantDecision {
+            copy: None,
+            recall_est: None,
+            fallback: false,
+        });
+    };
+    let Some(index) = index else {
+        return Err(MnemeError::Inconsistent {
+            reason: "量化建段缺少索引,无法抽样评估",
+        });
+    };
+    let estimate = estimate_recall(config, ws, built, included, index.as_ref())?;
+    if estimate < config.tuning.quant_recall_floor {
+        return Ok(QuantDecision {
+            copy: None,
+            recall_est: None,
+            fallback: true,
+        });
+    }
+    Ok(QuantDecision {
+        copy: Some(copy),
+        recall_est: Some(estimate),
+        fallback: false,
+    })
+}
+
+/// 建段抽样召回估计:同一 f32 图下,量化粗排 + f32 精排 top-k 与纯 f32 top-k
+/// 的平均一致率(等距抽样 `RECALL_SAMPLE_QUERIES` 条自查询)。
+fn estimate_recall(
+    config: &Config,
+    ws: &WriterState,
+    built: &SegmentSlots<'_>,
+    included: &[usize],
+    index: &dyn VectorIndex,
+) -> Result<f32> {
+    let node_count = index.node_count();
+    if node_count == 0 {
+        return Ok(1.0);
+    }
+    let mut alive = BitSet::default();
+    for &slot in included {
+        alive.set(slot);
+    }
+    let k = crate::quant::rescore::RECALL_TOP_K.min(node_count);
+    let candidate_cap =
+        crate::quant::rescore::coarse_candidates(k, config.tuning.rescore_oversample)
+            .min(node_count);
+    let indices = crate::quant::rescore::sample_indices(node_count);
+    let mut total = 0.0_f32;
+    for &node in &indices {
+        // 建图节点顺序与 `included` 一致(node id = 段内下标)。
+        let query = built.vectors[node];
+        let query_norm = if config.metric.needs_norm() {
+            crate::memory::search::norm_sq(query)
+        } else {
+            0.0
+        };
+        let reference = search_payloads(index, query, query_norm, &alive, k, config, false);
+        let coarse = search_payloads(
+            index,
+            query,
+            query_norm,
+            &alive,
+            candidate_cap,
+            config,
+            true,
+        );
+        let candidate = rescore_payloads(ws, config.metric, query, query_norm, &coarse, k);
+        let reference_ids: Vec<u64> = reference.iter().map(|(rowid, _)| rowid.get()).collect();
+        let candidate_ids: Vec<u64> = candidate.iter().map(|(rowid, _)| rowid.get()).collect();
+        total += crate::quant::rescore::agreement(&reference_ids, &candidate_ids);
+    }
+    Ok(total / indices.len() as f32)
+}
+
+/// 在段索引上搜索并返回排序后的 `(RowId, SlotId)` 列表(`use_quant` 控粗排口径)。
+fn search_payloads(
+    index: &dyn VectorIndex,
+    query: &[f32],
+    query_norm: f32,
+    alive: &BitSet,
+    k: usize,
+    config: &Config,
+    use_quant: bool,
+) -> Vec<(crate::core::types::RowId, SlotId)> {
+    let top = index.search(&IndexSearch {
+        query,
+        query_norm,
+        ef: config.hnsw.ef_search as usize,
+        k,
+        alive,
+        filter: None,
+        post_threshold: config.tuning.filter_post_threshold,
+        brute_threshold: config.tuning.filter_brute_threshold,
+        use_quant,
+    });
+    top.into_sorted_vec()
+}
+
+/// 对粗排候选按 f32 原向量精排,取 top-k(两阶段第二阶段)。
+fn rescore_payloads(
+    ws: &WriterState,
+    metric: Metric,
+    query: &[f32],
+    query_norm: f32,
+    coarse: &[(crate::core::types::RowId, SlotId)],
+    k: usize,
+) -> Vec<(crate::core::types::RowId, SlotId)> {
+    let mut top = TopK::new(k, metric);
+    for &(rowid, slot) in coarse {
+        let Some(data) = ws.slots.get(slot.get() as usize) else {
+            continue;
+        };
+        let score = metric.score(query, &data.vector, query_norm, data.norm_sq);
+        top.push(score, (rowid, slot));
+    }
+    top.into_sorted_vec()
 }
 
 /// 由写状态构造本次段物化需要的 delta 条目(访问计数 + 关系边净变更)。
@@ -328,9 +548,16 @@ struct BuiltIndex {
 
 /// 构建 HNSW 图并序列化为 hidx(无工厂或空段时各字段为空/零)。
 ///
+/// `quant` 为查询期粗排副本(图仍由 f32 构建);`None` 为纯 f32 段。
+///
 /// # Errors
 /// 图序列化失败(hidx 长度字段超出格式上限)时返回结构化错误。
-fn build_index(ws: &WriterState, config: &Config, included: &[usize]) -> Result<BuiltIndex> {
+fn build_index(
+    ws: &WriterState,
+    config: &Config,
+    included: &[usize],
+    quant: Option<QuantCopy>,
+) -> Result<BuiltIndex> {
     let Some(factory) = config.index_factory.as_ref() else {
         return Ok(BuiltIndex {
             bytes: None,
@@ -365,7 +592,7 @@ fn build_index(ws: &WriterState, config: &Config, included: &[usize]) -> Result<
             SlotId::new(u32::try_from(idx).expect("槽位下标必可转入 u32(FC-MEM-INV-004)"))
         })
         .collect();
-    let index = factory.build(&nodes, &slot_of, config.hnsw, config.metric);
+    let index = factory.build(&nodes, &slot_of, config.hnsw, config.metric, quant);
     let entry = index.entry();
     let bytes = index.serialize()?;
     Ok(BuiltIndex {

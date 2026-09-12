@@ -47,6 +47,17 @@ pub struct Tuning {
     /// **建库即锁定**:打开既有库时以 MANIFEST 记录值为准,本字段仅对新建库生效;
     /// 冲突值会被忽略,以保证索引分词与查询分词同口径(FC-PERSIST-POST-009)。
     pub stopwords: bool,
+    /// 两阶段粗排过采样倍率,默认 4。
+    ///
+    /// 粗排候选数 = `top_k × 本值`(与候选总数取小);再以 f32 原向量精排并按 f32
+    /// 分重排取 `top_k`(设计 08 §4.2;`FC-QUANT-INV-015`)。必须 ≥ 1。
+    pub rescore_oversample: usize,
+    /// 建段抽样召回一致率门槛,默认 0.98。
+    ///
+    /// 开量化建段时抽样的「量化粗排 top-k 与 f32 精排 top-k 一致率」低于本值时,
+    /// 该段自动回退为 f32 并如实反映在 `stats().quant`(I13)。取值须为有限且 ≥ 0;
+    /// `0.0` 表示关闭自动回退,`> 1` 表示恒回退(测试/强制关闭用)。
+    pub quant_recall_floor: f32,
 }
 
 impl Default for Tuning {
@@ -59,6 +70,8 @@ impl Default for Tuning {
             filter_post_threshold: 0.10,
             filter_brute_threshold: 0.001,
             stopwords: true,
+            rescore_oversample: crate::quant::rescore::DEFAULT_RESCORE_OVERSAMPLE,
+            quant_recall_floor: 0.98,
         }
     }
 }

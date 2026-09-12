@@ -8,16 +8,17 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::error::{MnemeError, Result};
 use crate::core::metric::Metric;
-use crate::core::options::{FsyncPolicy, Tuning};
+use crate::core::options::{FsyncPolicy, Tuning, VectorFormat};
 use crate::core::types::SlotId;
 use crate::memory::analysis::{BLOOM_INITIAL_CAPACITY, BloomSet, ZoneIndex};
-use crate::memory::index::{IndexFactory, IndexNode, VectorIndex};
+use crate::memory::index::{IndexFactory, IndexNode, QuantCopy, VectorIndex};
 use crate::memory::table::WriterState;
 use crate::persist::hook::FsyncHook;
 use crate::persist::manifest::Manifest;
 use crate::persist::recover;
 use crate::persist::storage::{self, FileLock, SEGMENTS_DIR, WAL_DIR};
 use crate::persist::trash;
+use crate::persist::vsec;
 use crate::persist::wal;
 
 use super::manifest_io;
@@ -359,6 +360,8 @@ fn load_hidx_indexes(
         let Some(hidx) = segment.hidx.as_ref() else {
             continue;
         };
+        let quant = load_quant_copy(segment)?;
+        let format = quant.as_ref().map_or(VectorFormat::F32, |copy| copy.format);
         match load_index(
             input.factory,
             hidx,
@@ -367,6 +370,7 @@ fn load_hidx_indexes(
                 remap: &remap.remap,
             },
             input.metric,
+            quant,
         ) {
             Ok(index) => {
                 let slots: Vec<SlotId> = remap
@@ -378,6 +382,8 @@ fn load_hidx_indexes(
                     segment.segment_id,
                     index,
                     slots,
+                    format,
+                    None,
                 ));
             }
             Err(error) if input.options.fail_fast_on_corruption => return Err(error),
@@ -388,6 +394,36 @@ fn load_hidx_indexes(
         }
     }
     Ok(Arc::new(indexes))
+}
+
+/// 从段 vsec 还原量化副本(行顺序 = 段内槽位顺序 = hidx 节点顺序)。
+///
+/// # Errors
+/// vsec 解析失败、行数与索引不一致,或 f16 段在未开 `quant-f16` 的构建上打开时
+/// 返回结构化错误(FC-QUANT-ERR-002)。
+fn load_quant_copy(segment: &recover::SegmentBytes) -> Result<Option<QuantCopy>> {
+    let view = vsec::parse(&segment.vsec)?;
+    let format = view.quant();
+    if format == VectorFormat::F32 {
+        return Ok(None);
+    }
+    crate::quant::ensure_format_supported(format)?;
+    let node_count = view.row_count() as usize;
+    let mut rows = Vec::with_capacity(node_count);
+    for row in 0..node_count {
+        let Some(codes) = view.quant_row(row) else {
+            return Err(MnemeError::Corrupted {
+                segment: Some(crate::core::types::SegmentId::new(segment.segment_id)),
+                reason: "vsec: 量化副本行缺失".to_string(),
+            });
+        };
+        rows.push(Arc::<[u8]>::from(codes));
+    }
+    Ok(Some(QuantCopy {
+        format,
+        params: view.quant_params(),
+        rows,
+    }))
 }
 
 /// 回放全部 WAL 文件(仅 seqno > watermark),并截断最后一个文件的撕裂尾部。
@@ -427,6 +463,7 @@ fn load_index(
     hidx: &[u8],
     slots: SlotRemap<'_>,
     metric: Metric,
+    quant: Option<QuantCopy>,
 ) -> Result<Arc<dyn VectorIndex>> {
     let mut nodes = Vec::with_capacity(slots.remap.len());
     let mut slot_of = Vec::with_capacity(slots.remap.len());
@@ -446,7 +483,7 @@ fn load_index(
         });
         slot_of.push(SlotId::new(global));
     }
-    factory.load(hidx, &nodes, &slot_of, metric)
+    factory.load(hidx, &nodes, &slot_of, metric, quant)
 }
 
 #[cfg(test)]
@@ -491,6 +528,7 @@ mod tests {
             _slot_of: &[SlotId],
             _params: HnswParams,
             _metric: Metric,
+            _quant: Option<QuantCopy>,
         ) -> Arc<dyn VectorIndex> {
             Arc::new(StubIndex)
         }
@@ -505,6 +543,7 @@ mod tests {
             _nodes: &[IndexNode],
             _slot_of: &[SlotId],
             _metric: Metric,
+            _quant: Option<QuantCopy>,
         ) -> Result<Arc<dyn VectorIndex>> {
             Ok(Arc::new(StubIndex))
         }
@@ -524,6 +563,7 @@ mod tests {
                 remap: &[0],
             },
             Metric::Dot,
+            None,
         )
         .err()
         .expect("重排映射越界必须拒绝载入");

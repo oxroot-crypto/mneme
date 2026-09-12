@@ -12,7 +12,7 @@ use crate::core::types::SegmentId;
 use crate::life::compact::{self, SegmentInfo};
 use crate::memory::engine::Mneme;
 use crate::memory::ops::{
-    CheckReport, CompactionControl, HistoryStat, NsStat, QuantStat, Stats, StorageStat,
+    CheckReport, CompactionControl, HistoryStat, NsStat, QuantStat, SegmentStat, Stats, StorageStat,
 };
 use crate::memory::table::{ReaderView, WriterState};
 
@@ -69,6 +69,29 @@ fn dead_ratios(view: &ReaderView, now: i64) -> HashMap<u32, f32> {
         .collect()
 }
 
+/// 汇总量化运行状态:`active` 取实际存在副本的格式(无副本 = `F32`,绝不回显
+/// 配置);`recall_est` 取各段建段抽样估计的最小值(重开库后为 `None`,I13)。
+fn quant_stat(configured: VectorFormat, segments: &[SegmentStat]) -> QuantStat {
+    let mut active = VectorFormat::F32;
+    let mut recall_est: Option<f32> = None;
+    for segment in segments {
+        if segment.quant == VectorFormat::F32 {
+            continue;
+        }
+        if active == VectorFormat::F32 {
+            active = segment.quant;
+        }
+        if let Some(estimate) = segment.recall_est {
+            recall_est = Some(recall_est.map_or(estimate, |current| current.min(estimate)));
+        }
+    }
+    QuantStat {
+        configured,
+        active,
+        recall_est,
+    }
+}
+
 impl Mneme {
     /// 返回运行统计。
     ///
@@ -103,6 +126,7 @@ impl Mneme {
                 segment.dead_ratio = *ratio;
             }
         }
+        let quant = quant_stat(self.config.quantization, &store.segments);
         Ok(Stats {
             segments: store.segments,
             wal_bytes: store.wal_bytes,
@@ -112,14 +136,7 @@ impl Mneme {
             trash_bytes: store.trash_bytes,
             query_latency: self.table.latency_histogram(),
             per_namespace,
-            quant: QuantStat {
-                configured: self.config.quantization,
-                // L6 未落地:量化副本与两阶段检索尚无实现,存储/检索实际恒为 F32;
-                // `active` 必须反映实际生效格式,绝不回显用户配置(设计 08 §3/§8、
-                // 契约 FC-QUANT-ERR-001 仍为 Planned)。
-                active: VectorFormat::F32,
-                recall_est: None,
-            },
+            quant,
             compaction: self.control.state(),
             retain: self.table.retain_report(),
             relations,

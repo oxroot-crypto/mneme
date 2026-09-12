@@ -55,10 +55,28 @@ impl Metric {
     /// assert_eq!(Metric::Dot.score(&[1.0, 2.0], &[3.0, 4.0], 0.0, 0.0), 11.0);
     /// ```
     pub fn score(&self, a: &[f32], b: &[f32], a_norm: f32, b_norm: f32) -> Score {
+        self.score_from_dot(simd::dot(a, b), a_norm, b_norm)
+    }
+
+    /// 由**已算好的点积**按本度量口径折算分数。
+    ///
+    /// L6 量化粗排复用同一折算口径(仅点积为近似值),保证粗排分与精排分同向可比:
+    /// `Dot` 直通点积;`Cosine` 除以范数乘积(零向量返回 0);`Euclidean` 返回
+    /// `‖a‖² + ‖b‖² − 2·a·b`。
+    ///
+    /// # Arguments
+    ///
+    /// * `dot` - 两向量的点积(量化路径下为近似值)。
+    /// * `a_norm`、`b_norm` - 两向量的**范数平方**。
+    ///
+    /// # Returns
+    ///
+    /// 与 [`Metric::score`] 同口径的分数。
+    pub(crate) fn score_from_dot(&self, dot: f32, a_norm: f32, b_norm: f32) -> Score {
         match self {
-            Metric::Dot => simd::dot(a, b),
-            Metric::Cosine => cosine(a, b, a_norm, b_norm),
-            Metric::Euclidean => euclidean_sq(a, b, a_norm, b_norm),
+            Metric::Dot => dot,
+            Metric::Cosine => cosine_from_dot(dot, a_norm, b_norm),
+            Metric::Euclidean => a_norm + b_norm - 2.0 * dot,
         }
     }
 
@@ -135,11 +153,25 @@ impl Metric {
 /// assert!((s - 0.8).abs() < 1e-6);
 /// ```
 pub fn cosine(a: &[f32], b: &[f32], a_norm: f32, b_norm: f32) -> Score {
+    cosine_from_dot(simd::dot(a, b), a_norm, b_norm)
+}
+
+/// 由点积折算余弦相似度(量化粗排与精确路径共用)。
+///
+/// # Arguments
+///
+/// * `dot` - 两向量的点积(量化路径下为近似值)。
+/// * `a_norm`、`b_norm` - 两向量的范数平方。
+///
+/// # Returns
+///
+/// `dot / (‖a‖·‖b‖)`;分母低于 `COSINE_EPSILON` 时返回 `0`。
+pub(crate) fn cosine_from_dot(dot: f32, a_norm: f32, b_norm: f32) -> Score {
     let denominator = (a_norm * b_norm).sqrt();
     if denominator < COSINE_EPSILON {
         0.0
     } else {
-        simd::dot(a, b) / denominator
+        dot / denominator
     }
 }
 

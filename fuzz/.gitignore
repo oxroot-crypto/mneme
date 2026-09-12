@@ -1,0 +1,6 @@
+# cargo-fuzz 产物(本地生成,不提交)
+target/
+corpus/
+artifacts/
+coverage/
+Cargo.lock

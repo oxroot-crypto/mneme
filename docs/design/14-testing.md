@@ -190,10 +190,14 @@ BM25 统计范围:同段内混入两个命名空间的文档,断言对命名空�
 ### 3.2 量化分数口径与自动回退(I12,I13)
 
 ```text
-I12: 量化模式下每个 Hit.score == 对同一候选用 f32 重算的分数(逐位/容差内相等)
-I13: 注入一个"召回劣化"的假量化器 → 建库基准不达标 → 断言自动回退 f32,
-     且 stats() 的量化状态显示已回退
+I12: 量化模式下每个 Hit.score == 对同一候选用 f32 重算的分数(逐位相等)
+I13: 把 Tuning.quant_recall_floor 设为不可达值(> 1)→ 建段抽样一致率必然不达标 →
+     断言该段自动回退 f32、不写 qvec,且 stats().quant 显示 configured/active 差异
 ```
+
+> **L6 落地状态(2026-09)**:I12/I13/I14 与召回损失 ≤2% 由
+> `tests/l6_contracts.rs` 验收(含 qvec 往返/损坏、compaction 重写、f16 feature 门控);
+> 离线 1 万查询基准未接线,微缩确定性回归见 `quantized_two_stage_recall_loss_within_two_percent`。
 
 ### 3.3 async 与 sync 等价(I14)
 
@@ -253,8 +257,10 @@ as_of(删除前) 在 compaction 回收该版本前仍能看到 A→B(双时态�
 
 > **L3 落地状态**:`benches/hnsw.rs` 已提供建库吞吐与查询延迟两项 criterion 基准
 > (当前为 1k/8k×64 维微缩样本,1M×1536 门槛待 heavy 档);召回门槛由
-> `tests/hnsw_contracts.rs` 以微缩双分布验收(见 §3)。**冷启动门槛尚未兑现**——L3 的
-> mmap 只是段读取路径优化,恢复仍整段载入,真正"惰性驻留"待 L6 段句柄重构
+> `tests/hnsw_contracts.rs` 以微缩双分布验收(见 §3)。**L6 落地状态(2026-09)**:
+> `benches/quant.rs` 增 f32 vs i8 查询/建库微缩对照;量化召回损失由
+> `tests/l6_contracts.rs` 以确定性簇状数据验收。**冷启动门槛尚未兑现**——L3 的
+> mmap 只是段读取路径优化,恢复仍整段载入,真正"惰性驻留"待段句柄重构
 > (见 [05 §10](05-l3-hnsw.md))。
 
 基线入库(`benches/` + 夜间趋势图),回归 > 10% 阻断合并。
@@ -270,6 +276,11 @@ as_of(删除前) 在 compaction 回收该版本前仍能看到 A→B(双时态�
 cargo-fuzz 目标:`fuzz_vsec`、`fuzz_msec`、`fuzz_hidx`、`fuzz_wal_replay`、`fuzz_dsl`。
 断言统一:**任意输入不 panic、不 UB、不无限循环**;解析失败必须返回结构化错误
 (I7:DSL 任意输入不 panic)。
+
+> **L6 落地状态(2026-09)**:`fuzz/` 五个目标已搭起,经主 crate 的
+> `feature = "fuzzing"` 暴露 `src/fuzzing.rs` 解析入口;`fuzz/` 是独立 workspace,
+> 需 nightly 工具链 + `cargo-fuzz`,`cargo test` 不编译它。仓库内以
+> `src/fuzzing.rs` 的冒烟单测保证入口不 panic;正式 1h/24h 长跑待本地/CI 执行。
 
 **版本注入**(I18):在上述解码目标中随机改写文件头 `format_version` 为任意不同值,
 断言返回 `UnsupportedVersion` 而非继续解析;改写为魔数不符的值,断言 `Corrupted`。

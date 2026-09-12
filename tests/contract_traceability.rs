@@ -38,6 +38,8 @@ const HNSW_TESTS: &str = include_str!("hnsw_contracts.rs");
 const L4_TESTS: &str = include_str!("l4_contracts.rs");
 /// L5 契约验收测试(多段增量 flush/delta/WAL 轮转/多图检索)。
 const L5_TESTS: &str = include_str!("l5_contracts.rs");
+/// L6 契约验收测试(量化副本/两阶段检索/自动回退/async 门面)。
+const L6_TESTS: &str = include_str!("l6_contracts.rs");
 /// 承载操作计数单测的源码文件。
 const SRC_SEARCH: &str = include_str!("../src/memory/search.rs");
 const SRC_TABLE: &str = include_str!("../src/memory/table/state.rs");
@@ -109,9 +111,13 @@ const SRC_PRED_EVAL: &str = include_str!("../src/memory/pred_eval.rs");
 const SRC_MEMORY_OPS: &str = include_str!("../src/memory/ops.rs");
 /// L2 增量 flush/备份源码(硬链接回退单测被 POST 契约引用)。
 const SRC_STORE_SNAPSHOT: &str = include_str!("../src/persist/store/snapshot.rs");
+/// L6 量化原语入口源码(feature 门控单测被 ERR 契约引用)。
+const SRC_QUANT_MOD: &str = include_str!("../src/quant/mod.rs");
+/// L6 i8 量化源码(误差界单测被 POST 契约引用)。
+const SRC_QUANT_I8: &str = include_str!("../src/quant/scalar_i8.rs");
 
 /// 契约测试文件(孤立检查与覆盖声明检查的范围)。
-const CONTRACT_TEST_FILES: [(&str, &str); 9] = [
+const CONTRACT_TEST_FILES: [(&str, &str); 10] = [
     ("tests/core_contracts.rs", CORE_TESTS),
     ("tests/memory_contracts.rs", MEMORY_TESTS),
     ("tests/query_contracts.rs", QUERY_TESTS),
@@ -121,10 +127,11 @@ const CONTRACT_TEST_FILES: [(&str, &str); 9] = [
     ("tests/hnsw_contracts.rs", HNSW_TESTS),
     ("tests/l4_contracts.rs", L4_TESTS),
     ("tests/l5_contracts.rs", L5_TESTS),
+    ("tests/l6_contracts.rs", L6_TESTS),
 ];
 
 /// 契约引用的测试可能落在的全部文件(路径必须与 `contracts.md` 中书写一致)。
-const SOURCES: [(&str, &str); 49] = [
+const SOURCES: [(&str, &str); 52] = [
     ("tests/core_contracts.rs", CORE_TESTS),
     ("tests/memory_contracts.rs", MEMORY_TESTS),
     ("tests/query_contracts.rs", QUERY_TESTS),
@@ -134,6 +141,7 @@ const SOURCES: [(&str, &str); 49] = [
     ("tests/hnsw_contracts.rs", HNSW_TESTS),
     ("tests/l4_contracts.rs", L4_TESTS),
     ("tests/l5_contracts.rs", L5_TESTS),
+    ("tests/l6_contracts.rs", L6_TESTS),
     ("src/memory/search.rs", SRC_SEARCH),
     ("src/memory/table/state.rs", SRC_TABLE),
     ("src/memory/lifecycle.rs", SRC_LIFECYCLE),
@@ -174,6 +182,8 @@ const SOURCES: [(&str, &str); 49] = [
     ("src/persist/edges.rs", SRC_PERSIST_EDGES),
     ("src/memory/ops.rs", SRC_MEMORY_OPS),
     ("src/persist/store/snapshot.rs", SRC_STORE_SNAPSHOT),
+    ("src/quant/mod.rs", SRC_QUANT_MOD),
+    ("src/quant/scalar_i8.rs", SRC_QUANT_I8),
 ];
 
 /// 契约编号的类型段(五维 + CPLX,见 `contracts.md` §0)。

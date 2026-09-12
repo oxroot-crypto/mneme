@@ -23,8 +23,8 @@ Mneme 采用**渐进式分层设计**:自底向上共 7 层(L0–L6),每层只�
 
 ```mermaid
 flowchart TD
-    F["门面层 lib.rs<br/>Mneme / Namespace / Builder<br/>(async 门面为 L6 规划)"]
-    Q["L6 打磨层 quant/<br/>量化 + 重打分 · async 门面 · 基准<br/>(规划)"]
+    F["门面层 lib.rs<br/>Mneme / Namespace / Builder<br/>(feature async 提供 AsyncNamespace)"]
+    Q["L6 打磨层 quant/<br/>量化副本 + 两阶段重打分 · async 门面 · 基准"]
     L["L5 生命周期层 life/<br/>TTL · 遗忘曲线 · compaction<br/>命名空间 · 快照备份"]
     QL["L4 检索层 query/<br/>过滤 DSL · BM25 · RRF 融合 · 去重"]
     H["L3 索引层 index/<br/>自研 HNSW · 过滤感知搜索 · mmap"]
@@ -57,7 +57,7 @@ flowchart TD
 | L3 索引层 | 同一 API 下暴力→HNSW 无感升级 | [05-l3-hnsw.md](design/05-l3-hnsw.md) |
 | L4 检索层 | 过滤 + BM25 混合检索 + 去重 | [06-l4-query.md](design/06-l4-query.md) |
 | L5 生命周期 | "超长期"闭环:段数有界、安全遗忘 | [07-l5-life.md](design/07-l5-life.md) |
-| L6 打磨 | 量化提速、async 门面、性能达标 | [08-l6-quant.md](design/08-l6-quant.md) |
+| L6 打磨 | 量化提速(i8/f16 + 两阶段)、async 门面 | [08-l6-quant.md](design/08-l6-quant.md) |
 | 记忆模型 | 关系图、双时态 `as_of`(历史默认永久保留)、来源/可信度、沉淀 | [09-memory-model.md](design/09-memory-model.md) |
 | 排序层 | 相似度+新鲜度+重要度+访问+可信度+联想 | [10-scoring.md](design/10-scoring.md) |
 | 存储安全 | 可选静态加密、文本压缩 | [11-security-storage.md](design/11-security-storage.md) |

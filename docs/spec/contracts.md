@@ -39,6 +39,7 @@
 
 | 日期 | 变更 |
 |---|---|
+| 2026-09 | 启动并落地 L6 打磨层(量化 + 两阶段检索 + async 门面):① 新增 `src/quant/`(i8 每维 `(v_min,v_max)` 编解码与粗排点积、f16(feature `quant-f16`)、两阶段候选预算与召回抽样);② vsec 段格式升 `0x0005`,新增 qvec 区(布局见 `FC-QUANT-POST-002`),`quant` 字节 0=F32/1=i8/2=f16;③ 两阶段检索(粗排候选 = `top_k × Tuning.rescore_oversample`,默认 4 倍;精排恒回退 f32 原向量并**按 f32 分重排**,修复粗排次序泄漏)+ 建段抽样召回门槛(`Tuning.quant_recall_floor`,默认 0.98)不达标自动回退;④ `feature = "async"` 提供 `AsyncNamespace`(`spawn_blocking` 薄包装,核心零 tokio),点读返回加法性新类型 `StoredRecord`(`RecordRef::to_stored` 同步可用);⑤ 新增 `tests/l6_contracts.rs`、`benches/quant.rs` 与 `fuzz/` 骨架(feature `fuzzing` 暴露解析入口);⑥ 新增 `FC-QUANT-PRE-001`、`FC-QUANT-POST-001..004`、`FC-QUANT-INV-015`、`FC-QUANT-ERR-002/003`,转正 `FC-QUANT-INV-012/013/014`、`FC-QUANT-ERR-001`、`FC-QUANT-CPLX-001/002`;⑦ `src/quant/` 为纯原语模块(无 I/O/锁/全局态,依赖等级同 L0),依赖例外与取舍登记于 08 §落地状态;⑧ 段句柄重构(惰性驻留/冷启动)与 1M×1536 门槛、fuzz 长跑仍属 CI/后续收尾 |
 | 2026-09 | `/rust-check` 规范审计整改(第八轮):① 新增 `FC-SCORE-POST-005` 结果级去重契约(`Off`/`ById`/`Near`;`Near.threshold` 须为 `[0,1]` 内有限值,`execute()` 入口非法即 `Config`,修复 `NaN` 静默空转)并补 1:1 测试;② `src/query/parse/mod.rs` → `src/query/parse.rs`(`mod.rs` 只做组织,规范 §3),追溯门禁与文档路径同步;③ 公开 API rustdoc 段落补全 48 处(`# Returns`/`# Arguments`),订正 `Mneme::close` 的 `# Errors`;④ criterion `0.5` → `0.8`(`black_box` 改 `std::hint`,`Cargo.lock` 同步);⑤ `iso.rs` 公历算法魔数常量化;⑥ 16 §4 panic 例外补记 `wal::codec::encode_frame`;⑦ 已知偏差登记:`state.rs`/`flush.rs`/`hnsw.rs`/`open.rs`/`snapshot.rs`/`engine_ops.rs`/`exec.rs` 7 个生产文件仍超 400 行、`wal/mod.rs` 含 `FrameKind` 映射,拆分留待单独重构(不改变行为) |
 | 2026-09 | 独立文档审查整改(第七轮):① **修复联想扩展跨命名空间泄漏**——扩展器只沿同命名空间边推进,跨命名空间边视为不存在(`FC-SCORE-POST-004` 新增,回归 `tests/query_contracts.rs::expansion_does_not_cross_namespaces`);扩展访问上限改为 `visited`+结果合计(空间 `O(max_nodes+seeds)`,`FC-SCORE-CPLX-002` 同步);② `QuantStat.active` 不再回显用户配置(L6 未落地时恒为 `F32`),`StorageStat` 口径改为「压缩配置已接线、实现待 L11」;③ `FC-SCORE-CPLX-001/002/003` 按 §9.3 回填解析证明 + 哨兵并转 `Passed`(001 含排序为 $O(m\log m)$、002 空间 `max_nodes+seeds`、003 为未缓存 $O(mk^2d)$);④ `FC-PERSIST-POST-010` 排序键由 `(target, seqno)` 修正为 `(target, seqno, kind)`(实现与注释同步);⑤ 设计文档(`00`–`16`)、`docs/DESIGN.md` 与 `docs/rust` 教学文档漂移同步(量化/Drop 语义/模块清单/行号引用等) |
 | 2026-09 | 文档最终收尾(第六轮):修正 WAL `Insert` 负载字段序(`[i64 tx_ms][u32 dim][f32×dim]`)、`Delete` 保留帧措辞、`Builder::mmap(false)` 伪 API、mmap 口径统一(§11/§13)、`TouchRow` 帧名、`list_namespaces` 口径、zone map 17 B、版本「过新→不一致」措辞、feature 表标注(当前仅 `mmap` 已定义)、`Scoring` 链式示例改结构体字面量、README 规划项标注、`brute_force_max_rows`「不超过」分派口径;`wal_capacity_triggers_snapshot_flush` 改名 `wal_capacity_triggers_incremental_flush`(契约同步);`storage`/`index`/`source`/`builder` 过时注释清理 |
@@ -103,7 +104,7 @@
 | 变体 | 触发条件 | 对应 FC | 备注 |
 |---|---|---|---|
 | `Io` | 底层 I/O 失败 | — | `#[from] std::io::Error` |
-| `Corrupted { segment, reason }` | CRC/魔数不符等数据损坏(msec `delta` 区畸形见 FC-PERSIST-ERR-011) | FC-CORE-ERR-001、FC-INDEX-ERR-001、FC-INDEX-ERR-002、FC-PERSIST-ERR-011 | `segment=None` 表示文件级损坏 |
+| `Corrupted { segment, reason }` | CRC/魔数不符等数据损坏(msec `delta` 区畸形见 FC-PERSIST-ERR-011;vsec qvec 区畸形见 FC-QUANT-ERR-003) | FC-CORE-ERR-001、FC-INDEX-ERR-001、FC-INDEX-ERR-002、FC-PERSIST-ERR-011、FC-QUANT-ERR-003 | `segment=None` 表示文件级损坏 |
 | `DimensionMismatch { expected, got }` | 向量长度 ≠ 建库维度(写/查) | FC-GLOBAL-PRE-001、FC-MEM-PRE-001/004 | |
 | `MetricMismatch { existing, requested }` | 打开时度量与库中记录不符 | — | 保留,L2 起使用 |
 | `KeyMismatch { expected, got }` | `supersede` 的新记录自带 key 与目标 key 冲突(信念修订须沿用同一 key) | FC-MODEL-POST-003 | 新记录省略 key 时继承目标 key |
@@ -118,7 +119,7 @@
 | `LimitExceeded { field, limit, got }` | 参数越上限(维度、`top_k`、`ef`、`ef_search`、HNSW 度数) | FC-CORE-PRE-001、FC-GLOBAL-PRE-004、FC-MEM-PRE-003、FC-INDEX-PRE-001 | 原 `Invalid("top_k 超过上限")` 等 |
 | `MetaTooDeep { limit, got }` | metadata 嵌套深度超限 | FC-GLOBAL-PRE-003、FC-MEM-PRE-002 | 原 `Invalid("metadata 嵌套过深")` |
 | `Config { reason }` | 建库/查询配置非法(缺维度、无查询通道、MMR `lambda` 非有限值、`Fusion` 未同时启用双通道、`Weighted.alpha` 越界或非有限)、策略参数含非有限值(`min_importance`/`access_weight`/`threshold`/`dedup_threshold`)或越界(`dedup_threshold`/`threshold` ∉ [0,1])或非法(`max_cluster = 0`)、HNSW 参数域非法(`m < 2`/`m0 < m`/`ef_construction = 0`/`ef_search = 0`/过滤阈值越界或 `brute > post`)、命名空间路径深度超 `Limits.ns_depth` 或含非法字符(首次写入时,`namespace()` 本身不返回 `Result`) | FC-MEM-STA-001、FC-MEM-PRE-003、FC-MODEL-POST-006、FC-LIFE-POST-002、FC-LIFE-POST-005、FC-GLOBAL-PRE-004、FC-INDEX-PRE-001、FC-MEM-ERR-002 | 原 `Invalid("新建内存库必须指定维度")` 等 |
-| `Unsupported { feature }` | 能力延后到后续层,绝不静默降级(持久库 `backup_to` 已在 L2 落地;只读模式写亦返回本变体;L4 起 `text`/`Fusion` 已实现,见 FC-MEM-ERR-002) | FC-MEM-ERR-002、FC-PERSIST-ERR-003 | 只读写、**纯内存库** backup |
+| `Unsupported { feature }` | 能力延后到后续层,绝不静默降级(持久库 `backup_to` 已在 L2 落地;只读模式写亦返回本变体;L4 起 `text`/`Fusion` 已实现,见 FC-MEM-ERR-002);L6 量化门控见 FC-QUANT-ERR-001/002 | FC-MEM-ERR-002、FC-PERSIST-ERR-003、FC-QUANT-ERR-001、FC-QUANT-ERR-002 | 只读写、**纯内存库** backup、量化 feature/纯内存限制 |
 | `Inconsistent { reason }` | 内部不变量被破坏 | FC-MEM-INV-004 | 原 `Invalid("去重命中但记录不可见")` |
 
 ---
@@ -306,12 +307,24 @@
 
 ## 6. 量化与门面(quant)
 
+> `src/quant/` 是纯原语模块(无 I/O、无锁、无全局态;依赖等级同 L0,见 08 §落地状态);
+> 量化副本随段同生同灭:flush/compaction 按当前配置写 `vsec` qvec 区,f32 原向量始终保留
+> 供精排(两阶段检索)。纯内存库无段,配置量化在构造期返回 `Unsupported`。
+
 | 编号 | 类型 | 形式化规范 | 对应测试 | 状态 |
 |---|---|---|---|---|
-| FC-QUANT-INV-012 | INV | **I12**:量化模式 `Hit.score` = f32 精排分 | 待补 | Planned |
-| FC-QUANT-INV-013 | INV | **I13**:召回不达标自动回退 f32,`stats()` 可见 | 待补 | Planned |
-| FC-QUANT-INV-014 | INV | **I14**:async 与 sync API 等价(共享同一写锁) | 待补 | Planned |
-| FC-QUANT-ERR-001 | ERR | 未开 `quant-f16` 时 `VectorFormat::F16` 构造期返回 `Unsupported`,不静默降级 | 待补 | Planned |
+| FC-QUANT-PRE-001 | PRE | `Tuning.rescore_oversample ≥ 1`;`Tuning.quant_recall_floor` 为有限值且 `≥ 0`(`> 1` 表示恒回退,供测试/强制关闭);`quantization != F32` 且未设置 `path`(纯内存库)于构造期返回 `Unsupported`(FC-QUANT-ERR-002);非法值返回 `Config` | `tests/l6_contracts.rs::in_memory_quantization_is_unsupported`、`tests/l6_contracts.rs::invalid_tuning_rejects_quantization_knobs` | Passed |
+| FC-QUANT-POST-001 | POST | i8 每维线性量化误差上界 `\|x − x̂\| ≤ Δ/2`(`Δ = (v_max−v_min)/255`;`v_max = v_min` 时 `x̂ = v_max`);编码码值恒在 `[0,255]`;解码与编码使用同一张段级逐维表 | `src/quant/scalar_i8.rs::encode_error_within_half_delta` | Passed |
+| FC-QUANT-POST-002 | POST | vsec v5 qvec 区:i8 = `2d` 个 f32 `(v_min,v_max)` 交错表(LE) + `row_count × d` 字节码;f16 = `row_count × 2d` 字节;`encode → parse → VsecView` 往返逐位一致,payload CRC 覆盖 qvec 区 | `src/persist/vsec.rs::vsec_i8_quantized_roundtrip`、`tests/l6_contracts.rs::i8_qvec_roundtrip_after_reopen` | Passed |
+| FC-QUANT-POST-003 | POST | 开启量化后 flush 与 compaction 均按**当前** `quantization` 写/重写副本(格式迁移零特殊逻辑);f32 原向量始终保留,`Hit.score` 走 f32 精排 | `tests/l6_contracts.rs::compaction_rewrites_quantized_copies` | Passed |
+| FC-QUANT-POST-004 | POST | 量化两阶段检索相对 f32 检索的 Recall@10 损失 ≤ 2%(小规模确定性数据;离线 1M×1536 门槛见 14 §4) | `tests/l6_contracts.rs::quantized_two_stage_recall_loss_within_two_percent` | Passed |
+| FC-QUANT-INV-012 | INV | **I12**:量化模式 `Hit.score` = f32 精排分 | `tests/l6_contracts.rs::quantized_hit_score_matches_f32_exact` | Passed |
+| FC-QUANT-INV-013 | INV | **I13**:建段抽样一致率 < `quant_recall_floor` → 该段自动回退 F32(不写 qvec),`stats().quant` 的 `configured`/`active`/`recall_est` 如实反映 | `tests/l6_contracts.rs::unreachable_recall_floor_falls_back_to_f32`、`tests/l6_contracts.rs::quantized_segment_reports_recall_estimate` | Passed |
+| FC-QUANT-INV-014 | INV | **I14**:async 与 sync API 等价(共享同一写锁;同操作序列产生相同状态与错误) | `tests/l6_contracts.rs::async_and_sync_namespace_sequences_are_equivalent` | Passed |
+| FC-QUANT-INV-015 | INV | 两阶段粗排候选数 `≤ min(top_k × rescore_oversample, 候选总数)`;精排一律基于 f32 原向量并按 f32 分重排,不复用量化序 | `src/memory/search.rs::coarse_candidates_respect_rescore_cap` | Passed |
+| FC-QUANT-ERR-001 | ERR | 未开 `quant-f16` 时 `VectorFormat::F16` 构造期返回 `Unsupported { feature: "quant-f16" }`,不静默降级;`F32`/`I8Rescored` 不依赖 feature | `tests/l6_contracts.rs::f16_requires_feature_at_build`、`tests/l6_contracts.rs::f16_roundtrip_when_feature_enabled`、`src/quant/mod.rs::format_support_matches_feature_gate` | Passed |
+| FC-QUANT-ERR-002 | ERR | 纯内存库(`Builder` 无 `path`)配置 `F16`/`I8Rescored` → 构造期 `Unsupported`;打开含 f16 段而当前构建未开 `quant-f16` → `Unsupported`,绝不静默按 f32 服务 | `tests/l6_contracts.rs::in_memory_quantization_is_unsupported`、`src/quant/mod.rs::format_support_matches_feature_gate` | Passed |
+| FC-QUANT-ERR-003 | ERR | vsec qvec 区未知 `quant` 编码、长度与头不符、非有限/失序的逐维表 → `Corrupted`,绝不部分解析 | `tests/l6_contracts.rs::qvec_corruption_is_detected`、`src/persist/vsec.rs::vsec_rejects_unknown_quant_code`、`src/persist/vsec.rs::vsec_rejects_malformed_i8_params` | Passed |
 
 ---
 
@@ -404,12 +417,12 @@
 | 编号 | 类型 | 形式化规范(时间 / 空间) | 对应测试 / 基准 | 状态 |
 |---|---|---|---|---|
 | FC-PERSIST-CPLX-001 | CPLX | WAL 提交:单条 $O(1)$ 内存追加;组提交 $N$ 条 $O(N)$ 追加 + **1 次** fsync/批;空间顺序写 | 操作计数单测 `tests/persist_contracts.rs::batch_insert_uses_single_fsync`(整批 Fsync 动作数 = 1) | Passed |
-| FC-PERSIST-CPLX-002 | CPLX | WAL 回放(`wal::visit_frames`):时间 $O(\text{有效帧})$;空间 $O(1)$ 流式(批内帧缓冲 ≤ 单批帧数)。注:`Store::open` 当前将 WAL 整文件读入内存后再流式回放,该路径空间 $O(\text{WAL 字节})$(mmap 读路径优化已随 L3 落地;真正惰性驻留待 L6 段句柄重构) | 解析证明(设计 04 §3.4;`wal::visit_frames` 逐帧回调不物化)+ 哨兵 `src/persist/wal/mod.rs::wal_replay_roundtrip` | Passed |
+| FC-PERSIST-CPLX-002 | CPLX | WAL 回放(`wal::visit_frames`):时间 $O(\text{有效帧})$;空间 $O(1)$ 流式(批内帧缓冲 ≤ 单批帧数)。注:`Store::open` 当前将 WAL 整文件读入内存后再流式回放,该路径空间 $O(\text{WAL 字节})$(mmap 读路径优化已随 L3 落地;真正惰性驻留待段句柄重构(未落地)) | 解析证明(设计 04 §3.4;`wal::visit_frames` 逐帧回调不物化)+ 哨兵 `src/persist/wal/mod.rs::wal_replay_roundtrip` | Passed |
 | FC-PERSIST-CPLX-003 | CPLX | CRC-32:时间 $O(n)$、空间 $O(1)$;$n$ = 字节数(实现为 `crc32fast` 查表/切片,常量因子依平台) | 解析证明(设计 04 §4.4;`crc32fast`)+ 哨兵 `src/persist/vsec.rs::vsec_detects_payload_corruption` | Passed |
 | FC-PERSIST-CPLX-004 | CPLX | zone map:**写路径增量维护**(每条记录每字段均摊 $O(1)$、共 $O(N\cdot\text{fields})$,随快照以 `Arc` COW 共享;存在长命快照句柄时单次写可能深拷贝索引,属已登记取舍),flush 仅编码 $O(\text{blocks}\cdot\text{fields})$;查询期块级剪枝 $O(\lceil n/1024\rceil \times \text{predicates})$;落盘空间 17 B/块/字段(`has_any`/`mixed` 标志仅存内存,重开时 zone map 从槽位重建)。L4 起实际写入 msec `zmap` 区并服务于查询计划器 | 解析证明(设计 04 §5.2)+ 哨兵 `tests/l4_contracts.rs::plan_filter_matches_pointwise_count` | Passed |
 | FC-PERSIST-CPLX-005 | CPLX | bloom:构建 $O(N_{key}\cdot k)$、判定 $O(k)=O(7)$;空间 $1.44\log_2(1/p)$ bit/元素(**承诺在元素数 ≤ 初始容量 65536 时成立**;写路径超出后位图饱和,只升误报率、绝不漏报)。极小/非法 `fpp` 在校验与构造两层夹紧,`k` 恒落在可落盘范围 `[1,64]`。L4 起实际写入 msec `bloom` 区,供 `key` 等值预筛 | 解析证明(设计 04 §5.3 双哈希)+ 哨兵 `tests/l4_contracts.rs::text_index_survives_reopen`、`src/memory/analysis/bloom.rs::extreme_fpp_stays_within_storable_k` | Passed |
 | FC-PERSIST-CPLX-006 | CPLX | MANIFEST 提交:时间 $O(S_{\text{seg}})$ 写新文件;空间保留 2 版 | 解析证明(设计 04 §6;`manifest::encode` 逐段线性)+ 哨兵 `src/persist/manifest.rs::manifest_roundtrip` | Passed |
-| FC-PERSIST-CPLX-007 | CPLX | `open` 恢复:时间 $O(\text{段总字节} + \text{WAL 字节})$(逐段读入并校验 + 回放);空间 $O(\text{段总字节} + \text{WAL 字节})$——L2 将段/WAL 整读入内存,mmap 读路径优化已随 L3 落地,真正惰性访问待 L6 段句柄重构(设计 04 §11) | 哨兵 `tests/persist_contracts.rs::reopen_after_drop_recovers_from_wal`;解析证明(设计 04 §7;`read_segment_bytes` 逐段读入) | Passed |
+| FC-PERSIST-CPLX-007 | CPLX | `open` 恢复:时间 $O(\text{段总字节} + \text{WAL 字节})$(逐段读入并校验 + 回放);空间 $O(\text{段总字节} + \text{WAL 字节})$——L2 将段/WAL 整读入内存,mmap 读路径优化已随 L3 落地,真正惰性访问待段句柄重构(未落地)(设计 04 §11) | 哨兵 `tests/persist_contracts.rs::reopen_after_drop_recovers_from_wal`;解析证明(设计 04 §7;`read_segment_bytes` 逐段读入) | Passed |
 | FC-PERSIST-CPLX-008 | CPLX | 单点写 `insert`:时间 $O(1)$ 内存 + WAL 追加(fsync 按 `FsyncPolicy`);空间 $O(d)$ | 哨兵 `tests/persist_contracts.rs::reopen_after_close_recovers_records`;解析证明(HashMap 追加 + 定长帧) | Passed |
 | FC-PERSIST-CPLX-009 | CPLX | 单点读 `get(key)`:时间 $O(\log n)$ + 一次记录读(实现为 HashMap 期望 $O(1)$ $\subseteq O(\log n)$);`get_by_rowid`: $O(\log n)$ 版本链定位 | 哨兵 `tests/persist_contracts.rs::namespace_and_rowid_survive_reopen`;解析证明(设计 04 §5.5) | Passed |
 | FC-PERSIST-CPLX-010 | CPLX | `as_of(t)`:时间 $O(V + N_c\cdot d)$($V$ = 全部物理版本数,`temporal::snapshot_at` 单遍择版本;当前实现不随段数$S_{\text{seg}}$分层加速);空间 $O(V + N_c)$(随历史窗口与候选规模增长) | 哨兵 `tests/persist_contracts.rs::version_chain_survives_reopen`;解析证明(设计 04 §5.5) | Passed |
@@ -420,7 +433,7 @@
 | 编号 | 类型 | 形式化规范(时间 / 空间) | 对应测试 / 基准 | 状态 |
 |---|---|---|---|---|
 | FC-INDEX-CPLX-001 | CPLX | HNSW 单点插入:时间 $O(d\cdot(ef_c\cdot M_0 + M\log_M N))$;构建 $O(N\cdot d\cdot ef_c\cdot M_0)$;空间 $\approx(8M+20)$ B/节点 + 边表。注:$M$/$M_0$ 为**有界常数**(≤4096,FC-INDEX-PRE-001);启发式选邻与修剪的 $M_0$ 多项式项(变量展开时最坏额外 $O(d\cdot M_0^3\cdot\log_M N)$)在最坏口径下含于系数,不影响 $N$/$d$/$\log N$ 的渐进结论 | 操作计数单测 `src/index/hnsw.rs::build_distance_calls_scale_linearly` | Passed |
-| FC-INDEX-CPLX-002 | CPLX | HNSW 查询:期望上界 $O(d\cdot ef\cdot M_0)$(实测 $\approx(2\text{–}5)\cdot ef$ 次点积);空间期望 $O(ef\cdot M_0)$(`visited` 集合覆盖已展开节点的邻边)。注:本条目只约束索引内部;调用方 `memory::search` 当前的候选收集与 alive/过滤位图构造仍为 $O(N)$(L4 已引入 zone map/bloom 块级下推减少行级求值,但候选遍历本身仍为 $O(N)$,待 L6 段句柄重构消除,设计 05 §8) | 操作计数单测 `src/index/hnsw.rs::search_distance_calls_bounded_by_ef` | Passed |
+| FC-INDEX-CPLX-002 | CPLX | HNSW 查询:期望上界 $O(d\cdot ef\cdot M_0)$(实测 $\approx(2\text{–}5)\cdot ef$ 次点积);空间期望 $O(ef\cdot M_0)$(`visited` 集合覆盖已展开节点的邻边)。注:本条目只约束索引内部;调用方 `memory::search` 当前的候选收集与 alive/过滤位图构造仍为 $O(N)$(L4 已引入 zone map/bloom 块级下推减少行级求值,但候选遍历本身仍为 $O(N)$,待段句柄重构(未落地)消除,设计 05 §8) | 操作计数单测 `src/index/hnsw.rs::search_distance_calls_bounded_by_ef` | Passed |
 | FC-INDEX-CPLX-003 | CPLX | 上层下降:时间期望 $O(d\cdot M\cdot\log_M N)$(依赖层级随机分布,§9.1 口径③);层高期望 $O(\log_M N)$ | 操作计数单测 `src/index/hnsw.rs::level_height_grows_logarithmically` | Passed |
 | FC-INDEX-CPLX-004 | CPLX | hidx 编解码:时间 $O(\text{nodes}+\text{edges})$、空间 $O(\text{bytes})$ | 操作计数单测 `src/index/hidx.rs::hidx_encode_decode_scale_linearly` | Passed |
 
@@ -429,8 +442,8 @@
 | 编号 | 类型 | 形式化规范(时间 / 空间) | 对应测试 / 基准 | 状态 |
 |---|---|---|---|---|
 | FC-QUERY-CPLX-001 | CPLX | DSL 解析:时间 $O(L)$ 单遍;空间 $O(\|\phi\|)$ | 解析证明(设计 06 §1.2:单遍递归下降)+ 哨兵 `tests/l4_contracts.rs::dsl_parse_handles_large_input_once`(2000 项 Or 链) | Passed |
-| FC-QUERY-CPLX-002 | CPLX | 计划编译:时间 $O(N + \text{blocks}\times\text{predicates})$、空间 $O(n/8)$ 块位图 + $O(N_c)$ 候选。注:$N$ 为视图物理槽位数(逐行判定命名空间/可见性);块掩码求值本身为 $O(\text{blocks}\times\text{predicates})$。内存架构下无段句柄直读,该 $O(N)$ 项待 L6 段句柄重构消除 | 解析证明(设计 06 §2)+ 哨兵 `tests/l4_contracts.rs::plan_filter_matches_pointwise_count` | Passed |
-| FC-QUERY-CPLX-003 | CPLX | BM25 打分:时间 $O(N_{ns} + 2\sum_{t\in Q} df_t)$ postings 访问;空间 $O(\min(N_{ns}, \sum_{t\in Q} df_t))$(第二遍物化全部命中文档的分数映射,TopK 另计 $O(k)$)($N_{ns}$ = 查询命名空间有文本的物理槽位数,用于可见性过滤后的 N/avgdl 统计;段统计不可变后时间项可降为 $O(S_{\text{seg}})$,待 L6) | 解析证明(设计 06 §3.2 两遍法)+ 哨兵 `tests/l4_contracts.rs::bm25_formula_behaviour` | Passed |
+| FC-QUERY-CPLX-002 | CPLX | 计划编译:时间 $O(N + \text{blocks}\times\text{predicates})$、空间 $O(n/8)$ 块位图 + $O(N_c)$ 候选。注:$N$ 为视图物理槽位数(逐行判定命名空间/可见性);块掩码求值本身为 $O(\text{blocks}\times\text{predicates})$。内存架构下无段句柄直读,该 $O(N)$ 项待段句柄重构(未落地)消除 | 解析证明(设计 06 §2)+ 哨兵 `tests/l4_contracts.rs::plan_filter_matches_pointwise_count` | Passed |
+| FC-QUERY-CPLX-003 | CPLX | BM25 打分:时间 $O(N_{ns} + 2\sum_{t\in Q} df_t)$ postings 访问;空间 $O(\min(N_{ns}, \sum_{t\in Q} df_t))$(第二遍物化全部命中文档的分数映射,TopK 另计 $O(k)$)($N_{ns}$ = 查询命名空间有文本的物理槽位数,用于可见性过滤后的 N/avgdl 统计;段统计不可变后时间项可降为 $O(S_{\text{seg}})$,待段句柄重构(未落地)) | 解析证明(设计 06 §3.2 两遍法)+ 哨兵 `tests/l4_contracts.rs::bm25_formula_behaviour` | Passed |
 | FC-QUERY-CPLX-004 | CPLX | RRF/加权融合:时间 $O(k)$、空间 $O(k)$ | 解析证明(设计 06 §4:只对两通道 top-k 名次表操作)+ 哨兵 `tests/l4_contracts.rs::hybrid_fusion_and_validation` | Passed |
 | FC-SCORE-CPLX-001 | CPLX | 综合重排/归一化:时间 $O(m\log m)$($m$ = 候选数;逐候选 $O(1)$ 因子计算 + 一次排序);空间 $O(m)$ | 解析证明(设计 10 §2.5:单遍逐候选计算因子与加权和,末尾按分数稳定排序)+ 哨兵 `tests/query_contracts.rs::scoring_composite_factors_clamped` | Passed |
 | FC-SCORE-CPLX-002 | CPLX | 联想扩展:时间 $O(\text{seeds}\cdot\text{max\_nodes}\cdot\text{avg\_degree})$($\text{seeds}$ = 上跳种子数;有界 BFS,$hops\le 3$);空间 $O(\text{max\_nodes}+\text{seeds})$(`visited` 集合**总量**受 `max_nodes` 封顶,种子预置其中、结果为其子集;被命名空间/存活/过滤拒绝的节点同样计入,达到上限即提前停止扩展) | 解析证明(设计 10 §3.2:逐跳 BFS,`visited` 总量封顶)+ 哨兵 `tests/query_contracts.rs::expansion_does_not_cross_namespaces` | Passed |
@@ -451,8 +464,8 @@
 
 | 编号 | 类型 | 形式化规范(时间 / 空间) | 对应测试 / 基准 | 状态 |
 |---|---|---|---|---|
-| FC-QUANT-CPLX-001 | CPLX | i8 量化点积:粗排副本带宽 $4d\to d$ B/行(÷4);VNNI 指令再 $\approx 4\times$;空间副本 $d$ B/行(f32 原向量另存) | 待补 | Planned |
-| FC-QUANT-CPLX-002 | CPLX | 两阶段检索:粗排候选 $\le$ `rescore_candidates`(默认 4k);精排时间 $O(k\cdot d)$ | 待补 | Planned |
+| FC-QUANT-CPLX-001 | CPLX | i8 量化点积:粗排副本带宽 $4d\to d$ B/行(÷4);空间副本 $d$ B/行(f32 原向量另存),段级逐维参数表 $2d$ 个 f32(f16 无表、每行 $2d$ B) | 解析证明(08 §2)+ 哨兵 `src/persist/vsec.rs::vsec_i8_quantized_roundtrip`(逐行码流恰 $d$ 字节、参数表恰 $2d$ 个 f32) | Passed |
+| FC-QUANT-CPLX-002 | CPLX | 两阶段检索:粗排候选 $\le$ `top_k × rescore_oversample`(默认 4×k,k=10 时 40 个);精排时间 $O(c\cdot d)$($c \le$ 候选上限)、按 f32 分重排后取 $k$ | 解析证明(08 §4.2)+ 哨兵 `src/memory/search.rs::coarse_candidates_respect_rescore_cap` | Passed |
 
 #### 9.2.8 记忆模型 / 安全 / 部署
 

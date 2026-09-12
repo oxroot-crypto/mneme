@@ -4,8 +4,9 @@
 > 专为 **AI Agent 的超长期记忆层**设计:进程内运行、无需服务端、数据经年累月增长而不失控。
 
 **状态**:开发中(尚未发布到 crates.io)。**L0 原语层(`src/core/`)、L1 内存引擎(`src/memory/`)、
-L2 持久层(`src/persist/`)、L3 索引层(`src/index/`)、L4 检索层(`src/query/`)与
-L5 生命周期层(`src/life/`)**已实现并通过形式化契约验收,后续按 L6 推进,
+L2 持久层(`src/persist/`)、L3 索引层(`src/index/`)、L4 检索层(`src/query/`)、
+L5 生命周期层(`src/life/`)与 L6 打磨层(`src/quant/` + `feature = "async"` 门面)**
+已实现并通过形式化契约验收;1M×1536 性能门槛与 fuzz 长跑仍属 CI 收尾,
 每层完成时都是一个可独立交付的完整产品。
 设计与验收标准见 [docs/DESIGN.md](docs/DESIGN.md)。
 
@@ -32,7 +33,7 @@ LLM 每次对话结束就"忘光"上下文之外的一切。要让 Agent 长期�
 | 记忆生命周期 | TTL 两阶段过期、指数遗忘曲线、访问强化、命名空间隔离(自动遗忘默认关闭) |
 | 持久化 | WAL + 不可变段 + MANIFEST 原子提交,任意点掉电可恢复、删除不复活 |
 | 超长期 | size-tiered compaction,写放大 O(log N)、活跃段数有界 |
-| 量化(规划) | i8 / f16 量化副本 + 两阶段重打分,查询带宽 i8 ÷4 / f16 ÷2(f32 原向量保留供精排,故磁盘不缩减);L6 落地 |
+| 量化 | i8 / f16 量化副本 + 两阶段精排重打分,查询带宽 i8 ÷4 / f16 ÷2(f32 原向量保留供精排,故磁盘不缩减);建段抽样不达标自动回退 f32 |
 | **存储安全**(规划) | AES-256-GCM 静态加密、文本/元数据压缩;L11 落地 |
 | **部署形态**(规划) | 多进程只读共享;`Storage` 抽象支持 WASM/边缘适配;可观测事件钩子;L12 落地 |
 | 依赖极简 | 当前非 feature 强依赖白名单 4 个小 crate(均为直接依赖,`serde_json` 另带入 itoa/ryu/memchr 等极少数传递依赖);默认开 `mmap` 时额外引入 1 个(`memmap2`,可经 feature 关闭);复杂算法全部自研;加密/压缩均为可选 feature |
@@ -92,14 +93,15 @@ fn main() -> mneme::Result<()> {
 | feature | 默认 | 说明 |
 |---|---|---|
 | `mmap` | ✅ 开 | 段文件 mmap 零拷贝读(**L3 已实现**);关闭后走 `Read + Seek` 兜底 |
-| `async` | ❌ 关 | 提供 `insert().await` 等 async 门面(`spawn_blocking` 薄包装);待 L6 |
-| `quant-f16` | ❌ 关 | f16 量化副本;关闭时只有 f32 / i8;待 L6 |
+| `async` | ❌ 关 | `AsyncNamespace` async 门面(`spawn_blocking` 薄包装);核心零 tokio |
+| `quant-f16` | ❌ 关 | f16 量化副本;关闭时只有 f32 / i8,`F16` 构造期报 `Unsupported` |
+| `fuzzing` | ❌ 关 | fuzz 专用解析入口(服务 `fuzz/`,不改变运行时行为) |
 | `encrypt` | ❌ 关 | AES-256-GCM 静态加密;待 L11 |
 | `compress` | ❌ 关 | 文本/元数据压缩(内置 LZ4 风格 codec);待 L11 |
 | `compress-zstd` | ❌ 关 | 可选更强压缩(引入 `zstd`);待 L11 |
 | `wasm` | ❌ 关 | 关闭 mmap/线程并行,WASM 目标;待 L12 |
 
-> 除 `mmap` 外,其余 feature 尚未在 `Cargo.toml` 定义,系 L6/L11/L12 目标;
+> `encrypt`/`compress`/`compress-zstd`/`wasm` 尚未在 `Cargo.toml` 定义,系 L11/L12 目标;
 > 启用会因 feature 未定义报错。
 
 ## 文档
@@ -136,9 +138,9 @@ mdbook build               # 输出到 book/
 
 ## 开发与测试
 
-> 当前已实现 L0 原语层、L1 内存引擎、L2 持久层、L3 索引层、L4 检索层与 L5 生命周期层,下列命令即可运行;
-> `cargo test --features async`(async 门面等价性)等 feature 相关命令待对应层落地后加入。
-> `cargo bench` 已在 L3 引入(见 `benches/hnsw.rs`)。
+> 当前已实现 L0–L6 全部层,L1–L6 契约测试与追溯门禁随 `cargo test` 运行;
+> `cargo test --features async` / `--features quant-f16` / `--all-features` 均可跑。
+> `cargo bench` 已有 `benches/hnsw.rs` 与 `benches/quant.rs`(1M×1536 正式门槛待 CI)。
 
 ```bash
 cargo fmt --all -- --check
