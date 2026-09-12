@@ -103,12 +103,12 @@ pub struct QuantStat {
     pub recall_est: Option<f32>,
 }
 
-/// 加密/压缩生效状态。
+/// 存储安全配置与迁移统计(加密未落地;压缩配置已接线,压缩实现待 L11)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageStat {
-    /// 是否启用静态加密。
+    /// 是否启用静态加密(当前恒 `false`,加密随 L11 落地)。
     pub encryption: bool,
-    /// 文本/元数据压缩策略。
+    /// 文本/元数据压缩的配置值(实现待 L11,尚未影响磁盘编码)。
     pub compression: Compression,
     /// 已迁移段数。
     pub migrated_segments: usize,
@@ -174,7 +174,7 @@ pub struct Stats {
     pub relations: u64,
     /// 版本链/历史保留统计。
     pub history: HistoryStat,
-    /// 加密/压缩生效状态。
+    /// 存储安全配置与迁移统计(压缩实现待 L11)。
     pub storage: StorageStat,
 }
 

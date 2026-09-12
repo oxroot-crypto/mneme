@@ -75,7 +75,9 @@ pub struct RelationExpand {
     pub kinds: Vec<RelationKind>,
     /// 每跳衰减系数,默认 0.5。
     pub decay: f32,
-    /// 扩展节点数上限,默认 4096。
+    /// 扩展过程的访问上限,默认 4096:`visited` 集合总量上限(种子预置其中、
+    /// 结果为其子集),被命名空间/存活/过滤拒绝的节点也计入;达到上限即停止
+    /// 后续扩展(`FC-SCORE-CPLX-002`)。
     pub max_nodes: usize,
 }
 

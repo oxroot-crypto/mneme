@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::core::error::{MnemeError, Result};
+use crate::core::options::VectorFormat;
 use crate::core::types::SegmentId;
 use crate::life::compact::{self, SegmentInfo};
 use crate::memory::engine::Mneme;
@@ -110,7 +111,10 @@ impl Mneme {
             per_namespace,
             quant: QuantStat {
                 configured: self.config.quantization,
-                active: self.config.quantization,
+                // L6 未落地:量化副本与两阶段检索尚无实现,存储/检索实际恒为 F32;
+                // `active` 必须反映实际生效格式,绝不回显用户配置(设计 08 §3/§8、
+                // 契约 FC-QUANT-ERR-001 仍为 Planned)。
+                active: VectorFormat::F32,
                 recall_est: None,
             },
             compaction: self.control.state(),

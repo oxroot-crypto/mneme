@@ -4,17 +4,21 @@
 > 写代码的人。你不需要任何 Rust 基础,也不需要 AI 或数据库背景。
 >
 > **本套文档想解决什么**:让你能**独立读懂 `mneme` 的源码**。本套以 L0 原语层
-> `src/core/` 为教材,并把 L1 内存引擎 `src/memory/`、L3 索引层 `src/index/` 与
-> L4 检索层 `src/query/` 新引入的 Rust 知识(`Arc` 共享所有权、写时复制、
-> `Mutex`/`RwLock` 守卫与原子类型、`move` 闭包写事务、`dyn` 策略与函数指针、
-> 构建者模式,手写 `Ord` 与 `BinaryHeap`、`TryFrom`/受检运算、字节切片操作、
-> `let` 链与 `let...else`、递归枚举与 `Box`、带生命周期的解析器与切片借用、
-> `HashMap` entry API、运算符重载、`Option` 组合子、`fmt::Write`、
-> `thread_local!` 测试探针、`proptest` 自定义策略)**回填到各章对应小节**
-> (见 §4 对照表);L1、L3 与 L4 的业务语义与分文件阅读路线见
+> `src/core/` 为教材,并把 L1 内存引擎 `src/memory/`、L2 持久层 `src/persist/`、
+> L3 索引层 `src/index/`、L4 检索层 `src/query/` 与 L5 生命周期层 `src/life/`
+> 新引入的 Rust 知识(`Arc` 共享所有权、写时复制,`Mutex`/`RwLock` 守卫、原子类型与
+> CAS,`std::thread` 后台线程、`Weak` 弱引用与 `Condvar`,`thread::scope` 借用式并行,
+> `Drop`/RAII,`move` 闭包写事务,`dyn` 策略与函数指针,构建者模式,手写 `Ord` 与
+> `BinaryHeap`,`TryFrom`/受检运算,字节切片操作,`std::io` 文件读写与 `ErrorKind`,
+> `memmap2` 的 `unsafe`,`let` 链与 `let...else`,递归枚举与 `Box`,带生命周期的
+> 解析器与切片借用,`PhantomData`,`HashMap` entry API,运算符重载,`Option` 组合子,
+> `fmt::Write`,`thread_local!` 测试探针,`proptest` 自定义策略)**回填到各章对应小节**
+> (见 §4 对照表);L1–L5 的业务语义与分文件阅读路线见
 > [设计 03 L1 内存引擎](../design/03-l1-memory.md)、
-> [设计 05 L3 HNSW](../design/05-l3-hnsw.md) 与
-> [设计 06 L4 检索层](../design/06-l4-query.md)。
+> [设计 04 L2 持久层](../design/04-l2-persist.md)、
+> [设计 05 L3 HNSW](../design/05-l3-hnsw.md)、
+> [设计 06 L4 检索层](../design/06-l4-query.md) 与
+> [设计 07 L5 生命周期层](../design/07-l5-life.md)。
 > 所有语法点都锚定在 mneme 的真实代码上,不讲"为了教语法而教语法"的空例子。
 >
 > **预计阅读**:6–10 小时(边读边敲会更快掌握)。建议**开着源码对照阅读**。
@@ -40,11 +44,12 @@ Rust 的通用教材很多(见 §5),但它们有两个问题:
 
 - **顺序读**:01 → 10。每章只依赖前面章节,不跳步。
 - **边读边跑**:每章末尾有「动手练习」,在 `examples/` 下新建一个文件敲一遍(或用临时 crate)。
-  **不要直接改 `src/core/`、`src/memory/`、`src/index/` 与 `src/query/`**:库里的公开项受 `#![deny(missing_docs)]` 约束,乱加还会污染源码。
+  **不要直接改 `src/core/`、`src/memory/`、`src/persist/`、`src/index/`、`src/query/` 与 `src/life/`**:库里的公开项受 `#![deny(missing_docs)]` 约束,乱加还会污染源码。
   光看不敲,Rust 的所有权和借用是学不会的。
 - **对照源码**:遇到 `文件:行号` 就跳过去看完整上下文。
 - **不要背语法**:Rust 编译器报错信息极其友好,学会"看报错 → 改代码"比背规则更重要。
-  每章都列了「你会遇到的编译器报错」。
+  多数章都列了「你会遇到的编译器报错」(01 章的报错入门见 §5.1;03 章未单列,遇到时按
+  04/05 两章的方法处理)。
 
 > 阅读前请先确认本机已装 Rust 工具链;没有的话见 [01 工具链](01-toolchain.md) 的安装小节。
 
@@ -149,11 +154,34 @@ L4(`src/query/`)新引入的 Rust 特性同样已**回填到对应章节**:
 | proptest 字符串正则策略(`".{0,200}"`) | [10 §4](10-testing.md) |
 | `format!("{month:02}")` 宽度与补零 | [01 §6](01-toolchain.md) |
 
-> L1 的业务语义(命名空间、写事务、去重、双时态等)、L3 的业务语义(HNSW 构建/查询、
-> 过滤三档、hidx 字节布局)与 L4 的业务语义(DSL 文法、BM25、RRF 融合、计划器)不属于
-> 语言教学,分别见 [设计 03 L1 内存引擎](../design/03-l1-memory.md)、
-> [设计 05 L3 HNSW](../design/05-l3-hnsw.md) 与
-> [设计 06 L4 检索层](../design/06-l4-query.md)。
+L2(`src/persist/`)与 L5(`src/life/`)新引入的 Rust 特性同样已**回填到对应章节**:
+
+| L2/L5 新特性 | 落在哪一节 |
+|---|---|
+| `std::thread::spawn`/`JoinHandle`/`join`、`thread::scope` | [04 §5.3](04-borrowing-strings-slices.md) |
+| `Weak`/`Arc::downgrade`/`upgrade`(后台线程不阻止 Drop) | [04 §5.3](04-borrowing-strings-slices.md) |
+| `Condvar` 与 `wait_timeout`/`notify_all`(虚假唤醒、丢通知) | [04 §5.3](04-borrowing-strings-slices.md) |
+| 原子类型(`AtomicI64`)与 `compare_exchange_weak` CAS 循环(`MonotonicClock`) | [04 §5.3](04-borrowing-strings-slices.md) |
+| `Drop`/RAII(最后句柄停线程、`FileLock` 尽力解锁) | [04 §5.4](04-borrowing-strings-slices.md) |
+| `std::io`:`File`/`Read`/`Seek`/`read_exact`/`write_all`/`ErrorKind` | [05 §3.5](05-errors.md) |
+| `usize::try_from`、`std::mem::size_of`(32 位防截断) | [05 §3.5](05-errors.md) |
+| `memmap2::Mmap::map` 的 `unsafe` 与 `// SAFETY:` | [09 §4.2](09-cfg-unsafe-simd.md) |
+| `#[cfg]`/`#[cfg_attr]` 条件类型与后端切换 | [01 §4.2](01-toolchain.md)、[09 §4.2](09-cfg-unsafe-simd.md) |
+| `#[cfg(feature = "mmap")] pub(crate) struct` 条件模块声明 | [08 §2](08-modules-docs.md) |
+| `impl AsRef<Path>` 路径参数惯例 | [06 §2.3](06-generics-traits.md) |
+| `PhantomData`(借用型句柄) | [06 §2.3](06-generics-traits.md) |
+| 手写 `Debug` + `finish_non_exhaustive()` | [06 §3.2](06-generics-traits.md) |
+| `or_default`/`sort_by_key`/`binary_search`/`filter_map`/`windows`/`peekable` | [07 §3.4](07-iterators-closures.md) |
+| 跨线程共享的测试状态用原子(`FsyncHook` 实现的 `AtomicUsize` 计数器) | [10 §4.6](10-testing.md) |
+| 共享测试助手全貌(`tests/common/mod.rs`) | [10 §2](10-testing.md) |
+
+> L1 的业务语义(命名空间、写事务、去重、双时态等)、L2 的业务语义(段布局、WAL、
+> MANIFEST、崩溃恢复)、L3 的业务语义(HNSW 构建/查询、过滤三档、hidx 字节布局)、
+> L4 的业务语义(DSL 文法、BM25、RRF 融合、计划器)与 L5 的业务语义(compaction、
+> 遗忘、命名空间、快照备份)不属于语言教学,分别见
+> [设计 03 L1](../design/03-l1-memory.md)、[设计 04 L2](../design/04-l2-persist.md)、
+> [设计 05 L3](../design/05-l3-hnsw.md)、[设计 06 L4](../design/06-l4-query.md) 与
+> [设计 07 L5](../design/07-l5-life.md)。
 
 ---
 

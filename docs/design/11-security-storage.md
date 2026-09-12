@@ -8,8 +8,14 @@
 >
 > 两者均为**可选 feature**,默认关闭时磁盘布局与
 > [04](04-l2-persist.md) 完全一致,依赖白名单不扩大。
+>
+> **落地状态(2026-09)**:**本章尚未落地**——`src/` 无 `crypto/`/`compress/` 模块,
+> feature `encrypt`/`compress` 尚未定义;`Builder` 无加密/密钥相关 API,`Config` 中的
+> `Compression` 仅记录配置、尚未接线压缩实现;磁盘格式仅按 [04 §2.5](04-l2-persist.md)
+> 预留扩展区(`key_id`/`codec` 当前恒 0)。`FC-SEC-*` 契约均为 `Planned`;真实威胁
+> 模型与接口见下文目标设计。
 
-模块:`crypto/{aead.rs, keyring.rs}`(feature `encrypt`)、`compress/{codec.rs, lz4.rs}`(feature `compress`)
+模块:`crypto/{aead.rs, keyring.rs}`(feature `encrypt`)、`compress/{codec.rs, lz4.rs}`(feature `compress`)(规划)
 
 ---
 
@@ -147,7 +153,7 @@ pub enum Compression { None, Lz4, Zstd }   // 默认 None;`Lz4` 为内置自研�
 
 1. `Encryption` + `KeyProvider`(feature `encrypt`)与密钥轮换;
 2. `Compression` + `Codec`(feature `compress`)与内置 codec;
-3. `Stats.storage` 暴露加密/压缩生效状态与迁移进度。
+3. `Stats.storage` 暴露加密/压缩的配置值与迁移进度(压缩实现随 L11;见 [16 §5](16-api-reference.md))。
 
 **依赖**:L0(类型)、L2(段/WAL/MANIFEST 布局、`SegmentSource`)、L5(后台迁移复用 compaction)。
 

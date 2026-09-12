@@ -90,7 +90,7 @@ impl SearchBuilder<'_> {
             .unwrap_or_else(|| self.config.clock.now_unix_ms());
         let view = self.apply_as_of(view);
         let scored = self.run_channels(&view, ns_id, now)?;
-        let (scored, via_map) = self.apply_expansion(&view, scored, now);
+        let (scored, via_map) = self.apply_expansion(&view, ns_id, scored, now);
         let ranked = self.rank(&view, scored, now);
         let hits = self.build_hits(&view, ranked, self.resolve_query_id(), &via_map);
         // 读路径命中计入访问统计:仅当前视图检索(历史/快照检索不污染当前统计),
@@ -292,9 +292,12 @@ impl SearchBuilder<'_> {
     }
 
     /// 沿关系边做联想扩展,返回扩展后的候选与来源边映射。
+    ///
+    /// 扩展只在本命名空间内推进,跨命名空间边视为不存在(`FC-SCORE-POST-004`)。
     fn apply_expansion(
         &self,
         view: &ReaderView,
+        ns_id: NsId,
         mut scored: Vec<Scored>,
         now: i64,
     ) -> (Vec<Scored>, HashMap<RowId, Edge>) {
@@ -302,6 +305,7 @@ impl SearchBuilder<'_> {
         if let Some(expand) = &self.expand {
             let ctx = ExpandCtx {
                 view,
+                ns_id,
                 expand,
                 filter: self.filter.as_ref(),
                 now,

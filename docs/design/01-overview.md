@@ -185,17 +185,17 @@ mneme/
 │   ├── memory/         # L1:engine.rs engine_ops.rs builder/ namespace/ analysis/ table/ snapshot.rs snapshot_scan.rs search_builder.rs expand.rs rerank.rs index.rs search.rs pred.rs pred_eval.rs record.rs write_helpers.rs mutate_helpers.rs dedup.rs relation.rs temporal.rs score.rs lifecycle.rs ops.rs config.rs
 │   ├── persist/        # L2:mod.rs codec.rs hook.rs wal/ msec/ recover/ store/ vsec.rs manifest.rs edges.rs flush.rs source.rs storage.rs trash.rs
 │   ├── index/          # L3:hnsw.rs graph.rs filtered.rs rebuild.rs hidx.rs factory.rs
-│   ├── query/          # L4:parse/{mod,literal}.rs display.rs json.rs iso.rs plan.rs zmap.rs bm25.rs fusion.rs exec.rs
+│   ├── query/          # L4:parse.rs parse/literal.rs display.rs json.rs iso.rs plan.rs zmap.rs bm25.rs fusion.rs exec.rs
 │   ├── life/           # L5:compact.rs(选段/幸存版本)maintenance.rs(后台维护)
-│   ├── quant/          # L6:scalar_i8.rs f16.rs rescore.rs
-│   ├── model/          # 记忆模型:relation.rs temporal.rs provenance.rs consolidate.rs   (09)
-│   ├── score/          # 排序层:formula.rs expand.rs feedback.rs diversify.rs           (10)
-│   ├── crypto/         # feature encrypt:aead.rs keyring.rs                              (11)
-│   ├── compress/       # feature compress:codec.rs lz4.rs                                (11)
-│   ├── deploy/         # readonly.rs                                                    (12)
-│   └── obs/            # observer.rs                                                      (12)
+│   ├── (L6 规划) quant/    # 量化:scalar_i8.rs f16.rs rescore.rs(当前无此目录)
+│   ├── (规划) model/       # 记忆模型;当前实现见 memory/{relation,temporal}.rs、score.rs、namespace/life.rs (09)
+│   ├── (规划) score/       # 排序层;当前实现见 memory/{score,expand,rerank}.rs               (10)
+│   ├── (规划) crypto/      # feature encrypt:aead.rs keyring.rs                               (11)
+│   ├── (规划) compress/    # feature compress:codec.rs lz4.rs                                 (11)
+│   ├── (规划) deploy/      # readonly.rs                                                      (12)
+│   └── (规划) obs/         # observer.rs                                                      (12)
 ├── benches/            # criterion 基准(L3 起)
-├── fuzz/               # cargo-fuzz 目标(L6 起)
+├── fuzz/               # cargo-fuzz 目标(L6 起;当前无此目录)
 ├── tests/              # 契约验收 + contract_traceability.rs 追溯门禁
 ├── docs/               # 本文档
 │   └── spec/           # FC-Matrix 形式化契约
@@ -340,7 +340,7 @@ db.check()?;                // fsck:校验 CRC 与索引一致性,并给出合�
 db.backup_to("./backup")?;  // 一致性快照备份(同盘优先硬链接)
 db.compact()?;              // 显式触发一轮 size-tiered compaction
 db.flush()?;                // 显式落盘(把可变表写成增量段)
-db.close()?;                // flush + 停后台维护 + 释放文件锁;Drop 只尽力 flush
+db.close()?;                // flush + 停后台维护 + 释放文件锁;Drop 不 flush、不保证持久
 ```
 
 > 示例中的 `json!` / `filter!` 由库导出;`ts("2024-03-01")` 为 ISO 8601 → Unix 毫秒的示意辅助函数。
@@ -367,14 +367,14 @@ db.close()?;                // flush + 停后台维护 + 释放文件锁;Drop �
 | `Scoring` / `ScoreBreakdown` / `Diversity` / `RelationExpand` / `TimeAxis` | 综合打分及其因子分解 / MMR / 联想扩展 / 时间轴(见 10) |
 | `RelationKind` / `RelationIndex` / `Edge` / `Feedback` / `QueryId` | 记忆关系、反向索引与检索反馈(见 09/10) |
 | `ConsolidationPolicy` / `Summarizer` / `ConsolidateReport` | 记忆沉淀(见 09) |
-| `Encryption` / `KeyProvider` / `Cipher` / `Compression` / `Codec` | 静态加密与压缩(见 11,可选 feature) |
-| `Storage` / `Observer` / `Event` / `WriteOp` | 存储抽象与可观测(见 12) |
-| `VectorFormat` | `F32 / F16 / I8Rescored`(L6 量化) |
+| `Encryption` / `KeyProvider` / `Cipher` / `Compression` / `Codec` | 静态加密与压缩(见 11;**L11 规划**,`Compression` 配置已接线、实现未落地) |
+| `Storage` / `Observer` / `Event` / `WriteOp` | 存储抽象与可观测(见 12;**L12 规划**,当前无此 API) |
+| `VectorFormat` | `F32 / F16 / I8Rescored`(**L6 未落地**,当前仅记录配置、不生效) |
 | `HnswParams` / `CompactionPolicy` / `Tuning` / `Limits` | 索引 / 合并 / 进阶调参 / 数据限额配置 |
 | `Clock` | 时间源注入(测试确定性) |
 | `SnapshotHandle` | 钉住某 ReaderView(段集 + 可变表快照)的只读句柄;经 `namespace()` 取命名空间视图(时间旅行读) |
 | `SnapshotNamespace` | 快照上的命名空间只读视图,提供 `search`/`get`/`iter` 等读取面 |
-| `AsyncNamespace` | async 门面(feature `async`),共享同一底层句柄 |
+| `AsyncNamespace` | async 门面(**L6 规划**,feature `async` 尚未定义),共享同一底层句柄 |
 | `Reranker` / `QueryCtx` | 精排回调钩子及其查询上下文 |
 | `Stats` / `SegmentStat` / `NsStat` / `Histogram` / `QuantStat` / `StorageStat` / `HistoryStat` | 运行统计(段/WAL/延迟/每命名空间/量化/合并/存储安全/版本链) |
 | `CheckReport` / `BackupReport` / `RetainReport` / `SnapshotStats` | 运维报告(`SnapshotStats` 为快照钉住视图的段数/行数/水位) |

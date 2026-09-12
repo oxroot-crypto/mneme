@@ -173,32 +173,40 @@ agent_memory/
 > compaction 时物化进新段;该设计已在 L5 落地(增量段 flush 与
 > compaction 均使用)。
 
-**问题**:`delete(key)` / `update(key, patch)` / `touch` / `relate` 作用的对象可能位于
-**更早的不可变段**。这些操作不能原地改写旧段(vsec 的 `dead` 位图只能标本段 SlotId,
-msec 记录体也不可变),若只放在内存可变表 + WAL,则 Checkpoint 截断 WAL 后会丢失
-(删除"复活"、更新/importance 丢失)。**delta 区把这类"作用于旧段记录的操作"持久化**,
-使 WAL 可以安全截断。
+**问题**:`touch`(读路径攒批的访问统计)与 `relate` / `unrelate` 作用的对象可能位于
+**更早的不可变段**。这些是**非版本化变更**——它们不产生新记录版本,不能原地改写旧段
+(vsec 的 `dead` 位图只能标本段 SlotId,msec 记录体也不可变);若只放在内存可变表 + WAL,
+则 Checkpoint 截断 WAL 后会丢失(访问计数、关系边)。**delta 区把这类"作用于旧段记录的
+非版本化变更"持久化**,使 WAL 可以安全截断。`delete`/`update`/`supersede`/`touch(boost)`
+等**版本化**操作不在此列——它们总是写入新的 version_table 版本行(墓碑即墓碑行),
+由增量段 flush 物化。
 
 ```text
 delta 区(紧随 msec 数据区,自身带长度前缀与 CRC):
   0  magic "DLT1" | u16 ver | u16 count | u32 delta_crc32(覆盖本条之后的条目区)
-  条目 × count(按 (target, seqno) 排序):
+  条目 × count(按 (target, seqno, kind) 排序):
     [u8 kind][u64 seqno][i64 tx_ms][u32 ns_id]
-    kind=1 DeleteKey   : [key len+bytes]
-    kind=2 DeleteRow   : [RowId u64]
-    kind=3 UpdateRow   : [RowId u64][u8 field_mask][可选字段,格式同 entry 的对应字段]
+    kind=1 DeleteKey   : [key len+bytes]   （编号保留,解码拒绝）
+    kind=2 DeleteRow   : [RowId u64]       （编号保留,解码拒绝）
+    kind=3 UpdateRow   : [RowId u64][u8 field_mask][可选字段,格式同 entry 的对应字段]（编号保留,解码拒绝）
     kind=4 Access      : [RowId u64][i64 last_access_ms][u32 access_delta][f32 importance_delta]
     kind=5 Relate      : [from u64][to u64][kind u16][f32 weight][meta len+bytes]
     kind=6 Unrelate    : [from u64][to u64][kind u16]
 ```
 
+- kind 1–3(`DeleteKey`/`DeleteRow`/`UpdateRow`)仅**保留编号**:删除与更新在本层
+  总是以版本行(`version_table`)承载,不需要 delta 形式;解码遇 kind 1–3 一律按
+  `Corrupted` 拒绝(契约 `FC-PERSIST-ERR-011`),绝不静默跳过;墓碑由 version_table
+  的墓碑行承载;
+
 - 读取时,delta 条目与各段记录体、可变表一起参与**统一的可见性合并**(§5.5):同一
-  RowId 取最高 seqno;DeleteKey/DeleteRow 遮蔽所有更早版本;Access 覆盖字段;关系边
-  叠加到关系邻接索引([09 §2](09-memory-model.md));
+  RowId 取最高 seqno;`Access` 覆盖访问统计字段;关系边叠加到关系邻接索引
+  ([09 §2](09-memory-model.md));删除/更新的可见性由 version_table 的版本行/墓碑行
+  决定,与 delta 无关;
 - delta 与 msec 同 CRC、同生同灭,因此 delta 一经所在段提交(MANIFEST 生效)即可
   参与 WAL 截断判定(§3.2);
-- compaction 时 delta 被**物化**:目标行若仍在活段则应用更新/删除,关系边重建进新段
-  relations 区;窗口内的墓碑/更新作为版本链保留,超期条目才随旧段清理;
+- compaction 时 delta 被**物化**:访问统计并入新段的 `last_access`/`access_count` 列,
+  关系边重建进新段 relations 区;窗口内的版本行按版本链保留,超期条目才随旧段清理;
   多个 delta 区叠加时按 seqno 合并。
 
 ### 2.2b 关系邻接索引
@@ -729,9 +737,9 @@ open(dir):
     (可配 fail-fast 模式:`Builder::fail_fast_on_corruption(true)`,直接报错拒绝启动)。绝不自动移入
     `trash/`:MANIFEST 仍引用该段,移动后再次打开会因引用缺失拒启、隔离文件更会被 purge 删除;数据可能
     仍可人工修复,损坏段经 `stats()`/`check()` 报告
- 3. 打开唯一的 WAL 文件(`wal/wal_000001.log`),只重放 seqno > manifest.watermark_seqno 的帧(§3.3);
-    遇撕裂帧 → 可写实例截断该文件尾部;只读实例(`read_only`)不写盘,仅在内存中忽略
-    该帧及其后(见 §13 只读模式)
+  3. 按文件序回放全部 WAL 文件(`wal/wal_*.log`;L5 起按容量轮转,见 §3.3),只重放
+     seqno > manifest.watermark_seqno 的帧;遇撕裂帧 → 可写实例截断该文件尾部;
+     只读实例(`read_only`)不写盘,仅在内存中忽略该帧及其后(见 §13 只读模式)
  4. 构建 ReaderView{ manifest 版本, 可变表 }:合并各段 version_table 与 WAL 覆盖
     (含 §2.2a delta 区),重建每个 RowId 的版本链与当前可见版本(§5.5) → 对外服务
 不变量:恢复后的状态 = "已 fsync 确认的全部操作" 的重放结果(可多,不可错;
@@ -819,23 +827,23 @@ Windows 不允许删除被 mmap/句柄打开的文件。方案:
 
 ```rust
 /// 待注入的 I/O 动作。
-pub enum IoAction {
-    Write { file: &'static str, offset: u64, len: usize },
-    Fsync { file: &'static str },
-    Rename { from: &'static str, to: &'static str },
+pub enum IoAction<'a> {
+    Write { file: &'a str, offset: u64, len: usize },
+    Fsync { file: &'a str },
+    Rename { from: &'a str, to: &'a str },
 }
 
 pub trait FsyncHook: Send + Sync {
     /// 在每次 write/fsync/rename 前调用;可注入故障(丢写/翻转字节/截断/崩溃)
-    fn before(&self, action: IoAction) -> std::io::Result<()>;
+    fn before(&self, action: IoAction<'_>) -> std::io::Result<()>;
 }
 ```
 
 经 `Builder::fsync_hook` 公开注入(测试用 seam;生产不设置即无开销)。
 用法见 [14 §2](14-testing.md):在随机点"杀死"进程,断言恢复后状态 = 已确认操作前缀。
 
-> **L2 落地状态**:L2 只经此钩子发出 `Write` 与 `Fsync` 两种动作;`Rename` 变体**保留**给
-> L5 compaction 的段移动,L2 的段移动直接经 `trash` 模块完成,不发出 `Rename` 动作。
+> **落地状态**:当前实现只发出 `Write` 与 `Fsync` 两种动作;`Rename` 变体为接口保留
+> (供段移动类原子操作使用),目前**没有任何发出点**——段回收直接经 `trash` 模块完成。
 
 ### 10.2 时间源:`Clock`
 

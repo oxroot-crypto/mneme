@@ -287,12 +287,13 @@ $$S_{\text{node}} = \underbrace{4 M_0}_{=8M\ \text{bytes}} + \underbrace{\frac{4
 HNSW 的剪枝只依赖**向量距离**;而 [10](10-scoring.md) 的综合排序还含新鲜度/重要度/
 访问/可信度,这些量与距离不相关,不能直接进剪枝(会破坏召回)。因此:
 
-- **默认**:HNSW 用原始相似度粗排 `ef' = max(ef, 4k)` 候选,再由 [10 §2.3](10-scoring.md)
-  综合重排;
+- **默认(落地口径)**:HNSW 用原始相似度粗排(取用户 `ef`),再由 [10 §2.3](10-scoring.md)
+  综合重排;设计中的候选放大 `ef' = max(ef, 4k)` **尚未接线**(见 [10 §2.3](10-scoring.md)
+  的落地状态);
 - **可选重要性偏置路由**(`Scoring::bias_routing`):遍历优先级用
   `dist / √(1 + β·imp + β·acc)` 作为启发式(β 为实现内部固定系数,默认 1.0,不对外暴露),
   **只改访问顺序、不改最终分**,在不显著损召回的前提下减少探查量;这是"时间感知 ANN"的
-  工程形态,默认关闭。
+  工程形态;**当前设置即返回 `Unsupported`**(未落地,绝不静默无效,FC-MEM-ERR-002)。
 
 ---
 
@@ -328,7 +329,7 @@ $s = |\text{cand}| / N_{\text{alive}}$ 自适应三档:
 
 | 档 | 条件 | 策略 | ef 调整 |
 |---|---|---|---|
-| ① 后过滤 | $s > 0.10$ | 正常 HNSW,结果集过滤 | $ef' = \max(ef,k) \cdot \min(8,\ 1/s)$ |
+| ① 后过滤 | $s > 0.10$ | 全图遍历(与档②共用)+ 结果集过滤 | $ef' = \max(ef,k) \cdot \min(8,\ 1/s)$ |
 | ② 放大后过滤 | $0.001 < s \le 0.10$(且候选数 ≥ `max(ef,1024)`) | **全图遍历**(保连通)+ 结果限候选 | $ef' = \max(ef,k) \cdot 4$ |
 | ③ 候选暴力 | $s \le 0.001$ 或候选数 < `max(ef, 1024)`(仅当存在过滤位图;无过滤时候选即 alive、$s=1$,按 `post_threshold` 走档①/②) | 直接对候选位图暴力扫描 | — |
 
@@ -393,7 +394,7 @@ $s = |\text{cand}| / N_{\text{alive}}$ 自适应三档:
     entry: (u32 slot, u8 level)           # 段内入口(节点 = SlotId)
     node_table_offset / len, adj_offset / len, header_crc32
 node_table: [(u8 level, u32 adj_off)] × count     # 定长,O(1) 定位
-adj_blob:   逐点逐层 u32 邻居槽位数组(层0 ≤ M0 个,上层按 level ≤ M 个)
+adj_blob:   逐点逐层 [u16 degree] + u32 邻居槽位数组(层0 ≤ M0 个,上层按 level ≤ M 个)
 尾部 payload_crc32
 ```
 

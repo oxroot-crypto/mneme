@@ -117,7 +117,7 @@ impl DeltaEntry {
         }
     }
 
-    /// 排序目标(设计 04 §2.2a:按 `(target, seqno)` 排序)。
+    /// 排序目标(设计 04 §2.2a:按 `(target, seqno, kind)` 排序)。
     fn target(&self) -> u64 {
         match self {
             DeltaEntry::Access { rowid, .. } => *rowid,
@@ -334,12 +334,12 @@ mod tests {
         ]
     }
 
-    /// FC-PERSIST-POST-010(往返一致 + 按 `(target, seqno)` 排序)
+    /// FC-PERSIST-POST-010(往返一致 + 按 `(target, seqno, kind)` 排序)
     #[test]
     fn delta_roundtrip_is_sorted_and_lossless() {
         let bytes = encode_delta(&sample()).expect("encode");
         let decoded = decode_delta(&bytes).expect("decode");
-        // 排序键 (target, seqno):(1,6) Relate,(3,5) Access,(3,9) Unrelate。
+        // 排序键 (target, seqno, kind):(1,6) Relate、(3,5) Access、(3,9) Unrelate。
         assert_eq!(decoded.len(), 3);
         assert!(matches!(decoded[0], DeltaEntry::Relate { from: 1, .. }));
         assert!(matches!(

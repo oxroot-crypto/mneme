@@ -48,8 +48,9 @@
 **设计:内存累积 + 批量落盘**:
 
 ```text
-查询命中 → 读者把 RowId 追加进线程本地缓冲 → 攒批后合并进
-  Mutex<HashMap<RowId, AccessStat>>     (内存,写者锁外;AccessStat 见 [16 §1.6](16-api-reference.md))
+查询命中 → 读者把 RowId 追加进内存访问缓冲(Mutex<HashMap<RowId, u32>>,写者锁外,
+          条目数有上限,超限后新 RowId 丢弃;缓冲只在有持久层或开启自动遗忘时启用)
+         → 攒批时合并进 access 统计(AccessStat 见 [16 §1.6](16-api-reference.md))
 后台每 30s(默认): 把增量以 WAL TouchRow 帧落盘(一帧合并多次命中,`access_delta` 记合并后的次数)
 compaction: 把 Touch 历史并入新 msec 的 last_access / access_count 列([04 §2.2](04-l2-persist.md) entry 格式)
 ```
@@ -61,7 +62,7 @@ compaction: 把 Touch 历史并入新 msec 的 last_access / access_count 列([0
 
 ---
 
-## 3. 遗忘曲线:`retain.rs`
+## 3. 遗忘曲线:`memory/lifecycle.rs`
 
 ### 3.1 【直觉】人脑怎么忘
 
@@ -179,7 +180,8 @@ RowId 的版本链:
 保留窗口内,**活跃段数仍有界**(I8),但磁盘随历史版本数线性增长——这是"保留历史"的必然代价。
 
 **版本链物化**:compaction 把同一 RowId 跨段的多版本合并进新段的一条 version_table 记录序列
-(§2.2),墓碑并入 delta;合并只重排物理布局,不改变可见性结果(同快照语义)。
+([04 §2.2](04-l2-persist.md)),墓碑以 version_table 的墓碑行承载、访问/关系变更以
+delta 区承载([04 §2.2a](04-l2-persist.md));合并只重排物理布局,不改变可见性结果(同快照语义)。
 
 ### 4.3 触发条件(任一满足)
 
@@ -271,7 +273,7 @@ ns.iter(None)?;                 // 遍历/导出一个命名空间的全部活�
 
 ---
 
-## 6. 快照与备份:`backup.rs`
+## 6. 快照与备份:`memory/snapshot.rs` + `persist/store/snapshot.rs`
 
 ```text
 db.snapshot()  → SnapshotHandle: 钉住当前 ReaderView(该时刻的 MANIFEST 段集 +
@@ -299,7 +301,7 @@ neighbors / iter`)见 [16 §1.6](16-api-reference.md);二者均 `Send + Sync`,�
 
 ---
 
-## 7. stats 与 fsck:`stats.rs`
+## 7. stats 与 fsck:`memory/engine_ops.rs`
 
 ```rust
 db.stats()?  -> Stats {
@@ -308,11 +310,11 @@ db.stats()?  -> Stats {
     query_latency: Histogram(固定桶: 1ms..1s, 32 桶),
     per_namespace: HashMap<String, NsStat>,   // 键为命名空间路径(经 MANIFEST 注册表解析)
     quant: QuantStat,              // 配置/生效量化格式 + 召回估计(08 §4.3)
-    compaction: CompactionState,   // Idle | Running{progress, segments},定义见 [16 §1.6](16-api-reference.md)
+    compaction: CompactionState,   // Idle | Running{progress, segments} | Paused,定义见 [16 §1.6](16-api-reference.md)
     retain: Option<RetainReport>,  // 最近一次后台遗忘(未开启则 None,§3.4)
     relations: u64,                // 关系边数(09 §2)
     history: HistoryStat,          // 版本链/历史保留统计(§4.2a)
-    storage: StorageStat,          // 加密/压缩生效状态与迁移进度(11)
+    storage: StorageStat,          // 存储安全配置与迁移进度(压缩实现待 L11;11)
 }
 db.check()?   // fsck: 全量 CRC + version_table/RowId 版本链一致性 + key 索引 ↔ entries 对账
               //           + 墓碑/TTL 占比报告 + 建议动作(如 "建议合并 3 个 25MB 段")

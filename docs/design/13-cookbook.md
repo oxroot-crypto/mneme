@@ -158,7 +158,7 @@ profile.supersede("pref.theme",
 let db = Mneme::builder().path("./m").dimension(1536)
     .dedup(Dedup::Merge(|old, new| {
         let mut r = new.to_record();
-        r = r.importance(old.importance.max(new.importance));
+        r = r.importance(old.importance().max(new.importance()));
         Some(r)                                   // 保留更新时间与更高重要度
     }))
     .dedup_threshold(0.95)
@@ -276,8 +276,10 @@ db.close()?;
 ```
 
 - 备份目标必须不存在或为空([16 §7](16-api-reference.md));
-- PITR:把备份里的 `current` 指回上一 MANIFEST 版本([16 §7.2](16-api-reference.md));
-- 观测:`.observer(Arc::new(MyMetrics))` 接事件流([12 §4](12-deployment.md))。
+- PITR:按目标时间点定期 `backup_to`,每份备份独立可开;单份备份**不能**把 `current`
+  指回旧 MANIFEST(实时库的 MANIFEST 保留 2 版可供回滚,见 [16 §7.2](16-api-reference.md));
+- 观测:`.observer(Arc::new(MyMetrics))` 接事件流为 **L12 规划 API**(`Observer` 尚未
+  落地,见 [12 §4](12-deployment.md))。
 
 ---
 
@@ -288,9 +290,10 @@ db.close()?;
 let ro = Mneme::builder().path("./agent_memory").read_only(true).build()?;
 ```
 
-- 只读实例自动跟随写者的 MANIFEST 推进([12 §2](12-deployment.md)),无需锁;
-- 加密(feature `encrypt`):`Builder::encryption(Some(Encryption { provider: Arc::new(KmsKeyProvider), cipher: Cipher::Aes256Gcm }))`([11 §2](11-security-storage.md));
-- 压缩(feature `compress`):`Builder::compression(Compression::Lz4)`([11 §3](11-security-storage.md))。
+- 只读实例打开后**不随写者推进刷新**(周期性探测与原子切换视图是 L12 目标,
+  见 [12 §2.1](12-deployment.md)),无需锁;
+- 加密(feature `encrypt`):`Builder::encryption(Some(Encryption { provider: Arc::new(KmsKeyProvider), cipher: Cipher::Aes256Gcm }))` 为 **L11 规划 API**,当前未落地([11 §2](11-security-storage.md));
+- 压缩:`Builder::compression(Compression::Lz4)` 配置已可设置,压缩实现待 **L11**([11 §3](11-security-storage.md))。
 
 ## 本章小结
 

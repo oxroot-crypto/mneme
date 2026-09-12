@@ -39,6 +39,7 @@
 
 | 日期 | 变更 |
 |---|---|
+| 2026-09 | 独立文档审查整改(第七轮):① **修复联想扩展跨命名空间泄漏**——扩展器只沿同命名空间边推进,跨命名空间边视为不存在(`FC-SCORE-POST-004` 新增,回归 `tests/query_contracts.rs::expansion_does_not_cross_namespaces`);扩展访问上限改为 `visited`+结果合计(空间 `O(max_nodes+seeds)`,`FC-SCORE-CPLX-002` 同步);② `QuantStat.active` 不再回显用户配置(L6 未落地时恒为 `F32`),`StorageStat` 口径改为「压缩配置已接线、实现待 L11」;③ `FC-SCORE-CPLX-001/002/003` 按 §9.3 回填解析证明 + 哨兵并转 `Passed`(001 含排序为 $O(m\log m)$、002 空间 `max_nodes+seeds`、003 为未缓存 $O(mk^2d)$);④ `FC-PERSIST-POST-010` 排序键由 `(target, seqno)` 修正为 `(target, seqno, kind)`(实现与注释同步);⑤ 设计文档(`00`–`16`)、`docs/DESIGN.md` 与 `docs/rust` 教学文档漂移同步(量化/Drop 语义/模块清单/行号引用等) |
 | 2026-09 | 文档最终收尾(第六轮):修正 WAL `Insert` 负载字段序(`[i64 tx_ms][u32 dim][f32×dim]`)、`Delete` 保留帧措辞、`Builder::mmap(false)` 伪 API、mmap 口径统一(§11/§13)、`TouchRow` 帧名、`list_namespaces` 口径、zone map 17 B、版本「过新→不一致」措辞、feature 表标注(当前仅 `mmap` 已定义)、`Scoring` 链式示例改结构体字面量、README 规划项标注、`brute_force_max_rows`「不超过」分派口径;`wal_capacity_triggers_snapshot_flush` 改名 `wal_capacity_triggers_incremental_flush`(契约同步);`storage`/`index`/`source`/`builder` 过时注释清理 |
 | 2026-09 | 审查收尾(第五轮):① 文档 WAL 帧表与实现同步(`Insert`/`DeleteRow` 补 `tx_ms`、补 `NsUnregister` 负载与帧归类、注册帧可在批内);② `valid_time` 标志只认 0/1 并登记 `FC-PERSIST-ERR-010` + 1:1 测试(`src/persist/msec/entry.rs` 纳入追溯门禁);③ 删 `Config` 三个冗余未读字段(`fsync`/`verify_on_open`/`fail_fast_on_corruption`,真值唯一入口为 `OpenOptions`)与对应 `allow(dead_code)`;`persist::source` 的豁免收窄到具体后端类型/方法(两个 feature 组合零告警);④ 过时注释与文档清理(storage/handle/index/open/recover、04 §2.3/§3.3/§7/§8/§12/§14、01/05/09/14/15);⑤ 两处弱断言补内容校验;⑥ 段条目 `format_version` 注明「审计用,打开以段文件自身头部为准」 |
 | 2026-09 | 按「项目未发布」纪律第三轮清理(代码+文档收尾):① 空倒排回退与空关系区宽容收紧(`decode_inverted`/`edges::parse` 空区 → `Corrupted`),四区/关系区统一「必填」口径;② 版本不一致测试补低版本向并改名(`*_rejects_version_mismatch`、`segment_version_mismatch_is_rejected`);③ 旧措辞清理:msec 区注释(「旧段/无索引时为空」)、`valid_time` 标志只认 0/1、`UnsupportedVersion` 文案、`load_index`/`is_version_rejection` 表述;④ 契约:错误矩阵、`FC-PERSIST-ERR-002`、`FC-PERSIST-POST-010/011`、`FC-INDEX-ERR-001` 同步精确匹配口径,删「迁移说明(破坏性变更)」旧消费者假设;⑤ 文档:04 §2.2b 关系区布局按实现重写(`EDG1` 头/flags/无逐条 `ns_id`/无稀疏索引)、WAL 帧表补 `15=NsUnregister`、stopwords 行、04 §13/§14 与 05/14/15/16 版本口径 |
@@ -213,7 +214,7 @@
 | FC-PERSIST-POST-007 | POST | 段读取后端等价:feature `mmap` 开/关时 `source::read_whole` 与 `std::fs::read` 逐字节一致;`MmapSource::slice` 返回整段、`read_at` 越界 → `UnexpectedEof`(mmap 为优化,不改变功能语义;32 位平台长度转换失败返回 `Io`,不静默截断,解析证明登记) | `src/persist/source.rs::read_whole_matches_bytes`、`src/persist/source.rs::mmap_source_slice_and_bounds` | Passed |
 | FC-PERSIST-POST-008 | POST | msec 轻量索引四区(字段字典 / zone map / bloom / 倒排)与内存结构往返一致:`flush` 全量写入;`open` 校验区结构并从磁盘倒排直接重建(经"段内槽位 → 全局槽位"重排映射),zone map 从槽位重建(等价);重开后 BM25 结果与分数逐位一致,段与未落盘增量共用同一全局统计(I21);四区为当前格式**必填**,任一缺失/畸形 → `Corrupted`(`fail_fast` 上报,否则降级为从槽位全量重建,两条路径等价);字段字典中 `key` 保留字段唯一(同名 metadata 不注册);`ttl_map` 随 L5 落地(块级 TTL 剪枝,FC-LIFE-CPLX-001) | `tests/l4_contracts.rs::text_index_survives_reopen`、`tests/l4_contracts.rs::flushed_and_tail_records_share_bm25_statistics`、`tests/l4_contracts.rs::lossy_zone_intervals_survive_fail_fast_reopen`、`tests/l4_contracts.rs::reopen_after_update_remaps_text_index`、`src/persist/flush.rs::field_dict_keeps_single_key_field`、`src/persist/msec/index.rs::ttl_map_roundtrip_and_invalid_tail` | Passed |
 | FC-PERSIST-POST-009 | POST | 文本分词口径(停用词开关)建库即锁定:新库写入 MANIFEST(1=关、2=开,其余值 → `Corrupted`);`open` 忽略调用方冲突配置并以磁盘值为准(同时锁定查询分词),保证索引分词与查询分词同口径、绝不静默漏召回 | `tests/l4_contracts.rs::stopwords_setting_is_locked_at_creation`、`src/persist/manifest.rs::stopwords_flag_roundtrip` | Passed |
-| FC-PERSIST-POST-010 | POST | msec `delta` 区(设计 04 §2.2a)编解码往返一致:条目按 `(target, seqno)` 排序,恢复时读入并回放访问统计与关系变更;`Access` delta 仅当 `seqno` 不早于该 RowId 最新版本行时才累加(版本行的 `access` 列**始终**为写入时刻累计快照,缺失会令更旧版本的值残留后与 delta 重复累加);compaction 必须把被合并段中「其 RowId 最新版本未被新段覆盖」的 `Access` delta 携带进新段;区内条目数与 CRC 校验通过;空区表示本段无跨段变更,解码为空 `Vec` | `src/persist/msec/delta.rs::delta_roundtrip_is_sorted_and_lossless`、`src/persist/msec/delta.rs::empty_delta_is_valid`、`tests/l5_contracts.rs::delta_access_and_relations_survive_reopen`、`tests/l5_contracts.rs::access_delta_is_not_double_counted_after_later_version`、`tests/l5_contracts.rs::compaction_carries_access_delta_for_unmerged_rows`、`tests/l5_contracts.rs::compaction_keeps_access_dirty_for_history_only_row`、`tests/l5_contracts.rs::compaction_latest_in_keep_drops_covered_delta`、`tests/l5_contracts.rs::touch_then_update_single_flush_does_not_double_count` | Passed |
+| FC-PERSIST-POST-010 | POST | msec `delta` 区(设计 04 §2.2a)编解码往返一致:条目按 `(target, seqno, kind)` 排序,恢复时读入并回放访问统计与关系变更;`Access` delta 仅当 `seqno` 不早于该 RowId 最新版本行时才累加(版本行的 `access` 列**始终**为写入时刻累计快照,缺失会令更旧版本的值残留后与 delta 重复累加);compaction 必须把被合并段中「其 RowId 最新版本未被新段覆盖」的 `Access` delta 携带进新段;区内条目数与 CRC 校验通过;空区表示本段无跨段变更,解码为空 `Vec` | `src/persist/msec/delta.rs::delta_roundtrip_is_sorted_and_lossless`、`src/persist/msec/delta.rs::empty_delta_is_valid`、`tests/l5_contracts.rs::delta_access_and_relations_survive_reopen`、`tests/l5_contracts.rs::access_delta_is_not_double_counted_after_later_version`、`tests/l5_contracts.rs::compaction_carries_access_delta_for_unmerged_rows`、`tests/l5_contracts.rs::compaction_keeps_access_dirty_for_history_only_row`、`tests/l5_contracts.rs::compaction_latest_in_keep_drops_covered_delta`、`tests/l5_contracts.rs::touch_then_update_single_flush_does_not_double_count` | Passed |
 | FC-PERSIST-POST-011 | POST | WAL 轮转与 Checkpoint:单文件达 `CompactionPolicy.wal_file_bytes` 换新文件、单批不跨文件;打开按文件序回放,`seqno ≤ watermark` 的帧跳过(**注册表 metadata 帧同样带真实 seqno 并受水位约束**),残留旧文件不得复活已注销命名空间;Checkpoint 后已完全覆盖的旧 WAL 文件可删除(删除失败仅残留,恢复时按 `seqno ≤ watermark` 跳过),未覆盖前缀绝不丢;撕裂尾按 `FC-PERSIST-INV-005` 处理 | `tests/l5_contracts.rs::wal_rotation_splits_files_without_losing_batches`、`tests/l5_contracts.rs::checkpoint_removes_covered_wal_files`、`tests/l5_contracts.rs::stale_wal_files_do_not_resurrect_unregistered_namespace`、`tests/l5_contracts.rs::namespace_registered_after_last_flush_survives_crash`、`src/persist/store/wal_writer.rs::wal_index_parsing_accepts_canonical_names_only` | Passed |
 | FC-PERSIST-POST-012 | POST | **槽位归属恢复**:打开时按各段重排映射回填"槽位 → 所属段",段按编号升序回放(防御 MANIFEST 乱序);`unpersisted_slots` 只列 WAL 尾部新槽位,重开后空 flush 为空操作、compaction 不得把已落盘段当未落盘而整体丢弃 | `tests/l5_contracts.rs::reopen_preserves_segment_membership`、`src/persist/recover/state.rs::collect_versions_orders_segments_by_id` | Passed |
 
@@ -243,6 +244,7 @@
 | FC-SCORE-POST-001 | POST | `Scoring::default()` 与未开启 `score()` 的排序全等 | `tests/query_contracts.rs::default_scoring_matches_similarity_order` | Passed |
 | FC-SCORE-POST-002 | POST | `Scoring::floor` 下的候选满足 `ŝ ≥ floor` 或 `S = 0`:归一化相似度 `ŝ < floor` 时综合分清零,`ŝ = floor` 为保留边界(实现用严格小于,等于保留);`floor = 0` 时恒不清零 | `tests/query_contracts.rs::scoring_floor_zeroes_below_threshold` | Passed |
 | FC-SCORE-POST-003 | POST | 放大 ef 后综合排序相对召回损失 ≤ 2% | 待补 | Planned |
+| FC-SCORE-POST-004 | POST | 联想扩展只沿**同命名空间**的边推进:目标槽位 `ns_id` 与发起检索的命名空间不一致时视为不存在,绝不把其他命名空间的记忆引入结果(`relate` 可记录跨命名空间边,但扩展不越界) | `tests/query_contracts.rs::expansion_does_not_cross_namespaces` | Passed |
 | FC-QUERY-ERR-001 | ERR | DSL 任意输入不 panic,返回结构化 `FilterParse`(I7);解析器设嵌套深度上限,错误携带字节位置;数字非有限(如 `1e999`)与相对时间量超出 `f64` 精确范围/ISO 8601 可往返范围(4 位年份) → `FilterParse`,绝不整数溢出 panic,也绝不产出 `Display` 读不回的值 | `tests/l4_contracts.rs::dsl_never_panics_on_arbitrary_input`、`src/query/parse/mod.rs::malformed_inputs_report_position`、`src/query/parse/mod.rs::out_of_range_numbers_and_durations_are_rejected`、`src/query/parse/mod.rs::deeply_nested_input_is_rejected_without_panic` | Passed |
 | FC-QUERY-ERR-002 | ERR | `Not` 对缺失字段采用三值语义(缺失 → `Not` 亦为 false) | `tests/query_contracts.rs::filter_uses_kleene_three_valued_logic` | Passed |
 | FC-QUERY-POST-001 | POST | 谓词类型规则:数值比较 `Int`/`Num` 互通;`Ts` 仅与 `Ts` 比较;`Contains`/`StartsWith`/`EndsWith`/`Glob` 要求字符串或数组;类型不匹配求值为 `Unknown`(不命中) | `tests/query_contracts.rs::predicate_type_rules` | Passed |
@@ -342,7 +344,7 @@
 > 复杂度是**资源后置约束**:每个公开操作在声明的输入规模下,时间与空间开销必须落在
 > 下表上界内。所有复杂度以**最坏情况**为默认口径;显式标注「摊还」「期望」者除外。
 > 变量定义见 §9.1,验证方式与门禁见 §9.3;与 [15 §3 复杂度速查](../design/15-glossary.md)
-> 一一对应,后者是阅读视图,本节是唯一真实数据源。
+> 对应(后者是阅读视图,覆盖主流操作;本节是唯一真实数据源,冲突以本节为准)。
 
 ### 9.1 符号与口径
 
@@ -360,6 +362,9 @@
 | $L$ | DSL 表达式字符长度 |
 | $E$ | 关系边数 |
 | $deg$ | 关系图中节点的度数 |
+| $\text{seeds}$ | 联想扩展的上跳种子数 |
+| $\text{avg\_degree}$ | 关系图平均度数 |
+| $\text{max\_nodes}$ | 联想扩展的访问上限(`visited` + 结果,`RelationExpand::max_nodes`) |
 | $B,\ r$ | 段初始行数 / 分级比 |
 | $M,\ M_0$ | HNSW 上层 / 第 0 层度数上限 |
 | $ef,\ ef_c$ | 查询 / 构建探查宽度 |
@@ -425,9 +430,9 @@
 | FC-QUERY-CPLX-002 | CPLX | 计划编译:时间 $O(N + \text{blocks}\times\text{predicates})$、空间 $O(n/8)$ 块位图 + $O(N_c)$ 候选。注:$N$ 为视图物理槽位数(逐行判定命名空间/可见性);块掩码求值本身为 $O(\text{blocks}\times\text{predicates})$。内存架构下无段句柄直读,该 $O(N)$ 项待 L6 段句柄重构消除 | 解析证明(设计 06 §2)+ 哨兵 `tests/l4_contracts.rs::plan_filter_matches_pointwise_count` | Passed |
 | FC-QUERY-CPLX-003 | CPLX | BM25 打分:时间 $O(N_{ns} + 2\sum_{t\in Q} df_t)$ postings 访问;空间 $O(\min(N_{ns}, \sum_{t\in Q} df_t))$(第二遍物化全部命中文档的分数映射,TopK 另计 $O(k)$)($N_{ns}$ = 查询命名空间有文本的物理槽位数,用于可见性过滤后的 N/avgdl 统计;段统计不可变后时间项可降为 $O(S_{\text{seg}})$,待 L6) | 解析证明(设计 06 §3.2 两遍法)+ 哨兵 `tests/l4_contracts.rs::bm25_formula_behaviour` | Passed |
 | FC-QUERY-CPLX-004 | CPLX | RRF/加权融合:时间 $O(k)$、空间 $O(k)$ | 解析证明(设计 06 §4:只对两通道 top-k 名次表操作)+ 哨兵 `tests/l4_contracts.rs::hybrid_fusion_and_validation` | Passed |
-| FC-SCORE-CPLX-001 | CPLX | 综合重排/归一化:时间 $O(m)$($m$ = 候选数),每候选 $O(1)$;空间 $O(m)$ | 待补 | Planned |
-| FC-SCORE-CPLX-002 | CPLX | 联想扩展:时间 $O(\text{seeds}\cdot\text{max\_nodes}\cdot\text{avg\_degree})$(有界 BFS,$hops\le 3$);空间 $O(\text{max\_nodes})$ | 待补 | Planned |
-| FC-SCORE-CPLX-003 | CPLX | MMR 贪心:时间 $O(k^2)$(冗余相似度缓存后;现算为 $O(k^2\cdot d)$);空间 $O(k)$ | 待补 | Planned |
+| FC-SCORE-CPLX-001 | CPLX | 综合重排/归一化:时间 $O(m\log m)$($m$ = 候选数;逐候选 $O(1)$ 因子计算 + 一次排序);空间 $O(m)$ | 解析证明(设计 10 §2.5:单遍逐候选计算因子与加权和,末尾按分数稳定排序)+ 哨兵 `tests/query_contracts.rs::scoring_composite_factors_clamped` | Passed |
+| FC-SCORE-CPLX-002 | CPLX | 联想扩展:时间 $O(\text{seeds}\cdot\text{max\_nodes}\cdot\text{avg\_degree})$($\text{seeds}$ = 上跳种子数;有界 BFS,$hops\le 3$);空间 $O(\text{max\_nodes}+\text{seeds})$(`visited` 集合**总量**受 `max_nodes` 封顶,种子预置其中、结果为其子集;被命名空间/存活/过滤拒绝的节点同样计入,达到上限即提前停止扩展) | 解析证明(设计 10 §3.2:逐跳 BFS,`visited` 总量封顶)+ 哨兵 `tests/query_contracts.rs::expansion_does_not_cross_namespaces` | Passed |
+| FC-SCORE-CPLX-003 | CPLX | MMR 贪心:时间 $O(m\cdot k^2\cdot d)$($m$ = 候选数,$k$ = 返回条数;每轮对剩余候选与已选集合两两重算余弦且**未缓存**);空间 $O(k)$ | 解析证明(设计 10 §5:逐轮线性扫描剩余候选,冗余相似度两两重算;缓存化优化须先改本条)+ 哨兵 `tests/query_contracts.rs::scoring_composite_factors_clamped` | Passed |
 
 #### 9.2.6 L5 生命周期层(life)
 
