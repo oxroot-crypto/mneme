@@ -56,6 +56,9 @@ impl Mneme {
     /// # Arguments
     /// * `path` - 库目录路径;不存在时按默认配置新建(维度需经 [`Mneme::builder`] 指定)。
     ///
+    /// # Returns
+    /// 已打开(或新建)的库句柄 [`Mneme`]。
+    ///
     /// # Errors
     /// 目录不可用、锁被占、MANIFEST/段损坏或维度冲突时返回结构化错误。
     ///
@@ -74,6 +77,9 @@ impl Mneme {
     ///
     /// # Arguments
     /// * `dimension` - 向量维度;取值 `[1, 65536]`,建库后锁定不可变。
+    ///
+    /// # Returns
+    /// 指定维度的纯内存库句柄 [`Mneme`]。
     ///
     /// # Errors
     /// 维度超出 `[1, 65536]` 时返回 [`MnemeError::LimitExceeded`]。
@@ -228,6 +234,9 @@ impl Mneme {
     /// # Arguments
     /// * `ts_ms` - 事务时间上界(Unix 毫秒);仅包含 `tx_ms <= ts_ms` 的版本。
     ///
+    /// # Returns
+    /// 钉住 `tx_ms <= ts_ms` 版本的一致快照句柄,`as_of_ms` 等于 `ts_ms`。
+    ///
     /// # Errors
     /// 库已关闭时返回 [`MnemeError::Closed`]。
     ///
@@ -257,6 +266,9 @@ impl Mneme {
     ///
     /// # Arguments
     /// * `dir` - 备份目标目录;必须不存在或为空。
+    ///
+    /// # Returns
+    /// 备份统计:文件数、字节数与是否走硬链接路径。
     ///
     /// # Errors
     /// 纯内存库返回 [`MnemeError::Unsupported`];目标非空返回 [`MnemeError::Busy`];
@@ -289,8 +301,13 @@ impl Mneme {
 
     /// 关闭共享库:标记关闭并释放资源;幂等。
     ///
+    /// # Returns
+    /// 关闭完成返回 `Ok(())`;持久库最终 flush 失败时返回 `Err`(触发条件见
+    /// `# Errors`)。
+    ///
     /// # Errors
-    /// 恒 `Ok`(L1 关闭不产生 I/O;`Result` 为 L2 持久化错误预留)。
+    /// 纯内存库恒 `Ok`;持久库关闭前最终 flush 失败时返回底层持久层错误
+    /// (如 [`MnemeError::Io`])。
     ///
     /// # Examples
     /// ```

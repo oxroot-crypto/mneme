@@ -98,6 +98,10 @@ impl Builder {
     /// 打开既有库时,`Tuning::stopwords` 以 MANIFEST 记录值为准(建库即锁定),
     /// 调用方冲突配置被忽略,避免索引分词与查询分词不一致(FC-PERSIST-POST-009)。
     ///
+    /// # Returns
+    ///
+    /// 打开(或新建)的库句柄 [`Mneme`]。
+    ///
     /// # Errors
     /// * 未设置 `dimension`(新建库)→ [`MnemeError::Config`];
     /// * `dedup_threshold` 非 `[0,1]` 内的有限值 → [`MnemeError::Config`]

@@ -51,6 +51,11 @@ impl RelateOptions {
     ///
     /// * `kind` - 关系类型。
     /// * `weight` - 边权;越界值在写入入口钳制到 `[0,1]`。
+    ///
+    /// # Returns
+    ///
+    /// `metadata` 为 [`Meta::Null`] 的选项,可经 [`metadata`](Self::metadata)
+    /// 覆盖。
     pub fn new(kind: RelationKind, weight: f32) -> Self {
         Self {
             kind,
@@ -60,6 +65,14 @@ impl RelateOptions {
     }
 
     /// 设置边元数据(链式)。
+    ///
+    /// # Arguments
+    ///
+    /// * `metadata` - 边元数据(开放 JSON);覆盖缺省 [`Meta::Null`]。
+    ///
+    /// # Returns
+    ///
+    /// 携带边元数据的选项(链式)。
     pub fn metadata(mut self, metadata: Meta) -> Self {
         self.metadata = metadata;
         self

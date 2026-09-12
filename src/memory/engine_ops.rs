@@ -72,6 +72,9 @@ fn dead_ratios(view: &ReaderView, now: i64) -> HashMap<u32, f32> {
 impl Mneme {
     /// 返回运行统计。
     ///
+    /// # Returns
+    /// 当前视图的运行统计快照,字段见 [`Stats`]。
+    ///
     /// # Errors
     /// 库已关闭时返回 [`MnemeError::Closed`]。
     ///
@@ -153,6 +156,10 @@ impl Mneme {
     /// 不符时报告不一致;已删除(墓碑)与已逻辑过期的记录不算不一致(FC-MEM-POST-008)。
     /// 持久侧(L2):逐段校验头部/payload CRC 与版本链记录体(设计 16 §1.6)。
     /// 另报告每段墓碑/过期占比与合并建议(FC-LIFE-POST-009;建议不影响 `ok`)。
+    ///
+    /// # Returns
+    /// fsck 报告:`ok` 为 `true` 表示未发现索引不一致或段损坏;`corrupted` 与
+    /// `suggestions` 给出损坏段与运维建议。
     ///
     /// # Errors
     /// 库已关闭时返回 [`MnemeError::Closed`]。
@@ -259,6 +266,9 @@ impl Mneme {
     /// 纯内存库为空操作;持久库执行增量段 flush + WAL Checkpoint(设计 04 §3.2、
     /// 07 §4);无新增且无 delta 时为空操作。
     ///
+    /// # Returns
+    /// 落盘完成(含空操作)返回 `Ok(())`。
+    ///
     /// # Errors
     /// 库已关闭时返回 [`MnemeError::Closed`];只读模式返回
     /// [`MnemeError::Unsupported`];I/O 失败返回 [`MnemeError::Io`]。
@@ -285,6 +295,9 @@ impl Mneme {
     /// 无触发条件、已暂停或纯内存库时为空操作。合并期间 `stats().compaction`
     /// 反映 `Running`(运行中暂停则为 `Paused`);`pause()` 在提交前生效,中止时
     /// 不改动任何已提交状态。
+    ///
+    /// # Returns
+    /// 本轮 compaction 完成(含空操作)返回 `Ok(())`。
     ///
     /// # Errors
     /// 库已关闭时返回 [`MnemeError::Closed`];只读模式返回

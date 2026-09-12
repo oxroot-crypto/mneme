@@ -87,6 +87,11 @@ impl Histogram {
     }
 
     /// 返回 32 个桶的累计计数。
+    ///
+    /// # Returns
+    ///
+    /// 长度恒 32 的桶计数数组:下标 0 为 ≤1ms、下标 31 为 ≥1s,其余按对数刻度
+    /// 分布;计数由 [`record`](Self::record) 累加,读取不清零。
     pub fn buckets(&self) -> &[u64; HISTOGRAM_BUCKETS] {
         &self.buckets
     }
@@ -275,11 +280,21 @@ impl CompactionControl {
     }
 
     /// 是否处于暂停状态。
+    ///
+    /// # Returns
+    ///
+    /// 暂停标志已置位返回 `true`;空闲时调用 `pause()` 也会置位,此时
+    /// [`state`](Self::state) 仍为 [`Idle`](CompactionState::Idle)。
     pub fn is_paused(&self) -> bool {
         self.inner.paused.load(Ordering::Relaxed)
     }
 
     /// 当前合并状态。
+    ///
+    /// # Returns
+    ///
+    /// 当前 [`CompactionState`] 的克隆:`Idle`、`Running`(含进度与参与段)或
+    /// `Paused`(含暂停时进度与参与段)。
     pub fn state(&self) -> CompactionState {
         self.inner
             .state

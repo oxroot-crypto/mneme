@@ -16,6 +16,11 @@ impl Namespace {
     /// # Arguments
     /// * `rec` - 待写入记录;向量维度须与建库维度一致,分量必须是有限值。
     ///
+    /// # Returns
+    /// 逐条写入结果:新建 [`InsertOutcome::Inserted`]、去重合并
+    /// [`InsertOutcome::Merged`](保留旧 `RowId`)、`RejectDuplicate` 命中
+    /// [`InsertOutcome::Duplicate`]。
+    ///
     /// # Errors
     /// 维度不符 → [`MnemeError::DimensionMismatch`];向量分量或 `importance`/`confidence`
     /// 非有限值 → [`MnemeError::NonFinite`];超限 → [`MnemeError::TooLarge`]/
@@ -60,6 +65,10 @@ impl Namespace {
     ///
     /// # Arguments
     /// * `recs` - 批量记录;按顺序逐条求值,返回顺序与输入一致。
+    ///
+    /// # Returns
+    /// 与 `recs` 等长、顺序一致的逐条结果;批内重复 key(`RejectDuplicate`)以
+    /// [`InsertOutcome::Duplicate`] 出现在对应位置,不算错误。
     ///
     /// # Errors
     /// 任一条维度不符 → [`MnemeError::DimensionMismatch`];分量非有限值 →
@@ -179,6 +188,10 @@ impl Namespace {
     /// * `key` - 记录键;按当前命名空间隔离查找。
     /// * `patch` - 局部补丁;仅 `Some` 字段生效,向量字段受维度与非有限值校验。
     ///
+    /// # Returns
+    /// 更新成功返回 [`UpdateOutcome::Updated`](携带命中 `RowId`);key 不存在或
+    /// 命名空间未注册返回 [`UpdateOutcome::NotFound`]。
+    ///
     /// # Errors
     /// 库已关闭 → [`MnemeError::Closed`];补丁向量维度不符 →
     /// [`MnemeError::DimensionMismatch`];向量分量或 `importance`/`confidence` 非有限值 →
@@ -225,6 +238,10 @@ impl Namespace {
     /// * `id` - 目标 `RowId`;不存在或已墓碑时返回 `NotFound`。
     /// * `patch` - 局部补丁;仅 `Some` 字段生效。
     ///
+    /// # Returns
+    /// 更新成功返回 [`UpdateOutcome::Updated`];`RowId` 不存在或已墓碑返回
+    /// [`UpdateOutcome::NotFound`]。
+    ///
     /// # Errors
     /// 库已关闭 → [`MnemeError::Closed`];补丁向量维度不符 →
     /// [`MnemeError::DimensionMismatch`];向量分量或 `importance`/`confidence` 非有限值 →
@@ -246,6 +263,10 @@ impl Namespace {
     /// # Arguments
     /// * `key` - 要修订的记录键;不存在时返回 `NotFound`。
     /// * `rec` - 新版本记录;其 `valid_from`(缺省为当前时刻)同时作为旧版本的 `valid_to`。
+    ///
+    /// # Returns
+    /// 修订成功返回 [`UpdateOutcome::Updated`](沿用原 `RowId`);key 不存在、
+    /// 命名空间未注册或已墓碑返回 [`UpdateOutcome::NotFound`]。
     ///
     /// # Errors
     /// 新记录维度不符 → [`MnemeError::DimensionMismatch`];向量分量或

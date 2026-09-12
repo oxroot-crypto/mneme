@@ -70,7 +70,7 @@ const SRC_STORE_OPEN: &str = include_str!("../src/persist/store/open.rs");
 /// L4 计划器源码(块级剪枝等价性单测被契约引用)。
 const SRC_QUERY_PLAN: &str = include_str!("../src/query/plan.rs");
 /// L4 解析器源码(越界/位置错误单测被契约引用)。
-const SRC_QUERY_PARSE: &str = include_str!("../src/query/parse/mod.rs");
+const SRC_QUERY_PARSE: &str = include_str!("../src/query/parse.rs");
 /// L4 BM25 源码(公式/可见性单测被契约引用)。
 const SRC_QUERY_BM25: &str = include_str!("../src/query/bm25.rs");
 /// L4 融合源码(RRF/加权单测被契约引用)。
@@ -153,7 +153,7 @@ const SOURCES: [(&str, &str); 49] = [
     ("src/persist/recover/state.rs", SRC_RECOVER_STATE),
     ("src/persist/store/open.rs", SRC_STORE_OPEN),
     ("src/query/plan.rs", SRC_QUERY_PLAN),
-    ("src/query/parse/mod.rs", SRC_QUERY_PARSE),
+    ("src/query/parse.rs", SRC_QUERY_PARSE),
     ("src/query/bm25.rs", SRC_QUERY_BM25),
     ("src/query/fusion.rs", SRC_QUERY_FUSION),
     ("src/persist/msec/inverted.rs", SRC_MSEC_INVERTED),

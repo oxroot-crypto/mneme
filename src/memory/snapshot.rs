@@ -32,11 +32,20 @@ impl std::fmt::Debug for SnapshotHandle {
 
 impl SnapshotHandle {
     /// 构建该视图时的基线序号水位。
+    ///
+    /// # Returns
+    ///
+    /// 快照视图的基线 [`SeqNo`](crate::SeqNo) 原始值;钉住后不随后续写入变化。
     pub fn version(&self) -> u64 {
         self.view.seqno.get()
     }
 
     /// 事务时间上界(普通快照 = 当前,`as_of` = 指定时刻)。
+    ///
+    /// # Returns
+    ///
+    /// 事务时间上界(Unix 毫秒):普通快照为构建时刻,`as_of` 快照为调用方
+    /// 指定的 `ts_ms`。
     pub fn as_of_ms(&self) -> i64 {
         self.as_of_ms
     }
@@ -45,6 +54,11 @@ impl SnapshotHandle {
     ///
     /// 统计取自快照钉住的 `ReaderView`,不随后续写入或后台 compaction 变化
     /// (设计 07 §6、I17)。
+    ///
+    /// # Returns
+    ///
+    /// 钉住视图的 [`SnapshotStats`](crate::memory::ops::SnapshotStats):基线水位、
+    /// 活跃段数与物理槽位数(含历史版本与墓碑,已物理回收槽位不计入)。
     ///
     /// # Examples
     /// ```

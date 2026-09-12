@@ -15,6 +15,7 @@ use crate::core::error::{MnemeError, Result};
 use crate::core::metric::Metric;
 use crate::core::options::{Diversity, QueryId};
 use crate::core::types::{NsId, RowId};
+use crate::memory::dedup::ResultDedup;
 use crate::memory::expand::{self, ExpandCtx, expand_candidates};
 use crate::memory::record::Hit;
 use crate::memory::relation::Edge;
@@ -54,7 +55,12 @@ impl SearchBuilder<'_> {
     /// * `top_k`/`ef` 超上限 → [`MnemeError::LimitExceeded`];
     /// * MMR `lambda` 含非有限值 → [`MnemeError::Config`](`clamp` 对 NaN 失效会静默退化);
     /// * `Scoring::bias_routing = true`(依赖 HNSW 启发式路由,尚未落地)
-    ///   → [`MnemeError::Unsupported`]:设置即拒绝,绝不静默忽略;    /// * 库已关闭 → [`MnemeError::Closed`]。
+    ///   → [`MnemeError::Unsupported`]:设置即拒绝,绝不静默忽略;
+    /// * 库已关闭 → [`MnemeError::Closed`]。
+    ///
+    /// # Returns
+    /// 命中列表,至多 `top_k` 条;未设置 `rerank` 时按最终分从优到劣排序。
+    /// 命名空间未注册或无命中时返回空 `Vec`。
     ///
     /// # Examples
     /// ```
@@ -80,6 +86,7 @@ impl SearchBuilder<'_> {
         self.validate_query()?;
         self.validate_fusion()?;
         self.validate_diversify()?;
+        self.validate_dedup()?;
         let Some(ns_id) = self.resolve_ns_id(&view) else {
             return Ok(Vec::new());
         };
@@ -186,6 +193,20 @@ impl SearchBuilder<'_> {
         {
             return Err(MnemeError::Config {
                 reason: "MMR lambda 必须是 [0,1] 内的有限值",
+            });
+        }
+        Ok(())
+    }
+
+    /// 校验结果级去重参数:`Near` 阈值须为 `[0,1]` 内的有限值——`NaN`/越界会让
+    /// `cosine_sim >= threshold` 恒假、去重静默空转,入口显式拒绝
+    /// (FC-SCORE-POST-005,拒绝静默失败)。
+    fn validate_dedup(&self) -> Result<()> {
+        if let ResultDedup::Near { threshold } = self.dedup
+            && !(0.0..=1.0).contains(&threshold)
+        {
+            return Err(MnemeError::Config {
+                reason: "ResultDedup::Near.threshold 必须是 [0,1] 内的有限值",
             });
         }
         Ok(())

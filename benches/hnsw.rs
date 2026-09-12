@@ -4,9 +4,10 @@
 //! 1M×1536 门槛待 CI heavy 档);召回门槛见 `tests/hnsw_contracts.rs`。
 //! 阈值与回归门禁由 CI 判定(相对基线 > 10% 阻断),仓库当前尚无 CI 配置。
 
+use std::hint::black_box;
 use std::time::Duration;
 
-use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use mneme::{Builder, Metric, Record};
 
 /// 生成确定性均匀向量(线性同余,避免依赖 `rand`)。

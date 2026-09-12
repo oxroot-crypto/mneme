@@ -37,6 +37,11 @@ pub struct Retention {
 impl Retention {
     /// 返回默认策略(半衰期 14 天、下限 0.2、增益权重 0.05)。
     ///
+    /// # Returns
+    ///
+    /// 默认 [`Retention`]:半衰期 14 天、下限 0.2、增益权重 0.05、`protect` 为
+    /// `None`。
+    ///
     /// # Examples
     /// ```
     /// use mneme::Retention;
