@@ -57,6 +57,8 @@ pub(crate) enum FrameKind {
     TouchRow,
     /// 命名空间注册。
     NsRegister,
+    /// 命名空间注销(删除路径;`NsId` 作废、永不复用)。
+    NsUnregister,
     /// 按 `(ns, key)` 局部更新。
     Update,
     /// 按 `RowId` 局部更新。
@@ -87,6 +89,7 @@ impl FrameKind {
             FrameKind::Relate => 12,
             FrameKind::Unrelate => 13,
             FrameKind::RelKindRegister => 14,
+            FrameKind::NsUnregister => 15,
         }
     }
 
@@ -107,6 +110,7 @@ impl FrameKind {
             12 => FrameKind::Relate,
             13 => FrameKind::Unrelate,
             14 => FrameKind::RelKindRegister,
+            15 => FrameKind::NsUnregister,
             _ => return None,
         })
     }

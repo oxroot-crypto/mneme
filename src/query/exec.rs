@@ -15,6 +15,7 @@ use crate::core::error::{MnemeError, Result};
 use crate::core::metric::Metric;
 use crate::core::options::{Diversity, QueryId};
 use crate::core::types::{NsId, RowId};
+use crate::memory::dedup::ResultDedup;
 use crate::memory::expand::{self, ExpandCtx, expand_candidates};
 use crate::memory::record::Hit;
 use crate::memory::relation::Edge;
@@ -53,7 +54,13 @@ impl SearchBuilder<'_> {
     /// * 查询向量维度不符 → [`MnemeError::DimensionMismatch`];
     /// * `top_k`/`ef` 超上限 → [`MnemeError::LimitExceeded`];
     /// * MMR `lambda` 含非有限值 → [`MnemeError::Config`](`clamp` 对 NaN 失效会静默退化);
+    /// * `Scoring::bias_routing = true`(依赖 HNSW 启发式路由,尚未落地)
+    ///   → [`MnemeError::Unsupported`]:设置即拒绝,绝不静默忽略;
     /// * 库已关闭 → [`MnemeError::Closed`]。
+    ///
+    /// # Returns
+    /// 命中列表,至多 `top_k` 条;未设置 `rerank` 时按最终分从优到劣排序。
+    /// 命名空间未注册或无命中时返回空 `Vec`。
     ///
     /// # Examples
     /// ```
@@ -65,10 +72,21 @@ impl SearchBuilder<'_> {
     /// assert_eq!(hits.len(), 1);
     /// ```
     pub fn execute(&self) -> Result<Vec<Hit>> {
+        // 查询延迟采样(固定 32 桶直方图;失败查询同样计入,便于定位慢路径)。
+        let started = std::time::Instant::now();
+        let result = self.execute_inner();
+        self.table
+            .record_query_latency(started.elapsed().as_secs_f64() * 1000.0);
+        result
+    }
+
+    /// `execute` 的实际流水线(延迟采样包裹在外层)。
+    fn execute_inner(&self) -> Result<Vec<Hit>> {
         let view = self.prepare_view()?;
         self.validate_query()?;
         self.validate_fusion()?;
         self.validate_diversify()?;
+        self.validate_dedup()?;
         let Some(ns_id) = self.resolve_ns_id(&view) else {
             return Ok(Vec::new());
         };
@@ -79,9 +97,14 @@ impl SearchBuilder<'_> {
             .unwrap_or_else(|| self.config.clock.now_unix_ms());
         let view = self.apply_as_of(view);
         let scored = self.run_channels(&view, ns_id, now)?;
-        let (scored, via_map) = self.apply_expansion(&view, scored, now);
+        let (scored, via_map) = self.apply_expansion(&view, ns_id, scored, now);
         let ranked = self.rank(&view, scored, now);
         let hits = self.build_hits(&view, ranked, self.resolve_query_id(), &via_map);
+        // 读路径命中计入访问统计:仅当前视图检索(历史/快照检索不污染当前统计),
+        // 且仅在有持久层或自动遗忘时报数(设计 07 §2;热路径一次内存追加)。
+        if self.pinned.is_none() && self.as_of.is_none() && self.table.tracks_access_hits() {
+            self.table.record_hits(hits.iter().map(|hit| hit.rowid));
+        }
         Ok(self.apply_rerank(hits))
     }
 
@@ -129,6 +152,17 @@ impl SearchBuilder<'_> {
                 got: ef,
             });
         }
+        // `bias_routing` 依赖 HNSW 遍历期启发式路由,尚未落地;设置即拒绝,
+        // 绝不静默忽略(FC-MEM-ERR-002、设计 10 §2.3)。
+        if self
+            .scoring
+            .as_ref()
+            .is_some_and(|scoring| scoring.bias_routing)
+        {
+            return Err(MnemeError::Unsupported {
+                feature: "Scoring::bias_routing",
+            });
+        }
         Ok(())
     }
 
@@ -159,6 +193,20 @@ impl SearchBuilder<'_> {
         {
             return Err(MnemeError::Config {
                 reason: "MMR lambda 必须是 [0,1] 内的有限值",
+            });
+        }
+        Ok(())
+    }
+
+    /// 校验结果级去重参数:`Near` 阈值须为 `[0,1]` 内的有限值——`NaN`/越界会让
+    /// `cosine_sim >= threshold` 恒假、去重静默空转,入口显式拒绝
+    /// (FC-SCORE-POST-005,拒绝静默失败)。
+    fn validate_dedup(&self) -> Result<()> {
+        if let ResultDedup::Near { threshold } = self.dedup
+            && !(0.0..=1.0).contains(&threshold)
+        {
+            return Err(MnemeError::Config {
+                reason: "ResultDedup::Near.threshold 必须是 [0,1] 内的有限值",
             });
         }
         Ok(())
@@ -265,9 +313,12 @@ impl SearchBuilder<'_> {
     }
 
     /// 沿关系边做联想扩展,返回扩展后的候选与来源边映射。
+    ///
+    /// 扩展只在本命名空间内推进,跨命名空间边视为不存在(`FC-SCORE-POST-004`)。
     fn apply_expansion(
         &self,
         view: &ReaderView,
+        ns_id: NsId,
         mut scored: Vec<Scored>,
         now: i64,
     ) -> (Vec<Scored>, HashMap<RowId, Edge>) {
@@ -275,6 +326,7 @@ impl SearchBuilder<'_> {
         if let Some(expand) = &self.expand {
             let ctx = ExpandCtx {
                 view,
+                ns_id,
                 expand,
                 filter: self.filter.as_ref(),
                 now,

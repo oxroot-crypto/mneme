@@ -13,9 +13,8 @@
 //! * [`hidx`] —— HID1 文件编解码。
 //! * [`factory`] —— HNSW 工厂(组合根注入 `IndexFactory`)。
 //!
-//! > 跨来源归并(索引前缀 + 未建树尾)复用 L0 的 [`TopK::merge`](crate::core::heap::TopK::merge),
-//! > 不单设 `merge.rs`——L2 全量快照下"多段"退化为单图 + 尾扫描,L5 compaction 再引入
-//! > 多图归并时恢复该模块(见设计 05 §9)。
+//! > 跨来源归并(各段图 + 未建树尾)复用 L0 的 [`TopK::merge`](crate::core::heap::TopK::merge),
+//! > 不单设 `merge.rs`;L5 起多段并存时逐段归并(见设计 05 §9)。
 
 pub(crate) mod filtered;
 pub(crate) mod graph;

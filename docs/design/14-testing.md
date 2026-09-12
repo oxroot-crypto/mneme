@@ -133,7 +133,7 @@ key 索引:   随机 key 集写入 → 重启 → 每个存活 key 的 get(key) 
 ```text
 对"记录在旧段"的场景:
   写记录 → flush 成段 → delete(key) / update(key,patch) / touch(key,boost) →
-  在 WAL 重置之前/之后任意点崩溃(L2:全量快照 flush 提交 MANIFEST 后再重置 WAL) → 重开:
+  在 WAL 重置之前/之后任意点崩溃(增量段 flush 提交 MANIFEST 后再重置 WAL) → 重开:
     删除的记录永不复活;update 的字段与 touch 的 importance 提升仍生效
   再触发多轮 compaction 后重复断言(L5)
 反例保护:在覆盖条目物化(随快照段落盘)前截断 WAL → 必须拒绝(FC-PERSIST-POST-002)
@@ -159,9 +159,10 @@ RowId 水位:回放含大 rowid 的 WAL → next_rowid > 该 rowid
 > **L4 落地状态(2026-09)**:单通道/带过滤候选的向量暴力对照、过滤先行(含 `top_k` 小于
 > 候选数的证伪构造)、融合参数校验与精确分数、BM25 精确分数/NS 隔离/只计活行、四区落盘
 > 重开一致性(分数逐位)、计划器不漏报(大整数/类型污染/非数值 `exists`)与历史视图 TTL,
-> 已在 `tests/l4_contracts.rs` 与 `src/query/*` 单测落地并纳入追溯门禁。**欠账**:§3 的
-> "逐行过滤 + 双通道暴力 + 融合"全流程 oracle 与 §3.4 的"跨 3 个未合并段"依赖多段形态,
-> 待 L5 段句柄/多段落地后补齐(L4 当前为单段 + 尾部增量);`fuzz_dsl`(cargo-fuzz)仍待接线(§5)。
+> 已在 `tests/l4_contracts.rs` 与 `src/query/*` 单测落地并纳入追溯门禁。**L5 已补齐多段
+> 形态**(增量段 + 每段倒排合并 + 多图 ANN 归并,`tests/l5_contracts.rs`);§3 全流程 oracle 与
+> §3.4 跨未合并段的扩展断言可按需继续追加;**欠账**:`fuzz_dsl`(cargo-fuzz)仍待接线(§5),
+> 24h 长跑与 criterion 门槛仍待 CI(§6/§7)。
 
 ```text
 数据: 种子固定;随机均匀 64 维 10 万条 + 8 簇合成数据 10 万条(两套)
@@ -253,7 +254,7 @@ as_of(删除前) 在 compaction 回收该版本前仍能看到 A→B(双时态�
 > **L3 落地状态**:`benches/hnsw.rs` 已提供建库吞吐与查询延迟两项 criterion 基准
 > (当前为 1k/8k×64 维微缩样本,1M×1536 门槛待 heavy 档);召回门槛由
 > `tests/hnsw_contracts.rs` 以微缩双分布验收(见 §3)。**冷启动门槛尚未兑现**——L3 的
-> mmap 只是段读取路径优化,恢复仍整段载入,真正"惰性驻留"待 L5/L6 段句柄重构
+> mmap 只是段读取路径优化,恢复仍整段载入,真正"惰性驻留"待 L6 段句柄重构
 > (见 [05 §10](05-l3-hnsw.md))。
 
 基线入库(`benches/` + 夜间趋势图),回归 > 10% 阻断合并。
@@ -270,7 +271,7 @@ cargo-fuzz 目标:`fuzz_vsec`、`fuzz_msec`、`fuzz_hidx`、`fuzz_wal_replay`、
 断言统一:**任意输入不 panic、不 UB、不无限循环**;解析失败必须返回结构化错误
 (I7:DSL 任意输入不 panic)。
 
-**版本注入**(I18):在上述解码目标中随机改写文件头 `format_version` 的**主版本**为更大值,
+**版本注入**(I18):在上述解码目标中随机改写文件头 `format_version` 为任意不同值,
 断言返回 `UnsupportedVersion` 而非继续解析;改写为魔数不符的值,断言 `Corrupted`。
 
 发布前本地连续跑:每个目标 ≥ 1h,且全部目标累计 ≥ 24h(可分多轮累计)。

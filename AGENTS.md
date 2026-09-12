@@ -2,10 +2,11 @@
 
 Mneme:纯 Rust 的嵌入式向量存储引擎(面向 AI Agent 超长期记忆)。单 crate,edition 2024,
 MSRV 1.93。**当前实现了 L0 原语层 `src/core/`、L1 内存引擎 `src/memory/`、L2 持久层
-`src/persist/`、L3 索引层 `src/index/` 与 L4 检索层 `src/query/`**(WAL、段文件、MANIFEST、
-崩溃恢复、全量快照 flush、自研 HNSW、过滤三档、hidx 图持久化、mmap 段读取、过滤 DSL、
-zone map/bloom 计划器、BM25、RRF/加权融合、msec 轻量索引四区落盘);L5–L6 目前仅有设计文档,
-`src/` 下没有对应代码。L2 依赖 `crc32fast`;L3 经 feature `mmap`(默认开)引入 `memmap2`,
+`src/persist/`、L3 索引层 `src/index/`、L4 检索层 `src/query/` 与 L5 生命周期层
+`src/life/`**(WAL 轮转、增量段、MANIFEST、崩溃恢复、size-tiered compaction、自研 HNSW、
+过滤三档、hidx 图持久化、mmap 段读取、过滤 DSL、zone map/bloom/ttl_map 计划器、BM25、
+RRF/加权融合、msec 轻量索引四区与 delta 区、后台维护线程、命名空间/快照/备份/统计);
+L6 尚无代码。L2 依赖 `crc32fast`;L3 经 feature `mmap`(默认开)引入 `memmap2`,
 `criterion` 为 dev-dependency。
 
 ## 契约优先工作流(FSVDD,强制)
@@ -20,11 +21,24 @@ zone map/bloom 计划器、BM25、RRF/加权融合、msec 轻量索引四区落�
 改算法/数据结构要同步维护 `contracts.md` §9 的 `FC-*-CPLX-*` 复杂度上界。
 未实现测试的条目填 `待补`,不要编造测试文件名占位。
 
+## 项目状态与兼容纪律(强制)
+
+- 项目**尚未发布**:L1–L5 仍在 `feat/*` 分支开发,不存在任何外部旧库、旧段、旧
+  MANIFEST、旧 WAL 或旧 API 消费者;开发中的磁盘格式一律视为**未发布**。
+- **禁止为开发中的中间格式写兼容代码或兼容测试**:段/MANIFEST/WAL/hidx/msec 布局需要
+  变更时,直接改当前定义并同步契约与测试;不保留"读旧开发格式"的读取分支、不写
+  "旧库升级"回归、不为假想的旧读者升主/次版本或维护兼容矩阵。
+- **动手前先看项目现状**:先读 `docs/DESIGN.md`、`docs/spec/contracts.md` 与 git 历史,
+  确认功能/格式是否已经存在、是否已发布;禁止把"向后兼容/迁移/弃用"当成默认需求。
+- 只有当某格式**已合并到 `main` 并对外发布**后,才需要兼容性设计;届时先在
+  `contracts.md` 登记版本策略,再按该策略实现。
+
 ## 分层与代码边界
 
 - L0→L6 只允许向下依赖;新代码必须落在正确的层,不能让下层依赖上层。
-  **已文档化例外**:门面/组合根(`memory::Builder`/`Mneme`)为装配需要可引用 `persist`
-  与 `index`(`Builder` 注入 `Store` 与 `IndexFactory`),不改变 L0→L6 的业务依赖方向。
+  **已文档化例外**:门面/组合根(`memory::Builder`/`Mneme`)为装配需要可引用 `persist`、
+  `index` 与 `life`(`Builder` 注入 `Store` 与 `IndexFactory`,`Mneme` 持有维护句柄与
+  compaction 门面),不改变 L0→L6 的业务依赖方向。
 - `src/core/`(L0)无 I/O、无全局状态、无锁,只有类型与纯函数。
 - `unsafe` 只允许两处:`src/core/simd.rs` 的 arch 内联与 `src/persist/source.rs` 的 `MmapSource`
   (mmap 固有 unsafe);每处必须附 `// SAFETY:` 证明。
@@ -59,7 +73,8 @@ cargo doc --no-deps        # 公开项须 100% 文档覆盖
 
 - 契约测试:`tests/core_contracts.rs`(L0)、`tests/memory_contracts.rs`、
   `tests/query_contracts.rs`、`tests/model_contracts.rs`、`tests/life_contracts.rs`(L1)、
-  `tests/persist_contracts.rs`(L2)、`tests/hnsw_contracts.rs`(L3)、`tests/l4_contracts.rs`(L4);
+  `tests/persist_contracts.rs`(L2)、`tests/hnsw_contracts.rs`(L3)、`tests/l4_contracts.rs`(L4)、
+  `tests/l5_contracts.rs`(L5);
   追溯门禁 `tests/contract_traceability.rs`;属性测试用 `proptest`(dev-dependency)。
 - 测试即文档:文件头列不变量编号,断言处引用 `FC-*`,与 `contracts.md` 双向可追溯(门禁强制:无悬空引用、无孤立测试)。
 

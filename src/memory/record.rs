@@ -33,6 +33,14 @@ pub struct Record {
 impl Record {
     /// 以向量构造记录;维度在 `insert` 时校验,故本函数不返回 `Result`。
     ///
+    /// # Arguments
+    ///
+    /// * `vector` - 初始向量;分量须为有限值,维度须与建库维度一致。
+    ///
+    /// # Returns
+    ///
+    /// 待写入记录;除向量外的字段均未设置,可经链式 setter 补齐。
+    ///
     /// # Examples
     /// ```
     /// use mneme::Record;
@@ -199,61 +207,110 @@ impl<'a> RecordRef<'a> {
     }
 
     /// 全局稳定逻辑标识。
+    ///
+    /// # Returns
+    ///
+    /// 本条物理版本对应的 [`RowId`]。
     pub fn rowid(&self) -> RowId {
         self.slot_data.rowid
     }
 
     /// 外部键。
+    ///
+    /// # Returns
+    ///
+    /// 记录的外部键;未设置 key 时返回 `None`。
     pub fn key(&self) -> Option<&str> {
         self.slot_data.key.as_ref().map(Key::as_str)
     }
 
     /// 写入时刻(Unix 毫秒)。
+    ///
+    /// # Returns
+    ///
+    /// 本条物理版本的写入时刻(Unix 毫秒)。
     pub fn created_at(&self) -> i64 {
         self.slot_data.created_at
     }
 
     /// 过期时刻;`None` = 永不过期。
+    ///
+    /// # Returns
+    ///
+    /// 过期时刻(Unix 毫秒,开区间);未设置 TTL 时返回 `None`。
     pub fn expires_at(&self) -> Option<i64> {
         self.slot_data.expires_at
     }
 
     /// 重要度。
+    ///
+    /// # Returns
+    ///
+    /// 重要度,`[0,1]`;写入时未显式设置则为缺省 0.5。
     pub fn importance(&self) -> f32 {
         self.slot_data.importance
     }
 
     /// 文本。
+    ///
+    /// # Returns
+    ///
+    /// 记忆正文;未设置文本时返回 `None`。
     pub fn text(&self) -> Option<&str> {
         self.slot_data.text.as_deref()
     }
 
     /// 元数据。
+    ///
+    /// # Returns
+    ///
+    /// 元数据;未设置时为 [`Meta::Null`]。
     pub fn metadata(&self) -> &Meta {
         &self.slot_data.meta
     }
 
     /// 有效时间起。
+    ///
+    /// # Returns
+    ///
+    /// 有效时间起点(Unix 毫秒);写入时未显式设置则等于
+    /// [`created_at`](Self::created_at)。
     pub fn valid_from(&self) -> i64 {
         self.slot_data.valid_from
     }
 
     /// 有效时间止。
+    ///
+    /// # Returns
+    ///
+    /// 有效时间终点(Unix 毫秒,开区间);未设置时返回 `None`。
     pub fn valid_to(&self) -> Option<i64> {
         self.slot_data.valid_to
     }
 
     /// 可信度。
+    ///
+    /// # Returns
+    ///
+    /// 可信度,`[0,1]`;写入时未显式设置则为缺省 1.0。
     pub fn confidence(&self) -> f32 {
         self.slot_data.confidence
     }
 
     /// 来源/派生链。
+    ///
+    /// # Returns
+    ///
+    /// 来源/派生链元数据;未设置时返回 `None`。
     pub fn provenance(&self) -> Option<&Meta> {
         self.slot_data.provenance.as_ref()
     }
 
     /// 原始向量(零拷贝)。
+    ///
+    /// # Returns
+    ///
+    /// 本条物理版本的向量切片;零拷贝借用本视图,生命周期随 `RecordRef`。
     pub fn vector(&self) -> &[f32] {
         &self.slot_data.vector
     }
@@ -320,6 +377,12 @@ pub struct Hit {
 
 impl Hit {
     /// 返回各打分因子贡献(调试/审计)。
+    ///
+    /// # Returns
+    ///
+    /// 本次命中的 [`ScoreBreakdown`];未开启
+    /// [`Scoring`](crate::Scoring) 时仅 [`sim`](ScoreBreakdown::sim) 非零,
+    /// 其余字段为 0,未携带打分明细时为全零默认值。
     pub fn explain(&self) -> ScoreBreakdown {
         self.breakdown.unwrap_or_default()
     }

@@ -7,7 +7,7 @@
 > [`src/core/error.rs`](../../src/core/error.rs)、[`src/core/options/`](../../src/core/options)、
 > [`src/memory/builder.rs`](../../src/memory/builder.rs)、[`src/memory/pred.rs`](../../src/memory/pred.rs)、
 > [`src/index/hnsw.rs`](../../src/index/hnsw.rs)、[`src/index/hidx.rs`](../../src/index/hidx.rs)、
-> [`src/query/parse/mod.rs`](../../src/query/parse/mod.rs)。
+> [`src/query/parse.rs`](../../src/query/parse.rs)。
 
 Rust 没有"类(class)",而是把数据和行为分开:
 
@@ -37,7 +37,7 @@ pub struct HnswParams {
 let p = HnswParams { m: 16, m0: 32, ef_construction: 200, ef_search: 64 };
 ```
 
-见 [`src/core/options/index.rs:8-17`](../../src/core/options/index.rs)。
+见 [`src/core/options/index.rs:7-17`](../../src/core/options/index.rs)。
 
 字段名与局部变量同名时,可以省略 `字段名:` 只写变量名,这叫**字段初始化简写(field init shorthand)**:
 
@@ -49,7 +49,7 @@ let ctx = MaskCtx { view, blocks };   // 等价于 MaskCtx { view: view, blocks:
 
 L4 的内部结构几乎都这么构造——`MaskCtx`、`Plan`、`EvalCtx`、`ChannelCtx` 等,见
 [`src/query/zmap.rs:20-23`](../../src/query/zmap.rs) 与
-[`src/query/plan.rs:80-84`](../../src/query/plan.rs)。简写与完整写法可以混用
+[`src/query/plan.rs:89-93`](../../src/query/plan.rs)。简写与完整写法可以混用
 (`Plan { candidates, bits, selectivity }` 三个字段全是简写),只影响书写,字段名与语义不变。
 
 只想改几个字段、其余沿用另一份值时,用**结构体更新语法(struct update syntax)** `..`:
@@ -86,7 +86,7 @@ pub struct RelationKind(pub u16);
 - 用 `.0` 访问第一个字段:`self.0`。
 - 只有一个字段的元组结构体就是 **newtype**,用来给底层类型起一个"语义名字"(见 [02 章 §4](02-values-and-ownership.md))。
 - 字段前也能加 `pub`(`RelationKind(pub u16)`),允许外部直接读写 `.0`;不加则只能通过方法访问。
-  见 [`src/core/options/scoring.rs:90`](../../src/core/options/scoring.rs)。
+  见 [`src/core/options/scoring.rs:93`](../../src/core/options/scoring.rs)。
 
 ### 1.3 单元结构体(unit struct)
 
@@ -148,7 +148,7 @@ impl Expr {
 }
 ```
 
-见 [`src/query/parse/mod.rs:19-48`](../../src/query/parse/mod.rs)。要点:
+见 [`src/query/parse.rs:19-48`](../../src/query/parse.rs)。要点:
 
 - **固有方法(inherent method)** 直接挂在类型上,`Expr::from_str(..)` 调用时不需要任何 `use`;
   而 **trait 方法**要求 trait 在作用域里才能调用(见 [08 §4](08-modules-docs.md))。
@@ -337,8 +337,11 @@ pub enum Expr {
 `recursive type has infinite size`。`Box<T>` / `Box<[T]>` 是"堆上单个值"的所有权指针,
 本身大小固定(分别为一个指针、一个"指针 + 长度"胖指针),递归因此被截断。要点:
 
+- 变体字段会随迭代增加:`Contains`/`StartsWith`/`EndsWith`/`Glob` 现在都带有第二个
+  字段(如 `StartsWith(String, Arc<str>)`),模式里用 `(..)` 比写死 `(_, _)` 更稳;
+
 - **构造**:`Expr::Not(Box::new(inner))`、`Expr::And(vec![a, b].into_boxed_slice())`——
-  L4 的解析器与 `Display` 都这么造节点,见 [`src/query/parse/mod.rs:228`](../../src/query/parse/mod.rs);
+  L4 的解析器与 `Display` 都这么造节点,见 [`src/query/parse.rs:228`](../../src/query/parse.rs);
 - **解构**:模式写法和普通枚举一样,`Expr::Not(inner)` 里的 `inner` 绑定到 `&Box<Expr>`,
   用 `*inner` 或直接当 `Expr` 用(自动 deref);`match` 里也照常写 `Expr::Not(_)`;
 - **列表为什么用 `Box<[Expr]>` 而不是 `Vec<Expr>`**:AST 构造完就不再增删,`Box<[T]>`
@@ -443,7 +446,7 @@ impl Ord for Cand {
 }
 ```
 
-见 [`src/index/hnsw.rs:59-87`](../../src/index/hnsw.rs)。逐条解释:
+见 [`src/index/hnsw.rs:61-86`](../../src/index/hnsw.rs)。逐条解释:
 
 - **`f32::total_cmp` 提供全序**:`partial_cmp` 遇 `NaN` 返回 `None`,而 `Ord::cmp` 必须
   **永远**给出 `Less`/`Equal`/`Greater` 之一。`total_cmp` 按 IEEE-754 位模式定义了一个
@@ -508,7 +511,7 @@ impl Scoring {
 }
 ```
 
-见 [`src/core/options/scoring.rs:43-45`](../../src/core/options/scoring.rs)。
+见 [`src/core/options/scoring.rs:46-48`](../../src/core/options/scoring.rs)。
 
 ---
 

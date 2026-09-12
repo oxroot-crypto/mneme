@@ -4,7 +4,7 @@
 //!
 //! * FC-MODEL-INV-024/025/026、FC-MODEL-POST-001..003/005/006、FC-MODEL-STA-001
 //! * FC-GLOBAL-PRE-004(关系边权:非有限值拒绝、越界钳制)
-//! * FC-MODEL-CPLX-002(consolidate 两两余弦复杂度哨兵,§9.2.8)
+//! * FC-MODEL-CPLX-001(`predecessors` 入边查询哨兵)、FC-MODEL-CPLX-002(consolidate 两两余弦复杂度哨兵,§9.2.8)
 
 use std::sync::Arc;
 

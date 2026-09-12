@@ -87,6 +87,11 @@ impl Histogram {
     }
 
     /// 返回 32 个桶的累计计数。
+    ///
+    /// # Returns
+    ///
+    /// 长度恒 32 的桶计数数组:下标 0 为 ≤1ms、下标 31 为 ≥1s,其余按对数刻度
+    /// 分布;计数由 [`record`](Self::record) 累加,读取不清零。
     pub fn buckets(&self) -> &[u64; HISTOGRAM_BUCKETS] {
         &self.buckets
     }
@@ -103,12 +108,12 @@ pub struct QuantStat {
     pub recall_est: Option<f32>,
 }
 
-/// 加密/压缩生效状态。
+/// 存储安全配置与迁移统计(加密未落地;压缩配置已接线,压缩实现待 L11)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageStat {
-    /// 是否启用静态加密。
+    /// 是否启用静态加密(当前恒 `false`,加密随 L11 落地)。
     pub encryption: bool,
-    /// 文本/元数据压缩策略。
+    /// 文本/元数据压缩的配置值(实现待 L11,尚未影响磁盘编码)。
     pub compression: Compression,
     /// 已迁移段数。
     pub migrated_segments: usize,
@@ -140,6 +145,13 @@ pub enum CompactionState {
         /// 参与合并的段。
         segments: Vec<SegmentId>,
     },
+    /// 运行中被 `pause()` 挂起;`resume()` 后回到 `Running`(FC-LIFE-STA-001)。
+    Paused {
+        /// 暂停时已完成的进度,`[0,1]`。
+        progress: f32,
+        /// 参与合并的段。
+        segments: Vec<SegmentId>,
+    },
 }
 
 /// `db.stats()` 的运行统计(字段为稳定契约)。
@@ -167,7 +179,7 @@ pub struct Stats {
     pub relations: u64,
     /// 版本链/历史保留统计。
     pub history: HistoryStat,
-    /// 加密/压缩生效状态。
+    /// 存储安全配置与迁移统计(压缩实现待 L11)。
     pub storage: StorageStat,
 }
 
@@ -193,6 +205,17 @@ pub struct BackupReport {
     pub hardlinked: bool,
 }
 
+/// `SnapshotHandle::stats()` 的只读视图统计(设计 07 §6)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotStats {
+    /// 视图基线序号水位(与 `SnapshotHandle::version` 一致)。
+    pub version: u64,
+    /// 视图内活跃段数(`slot_segment` 去重)。
+    pub segments: usize,
+    /// 视图内物理槽位数(含历史版本与墓碑)。
+    pub rows: u64,
+}
+
 /// 后台合并控制句柄(见设计 16 §1.6);克隆共享同一状态。
 #[derive(Debug, Clone, Default)]
 pub struct CompactionControl {
@@ -213,6 +236,9 @@ impl CompactionControl {
 
     /// 暂停后台合并。
     ///
+    /// 运行中调用时状态转 `Paused`;空闲时调用只置暂停标志,状态保持 `Idle`
+    /// (非法转移不改变状态,FC-LIFE-STA-001)。
+    ///
     /// # Examples
     /// ```
     /// use mneme::CompactionControl;
@@ -224,19 +250,51 @@ impl CompactionControl {
     /// ```
     pub fn pause(&self) {
         self.inner.paused.store(true, Ordering::Relaxed);
+        let mut guard = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let CompactionState::Running { progress, segments } = &*guard {
+            *guard = CompactionState::Paused {
+                progress: *progress,
+                segments: segments.clone(),
+            };
+        }
     }
 
-    /// 恢复后台合并。
+    /// 恢复后台合并;`Paused` 时状态转回 `Running`,其余状态不变。
     pub fn resume(&self) {
         self.inner.paused.store(false, Ordering::Relaxed);
+        let mut guard = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let CompactionState::Paused { progress, segments } = &*guard {
+            *guard = CompactionState::Running {
+                progress: *progress,
+                segments: segments.clone(),
+            };
+        }
     }
 
     /// 是否处于暂停状态。
+    ///
+    /// # Returns
+    ///
+    /// 暂停标志已置位返回 `true`;空闲时调用 `pause()` 也会置位,此时
+    /// [`state`](Self::state) 仍为 [`Idle`](CompactionState::Idle)。
     pub fn is_paused(&self) -> bool {
         self.inner.paused.load(Ordering::Relaxed)
     }
 
     /// 当前合并状态。
+    ///
+    /// # Returns
+    ///
+    /// 当前 [`CompactionState`] 的克隆:`Idle`、`Running`(含进度与参与段)或
+    /// `Paused`(含暂停时进度与参与段)。
     pub fn state(&self) -> CompactionState {
         self.inner
             .state
@@ -246,13 +304,81 @@ impl CompactionControl {
     }
 
     /// 更新内部状态(供后台任务调用;L5 起使用)。
-    // reason: 为 L5 后台 compaction 预留的写入口,L1 无调用方。
-    #[allow(dead_code)]
     pub(crate) fn set_state(&self, state: CompactionState) {
         *self
             .inner
             .state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = state;
+    }
+
+    /// 标记合并开始(参与段列表)。
+    pub(crate) fn mark_running(&self, segments: Vec<SegmentId>) {
+        self.set_state(CompactionState::Running {
+            progress: 0.0,
+            segments,
+        });
+    }
+
+    /// 更新合并进度(`[0,1]`)。
+    pub(crate) fn mark_progress(&self, progress: f32) {
+        let mut guard = self
+            .inner
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let CompactionState::Running { segments, .. } = &*guard {
+            let segments = segments.clone();
+            *guard = CompactionState::Running {
+                progress: progress.clamp(0.0, 1.0),
+                segments,
+            };
+        }
+    }
+
+    /// 标记合并回到空闲。
+    pub(crate) fn mark_idle(&self) {
+        self.set_state(CompactionState::Idle);
+    }
+}
+
+/// 一次 compaction 的选段计划(内部;由 L5 调度器产出,持久层执行)。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CompactionPlan {
+    /// 参与本轮合并的段编号(按 MANIFEST 顺序)。
+    pub(crate) segments: Vec<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// FC-LIFE-STA-001:`pause` 在 `Running` 上转 `Paused`、`resume` 转回;
+    /// 非法转移(`Idle` 上 `Pause`/`Resume`)不改变状态。
+    #[test]
+    fn compaction_state_transitions_follow_spec() {
+        let control = CompactionControl::new();
+        assert_eq!(control.state(), CompactionState::Idle);
+        // Idle 上 pause:非法转移,状态保持 Idle,只置标志。
+        control.pause();
+        assert_eq!(control.state(), CompactionState::Idle);
+        assert!(control.is_paused());
+        control.resume();
+        assert_eq!(control.state(), CompactionState::Idle);
+
+        control.mark_running(vec![SegmentId::new(3), SegmentId::new(4)]);
+        control.mark_progress(0.5);
+        control.pause();
+        assert_eq!(
+            control.state(),
+            CompactionState::Paused {
+                progress: 0.5,
+                segments: vec![SegmentId::new(3), SegmentId::new(4)],
+            }
+        );
+        control.resume();
+        assert!(matches!(control.state(), CompactionState::Running { .. }));
+        control.mark_idle();
+        assert_eq!(control.state(), CompactionState::Idle);
     }
 }

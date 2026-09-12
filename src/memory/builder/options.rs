@@ -61,7 +61,7 @@ impl Builder {
         self
     }
 
-    /// 设置 fsync 策略(仅记录,L2 生效)。
+    /// 设置 fsync 策略(L2 生效)。
     ///
     /// # Arguments
     ///
@@ -131,7 +131,7 @@ impl Builder {
         self
     }
 
-    /// 设置 HNSW 参数(仅记录,L3 生效)。
+    /// 设置 HNSW 参数(L3 生效)。
     ///
     /// # Arguments
     ///
@@ -145,7 +145,7 @@ impl Builder {
         self
     }
 
-    /// 设置 compaction 策略(仅记录,L5 生效)。
+    /// 设置 compaction 策略(L5 生效)。
     ///
     /// # Arguments
     ///
@@ -173,7 +173,7 @@ impl Builder {
         self
     }
 
-    /// 设置后台遗忘扫描周期(仅记录,L5 生效)。
+    /// 设置后台遗忘扫描周期(L5 生效)。
     ///
     /// # Arguments
     ///
@@ -187,7 +187,7 @@ impl Builder {
         self
     }
 
-    /// 设置访问统计落盘周期(仅记录,L5 生效)。
+    /// 设置访问统计落盘周期(L5 生效)。
     ///
     /// # Arguments
     ///
@@ -299,7 +299,7 @@ impl Builder {
         self
     }
 
-    /// 打开时全量校验(仅记录,L2 生效)。
+    /// 打开时全量校验(L2 生效)。
     ///
     /// # Arguments
     ///
@@ -313,7 +313,7 @@ impl Builder {
         self
     }
 
-    /// 损坏段 fail-fast(仅记录,L2 生效)。
+    /// 损坏段 fail-fast(L2 生效)。
     ///
     /// # Arguments
     ///

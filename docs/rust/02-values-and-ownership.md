@@ -6,7 +6,7 @@
 > [`src/core/metric.rs`](../../src/core/metric.rs)、[`src/memory/table/state.rs`](../../src/memory/table/state.rs)、
 > [`src/index/hidx.rs`](../../src/index/hidx.rs)、[`src/index/filtered.rs`](../../src/index/filtered.rs)、
 > [`src/query/iso.rs`](../../src/query/iso.rs)、[`src/query/zmap.rs`](../../src/query/zmap.rs)、
-> [`src/query/fusion.rs`](../../src/query/fusion.rs)、[`src/query/parse/mod.rs`](../../src/query/parse/mod.rs)。
+> [`src/query/fusion.rs`](../../src/query/fusion.rs)、[`src/query/parse.rs`](../../src/query/parse.rs)。
 
 这是全书**最关键**的一章。所有权是 Rust 区别于其他语言的核心,也是初学者最容易卡住的地方。
 读完本章你能理解 mneme 里为什么大量使用 `u32`/`u64`/`f32`、为什么 `newtype` 里直接包一个整数。
@@ -279,8 +279,8 @@ c.len_utf8();          // 3:'好' 在 UTF-8 里占 3 个字节
 - 别把 `char` 当 `u8`:一个汉字 3 字节、一个 emoji 常是 4 字节,
   `self.pos += 1` 会切在字符中间,后续 `&input[pos..]` 直接 panic。
 
-见 [`src/query/parse/mod.rs:84-93`](../../src/query/parse/mod.rs) 与
-[`src/query/parse/mod.rs:298-315`](../../src/query/parse/mod.rs)。
+见 [`src/query/parse.rs:84-93`](../../src/query/parse.rs) 与
+[`src/query/parse.rs:298-315`](../../src/query/parse.rs)。
 
 ### 2.4 数组与元组
 
@@ -355,7 +355,7 @@ mneme 的标识类型就是 `Copy`:
 pub struct RowId(u64);
 ```
 
-见 [`src/core/types.rs:15`](../../src/core/types.rs)。因为 `u64` 是 `Copy`,所以 `RowId` 也是 `Copy`:
+见 [`src/core/types.rs:16`](../../src/core/types.rs)。因为 `u64` 是 `Copy`,所以 `RowId` 也是 `Copy`:
 赋值/传参/放进 `Vec` 都按位复制,原变量依然可用,不存在"移动后失效"。
 
 ### 3.4 克隆(clone)
@@ -444,7 +444,7 @@ pub(crate) fn hide_latest(&mut self, rowid: RowId) {
 > let shared: Arc<[f32]> = Arc::from(vector.into_boxed_slice());
 > ```
 >
-> 见 [`src/index/hnsw.rs:475-480`](../../src/index/hnsw.rs)。`into_boxed_slice()` 把
+> 见 [`src/index/hnsw.rs:493-499`](../../src/index/hnsw.rs)。`into_boxed_slice()` 把
 > `Vec<T>` 收缩成 `Box<[T]>`(丢掉多余容量,长度固定),`Arc::from` 再接管这块内存。
 > 此后每次克隆都只是引用计数 +1,索引与段数据因此可以零拷贝共享同一份向量——和
 > `Arc<str>` 是同一个套路,只是元素从 `u8` 换成了 `f32`。

@@ -30,11 +30,9 @@ pub(crate) const HEADER_LEN: u16 = 72;
 /// 单个段条目的定长字节数(见 [`parse_segments`] 字段顺序)。
 const SEGMENT_ENTRY_BYTES: usize = 55;
 
-/// `header[17]` 的 stopwords 三态:旧版未记录(按默认 `true`)。
-const STOPWORDS_UNRECORDED: u8 = 0;
-/// `header[17]` 的 stopwords 三态:显式关闭。
+/// `header[17]` 的 stopwords 标志:显式关闭。
 const STOPWORDS_DISABLED: u8 = 1;
-/// `header[17]` 的 stopwords 三态:显式开启。
+/// `header[17]` 的 stopwords 标志:显式开启。
 const STOPWORDS_ENABLED: u8 = 2;
 
 /// 命名空间注册项(`path ↔ NsId`)。
@@ -60,7 +58,7 @@ pub(crate) struct RelKindEntry {
 pub(crate) struct SegmentEntry {
     /// 段编号。
     pub(crate) segment_id: u32,
-    /// 段文件格式版本(三文件应一致)。
+    /// 段文件格式版本(审计用;打开时以段文件自身头部的版本为权威,不读本字段)。
     pub(crate) format_version: u16,
     /// 行数。
     pub(crate) row_count: u64,
@@ -116,6 +114,16 @@ pub(crate) struct Manifest {
 /// # Errors
 /// 条目数或文件长度溢出 `u32` 时返回 [`MnemeError::TooLarge`]。
 pub(crate) fn encode(manifest: &Manifest) -> Result<Vec<u8>> {
+    let body = encode_body(manifest);
+    let header = encode_manifest_header(manifest)?;
+    let mut out = header.to_vec();
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&crc32(&body).to_le_bytes());
+    Ok(out)
+}
+
+/// 编码命名空间 / 关系类型 / 活跃段三个变长表。
+fn encode_body(manifest: &Manifest) -> Vec<u8> {
     let mut body = Vec::new();
     for ns in &manifest.namespaces {
         put_u32(&mut body, ns.ns_id);
@@ -138,7 +146,11 @@ pub(crate) fn encode(manifest: &Manifest) -> Result<Vec<u8>> {
         put_u32(&mut body, seg.entry_slot);
         body.push(seg.entry_level);
     }
+    body
+}
 
+/// 编码定长头部(含头部 CRC)。
+fn encode_manifest_header(manifest: &Manifest) -> Result<[u8; HEADER_LEN as usize]> {
     let mut header = [0_u8; HEADER_LEN as usize];
     header[0..4].copy_from_slice(&MAGIC);
     header[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
@@ -164,11 +176,7 @@ pub(crate) fn encode(manifest: &Manifest) -> Result<Vec<u8>> {
         .copy_from_slice(&count_u32(manifest.rel_kinds.len(), "rel_kind_count")?.to_le_bytes());
     let crc = header_crc(&header);
     header[8..12].copy_from_slice(&crc.to_le_bytes());
-
-    let mut out = header.to_vec();
-    out.extend_from_slice(&body);
-    out.extend_from_slice(&crc32(&body).to_le_bytes());
-    Ok(out)
+    Ok(header)
 }
 
 /// 计算头部 CRC(覆盖除 [8,12) 外的全部头部字节)。
@@ -247,6 +255,25 @@ struct ManifestHeader {
 
 /// 校验并解析 MANIFEST 定长头部。
 fn parse_header(bytes: &[u8]) -> Result<ManifestHeader> {
+    validate_header(bytes)?;
+    Ok(ManifestHeader {
+        dimension: u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
+        metric: metric_from_u8(bytes[16])?,
+        stopwords: decode_stopwords(bytes[17])?,
+        next_rel_kind: u16::from_le_bytes([bytes[22], bytes[23]]),
+        manifest_version: read_u64(bytes, 24),
+        watermark_seqno: read_u64(bytes, 32),
+        next_rowid: read_u64(bytes, 40),
+        next_segment_id: read_u32(bytes, 48),
+        next_ns_id: read_u32(bytes, 52),
+        active_count: read_u32(bytes, 56) as usize,
+        ns_count: read_u32(bytes, 60) as usize,
+        rel_kind_count: read_u32(bytes, 64) as usize,
+    })
+}
+
+/// 校验头部长度、魔数、版本、`header_len` 与头部 CRC。
+fn validate_header(bytes: &[u8]) -> Result<()> {
     if bytes.len() < HEADER_LEN as usize + 4 {
         return Err(MnemeError::Corrupted {
             segment: None,
@@ -259,7 +286,11 @@ fn parse_header(bytes: &[u8]) -> Result<ManifestHeader> {
             reason: "manifest: 魔数不符".to_string(),
         });
     }
-    check_version("manifest", u16::from_le_bytes([bytes[4], bytes[5]]))?;
+    check_version(
+        "manifest",
+        u16::from_le_bytes([bytes[4], bytes[5]]),
+        FORMAT_VERSION,
+    )?;
     let header_len = u16::from_le_bytes([bytes[6], bytes[7]]);
     if header_len != HEADER_LEN {
         return Err(MnemeError::Corrupted {
@@ -274,30 +305,19 @@ fn parse_header(bytes: &[u8]) -> Result<ManifestHeader> {
             reason: "manifest: header_crc32 不符".to_string(),
         });
     }
-    let stopwords = match bytes[17] {
-        STOPWORDS_ENABLED | STOPWORDS_UNRECORDED => true,
-        STOPWORDS_DISABLED => false,
-        _ => {
-            return Err(MnemeError::Corrupted {
-                segment: None,
-                reason: "manifest: stopwords 标志非法".to_string(),
-            });
-        }
-    };
-    Ok(ManifestHeader {
-        dimension: u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]),
-        metric: metric_from_u8(bytes[16])?,
-        stopwords,
-        next_rel_kind: u16::from_le_bytes([bytes[22], bytes[23]]),
-        manifest_version: read_u64(bytes, 24),
-        watermark_seqno: read_u64(bytes, 32),
-        next_rowid: read_u64(bytes, 40),
-        next_segment_id: read_u32(bytes, 48),
-        next_ns_id: read_u32(bytes, 52),
-        active_count: read_u32(bytes, 56) as usize,
-        ns_count: read_u32(bytes, 60) as usize,
-        rel_kind_count: read_u32(bytes, 64) as usize,
-    })
+    Ok(())
+}
+
+/// 解析 `stopwords` 标志;仅接受显式开/关,其余值按损坏拒绝。
+fn decode_stopwords(flag: u8) -> Result<bool> {
+    match flag {
+        STOPWORDS_ENABLED => Ok(true),
+        STOPWORDS_DISABLED => Ok(false),
+        _ => Err(MnemeError::Corrupted {
+            segment: None,
+            reason: "manifest: stopwords 标志非法".to_string(),
+        }),
+    }
 }
 
 /// 解析命名空间条目列表(按剩余字节数设预分配上界,抵御损坏计数)。
@@ -412,9 +432,9 @@ mod tests {
         assert_eq!(parse(&bytes).expect("parse"), manifest);
     }
 
-    /// FC-PERSIST-POST-009(stopwords 三态:显式开/关往返;旧版 0 按默认开;非法值拒绝)
+    /// FC-PERSIST-POST-009(stopwords 显式开/关往返;非法值拒绝)
     #[test]
-    fn stopwords_tristate_roundtrip() {
+    fn stopwords_flag_roundtrip() {
         for stopwords in [true, false] {
             let mut manifest = sample();
             manifest.stopwords = stopwords;
@@ -423,19 +443,17 @@ mod tests {
             assert_eq!(decoded.stopwords, stopwords);
         }
 
-        // 旧版未记录(0)→ 默认 true。
-        let mut bytes = encode(&sample()).expect("encode");
-        bytes[17] = 0;
-        let crc = header_crc(&bytes[..HEADER_LEN as usize]);
-        bytes[8..12].copy_from_slice(&crc.to_le_bytes());
-        assert!(parse(&bytes).expect("legacy parse").stopwords);
-
-        // 未知值 → Corrupted。
-        let mut bytes = encode(&sample()).expect("encode");
-        bytes[17] = 9;
-        let crc = header_crc(&bytes[..HEADER_LEN as usize]);
-        bytes[8..12].copy_from_slice(&crc.to_le_bytes());
-        assert!(matches!(parse(&bytes), Err(MnemeError::Corrupted { .. })));
+        // 未知值(含 0)→ Corrupted。
+        for flag in [0_u8, 9] {
+            let mut bytes = encode(&sample()).expect("encode");
+            bytes[17] = flag;
+            let crc = header_crc(&bytes[..HEADER_LEN as usize]);
+            bytes[8..12].copy_from_slice(&crc.to_le_bytes());
+            assert!(
+                matches!(parse(&bytes), Err(MnemeError::Corrupted { .. })),
+                "stopwords 标志 {flag} 必须拒绝"
+            );
+        }
     }
 
     /// 头部 CRC 损坏被检出。
@@ -455,17 +473,19 @@ mod tests {
         assert!(matches!(parse(&bytes), Err(MnemeError::Corrupted { .. })));
     }
 
-    /// 更高主版本 → `UnsupportedVersion`。
+    /// 更高/更低版本 → `UnsupportedVersion`。
     #[test]
-    fn manifest_rejects_higher_major() {
-        let manifest = sample();
-        let mut bytes = encode(&manifest).expect("encode");
-        bytes[4..6].copy_from_slice(&0x0100_u16.to_le_bytes());
-        let crc = header_crc(&bytes[..HEADER_LEN as usize]);
-        bytes[8..12].copy_from_slice(&crc.to_le_bytes());
-        assert!(matches!(
-            parse(&bytes),
-            Err(MnemeError::UnsupportedVersion { .. })
-        ));
+    fn manifest_rejects_version_mismatch() {
+        for version in [0x0100_u16, FORMAT_VERSION - 1] {
+            let manifest = sample();
+            let mut bytes = encode(&manifest).expect("encode");
+            bytes[4..6].copy_from_slice(&version.to_le_bytes());
+            let crc = header_crc(&bytes[..HEADER_LEN as usize]);
+            bytes[8..12].copy_from_slice(&crc.to_le_bytes());
+            assert!(matches!(
+                parse(&bytes),
+                Err(MnemeError::UnsupportedVersion { .. })
+            ));
+        }
     }
 }

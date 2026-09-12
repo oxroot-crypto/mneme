@@ -8,7 +8,8 @@
 >
 > `Scoring`/`Diversity`/`expand` 默认关闭,不改变默认行为。
 
-模块:`score/{formula.rs, expand.rs, feedback.rs, diversify.rs}`
+模块(`memory/` 下):`score.rs`(综合打分公式与归一化)、`expand.rs`(联想扩展)、
+`rerank.rs`(MMR 多样性/去重/精排钩子);`Feedback` 闭环经 `namespace` 写路径落地。
 
 ---
 
@@ -78,11 +79,17 @@ $$
 ② 综合重排:对候选集计算 S(d),取 top-k。
 ```
 
+> **落地状态**:① 的候选放大(`ef' = max(ef, 4k)`)与下方 `bias_routing`
+> **尚未落地**——放大逻辑未接线,`Scoring::bias_routing = true` 会在查询入口
+> 返回 `Unsupported`(拒绝静默忽略,FC-MEM-ERR-002),不按未兑现语义静默运行;
+> ② 综合重排已落地。放大与偏置路由的召回门槛见 [14 §4](14-testing.md)。
+
 - 放大 $ef$ 是为了让"向量相似度略低、但综合分高"的记忆进入候选池:经验上
   `ef' = max(ef, 4k)` 时综合排序的相对召回损失 ≤ 2%(门槛见 [14 §4](14-testing.md));
-- **可选的重要性偏置路由**(`Scoring::bias_routing=true`):HNSW 遍历时用
+- **可选的重要性偏置路由**(`Scoring::bias_routing=true`,设计目标):HNSW 遍历时用
   `dist/√(1 + β·imp + β·acc)` 作为启发式优先级(β 为实现内部固定系数,默认 1.0;
   仅改候选访问顺序,不改最终打分)。它能在保持召回的同时减少探查量;默认关闭;
+  **当前设置即返回 `Unsupported`**(未落地,绝不静默无效);
 - **可解释性**:`Hit` 可经 `Hit::explain()` 返回各因子贡献(调试/审计用,不影响主路径)。
 
 ### 2.4 【算例】
@@ -99,9 +106,12 @@ $w_{\text{sim}}=1, w_{\text{rec}}=0.3, w_{\text{imp}}=0.2$,半衰期 14d:
 
 | 阶段 | 时间 | 说明 |
 |---|---|---|
-| ANN 粗排 | 同 [05 §6.1](05-l3-hnsw.md),ef 放大到 `max(ef,4k)` | 约 4× 候选 |
+| ANN 粗排 | 同 [05 §6.1](05-l3-hnsw.md),`ef' = max(ef,4k)`(**设计目标,未接线**,见 §2.3 落地状态) | 约 4× 候选 |
 | 综合重排 | $O(m)$(m = 候选数) | 每候选常数次浮点运算 |
 | 归一化 | $O(m)$ | 单遍求 min/max |
+| 排序 | $O(m\log m)$ | 按综合分稳定排序(同分按 `RowId` 升序) |
+
+合计 $O(m\log m)$(契约 `FC-SCORE-CPLX-001`)。
 
 `Scoring::default()` 各时序权重为 0,退化为纯相似度,零额外开销。
 
@@ -120,18 +130,22 @@ $$
 - `hops` 默认 1(只扩展一跳),最大 3;
 - `decay` 默认 0.5/跳,`max_nodes` 限制扩展节点数以封顶延迟;
 - 扩展命中的 `Hit.via = Some(edge)`,调用方可解释来源;
-- 扩展分与向量分在 [§2](#2-综合打分scoring) 的综合分里取 `max(自身分, boost)` 后再排序,
-  不叠加(避免关联项被重复加权)。
+- 扩展候选用传播分 `seed_score × weight × decay^hop` 作为自身分数进入候选集:
+  未开启 `Scoring` 时它追加在向量候选之后、不重排;开启 `Scoring` 后与普通候选一样
+  参与归一与综合排序。设计目标里的"扩展分与向量分取 `max(自身分, boost)`"**尚未落地**
+  (当前不做 max 合并);
 
 ### 3.2 复杂度
 
-扩展 = 从每个种子做有界 BFS:$O(\text{seeds} \cdot \text{max\_nodes} \cdot \text{avg\_degree})$,
-`max_nodes` 默认 `4k`,与段数无关;关系邻接定位见 [09 §2.3](09-memory-model.md)。
+扩展 = 从每个种子做有界 BFS:$O(\text{seeds} \cdot \text{max\_nodes} \cdot \text{avg\_degree})$;
+`visited` 集合**总量**受 `max_nodes` 封顶(空间 $O(\text{max\_nodes}+\text{seeds})$——
+种子预置其中、结果为其子集,被命名空间/存活/过滤拒绝的节点也计入,达到上限会提前停止扩展),
+`max_nodes` 默认 `4096`(可配),与段数无关;关系邻接定位见 [09 §2.3](09-memory-model.md)。
 
 ### 3.3 边界
 
 - 只沿**活边**扩展(两端存活,I25);遇墓碑节点不传播;
-- 扩展**不引入跨命名空间**的记忆(命名空间隔离优先);
+- 扩展**不引入跨命名空间**的记忆(命名空间隔离优先;契约 `FC-SCORE-POST-004`);
 - 扩展结果同样受 filter 约束(过滤先行,[06 §2](06-l4-query.md))。
 
 ---
@@ -179,7 +193,9 @@ $$
 
 - `λ ∈ [0,1]`,设计推荐 0.7(偏相关),须显式构造(`Diversity::default()` 为 `Off`);`λ=1` 等价于不启用;
 - `rel(d)` 用 [§2](#2-综合打分scoring) 的综合分;`sim(d,r)` 用向量相似度;
-- 贪心 $O(k^2)$(k = 返回条数),k 通常 ≤ 50,可忽略。
+- 贪心实现的时间为 $O(m\cdot k^2\cdot d)$($m$ = 候选数、$k$ = 返回条数):每轮对
+  $\le m$ 个剩余候选、各对 $\le k$ 个已选候选重算余弦且**未缓存**;空间 $O(k)$。
+  契约见 FC-SCORE-CPLX-003;缓存化/预截断优化须先修订该契约。$k$ 通常 ≤ 50。
 
 ### 5.2 与去重的关系
 
@@ -199,7 +215,7 @@ sequenceDiagram
     participant F as 融合(RRF/Weighted)
     participant S as Scoring/MMR
 
-    E->>V: ANN 粗排 ef'=max(ef,4k)
+    E->>V: ANN 粗排 ef'=max(ef,4k)(设计目标,未接线)
     E->>B: BM25 全局统计打分
     V-->>E: 候选(向量分)
     B-->>E: 候选(BM25 分)

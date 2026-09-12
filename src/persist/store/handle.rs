@@ -18,7 +18,7 @@ use crate::persist::storage::{self, FileLock, SEGMENTS_DIR, hidx_name, msec_name
 use crate::persist::trash;
 use crate::persist::vsec;
 
-use super::wal_writer::{WAL_FILE, WalWriter};
+use super::wal_writer::{self, WalWriter};
 
 /// 当前 MANIFEST 快照(受 `Mutex` 保护)。
 pub(crate) struct ManifestState {
@@ -41,14 +41,17 @@ pub(crate) struct Store {
 }
 
 impl Store {
-    /// 当前 WAL 文件字节数。
-    ///
-    /// WAL 不存在/元数据不可读时返回 0(统计为尽力而为,不阻断调用方)。
+    /// 全部 WAL 文件字节数(统计为尽力而为,不阻断调用方)。
     pub(crate) fn wal_bytes(&self) -> u64 {
-        storage::resolve(&self.root, WAL_FILE)
-            .ok()
-            .and_then(|path| std::fs::metadata(path).ok())
-            .map_or(0, |metadata| metadata.len())
+        // reason: stats 为尽力而为;文件枚举/元数据读取失败仅少计字节,不影响正确性。
+        wal_writer::wal_files(&self.root).map_or(0, |files| {
+            files
+                .iter()
+                .filter_map(|rel| storage::resolve(&self.root, rel).ok())
+                .filter_map(|path| std::fs::metadata(path).ok())
+                .map(|metadata| metadata.len())
+                .sum()
+        })
     }
 
     /// `trash/` 目录字节数(统计为尽力而为,不可读时返回 0)。
@@ -57,19 +60,21 @@ impl Store {
         trash::bytes(&self.root).unwrap_or(0)
     }
 
-    /// 活跃段统计(来自当前 MANIFEST);`index` 为真实载入的索引(用于 HNSW 统计)。
+    /// 活跃段统计(来自当前 MANIFEST);`indexes` 为真实载入的段索引(用于 HNSW 统计)。
     pub(crate) fn segment_stats(
         &self,
-        index: Option<&dyn VectorIndex>,
+        indexes: &[crate::memory::index::SegmentIndex],
     ) -> Vec<crate::memory::ops::SegmentStat> {
         // 锁内只克隆段元数据,文件 I/O 放到锁外(避免阻塞并发 flush 的 MANIFEST 提交)。
         let segments = self.manifest_snapshot().segments;
         segments
             .iter()
-            .enumerate()
-            .map(|(position, segment)| {
-                // 单段架构:索引只对应第一个(唯一)活跃段。
-                let loaded = if position == 0 { index } else { None };
+            .map(|segment| {
+                // 多段架构:按段号匹配该段真实载入的索引。
+                let loaded = indexes
+                    .iter()
+                    .find(|loaded| loaded.segment_id == segment.segment_id)
+                    .map(|loaded| loaded.index.as_ref());
                 segment_stat(&self.root, segment, loaded)
             })
             .collect()
@@ -128,8 +133,8 @@ impl Store {
         storage::write_atomic(&self.root, rel, bytes)
     }
 
-    /// 当前 MANIFEST 快照(克隆);供 `snapshot` 子模块使用。
-    pub(super) fn manifest_snapshot(&self) -> Manifest {
+    /// 当前 MANIFEST 快照(克隆);供内存门面与 `snapshot` 子模块使用。
+    pub(crate) fn manifest_snapshot(&self) -> Manifest {
         self.manifest
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

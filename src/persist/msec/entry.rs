@@ -127,7 +127,16 @@ fn decode_valid_time(cursor: &mut Cursor<'_>, flags: u8) -> Result<Option<(i64, 
         return Ok(None);
     }
     let valid_from = cursor.i64()?;
-    let has_to = cursor.u8()? != 0;
+    let has_to = match cursor.u8()? {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(crate::core::error::MnemeError::Corrupted {
+                segment: None,
+                reason: "entry: valid_time 标志非法".to_string(),
+            });
+        }
+    };
     let valid_to = if has_to { Some(cursor.i64()?) } else { None };
     Ok(Some((valid_from, valid_to)))
 }
@@ -139,4 +148,46 @@ fn decode_provenance(cursor: &mut Cursor<'_>, flags: u8) -> Result<Option<Meta>>
     }
     let len = cursor.u32()? as usize;
     Ok(Some(meta::from_bytes(cursor.take(len)?)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persist::msec::encode_entry;
+
+    /// FC-PERSIST-ERR-010:记录体 `valid_time` 的 `has_to` 标志仅接受 0/1,
+    /// 其它值按畸形拒绝,绝不静默当 `true`。
+    #[test]
+    fn invalid_valid_time_flag_is_rejected() {
+        let entry = EntryData {
+            rowid: RowId::new(1),
+            seqno: SeqNo::new(1),
+            ns_id: NsId::new(1),
+            key: None,
+            text: None,
+            meta: Meta::Null,
+            created_at_ms: 0,
+            expires_at_ms: None,
+            importance: None,
+            access: None,
+            // 用独特值定位 `valid_from` 后的 `has_to` 字节。
+            valid_time: Some((i64::MIN, Some(i64::MIN + 1))),
+            confidence: None,
+            provenance: None,
+        };
+        let encoded = encode_entry(&entry).expect("encode");
+        let mut body = encoded[4..].to_vec();
+        let pattern = i64::MIN.to_le_bytes();
+        let pos = body
+            .windows(8)
+            .position(|window| window == pattern)
+            .expect("valid_from")
+            + 8;
+        assert_eq!(body[pos], 1, "has_to 应编码为 1");
+        body[pos] = 2;
+        assert!(matches!(
+            decode_entry(&body),
+            Err(MnemeError::Corrupted { .. })
+        ));
+    }
 }

@@ -111,7 +111,7 @@ pub unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
 }
 ```
 
-见 [`src/core/simd.rs:123-128`](../../src/core/simd.rs)。
+见 [`src/core/simd.rs:124-128`](../../src/core/simd.rs)。
 
 - `unsafe fn` 表示"调用此函数需要满足某些前提"。
 - `unsafe { ... }` 块表示"这里我做了不安全操作,并为此负责"。
@@ -183,6 +183,37 @@ SIMD 加载分两种:`_mm256_loadu_ps`(u = unaligned)不要求地址按 32 字�
 越界即使不解引用也是 UB,所以循环条件 `i + 8 <= n` 是安全证明的核心。裸指针不携带生命周期,
 `unsafe` 块里的正确性完全由程序员用 `// SAFETY:` 论证——这正是 mneme 把 `unsafe` 压缩到
 全库仅两处(L0 `simd.rs` 与 L2 `persist/source.rs` 的 `MmapSource`)、且每处必写证明的原因。
+
+### 4.2 第二处 `unsafe`:L2 的 mmap
+
+L2 用 `memmap2` 把段文件映射成内存,`Mmap::map` 本身是 `unsafe fn`:
+
+```rust
+// SAFETY: 段文件是 write-once 的——库内任何路径都不原地写入/截断已提交段
+// (单写者经临时文件 + rename 生成新段);`Mmap::map` 要求映射期间文件不被
+// 截断/改写,该不变量由存储层保证。映射长度取映射时刻的文件长度。
+let map = unsafe { memmap2::Mmap::map(&file)? };
+```
+
+见 [`src/persist/source.rs:100-107`](../../src/persist/source.rs)。为什么必须 `unsafe`:
+mmap 把文件"变成"一段内存,但**文件可能被其他进程截断或改写**,这段内存就可能失效
+——Rust 的类型系统无法校验这一点,所以由调用者承担"映射期间文件不被修改"的责任并写进
+`// SAFETY:`。mneme 的段文件是 write-once(内容不可变),这个前提成立。
+
+**feature 双后端**也在这里:同一个类型名按 feature 编译成两种实现,互斥存在:
+
+```rust
+#[cfg(feature = "mmap")]
+pub(crate) struct MmapSource { map: memmap2::Mmap }
+
+// 关闭 feature 时的兜底后端(总是编译;mmap 开启时仅测试使用)
+pub(crate) struct FileSource { file: Mutex<File> }
+```
+
+见 [`src/persist/source.rs:36-39`](../../src/persist/source.rs) 与
+[`src/persist/source.rs:89-92`](../../src/persist/source.rs)。`#[cfg]` 不止能加在
+`use`/函数上,还能加在**整个类型**、方法甚至语句/块上;`#[cfg_attr(feature = "mmap", allow(dead_code))]`
+则是"条件满足时才附加属性"(见 [01 §4.2](01-toolchain.md))。
 
 ---
 

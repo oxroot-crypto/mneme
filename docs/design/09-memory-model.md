@@ -9,7 +9,9 @@
 > 所有能力默认关闭、零额外成本:不写关系、不用 `as_of`、
 > 不开 `Scoring` 时,行为与 [03](03-l1-memory.md) 的纯向量/BM25 完全一致。
 
-模块:`model/{relation.rs, temporal.rs, provenance.rs, consolidate.rs}`
+模块:实现落在 `memory/`(`relation.rs` 关系图、`temporal.rs` 双时态、
+`namespace/life.rs` 与 `score.rs` 沉淀、`Record` 的 provenance 字段);
+独立的 `model/` 目录为规划形态
 
 ---
 
@@ -49,7 +51,7 @@ impl RelationKind {
     pub const SUPPORTS: Self;              // =1 支持
     pub const CONTRADICTS: Self;           // =2 矛盾
     pub const RELATED: Self;               // =3 弱相关
-    pub fn custom(name: &str) -> Result<Self>;  // 名称→稳定编号(≥16;已注册则返回既有编号;L2 注册表落地前无此 API)
+    pub fn custom(name: &str) -> Result<Self>;  // 名称→稳定编号(≥16;名称注册表未落地,当前不提供此 API)
 }
 pub struct Edge { pub from: RowId, pub to: RowId, pub kind: RelationKind, pub weight: f32, pub metadata: Meta }
 
@@ -65,19 +67,20 @@ let in_edges: Vec<Edge> = ns.predecessors(to, &[RelationKind::SUPPORTS])?;  // �
 
 - 关系边以 `(from, to, kind)` 为唯一键,重复 `relate` 为 upsert;
 - 边可携带 `weight ∈ [0,1]`(影响联想扩展的传播强度,[10 §3](10-scoring.md))与任意 metadata;
-- **自定义关系**的 `custom(name)` 经名称注册表映射为稳定 u16:内置固定占用 `0..=3`,
-  `4..=15` 预留给未来内置类型,自定义从 **16** 起分配;同一名称全局唯一,编号空间耗尽
-  (约 65520 个自定义类型)时返回 `TooLarge`。注册经 WAL
+- **自定义关系**(`custom(name)`,尚未落地):设计为经名称注册表映射为稳定 u16:内置固定
+  占用 `0..=3`,`4..=15` 预留给未来内置类型,自定义从 **16** 起分配;同一名称全局唯一,编号
+  空间耗尽(约 65520 个自定义类型)时返回 `TooLarge`。注册计划经 WAL
   `RelKindRegister` 帧落盘([04 §2.3](04-l2-persist.md)),并由 MANIFEST 的关系类型注册表
   持久化(`RelKindEntry` + `next_rel_kind` 水位,[04 §2.4](04-l2-persist.md)),
   不同进程/重启后编号一致(与 `NsRegister` 同一恢复机制,[04 §3.3](04-l2-persist.md))。
+  **当前实现不提供 `custom`**(内置 `0..=3` 可用),落地前不承诺语义。
 
 ### 2.3 存储与一致性
 
 | 形态 | 位置 |
 |---|---|
-| 内存增量 | `WriterState.relations`([03 §3](03-l1-memory.md)) |
-| 持久化 | 全量快照段的 relations 区([04 §2.2b](04-l2-persist.md),仅正向表;反向边恢复时在内存重建);变更经 WAL `Relate`/`Unrelate` 帧(delta 区属 L5,L2 恒空) |
+| 内存增量 | `WriterState.out_edges` / `in_edges`([03 §3](03-l1-memory.md)) |
+| 持久化 | 段文件的 relations 区([04 §2.2b](04-l2-persist.md),仅正向表;反向边恢复时在内存重建);变更经 WAL `Relate`/`Unrelate` 帧;delta 区已随 L5 落地([04 §2.2a](04-l2-persist.md)) |
 | 可见性 | 任一端被删除 → 边视为悬挂、不返回;compaction 物理清除 |
 
 - **不变量 I25**:`neighbors` 只返回两端都活着的边;删除/遗忘一端后,边**立即**在视图上失效
@@ -94,7 +97,8 @@ let in_edges: Vec<Edge> = ns.predecessors(to, &[RelationKind::SUPPORTS])?;  // �
 命中 A("用户喜欢深色模式", sim=0.91)
 neighbors(A, [SUPPORTS, RELATED]) → B(weight 0.8), C(weight 0.5)
 扩展分: B = 0.91 × 0.8 × decay^1, C = 0.91 × 0.5 × decay^1   (decay 默认 0.5/跳)
-最终结果按 [10 §2](10-scoring.md) 的综合分排序,B/C 即使向量相似度略低也可能进入 top-k
+开启 Scoring 后最终结果按 [10 §2](10-scoring.md) 的综合分排序,B/C 即使向量相似度略低也可能进入 top-k
+(未开启时扩展候选追加在向量结果之后,不重排;见 [10 §3](10-scoring.md))
 ```
 
 ---
@@ -128,7 +132,7 @@ old.namespace("agent-42/profile").get("os")?;   // → Windows
   底层由**版本链**支撑:compaction 按 `CompactionPolicy.history_horizon` 保留历史版本
   (默认 `None` = **永久**,[07 §4.2a](07-l5-life.md));仅当显式设置有限 horizon 时,
   超出窗口的历史才不可回溯;
-- `as_of` 与 `Scoring::recency` 使用不同的时间轴:前者是事务时间过滤,后者默认用有效时间
+- `as_of` 与 `Scoring` 的新鲜度因子(`w_recency`)使用不同的时间轴:前者是事务时间过滤,后者默认用有效时间
   ([10 §2](10-scoring.md)),二者正交;
 - **`valid_time` 只影响查询过滤与打分,不触发物理删除**:一条"已过期"的有效时间记忆
   仍可被历史查询召回;需要真正遗忘时用 TTL/`forget`。
@@ -201,7 +205,7 @@ Agent 每天产生大量 episodic 记忆("今天用户问了三件事")。时间
 
 ```text
 consolidate(policy):
-  1. 取候选 = iter(policy.filter)(默认全库活记录)
+  1. 取候选 = iter(policy.filter)(默认 = 调用方命名空间全部活记录)
   2. 聚类:以向量相似度 ≥ policy.threshold 为边做连通分量(union-find);
      单簇大小 > policy.max_cluster 时按 importance 保留前 max_cluster 条,其余暂不沉淀
   3. 每簇:
@@ -219,8 +223,8 @@ consolidate(policy):
 - **幂等**:同一 policy 重复执行,已沉淀的簇(来源已墓碑或已有 `DERIVED_FROM` 边)跳过;
 - **安全**:`keep_sources=true` 为默认,沉淀**不删除**原始记忆;要物理收敛需显式关闭;
 - **复杂度**:聚类是近邻图的连通分量。朴素实现 $O(N \cdot ef \cdot M_0 \cdot d)$(每点查
-  top-m 邻居);`policy.filter` 缩小范围可显著降本。沉淀在后台线程执行,受 compaction
-  同一 IO 预算限速([07 §4.4](07-l5-life.md))。
+  top-m 邻居);`policy.filter` 缩小范围可显著降本。`consolidate` 当前为**同步 API**
+  (由调用方自行安排调度);接入后台维护属规划。
 
 ### 5.3 【算例】
 

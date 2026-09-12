@@ -19,6 +19,15 @@ const MINUTE_MS: i64 = 60_000;
 /// 一秒的毫秒数。
 const SECOND_MS: i64 = 1_000;
 
+/// Howard Hinnant 公历算法:0000-03-01 到 1970-01-01 的天数偏移(换算基数)。
+const CIVIL_EPOCH_OFFSET: i64 = 719_468;
+/// 一个 400 年公历纪元的天数。
+const ERA_DAYS: i64 = 146_097;
+/// 一个 4 年周期(含闰日)的天数。
+const FOUR_YEAR_DAYS: u64 = 1_460;
+/// 一个 100 年周期(不含整 400 年闰规则修正)的天数。
+const CENTURY_DAYS: u64 = 36_524;
+
 /// [`format_iso8601_ms`] 可被 [`parse_iso8601_ms`] 原样读回的最小 Unix 毫秒
 /// (`0000-01-01T00:00:00.000Z`);解析器只接受 4 位年份,超出即无法往返。
 pub(crate) const MIN_ROUNDTRIP_MS: i64 = -62_167_219_200_000;
@@ -194,10 +203,10 @@ pub(crate) fn format_iso8601_ms(ms: i64) -> String {
 
 /// 从自 1970-01-01 起的天数换算为公历年月日(Howard Hinnant 算法)。
 fn civil_from_days(days: i64) -> (i64, u32, u32) {
-    let z = days + 719_468;
-    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
-    let doe = (z - era * 146_097) as u64;
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let z = days + CIVIL_EPOCH_OFFSET;
+    let era = if z >= 0 { z } else { z - (ERA_DAYS - 1) } / ERA_DAYS;
+    let doe = (z - era * ERA_DAYS) as u64;
+    let yoe = (doe - doe / FOUR_YEAR_DAYS + doe / CENTURY_DAYS - doe / (ERA_DAYS as u64)) / 365;
     let year = yoe as i64 + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
@@ -214,7 +223,7 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
     let mp = if month > 2 { month - 3 } else { month + 9 } as u64;
     let doy = (153 * mp + 2) / 5 + u64::from(day) - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe as i64 - 719_468
+    era * ERA_DAYS + doe as i64 - CIVIL_EPOCH_OFFSET
 }
 
 #[cfg(test)]

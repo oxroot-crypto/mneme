@@ -16,8 +16,10 @@
 二者都通过内部 `Arc` 共享、可自由克隆并跨线程传递(见 §5)。
 
 > **实现状态**:本参考按冻结签名描述目标语义。L4 起 `text`(BM25)、`Fusion`、
-> `Expr::from_str`/`Display`/JSON 往返与 `filter!` 均已落地;尚未落地的能力以结构化
-> 错误返回、绝不静默降级(FC-MEM-ERR-002),见 §4 错误表。
+> `Expr::from_str`/`Display`/JSON 往返与 `filter!` 均已落地;正文逐项标注了规划 API
+> (L6/L11/L12)与未落地能力。**已接线但未落地**的配置项(如 `quantization`/`compression`)
+> 当前仅记录配置、不生效,并以 `stats()` 如实反映;其余未落地能力以结构化错误返回、
+> 绝不静默降级(FC-MEM-ERR-002),见 §4 错误表。
 
 ### 1.1 构建与打开
 
@@ -43,13 +45,13 @@ impl Builder {
     pub fn insert_mode(self, m: InsertMode) -> Self;        // 默认 Upsert
     pub fn dedup(self, d: Dedup) -> Self;                   // 默认 Off
     pub fn dedup_threshold(self, t: f32) -> Self;           // 默认 0.95;近似去重余弦阈值,`[0,1]` 内的有限值(越界建库即拒绝)
-    pub fn quantization(self, f: VectorFormat) -> Self;     // 默认 F32;见 08
+    pub fn quantization(self, f: VectorFormat) -> Self;     // 默认 F32;L6 未落地,当前仅记录配置、不生效(stats().quant.active 恒 F32);见 08
     pub fn hnsw(self, p: HnswParams) -> Self;               // 默认 M=16/M0=32/efc=200/ef=64
     pub fn compaction(self, p: CompactionPolicy) -> Self;   // 默认见 §2
     pub fn retention(self, r: Option<Retention>) -> Self;   // 后台自动遗忘;默认 None = 关闭(见 07 §3.4)
     pub fn retain_interval(self, d: Duration) -> Self;      // 开启自动遗忘时的周期,默认 半衰期/4
     pub fn access_flush_interval(self, d: Duration) -> Self; // 默认 30s
-    pub fn compression(self, c: Compression) -> Self;       // 文本/元数据压缩,默认 None(见 11;L11 落地,当前记录不启用)
+    pub fn compression(self, c: Compression) -> Self;       // 文本/元数据压缩,默认 None(见 11;配置已接线,压缩实现待 L11)
     pub fn encryption(self, e: Option<Encryption>) -> Self; // 静态加密,feature `encrypt`(见 11;L11 落地,当前无此 API)
     pub fn storage(self, s: Arc<dyn Storage>) -> Self;      // 存储后端,默认 FsStorage;WASM/边缘自定义(见 12 §3;L12 落地,当前无此 API,内部直接 std::fs)
     pub fn read_only(self, yes: bool) -> Self;              // 只读共享模式(见 12 §2;L2 已实现单进程只读,不创建锁/WAL)
@@ -66,6 +68,12 @@ impl Builder {
     pub fn build(self) -> Result<Mneme>;
 }
 ```
+
+> **公开类型补充**:`lib.rs` 另导出 L0 标识类型 `Key`/`NsId`/`RowId`/`SegmentId`/
+> `SeqNo`/`SlotId`(定义见 [02 §1](02-l0-core.md)),以及测试崩溃注入钩子
+> `FsyncHook` 与 `IoAction`(见 [04 §10.1](04-l2-persist.md));`SeqNo` 与 `SlotId`
+> 均不作为公开 API 的参数/返回类型(`SeqNo` 水位经 `SnapshotStats.version` 的 `u64`
+> 诊断值展示,`SlotId` 数值不对外消费)。
 
 ### 1.2 写入
 
@@ -285,9 +293,9 @@ impl Namespace {
 
 ```rust
 impl Mneme {
-    pub fn namespace(&self, path: &str) -> Namespace;               // 返回句柄;注册表在首次成功写入时惰性登记(见 07 §5)
-    pub fn list_namespaces(&self) -> Result<Vec<String>>;           // 前缀树顺序
-    pub fn drop_namespace(&self, path: &str) -> Result<usize>;      // 含所有子命名空间
+    pub fn namespace(&self, path: &str) -> Namespace;               // 路径规范化(去首尾 `/`、合并 `//`);首次写入时惰性登记并校验深度/字符(见 07 §5)
+    pub fn list_namespaces(&self) -> Result<Vec<String>>;           // 规范化路径字典序
+    pub fn drop_namespace(&self, path: &str) -> Result<usize>;      // 按 `/` 段边界级联墓碑,返回行数;注销经 WAL 持久化(FC-LIFE-POST-006)
 }
 ```
 
@@ -301,18 +309,20 @@ impl Mneme {
     pub fn as_of(&self, ts_ms: i64) -> Result<SnapshotHandle>;  // 双时态历史读:版本链上取 tx_ms ≤ ts 的可见版本(默认永久保留,见 07 §4.2a)
     pub fn backup_to(&self, dir: impl AsRef<Path>) -> Result<BackupReport>;  // 先 flush 再备份(见 §7);L2 已落地(纯内存库返回 `Unsupported`)
     pub fn stats(&self) -> Result<Stats>;
-    pub fn check(&self) -> Result<CheckReport>;  // fsck:L1 做 key 索引 ↔ 最新版本对账(FC-MEM-POST-008);L2 起扩展段 CRC/版本链等全量校验
+    pub fn check(&self) -> Result<CheckReport>;  // fsck:key 索引 ↔ 最新版本对账 + 段 CRC/版本链 + 死比率与合并建议(FC-LIFE-POST-009)
     pub fn compact_control(&self) -> CompactionControl;  // pause()/resume()/state()
-    pub fn flush(&self) -> Result<()>;           // 把可变表落成段并 fsync WAL
-    pub fn close(self) -> Result<()>;            // flush + 释放文件锁;幂等(对已关闭的库经其他句柄再调返回 Ok)
+    pub fn compact(&self) -> Result<()>;         // 显式触发一轮 size-tiered compaction(无触发/暂停/纯内存库时空操作,见 07 §4)
+    pub fn maintenance_tick(&self) -> Result<()>; // 手动执行一轮后台维护(访问攒批/自动遗忘/自动 compaction,见 07 §2–§4)
+    pub fn flush(&self) -> Result<()>;           // 把可变表落成增量段并 fsync WAL
+    pub fn close(self) -> Result<()>;            // flush + 停后台维护 + 释放文件锁;幂等(对已关闭的库经其他句柄再调返回 Ok)
 }
 
 impl SnapshotHandle {
-    pub fn version(&self) -> u64;                          // 构建该视图时的基线 MANIFEST 版本
+    pub fn version(&self) -> u64;                          // 构建该视图时的基线序号水位(view.seqno)
     pub fn as_of_ms(&self) -> i64;                         // 事务时间上界;普通 snapshot() = 当前,as_of(t) = t
     /// 在钉住的快照上取命名空间视图(键唯一性按命名空间隔离,故读取须先选命名空间)。
     pub fn namespace(&self, path: &str) -> SnapshotNamespace;
-    pub fn stats(&self) -> SnapshotStats;                  // L5 规划,当前无此 API
+    pub fn stats(&self) -> SnapshotStats;                  // 快照钉住的视图统计(不随后续写入/compaction 变化)
 }
 
 /// 快照上的命名空间只读视图;持有快照视图的 `Arc`,克隆廉价、可跨线程使用。
@@ -322,6 +332,7 @@ impl SnapshotNamespace {
     pub fn get(&self, key: &str) -> Result<Option<RecordRef<'_>>>;
     pub fn get_by_rowid(&self, id: RowId) -> Result<Option<RecordRef<'_>>>;
     pub fn get_many(&self, keys: &[&str]) -> Result<Vec<Option<RecordRef<'_>>>>;
+    pub fn get_many_by_rowid(&self, ids: &[RowId]) -> Result<Vec<Option<RecordRef<'_>>>>;
     pub fn get_vector(&self, id: RowId) -> Result<Option<Vec<f32>>>;
     pub fn exists(&self, key: &str) -> Result<bool>;
     pub fn count(&self, filter: Option<Expr>) -> Result<u64>;
@@ -365,7 +376,7 @@ pub enum Fusion { Rrf { k: u32 }, Weighted { alpha: f32 } }
 pub struct RetainReport { pub scanned: usize, pub forgotten: usize, pub sampled_ids: Vec<RowId> }  // 可审计(I23)
 pub struct BackupReport { pub files: usize, pub bytes: u64, pub hardlinked: bool }
 pub struct CheckReport  { pub ok: bool, pub corrupted: Vec<SegmentId>, pub suggestions: Vec<String> }
-pub struct SnapshotStats { pub version: u64, pub segments: usize, pub rows: u64 }  // L5 规划,当前无此 API
+pub struct SnapshotStats { pub version: u64, pub segments: usize, pub rows: u64 }  // version = 视图基线序号水位;rows 为物理槽位数(含历史/墓碑)
 ```
 
 #### 运行统计
@@ -384,7 +395,7 @@ pub struct Stats {
     pub retain: Option<RetainReport>,             // 最近一次后台遗忘(未开启则 None,见 07 §3.4)
     pub relations: u64,                           // 关系边数(见 09 §2)
     pub history: HistoryStat,                     // 版本链/历史保留统计(见 07 §4.2a)
-    pub storage: StorageStat,                     // 加密/压缩生效状态(见 11)
+    pub storage: StorageStat,                     // 存储安全配置与迁移进度(压缩实现待 L11;见 11)
 }
 // `SegmentStat` 标注 #[non_exhaustive](字段随层扩展,下游不得穷尽构造/匹配);
 // `bytes` = 段内 vsec + 已落盘 hidx 字节数(不含 msec);`rows` 含墓碑与历史版本。
@@ -407,14 +418,16 @@ pub struct HistoryStat {
     pub horizon: Option<Duration>,  // 当前生效的历史保留窗口,None = 永久
 }
 
-/// 量化运行状态:`configured` 为用户配置,`active` 为实际生效格式(可能因 I13 自动回退),
+/// 量化运行状态:`configured` 为用户配置,`active` 为实际生效格式(可能因 I13 自动回退)。
+/// **L6 未落地**:量化副本与两阶段检索尚无实现,`active` 当前恒为 `F32`,绝不回显配置;
 /// `recall_est` 为抽样查询的粗/精排名一致率估计(见 [08 §4.3](08-l6-quant.md))。
 pub struct QuantStat { pub configured: VectorFormat, pub active: VectorFormat, pub recall_est: Option<f32> }
 
-/// 后台合并状态(`stats()` 的 `compaction` 字段)。
+/// 后台合并状态(`stats()` 的 `compaction` 字段);运行中 `pause()` 转 `Paused`。
 pub enum CompactionState {
     Idle,
     Running { progress: f32, segments: Vec<SegmentId> },
+    Paused { progress: f32, segments: Vec<SegmentId> },
 }
 impl CompactionControl {
     pub fn pause(&self);
@@ -433,8 +446,8 @@ pub struct AccessStat { pub last_access_ms: i64, pub access_count: u32 }
 
 - **推荐显式 `db.close()`**:它执行 `flush` 后释放文件锁,返回 `Ok` 即代表
   所有已确认写入已持久(不变量 I16)。
-- `Drop` 只**尽力** `flush`(忽略错误,无法向调用方报告),并释放锁;
-  需要确保持久性时不要依赖析构。
+- `Drop` **不做 flush**:只停止后台维护线程并释放句柄(锁随 `Store` 释放),
+  无法向调用方报告结果;需要确保持久性时不要依赖析构(已确认写入靠 WAL 恢复,见 §1.7 上条)。
 - **克隆与关闭语义**:`Mneme` 经内部 `Arc` 克隆,`close(self)` 关闭的是**共享库**;
   首个 `close` 完成 `flush` 并释放文件锁,此后其余克隆(及其 `Namespace`)上的
   操作返回 `Closed`,重复 `close` 返回 `Ok`。多线程长期共享时,应在确认
@@ -508,7 +521,7 @@ pub struct Scoring {
     pub time_axis: TimeAxis,// 新鲜度时间轴,默认 ValidTime(见 10 §2.1)
     pub bias_routing: bool, // HNSW 遍历按重要性偏置(只改访问顺序),默认 false(见 10 §2.3)
 }
-impl Scoring { pub fn new() -> Self; /* 链式 setter */ }
+impl Scoring { pub fn new() -> Self; }  // 字段公开,按需用结构体字面量覆盖
 // `Scoring` 亦实现 `Default`:`Scoring::default()` 等价于 `Scoring::new()`
 //(w_sim=1.0,其余权重 0),见 10 §2.5 与 FC-SCORE-POST-001。
 
@@ -519,7 +532,7 @@ pub enum TimeAxis { ValidTime, TransactionTime }
 pub enum Diversity { Off, Mmr { lambda: f32 } }   // lambda∈[0,1],越大越重相关性;设计推荐 0.7,须显式构造(`Diversity::default() == Off`);非有限值 execute() 返回 Config
 
 /// 关系联想扩展(见 [10 §3](10-scoring.md)):hops 默认 1(最大 3),decay 默认 0.5/跳,
-/// max_nodes 默认 4k(封顶扩展延迟)。
+/// max_nodes 默认 4096(`visited` 与结果合计上限,封顶扩展延迟)。
 pub struct RelationExpand { pub hops: u8, pub kinds: Vec<RelationKind>, pub decay: f32, pub max_nodes: usize }
 
 /// 关系邻接索引方向(见 [09 §2.3](09-memory-model.md)):`Both` 额外建反向边索引(空间 ×2),
@@ -531,7 +544,7 @@ pub struct RelationKind(pub u16);
 impl RelationKind {
     pub const DERIVED_FROM: Self; pub const SUPPORTS: Self;
     pub const CONTRADICTS: Self;  pub const RELATED: Self;
-    pub fn custom(name: &str) -> Result<Self>;   // 名称→稳定编号(注册表见 09 §2;耗尽返回 TooLarge;L2 注册表落地前无此 API)
+    pub fn custom(name: &str) -> Result<Self>;   // 名称→稳定编号(注册表见 09 §2;未落地,当前不提供)
 }
 /// 一条关系边。
 pub struct Edge { pub from: RowId, pub to: RowId, pub kind: RelationKind, pub weight: f32, pub metadata: Meta }
@@ -557,7 +570,7 @@ pub struct QueryId(pub u64);
 
 /// 记忆沉淀策略与报告(见 [09 §5](09-memory-model.md))。
 pub struct ConsolidationPolicy {
-    pub filter: Option<Expr>,     // 候选范围,默认 None = 全库活记录
+    pub filter: Option<Expr>,     // 候选范围,默认 None = 调用方命名空间全部活记录
     pub threshold: f32,           // 近似重复阈值,默认 0.95;[0,1] 内的有限值(越界入口拒绝)
     pub max_cluster: usize,       // 单簇上限,默认 32
     pub target: Option<String>,   // 摘要写入的命名空间路径,默认 None = 调用方所在命名空间
@@ -590,7 +603,7 @@ pub struct ConsolidateReport {
 | 同 key 行为 | `.insert_mode` | `Upsert` | `Upsert/RejectDuplicate` |
 | 去重策略 | `.dedup` | `Off` | `Off/Reject/Replace/KeepBoth/Merge`,[03 §6](03-l1-memory.md) |
 | 去重阈值 | `.dedup_threshold` | `0.95` | 近似去重阈值,**统一按余弦相似度口径**(非余弦度量下引擎内部先归一化);`[0,1]` 内的有限值,越界建库即拒绝;与 `ResultDedup::Near` 独立 |
-| 量化格式 | `.quantization` | `F32` | `F32/F16/I8Rescored`,[08](08-l6-quant.md) |
+| 量化格式 | `.quantization` | `F32` | `F32/F16/I8Rescored`,[08](08-l6-quant.md);**L6 未落地**,当前仅记录配置、不生效(`active` 恒 `F32`) |
 | HNSW 参数 | `.hnsw` | 见下 | `HnswParams` |
 | compaction | `.compaction` | 见下 | `CompactionPolicy` |
 | 历史保留窗口 | `.compaction(p)` 的 `p.history_horizon` | `None`(永久) | `Option<Duration>`;有限值可回收超期历史版本,见 [07 §4.2a](07-l5-life.md) |
@@ -603,7 +616,7 @@ pub struct ConsolidateReport {
 | 只读共享 | `.read_only` | `false` | 多进程只读打开,见 [12 §2](12-deployment.md) |
 | 只读探测周期 | `.read_only_probe_interval` | `1s` | 只读实例发现新 MANIFEST 的周期,见 [12 §2.1](12-deployment.md);**L12 落地**,当前无此 API |
 | 关系索引 | `.relation_index` | `Outgoing` | `Outgoing/Both`;`Both` 空间 ×2,见 [09 §2.3](09-memory-model.md) |
-| 并行度 | `.parallelism` | `0`(自动) | 扫描/建索引/合并的线程数;0 = `available_parallelism()` |
+| 并行度 | `.parallelism` | `0`(自动) | 并行扫描的线程数(当前仅用于暴力扫描分块);0 = `available_parallelism()` |
 | 可观测 | `.observer` | 无 | 可选事件钩子,见 [12 §4](12-deployment.md);**L12 落地**,当前无此 API |
 | 进阶调参 | `.tuning` | 见下 | `Tuning` |
 | 数据限额 | `.limits` | 见 §8 | `Limits` |
@@ -626,7 +639,7 @@ pub struct CompactionPolicy {
     pub tier_count: u32,     // 默认 4   同层合并阈值 T
     pub dead_ratio: f32,     // 默认 0.25 墓碑+过期占比触发线
     pub wal_bytes: u64,      // 默认 256MB WAL 压力触发线
-    pub wal_file_bytes: u64, // 默认 64MB  单个 WAL 文件轮转阈值(L5 落地;L2 单文件、未使用,见 04 §3.2)
+    pub wal_file_bytes: u64, // 默认 64MB  单个 WAL 文件轮转阈值(已落地,见 04 §3.2、FC-PERSIST-POST-011)
     pub segment_rows: u64,   // 默认 8192  段初始目标行数 B(07 §4.2)
     pub io_budget: f32,      // 默认 0.30 后台合并磁盘配额
     pub history_horizon: Option<Duration>, // 历史版本保留窗口,默认 None = 永久(07 §4.2a)
@@ -637,7 +650,7 @@ pub struct Tuning {
     pub parallel_block: usize,          // 默认 8192  暴力扫描的计算分块粒度(03 §4.2)
     pub field_dict_max: u16,            // 默认 16    每段可索引字段上限(04 §5.1)
     pub bloom_fpp: f32,                 // 默认 0.01  布隆过滤器目标误判率(04 §5.3)
-    pub brute_force_max_rows: u32,      // 默认 2048  段行数低于此值恒用暴力(05 §9)
+    pub brute_force_max_rows: u32,      // 默认 2048  段行数不超过此值恒用暴力(严格 > 才走图;05 §9)
     pub filter_post_threshold: f32,     // 默认 0.10  过滤三档:后过滤/放大后过滤分界(05 §8)
     pub filter_brute_threshold: f32,    // 默认 0.001 过滤三档:放大后过滤/候选暴力分界(05 §8)
     pub stopwords: bool,                // 默认 true  启用内置停用词表(06 §3.5;建库即锁定,既存库以 MANIFEST 为准)
@@ -651,7 +664,7 @@ pub struct Tuning {
 | 会话级临时记忆 | `Record::ttl` 短 + `FsyncPolicy::Batched(20ms)` + 默认 `retention`;命名空间按会话分 |
 | 长期偏好/事实 | `importance` 显式设高 + `Retention::min_importance` 提高 + `Dedup::Replace` 或 `Merge` |
 | 只读/分析副本 | `.fsync(Never)` 仅限测试;生产只读副本仍用 `Batched`,备份目录 `open` 后勿写 |
-| 延迟敏感 | `.quantization(I8Rescored)` + `ef=64~128`;`.parallelism(0)` 交给运行时 |
+| 延迟敏感 | `.quantization(I8Rescored)`(**L6 目标;未落地前无效**) + `ef=64~128`;`.parallelism(0)` 交给运行时 |
 | 内存受限 | 默认 mmap + i8;定期 `backup_to` 后重建更小的段 |
 
 > 以上只是起点:所有旋钮都有默认值,先用默认跑通,再按 `stats()` 的延迟直方图与召回基准调参。
@@ -715,7 +728,7 @@ pub struct Tuning {
 | `Config` | ❌ | 建库/查询配置非法(缺维度、无查询通道、MMR `lambda` 非有限值、`Fusion` 未同时启用双通道、`Weighted.alpha` 越界或非有限),策略参数含非有限值(`min_importance`/`access_weight`/`threshold`/`dedup_threshold`)或非法(如 `max_cluster = 0`) |
 | `Unsupported` | ❌ | 该能力延后到后续层,或对当前形态不适用(**纯内存库 `backup_to`**;只读模式写);按版本升级 |
 | `Inconsistent` | ❌ | 内部不变量被破坏(应为 bug);上报并附上下文 |
-| `UnsupportedVersion` | ❌ | 库由更新版本的 Mneme 写入;升级库,勿降级读 |
+| `UnsupportedVersion` | ❌ | 文件格式版本与当前定义不一致(未发布期无旧格式兼容);从备份恢复或重建 |
 | `Corrupted` | ❌ | 数据损坏:立即停止写入,跑 `db.check()`,按 §7 恢复 |
 
 **原则**:错误信息面向排查——`Corrupted` 带段号与原因,`FilterParse` 带出错位置
@@ -724,8 +737,10 @@ pub struct Tuning {
 ② `filter!` 宏对写死的非法字面量在展开处 panic——运行时输入请用 `Expr::from_str`
 返回的 `Result`([06 §1.1](06-l4-query.md)、不变量 I7);
 ③ 候选收集/槽位映射处对槽位下标的 `u32::try_from(..).expect`(如并行扫描、
-`query::plan::compile`、`WriterState::rebuild_indexes`),`commit_version` 经
-`slot_id_for` 拒绝溢出(FC-MEM-INV-004),该转换可证明不会失败。
+`query::plan::compile`、`WriterState::rebuild_indexes`,共六处),`commit_version` 经
+`slot_id_for` 拒绝溢出(FC-MEM-INV-004),该转换可证明不会失败;另有 `persist::wal::codec`
+的 `encode_frame` 负载长度转换(`FC-GLOBAL-PRE-003` 限额保证远小于 `u32::MAX`)一并
+登记为同源文档化例外(FC-GLOBAL-ERR-001)。
 
 ---
 
@@ -736,12 +751,12 @@ pub struct Tuning {
 | `Mneme` / `Namespace` | ✅ | ✅ | 内部 `Arc`;克隆廉价,可跨线程共享 |
 | `SnapshotHandle` | ✅ | ✅ | 只读视图,任意线程并发查询 |
 | `SnapshotNamespace` | ✅ | ✅ | 快照上的命名空间只读视图,持有快照 `Arc` |
-| `AsyncNamespace` | ✅ | ✅ | async 门面,共享同一底层句柄(feature `async`) |
-| `SearchBuilder` | ✅ | ❌ | 短生命周期构建器,通常单线程用完即 `execute` |
+| `AsyncNamespace` | ✅ | ✅ | async 门面,共享同一底层句柄(feature `async`,**L6 规划,当前无此类型**) |
+| `SearchBuilder` | ✅ | ✅ | 短生命周期构建器,通常单线程用完即 `execute`(仅不承诺跨线程可变使用) |
 | `Record` / `Hit` / `InsertOutcome` / `UpdatePatch` / `QueryId` | ✅ | ✅ | 值类型 |
 | `RecordRef<'_>` | ✅ | ✅ | 以 `Arc` 持有记录数据的只读视图 |
-| `Reranker` / `Clock` / `Summarizer` / `KeyProvider` / `Observer` | ✅ | ✅ | 宿主实现需满足 |
-| `Storage` | ✅ | ✅ | 平台存储后端(见 12 §3) |
+| `Reranker` / `Clock` / `Summarizer` / `KeyProvider` / `Observer` | ✅ | ✅ | 宿主实现需满足(`KeyProvider`/`Observer` 为 L11/L12 规划,当前无此类型) |
+| `Storage` | ✅ | ✅ | 平台存储后端(见 12 §3,`trait` 为 L12 规划) |
 
 **并发语义**:
 
@@ -789,14 +804,14 @@ Mneme 提供引擎级支撑——命名空间隔离、去重、TTL/遗忘、混�
 ### 7.1 常规备份
 
 ```rust
-db.backup_to("./backup")?;   // 一致性快照:先 flush,再复制段/MANIFEST/WAL(不做硬链接)
+db.backup_to("./backup")?;   // 一致性快照:先 flush,再复制/硬链接段、MANIFEST 与 WAL
 ```
 
 **目标目录语义**:目标必须不存在或为空;若已含库内容则返回 `Busy`(不合并、不覆盖),
 避免把两次备份混在一起。备份写入是"先写全部文件、最后写 `current`"的顺序,
 中途失败会留下一个不含合法 `current` 的目录——它无法被打开,重新备份即可(不污染源库)。
-`BackupReport.hardlinked` 标记是否走硬链接;L2 始终**复制**文件,故恒为 `false`
-(硬链接是 L5 优化)。
+`BackupReport.hardlinked` 标记是否走硬链接:L5 起同盘优先硬链接,失败/跨盘回退逐文件复制,
+任一文件回退即置 `false`(见 [07 §6](07-l5-life.md))。
 
 备份目录是一个**可独立打开**的完整库;验证:
 
@@ -848,7 +863,7 @@ b.check()?;                  // 全绿 = 备份有效(写进 CI,见 14 §6)
 | metadata 嵌套深度 | 32 层 | 防解析栈溢出 |
 | `top_k` | 4096 | [03 §2.2](03-l1-memory.md) |
 | `ef` | 4096 | 仅 L3+ |
-| WAL 单帧 payload | 16 MiB | 撕裂写检测与内存上界;**L2 保留限额,尚未在写路径强制** |
+| WAL 单帧 payload | 16 MiB | 撕裂写检测与内存上界;**当前保留限额,尚未在写路径强制** |
 | 命名空间深度 | 32 级 | `a/b/c/...`,对应 `Limits.ns_depth` |
 | 自定义关系类型 | 65520 个 | u16 编号空间,内置占用 0..=15;超限 `TooLarge` |
 
@@ -893,8 +908,8 @@ I18 见 [04 §14](04-l2-persist.md)。为便于查阅,四条一并列出:
 - **I15 批量原子**:`insert_batch` 要么整批可见、要么整批不可见,不存在部分写入;
 - **I16 优雅关闭**:`close()` 返回 `Ok` 后,所有已确认写入持久;`Drop` 不保证;
 - **I17 快照一致**:`SnapshotHandle` 存活期间看到固定 ReaderView 的完整视图(段集 + 取快照时的可变表快照),后台 compaction 不影响其可见性与正确性;
-- **I18 版本兼容**:只接受主版本 ≤ 本库支持上界的文件(`major(format_version) ≤ max`);
-  更高主版本返回 `UnsupportedVersion`,拒绝打开而非静默误读([04 §12](04-l2-persist.md))。
+- **I18 版本精确匹配**:只接受 `format_version == FORMAT_VERSION` 的文件;
+  任何版本不一致返回 `UnsupportedVersion`,拒绝打开而非静默误读([04 §12](04-l2-persist.md))。
 
 其余不变量(I19–I30,完整定义见 [spec/contracts.md](../spec/contracts.md)):
 

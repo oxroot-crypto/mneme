@@ -117,15 +117,20 @@ pub(crate) fn touch_rowid(
         ws.commit_version(rowid, slot_data)?;
     }
     // 提交成功后再记访问,避免提交失败时计数被提前累加。
-    let stat = Arc::make_mut(&mut ws.access).entry(rowid).or_default();
-    stat.access_count = stat.access_count.saturating_add(1);
-    stat.last_access_ms = now;
+    {
+        let stat = Arc::make_mut(&mut ws.access).entry(rowid).or_default();
+        stat.access_count = stat.access_count.saturating_add(1);
+        stat.last_access_ms = now;
+    }
+    // 访问增量随下次 flush 以 delta 区 `Access` 条目落盘(读路径零写放大)。
+    ws.mark_access_dirty(rowid);
     // 访问统计单独落 WAL(重要性变更已随上面的版本 `Insert` 记录)。
     let seqno = ws.alloc_seqno();
     ws.pending.push(WriteOp::Access {
         rowid,
         seqno,
         at_ms: now,
+        access_delta: 1,
         importance_delta: 0.0,
     });
     Ok(true)

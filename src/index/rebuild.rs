@@ -6,11 +6,20 @@
 
 use crate::core::metric::Metric;
 use crate::core::options::HnswParams;
+use crate::core::types::SlotId;
 use crate::memory::index::IndexNode;
 
 use super::hnsw::HnswIndex;
 
-/// 由新节点集整体重建 HNSW 图。
-pub(crate) fn rebuild(nodes: &[IndexNode], params: HnswParams, metric: Metric) -> HnswIndex {
-    HnswIndex::build(nodes, params, metric)
+/// 由新节点集整体重建 HNSW 图,并显式给出节点到全局槽位的映射。
+///
+/// 增量段只覆盖部分全局槽位,节点 id 与全局槽位不再恒等,必须显式映射
+/// (设计 07 §4;查询期 `alive`/过滤位图按全局槽位索引)。
+pub(crate) fn rebuild_with_slots(
+    nodes: &[IndexNode],
+    slot_of: &[SlotId],
+    params: HnswParams,
+    metric: Metric,
+) -> HnswIndex {
+    HnswIndex::build_with_slots(nodes, slot_of, params, metric)
 }

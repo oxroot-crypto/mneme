@@ -53,6 +53,39 @@ pub(crate) struct IndexSearch<'a> {
     pub(crate) brute_threshold: f32,
 }
 
+/// 单个段的向量索引与其覆盖的全局槽位(多段架构,设计 07 §4)。
+///
+/// 每个不可变段各持一张 HNSW 图;图节点 `n` 对应 `slots[n]` 个全局槽位。
+/// 查询对全部段图分别搜索并归并 `TopK`;未被任何段索引覆盖的槽位(未落盘尾部或
+/// 无 `hidx` 的段)仍走暴力扫描,二者统计等价。
+#[derive(Clone)]
+pub(crate) struct SegmentIndex {
+    /// 所属段编号(统计与 compaction 用)。
+    pub(crate) segment_id: u32,
+    /// 该段的 HNSW 图(节点经内部 `slot_of` 映射到全局槽位)。
+    pub(crate) index: Arc<dyn VectorIndex>,
+    /// 图节点顺序的全局槽位(`slots[node] = slot_of(node)`)。
+    pub(crate) slots: Vec<SlotId>,
+    /// 覆盖位图(按全局槽位,O(1) 判定某槽位是否有索引)。
+    pub(crate) covered: BitSet,
+}
+
+impl SegmentIndex {
+    /// 由段号、索引与覆盖槽位构造;`slots` 与图节点一一对应。
+    pub(crate) fn new(segment_id: u32, index: Arc<dyn VectorIndex>, slots: Vec<SlotId>) -> Self {
+        let mut covered = BitSet::default();
+        for slot in &slots {
+            covered.set(slot.get() as usize);
+        }
+        Self {
+            segment_id,
+            index,
+            slots,
+            covered,
+        }
+    }
+}
+
 /// 只读向量索引(对象安全)。
 ///
 /// 节点 id 为段内下标;对外返回的 `SlotId` 由 [`VectorIndex`] 内部的 `slot_of`
@@ -81,10 +114,11 @@ pub(crate) trait VectorIndex: Send + Sync {
 
 /// 索引工厂:构建与载入(组合根注入)。
 pub(crate) trait IndexFactory: Send + Sync {
-    /// 由节点构建索引;节点 id = 全局槽位 `0..nodes.len()`。
+    /// 由节点构建索引;`slot_of[node]` 为节点对应的全局槽位(多段增量段用)。
     fn build(
         &self,
         nodes: &[IndexNode],
+        slot_of: &[SlotId],
         params: HnswParams,
         metric: Metric,
     ) -> Arc<dyn VectorIndex>;
