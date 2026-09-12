@@ -499,15 +499,18 @@ mod tests {
 
     /// 更高主版本 → `UnsupportedVersion`(I18)。
     #[test]
-    fn vsec_rejects_higher_major() {
-        let mut bytes = encode_sample(1);
-        bytes[4..6].copy_from_slice(&0x0100_u16.to_le_bytes());
-        // 重新计算头部 CRC,使版本成为唯一错误来源。
-        let crc = crc32(&bytes[0..32]);
-        bytes[32..36].copy_from_slice(&crc.to_le_bytes());
-        assert!(matches!(
-            parse(&bytes),
-            Err(MnemeError::UnsupportedVersion { .. })
-        ));
+    fn vsec_rejects_version_mismatch() {
+        // 高/低版本都必须拒绝(精确匹配,无旧格式兼容)。
+        for version in [0x0100_u16, crate::persist::FORMAT_VERSION - 1] {
+            let mut bytes = encode_sample(1);
+            bytes[4..6].copy_from_slice(&version.to_le_bytes());
+            // 重新计算头部 CRC,使版本成为唯一错误来源。
+            let crc = crc32(&bytes[0..32]);
+            bytes[32..36].copy_from_slice(&crc.to_le_bytes());
+            assert!(matches!(
+                parse(&bytes),
+                Err(MnemeError::UnsupportedVersion { .. })
+            ));
+        }
     }
 }

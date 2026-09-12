@@ -248,32 +248,32 @@ impl MsecView<'_> {
         Ok(rows)
     }
 
-    /// relations 区原始字节(可能为空)。
+    /// relations 区原始字节(空表也带 `EDG1` 头)。
     pub(crate) const fn relations_bytes(&self) -> &[u8] {
         self.relations
     }
 
-    /// delta 区原始字节(可能为空;跨段访问/关系变更)。
+    /// delta 区原始字节(空区 = 本段无跨段变更)。
     pub(crate) const fn delta_bytes(&self) -> &[u8] {
         self.delta
     }
 
-    /// 字段字典区原始字节(L4;无索引字段时为空)。
+    /// 字段字典区原始字节(恒非空)。
     pub(crate) const fn field_dict_bytes(&self) -> &[u8] {
         self.field_dict
     }
 
-    /// zone map 区原始字节(L4;无索引字段时为空)。
+    /// zone map 区原始字节(含区尾 `ttl_map`)。
     pub(crate) const fn zmap_bytes(&self) -> &[u8] {
         self.zmap
     }
 
-    /// bloom 区原始字节(L4;无 `key` 字段时为空)。
+    /// bloom 区原始字节(`key` 字段)。
     pub(crate) const fn bloom_bytes(&self) -> &[u8] {
         self.bloom
     }
 
-    /// 倒排区原始字节(L4;无文本记录时为空)。
+    /// 倒排区原始字节(空表也带版头)。
     pub(crate) const fn inverted_bytes(&self) -> &[u8] {
         self.inverted
     }

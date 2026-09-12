@@ -401,7 +401,7 @@ adj_blob:   逐点逐层 u32 邻居槽位数组(层0 ≤ M0 个,上层按 level 
 > 与 `0..64` 的对齐 padding(`src/index/hidx.rs` 模块文档为逐字节权威)。
 > `key_id`/`codec` 可选扩展区随加密/压缩(L11,设计 [04 §2.5](04-l2-persist.md))落地,
 > 当前恒为 0("同一段三文件必须一致"的约束自 L11 生效);版本号与 vsec/msec 同代
-> (`FORMAT_VERSION`),主版本过新一律拒读(I18)。
+> (`FORMAT_VERSION`),版本不一致一律拒读(I18)。
 
 **目标形态(尚未兑现)**:mmap 惰性加载——打开段只读头部与 node_table,邻接 blob
 由缺页按需载入,是"1M 条冷启动 < 1s"的主要支撑点([01 §1.1](01-overview.md))。

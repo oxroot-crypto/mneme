@@ -15,7 +15,7 @@
 //!
 //! kind 1–3(`DeleteKey`/`DeleteRow`/`UpdateRow`)由设计保留:本层无需以 delta
 //! 表示删除/更新(它们总以版本行承载),故编解码一律拒绝为 [`MnemeError::Corrupted`]。
-//! 空区(旧段)解码为空 `Vec`。
+//! 空区表示本段无跨段变更,解码为空 `Vec`。
 
 use crate::core::error::{MnemeError, Result};
 use crate::core::meta::{self, Meta};
@@ -355,7 +355,7 @@ mod tests {
         assert_eq!(bytes, reencoded, "解码后重编码必须逐字节一致");
     }
 
-    /// FC-PERSIST-POST-010(空区兼容)
+    /// FC-PERSIST-POST-010(空区 = 无跨段变更)
     #[test]
     fn empty_delta_is_valid() {
         assert!(decode_delta(&[]).expect("空区").is_empty());

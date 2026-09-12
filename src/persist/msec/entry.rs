@@ -127,7 +127,16 @@ fn decode_valid_time(cursor: &mut Cursor<'_>, flags: u8) -> Result<Option<(i64, 
         return Ok(None);
     }
     let valid_from = cursor.i64()?;
-    let has_to = cursor.u8()? != 0;
+    let has_to = match cursor.u8()? {
+        0 => false,
+        1 => true,
+        _ => {
+            return Err(crate::core::error::MnemeError::Corrupted {
+                segment: None,
+                reason: "entry: valid_time 标志非法".to_string(),
+            });
+        }
+    };
     let valid_to = if has_to { Some(cursor.i64()?) } else { None };
     Ok(Some((valid_from, valid_to)))
 }

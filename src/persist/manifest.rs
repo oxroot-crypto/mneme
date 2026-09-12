@@ -58,7 +58,7 @@ pub(crate) struct RelKindEntry {
 pub(crate) struct SegmentEntry {
     /// 段编号。
     pub(crate) segment_id: u32,
-    /// 段文件格式版本(三文件应一致)。
+    /// 段文件格式版本(审计用;打开时以段文件自身头部的版本为权威,不读本字段)。
     pub(crate) format_version: u16,
     /// 行数。
     pub(crate) row_count: u64,
@@ -475,15 +475,17 @@ mod tests {
 
     /// 更高主版本 → `UnsupportedVersion`。
     #[test]
-    fn manifest_rejects_higher_major() {
-        let manifest = sample();
-        let mut bytes = encode(&manifest).expect("encode");
-        bytes[4..6].copy_from_slice(&0x0100_u16.to_le_bytes());
-        let crc = header_crc(&bytes[..HEADER_LEN as usize]);
-        bytes[8..12].copy_from_slice(&crc.to_le_bytes());
-        assert!(matches!(
-            parse(&bytes),
-            Err(MnemeError::UnsupportedVersion { .. })
-        ));
+    fn manifest_rejects_version_mismatch() {
+        for version in [0x0100_u16, FORMAT_VERSION - 1] {
+            let manifest = sample();
+            let mut bytes = encode(&manifest).expect("encode");
+            bytes[4..6].copy_from_slice(&version.to_le_bytes());
+            let crc = header_crc(&bytes[..HEADER_LEN as usize]);
+            bytes[8..12].copy_from_slice(&crc.to_le_bytes());
+            assert!(matches!(
+                parse(&bytes),
+                Err(MnemeError::UnsupportedVersion { .. })
+            ));
+        }
     }
 }

@@ -724,7 +724,7 @@ pub struct Tuning {
 | `Config` | ❌ | 建库/查询配置非法(缺维度、无查询通道、MMR `lambda` 非有限值、`Fusion` 未同时启用双通道、`Weighted.alpha` 越界或非有限),策略参数含非有限值(`min_importance`/`access_weight`/`threshold`/`dedup_threshold`)或非法(如 `max_cluster = 0`) |
 | `Unsupported` | ❌ | 该能力延后到后续层,或对当前形态不适用(**纯内存库 `backup_to`**;只读模式写);按版本升级 |
 | `Inconsistent` | ❌ | 内部不变量被破坏(应为 bug);上报并附上下文 |
-| `UnsupportedVersion` | ❌ | 库由更新版本的 Mneme 写入;升级库,勿降级读 |
+| `UnsupportedVersion` | ❌ | 文件格式版本与当前定义不一致(未发布期无旧格式兼容);从备份恢复或重建 |
 | `Corrupted` | ❌ | 数据损坏:立即停止写入,跑 `db.check()`,按 §7 恢复 |
 
 **原则**:错误信息面向排查——`Corrupted` 带段号与原因,`FilterParse` 带出错位置
@@ -902,8 +902,8 @@ I18 见 [04 §14](04-l2-persist.md)。为便于查阅,四条一并列出:
 - **I15 批量原子**:`insert_batch` 要么整批可见、要么整批不可见,不存在部分写入;
 - **I16 优雅关闭**:`close()` 返回 `Ok` 后,所有已确认写入持久;`Drop` 不保证;
 - **I17 快照一致**:`SnapshotHandle` 存活期间看到固定 ReaderView 的完整视图(段集 + 取快照时的可变表快照),后台 compaction 不影响其可见性与正确性;
-- **I18 版本兼容**:只接受主版本 ≤ 本库支持上界的文件(`major(format_version) ≤ max`);
-  更高主版本返回 `UnsupportedVersion`,拒绝打开而非静默误读([04 §12](04-l2-persist.md))。
+- **I18 版本精确匹配**:只接受 `format_version == FORMAT_VERSION` 的文件;
+  任何版本不一致返回 `UnsupportedVersion`,拒绝打开而非静默误读([04 §12](04-l2-persist.md))。
 
 其余不变量(I19–I30,完整定义见 [spec/contracts.md](../spec/contracts.md)):
 

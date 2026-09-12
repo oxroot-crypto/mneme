@@ -33,7 +33,7 @@ pub(super) fn load_segment_views<'a>(
 ) -> Result<Option<(vsec::VsecView<'a>, msec::MsecView<'a>)>> {
     let mut vsec_view = match vsec::parse(&segment.vsec) {
         Ok(view) => view,
-        // 主版本过新一律拒绝打开(I18),绝不因 fail-fast 关闭而降级为跳过。
+        // 版本不一致一律拒绝打开(I18),绝不因 fail-fast 关闭而降级为跳过。
         Err(error) if fail_fast || is_version_rejection(&error) => return Err(error),
         Err(_) => return Ok(None),
     };
@@ -59,7 +59,7 @@ pub(super) fn load_segment_views<'a>(
     Ok(Some((vsec_view, msec_view)))
 }
 
-/// 是否为"主版本过新"导致的拒绝(不可降级跳过,I18)。
+/// 是否为格式版本不匹配导致的拒绝(不可降级跳过,I18)。
 fn is_version_rejection(error: &MnemeError) -> bool {
     matches!(error, MnemeError::UnsupportedVersion { .. })
 }

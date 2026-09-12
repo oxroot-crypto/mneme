@@ -271,7 +271,7 @@ cargo-fuzz 目标:`fuzz_vsec`、`fuzz_msec`、`fuzz_hidx`、`fuzz_wal_replay`、
 断言统一:**任意输入不 panic、不 UB、不无限循环**;解析失败必须返回结构化错误
 (I7:DSL 任意输入不 panic)。
 
-**版本注入**(I18):在上述解码目标中随机改写文件头 `format_version` 的**主版本**为更大值,
+**版本注入**(I18):在上述解码目标中随机改写文件头 `format_version` 为任意不同值,
 断言返回 `UnsupportedVersion` 而非继续解析;改写为魔数不符的值,断言 `Corrupted`。
 
 发布前本地连续跑:每个目标 ≥ 1h,且全部目标累计 ≥ 24h(可分多轮累计)。

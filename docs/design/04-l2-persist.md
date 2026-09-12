@@ -170,8 +170,8 @@ agent_memory/
 > `version_table`/`key_index`(§2.2、§5.5),不依赖 delta 区;不变量 I19 由"WAL 不提前截断 +
 > 版本行"保证。L5 起 `delta` 区承载增量段中"作用于旧段记录"的非版本化变更
 > (kind=4 Access、kind=5/6 Relate/Unrelate;kind 1–3 保留),恢复时按段序回放、
-> compaction 时物化进新段。下述 delta 设计是 **L5 compaction**
-> 的目标形态。
+> compaction 时物化进新段;该设计已在 L5 落地(增量段 flush 与
+> compaction 均使用)。
 
 **问题**:`delete(key)` / `update(key, patch)` / `touch` / `relate` 作用的对象可能位于
 **更早的不可变段**。这些操作不能原地改写旧段(vsec 的 `dead` 位图只能标本段 SlotId,
@@ -207,12 +207,13 @@ delta 区(紧随 msec 数据区,自身带长度前缀与 CRC):
 relations 区是**按 `from` RowId 排序**的边表,供 `O(log n + degree)` 定位:
 
 ```text
-relations: [from u64][to u64][kind u16][f32 weight][meta len+bytes] × edge_count
-           按 (from, kind, to) 排序;另存 from→区间 的稀疏索引(sparse, 每 256 条一个锚点)
-           反向边默认不单独存:relations 区按 from 排序,查询 to 的入边只能全段扫描;
-           高频入边场景显式开启 RelationIndex::Both,引擎在 relations 区内追加按 (to, kind, from)
-           排序的反向邻接索引(区首记录正向/反向两段偏移,不新增 msec 头字段),
-           供 ns.predecessors() 以 O(log n + degree) 定位(见 09 §2.3)
+relations: [magic "EDG1"][u16 ver][u16 flags][u32 forward_count][u32 reverse_count]
+           正向边 × forward_count:[from u64][to u64][kind u16][f32 weight][meta len+bytes]
+             按 (from, kind, to) 排序,供 O(log n + degree) 定位出边(不设稀疏索引)
+           反向边 × reverse_count(flags bit0=反向表存在):
+             按 (to, kind, from) 排序 —— RelationIndex::Both 时追加,
+             供 ns.predecessors() 以 O(log n + degree) 定位(见 09 §2.3)
+           flags bit1=全量关系表:恢复时先重置关系表再应用;无该位为增量段(见 FC-MODEL-POST-007)
 ```
 
 > **落地状态**:默认 `RelationIndex::Outgoing` 只写正向表;`Both` 时自 L5 起追加反向表
@@ -223,9 +224,8 @@ relations: [from u64][to u64][kind u16][f32 weight][meta len+bytes] × edge_coun
   视为不可见(悬挂边不返回,compaction 时物理清除);
 - 关系边是**一等公民**但不参与向量打分,只作为检索的**扩展算子**([10 §3](10-scoring.md))。
 
-`ns_id` 逐条存储,因为同一段内混合多个命名空间([07 §5](07-l5-life.md) 的单库前缀聚合),
-记录体的命名空间不可从段位置推断;它同时是 [16 §8.1](16-api-reference.md) 中保留字段 `__ns` 的
-持久化来源。
+边表不重复存 `ns_id`:命名空间由记录体的 `NsId` 得出(段内可混合多个命名空间,
+[07 §5](07-l5-life.md) 的单库前缀聚合),无需在关系区重复。
 
 设计取舍:记录体是**变长 blob 连续排放**——`get(key)` 走 key_index 二分
 $O(\log n)$ 一次读;顺序重放/compaction 顺序读,对页缓存与 SSD 都友好。
@@ -243,7 +243,7 @@ crc32 覆盖 [payload_len, seqno, type, payload](即本帧除自身 crc 外的�
 seqno 为该写操作分配的全局单调序号(§3.1);回放据此跳过已落段的前缀(§3.3)
 type: 1=Insert 2=Delete 3=Touch 4=Checkpoint 5=BatchBegin 6=BatchCommit
       7=DeleteRow 8=TouchRow 9=NsRegister 10=Update 11=UpdateRow 12=Relate 13=Unrelate
-      14=RelKindRegister
+      14=RelKindRegister 15=NsUnregister
 Insert     = 记录体(同 msec entry 格式,含 NsId)[u32 dim][f32 × dim]  # 记录体不含向量,故附向量副本供崩溃恢复
 Delete     = [NsId u32][key len+bytes]
 DeleteRow  = [RowId u64]                          # 无 key 记录按 RowId 删除
@@ -291,7 +291,7 @@ Checkpoint = [u64 watermark_seqno]
 8      header_crc32                      u32     覆盖除自身外的全部头部字段
 12     dimension                         u32     建库维度(空库也可回读;打开时校验)
 16     metric                            u8      0=Cosine 1=Dot 2=Euclidean
-17     stopwords                         u8      0=未记录(旧版,按默认开) 1=关 2=开(建库即锁定)
+17     stopwords                         u8      1=关 2=开(建库即锁定;其它值视为损坏)
 18..22 reserved                          4
 22     next_rel_kind                     u16     自定义关系类型编号分配水位(永不复用)
 24     manifest_version                  u64
@@ -340,7 +340,7 @@ HNSW 入口是**每段一个**(与 [05 §7/§9](05-l3-hnsw.md) 的"每段独立�
 - 扩展字段出现在 **vsec / msec / WAL / MANIFEST** 四类文件头中;同一段的三个文件
   (vsec/msec/hidx)的 `key_id` 与 `codec` 必须一致,不一致视为 `Corrupted`;
 - feature 关闭时扩展区为空(`header_len` = 基础值),磁盘布局与 §2.1–§2.4 逐字节一致;
-  开启时 `header_len` 增大、次版本号递增,关闭 feature 的旧读者按 §12 跳过未知可选字段;
+  开启时 `header_len` 增大、次版本号递增(项目未发布期版本不一致即拒绝,不保留旧读者);
 - 加密页布局与压缩字段前缀的细节见 [11 §2.2](11-security-storage.md) / [11 §3.2](11-security-storage.md)。
 
 ### 2.6 一次写入的字节旅程(把本章串起来)
@@ -897,7 +897,7 @@ L3 恢复阶段仍需自有字节以重建内存表,真正的"零拷贝驻留"�
 | 目录被占用 | 第二个实例打开 | `Busy` | 确保单进程独占([16 §3](16-api-reference.md)) |
 | 全部 MANIFEST 损坏 | 扫描 `MANIFEST.*` 无合法版本 | `Corrupted` | 从备份恢复([16 §7](16-api-reference.md)) |
 | 个别段头损坏 | 打开时校验失败 | 内存跳过并从视图剔除,文件保持原地(可配 fail-fast,见 §7) | `db.check()` 复核;必要时从备份补段 |
-| WAL 未知帧类型 | 回放遇到 `type` 不在定义内 | **停止回放并报错**(不静默跳过) | 升级库版本;切勿手工改 WAL |
+| WAL 未知帧类型 | 回放遇到 `type` 不在定义内 | **停止回放并报错**(不静默跳过) | 视为损坏:从备份恢复并检查磁盘,切勿手工改 WAL |
 | mmap 失败 | 平台/文件系统不支持 | 自动退化为 `FileSource` | 无(功能不变,吞吐下降) |
 | 时钟回拨 | `Clock` 返回变小 | 以历史最大水位钳制(本章 §10.2) | 无 |
 | 崩溃残留锁文件 | 上次进程未正常退出 | OS 咨询锁随进程终止由内核自动释放(`File::try_lock`),下次打开直接获取;`LOCK` 文件保留不删([16 §3](16-api-reference.md)) | 无(自动释放) |
@@ -916,7 +916,7 @@ L3 恢复阶段仍需自有字节以重建内存表,真正的"零拷贝驻留"�
 3. `SegmentSource` 抽象、`FsyncHook` / `Clock` 注入点、`trash` 管理;
 4. 事务语义:单次 `insert_batch` 原子(要么整批进 WAL,要么整批不出现);
    flush + MANIFEST 提交 = 一致性点;
-5. 格式版本校验与在线迁移(§12)、失败模式处置约定(§13)。
+5. 格式版本精确校验(§12)、失败模式处置约定(§13)。
 
 **不变量**(任何上层、任何测试可依赖):
 
@@ -927,7 +927,7 @@ L3 恢复阶段仍需自有字节以重建内存表,真正的"零拷贝驻留"�
 - I3 活跃段集合任意时刻 = 某 MANIFEST 版本所列集合(读端无锁的前提);
 - I4 WAL 总量有界(§3.2 兜底),段文件只增不改(write-once);磁盘占用随保留的历史版本
   线性增长,由 `history_horizon` 控制(默认永久);
-- I18 只接受 `major(format_version) ≤ major(max_supported)` 的文件,主版本更高的拒绝打开(§12);
+- I18 只接受 `format_version == FORMAT_VERSION` 的文件,任何版本不一致都拒绝打开(§12);
 - **I19 覆盖持久性**:任何已返回 `Ok` 的 `delete`/`update`/`touch`/`relate` 操作,在任意
   崩溃 + WAL 截断后仍然生效——因为其覆盖条目要么在 WAL,要么已随某个已提交的**全量快照段**
   (墓碑/新版本)落盘;WAL 只在覆盖物化后才重置截断(§3.2);被删除记录**永不复活**
@@ -944,7 +944,7 @@ L3 恢复阶段仍需自有字节以重建内存表,真正的"零拷贝驻留"�
 - WAL 组提交、帧 CRC、`BatchBegin/Commit` 与 MANIFEST watermark + WAL 重置保证崩溃一致性
   (`Checkpoint` 帧类型保留、L2 不发出)。
 - **全量快照 flush**(L2)把"作用于旧段记录"的删除/更新/访问/关系随新段(墓碑/新版本)持久化,
-  是 I19 的关键;**delta 覆盖区**是 L5 compaction 的目标形态(L2 恒空)。
+  是 I19 的关键;**delta 覆盖区**已在 L5 落地(L2 阶段恒空)。
 - MANIFEST 用 write-once + 指针规避 Windows 替换语义,trash 做延迟删除。
 - **本章不变量**:I1–I4、I18–I20,以及版本链的存储侧保留保证(I26)。
 

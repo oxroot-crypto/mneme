@@ -410,7 +410,6 @@ fn replay_all_wal(
     Ok(())
 }
 
-/// (已移除)损坏段不再移入 `trash/`:MANIFEST 仍引用它们,移动会使后续打开拒启。
 /// [`load_index`] 的槽位来源:恢复后的写状态与"段内槽位 → 全局槽位"重排映射。
 struct SlotRemap<'a> {
     /// 恢复后的写状态(hidx 节点按段内顺序取 `rowid`/向量)。
@@ -422,7 +421,7 @@ struct SlotRemap<'a> {
 /// 由 hidx 字节与恢复出的槽位构建索引。
 ///
 /// # Errors
-/// hidx 解析失败(损坏/版本过高)或重排映射越界时返回结构化错误。
+/// hidx 解析失败(损坏/版本不一致)或重排映射越界时返回结构化错误。
 fn load_index(
     factory: &Arc<dyn IndexFactory>,
     hidx: &[u8],

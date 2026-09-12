@@ -669,7 +669,6 @@ fn ttl_expiry_survives_multi_segment_reopen() {
     db.close().expect("close");
 }
 
-/// 轮询等待 `cond` 成立(后台维护为异步;注入时钟决定触发,真实时间只驱动线程)。
 /// FC-LIFE-POST-004:读路径命中攒批后落 WAL;崩溃(未 close)重开后访问计数仍在。
 #[test]
 fn access_hits_are_batched_and_flushed() {

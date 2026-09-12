@@ -502,15 +502,17 @@ mod tests {
 
     /// FC-INDEX-ERR-001:更高主版本 → `UnsupportedVersion`(I18)。
     #[test]
-    fn hidx_rejects_higher_major() {
-        let mut bytes = encode(&sample_graph(), GRAPH_PARAMS).expect("encode");
-        bytes[4..6].copy_from_slice(&0x0100_u16.to_le_bytes());
-        let crc = crc32(&bytes[0..36]);
-        bytes[36..40].copy_from_slice(&crc.to_le_bytes());
-        assert!(matches!(
-            decode(&bytes),
-            Err(MnemeError::UnsupportedVersion { .. })
-        ));
+    fn hidx_rejects_version_mismatch() {
+        for version in [0x0100_u16, crate::persist::FORMAT_VERSION - 1] {
+            let mut bytes = encode(&sample_graph(), GRAPH_PARAMS).expect("encode");
+            bytes[4..6].copy_from_slice(&version.to_le_bytes());
+            let crc = crc32(&bytes[0..36]);
+            bytes[36..40].copy_from_slice(&crc.to_le_bytes());
+            assert!(matches!(
+                decode(&bytes),
+                Err(MnemeError::UnsupportedVersion { .. })
+            ));
+        }
     }
 
     /// FC-INDEX-ERR-001:头部 `ef_construction = 0` → `Corrupted`(与建库校验同口径)。

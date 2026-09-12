@@ -122,10 +122,10 @@ pub(crate) struct EdgeView {
 /// 魔数/版本不符、长度不足或 meta 损坏时返回结构化错误。
 pub(crate) fn parse(bytes: &[u8]) -> Result<EdgeView> {
     if bytes.is_empty() {
-        return Ok(EdgeView {
-            forward: Vec::new(),
-            reverse: Vec::new(),
-            full: false,
+        // 关系区为当前格式必填(空表也带 `EDG1` 头),空区只可能是畸形。
+        return Err(MnemeError::Corrupted {
+            segment: None,
+            reason: "relations: 区为空".to_string(),
         });
     }
     let mut cursor = Cursor::new(bytes, "relations");
@@ -214,12 +214,10 @@ mod tests {
         assert_eq!(view.reverse[0].to, 1);
     }
 
-    /// 空区解析为零边。
+    /// 空区按畸形拒绝(当前格式空表也带 `EDG1` 头)。
     #[test]
-    fn edges_empty_is_valid() {
-        let view = parse(&[]).expect("parse");
-        assert!(view.forward.is_empty());
-        assert!(view.reverse.is_empty());
+    fn edges_empty_is_rejected() {
+        assert!(matches!(parse(&[]), Err(MnemeError::Corrupted { .. })));
     }
 
     /// 魔数损坏被检出。

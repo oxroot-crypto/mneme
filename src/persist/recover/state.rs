@@ -256,11 +256,7 @@ fn decode_segment_index(
     msec::validate_zmap(msec_view.zmap_bytes(), &fields, block_count)?;
     let _ttl_map = msec::decode_ttl_map(msec_view.zmap_bytes(), &fields, block_count)?;
     msec::decode_bloom(msec_view.bloom_bytes())?;
-    let inv = if msec_view.inverted_bytes().is_empty() {
-        crate::memory::analysis::InvertedIndex::default()
-    } else {
-        msec::decode_inverted(msec_view.inverted_bytes(), remap)?
-    };
+    let inv = msec::decode_inverted(msec_view.inverted_bytes(), remap)?;
     Ok(inv)
 }
 
@@ -276,11 +272,7 @@ fn load_disk_indexes(
     let fields = msec::decode_field_dict(msec_view.field_dict_bytes())?;
     validate_disk_regions(state, msec_view, &fields)?;
     let key_bloom = decode_key_bloom(msec_view, &fields)?;
-    let inv = if msec_view.inverted_bytes().is_empty() {
-        crate::memory::analysis::InvertedIndex::default()
-    } else {
-        msec::decode_inverted(msec_view.inverted_bytes(), remap)?
-    };
+    let inv = msec::decode_inverted(msec_view.inverted_bytes(), remap)?;
     state.load_disk_indexes(inv, key_bloom);
     Ok(())
 }
@@ -402,10 +394,11 @@ mod tests {
             dead: &[],
         })
         .expect("vsec");
+        let empty_edges = crate::persist::edges::encode(&[], false, false).expect("edges");
         SegmentBytes {
             segment_id: id,
             vsec,
-            msec: msec_only_segment(&[]),
+            msec: msec_only_segment(&empty_edges),
             hidx: None,
         }
     }
@@ -486,7 +479,7 @@ mod tests {
         );
     }
 
-    /// FC-PERSIST-ERR-010(字段字典缺失但其它索引区非空 → `Corrupted`)
+    /// FC-PERSIST-ERR-010(字段字典缺失或其它索引区畸形 → `Corrupted`)
     #[test]
     fn half_indexed_section_is_rejected() {
         let zmap = [0_u8; 8];

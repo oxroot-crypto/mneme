@@ -231,7 +231,7 @@
 | I15 | `insert_batch` 整批原子(可见数 ∈ {0, n}) | [16 §9](16-api-reference.md) | [14 §2.1](14-testing.md) |
 | I16 | `close()` 返回 `Ok` 后已确认写入持久 | [16 §9](16-api-reference.md) | [14 §2.2](14-testing.md) |
 | I17 | `SnapshotHandle` 视图一致,后台 compaction 不影响 | [07 §8](07-l5-life.md) | [14 §6.1](14-testing.md) |
-| I18 | 拒绝打开更高主版本的文件 | [04 §14](04-l2-persist.md) | [14 §5](14-testing.md) |
+| I18 | 只接受版本与当前定义精确一致的文件,不一致即拒绝打开 | [04 §14](04-l2-persist.md) | [14 §5](14-testing.md) |
 | I19 | 覆盖持久性:删除不复活、更新不丢 | [04 §14](04-l2-persist.md) | [14 §2.4](14-testing.md) |
 | I20 | 注册与水位可恢复,NsId/RowId 永不复用 | [04 §14](04-l2-persist.md) | [14 §2.5](14-testing.md) |
 | I21 | BM25 统计按查询命名空间跨全部活跃段全局聚合(df/N/avgdl),只计活行,跨 NS 互不影响 | [04 §5.6](04-l2-persist.md) | [14 §3.4](14-testing.md) |
