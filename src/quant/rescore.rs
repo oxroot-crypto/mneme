@@ -1,11 +1,9 @@
 //! 两阶段检索预算与建段召回抽样(设计 08 §4)。
 //!
-//! 粗排候选数 = `top_k × rescore_oversample`(默认 4 倍,即设计中的「4k」);
+//! 粗排候选数 = `top_k × rescore_oversample`(默认 4 倍,即设计中的「4k」,
+//! 默认值定义在 core 的 `options::index`,本模块只管预算计算);
 //! 精排一律基于 f32 原向量重算并按 f32 分重排,绝不复用量化分
 //! (I12 / FC-QUANT-INV-015)。
-
-/// 粗排过采样倍率缺省值:4 × `top_k`(设计 08 §4.2「放宽取 4k 个候选」)。
-pub(crate) const DEFAULT_RESCORE_OVERSAMPLE: usize = 4;
 
 /// 建段召回估计的抽样查询条数(内部常数;离线 1 万查询基准见设计 14 §3.2)。
 pub(crate) const RECALL_SAMPLE_QUERIES: usize = 16;

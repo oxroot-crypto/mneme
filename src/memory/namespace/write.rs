@@ -156,7 +156,7 @@ impl Namespace {
             let Some(rowid) = ws.key_index.get(&(ns_id, Key::new(key))).copied() else {
                 return Ok(false);
             };
-            let seqno = ws.alloc_seqno();
+            let seqno = ws.alloc_seqno()?;
             ws.tombstone(rowid, config.clock.now_unix_ms(), seqno)
         })
     }
@@ -177,7 +177,7 @@ impl Namespace {
             if ws.closed {
                 return Err(MnemeError::Closed);
             }
-            let seqno = ws.alloc_seqno();
+            let seqno = ws.alloc_seqno()?;
             ws.tombstone(id, config.clock.now_unix_ms(), seqno)
         })
     }
@@ -311,7 +311,7 @@ impl Namespace {
             validate_insert(&config, &rec)?;
             let now = config.clock.now_unix_ms();
             let new_valid_from = rec.valid_from.unwrap_or(now);
-            let seqno = ws.alloc_seqno();
+            let seqno = ws.alloc_seqno()?;
             let slot_data = build_slot(SlotSpec {
                 ns_id,
                 ns_path,

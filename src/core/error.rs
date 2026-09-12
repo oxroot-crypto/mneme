@@ -127,6 +127,13 @@ pub enum MnemeError {
         /// 被破坏的不变量说明。
         reason: &'static str,
     },
+    /// `RowId`/`NsId`/`SeqNo` 的整型表示空间耗尽(恢复出近上限水位后再写入);
+    /// 绝不回绕复用(FC-PERSIST-INV-020、FC-PERSIST-ERR-012)。
+    #[error("标识空间耗尽: {kind}")]
+    IdExhausted {
+        /// 耗尽的标识类型(`rowid` / `ns_id` / `seqno`)。
+        kind: &'static str,
+    },
 }
 
 /// Mneme 统一结果类型。

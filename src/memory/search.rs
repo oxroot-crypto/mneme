@@ -143,31 +143,39 @@ pub(crate) fn search(params: &SearchParams<'_>) -> Result<Vec<Scored>> {
         .map(|segment| segment.covered.count_ones())
         .sum();
     if indexed > params.brute_force_max_rows {
-        // 存在量化段时粗排放宽到 `top_k × rescore_oversample`(默认 4 倍,即设计中的
-        // 「4k」),f32 精排按 f32 分重排再截回 `top_k`(I12 / FC-QUANT-INV-015);
-        // 无量化段时口径与 L3 完全一致。
-        let quantized = params
-            .view
-            .indexes
-            .iter()
-            .any(|segment| segment.quant != VectorFormat::F32);
-        let coarse_k = if quantized {
-            crate::quant::rescore::coarse_candidates(params.top_k, params.rescore_oversample)
-                .min(candidates.len())
-        } else {
-            k
-        };
-        let budget = AnnBudget {
-            query_norm,
-            k: coarse_k,
-        };
-        let mut scored = ann_search(params, candidates, budget)?;
-        scored.truncate(params.top_k);
-        return Ok(scored);
+        return search_indexed(params, candidates, query_norm);
     }
 
     let top = run_scan(params, candidates, query_norm, k)?;
     Ok(rescore(params, top, query_norm))
+}
+
+/// ANN 路径:存在量化段时粗排放宽到 `top_k × rescore_oversample`(默认 4 倍,即
+/// 设计中的「4k」),f32 精排按 f32 分重排再截回 `top_k`(I12 / FC-QUANT-INV-015);
+/// 无量化段时口径与 L3 完全一致。
+fn search_indexed(
+    params: &SearchParams<'_>,
+    candidates: &[u32],
+    query_norm: f32,
+) -> Result<Vec<Scored>> {
+    let quantized = params
+        .view
+        .indexes
+        .iter()
+        .any(|segment| segment.quant != VectorFormat::F32);
+    let coarse_k = if quantized {
+        crate::quant::rescore::coarse_candidates(params.top_k, params.rescore_oversample)
+            .min(candidates.len())
+    } else {
+        params.top_k.min(candidates.len())
+    };
+    let budget = AnnBudget {
+        query_norm,
+        k: coarse_k,
+    };
+    let mut scored = ann_search(params, candidates, budget)?;
+    scored.truncate(params.top_k);
+    Ok(scored)
 }
 
 /// 过滤先行:只求值元数据,得到候选槽位(不读向量)。
@@ -313,6 +321,20 @@ fn plan_scan(params: &SearchParams<'_>) -> (usize, usize) {
     (chunk, threads)
 }
 
+/// 两阶段精排排序键:先按 [`Metric::better`] 方向,分数不可比(含 `NaN`)时用
+/// `total_cmp` 给出确定性全序,最后按 `RowId` 升序去平。
+fn compare_scored(metric: Metric, left: &Scored, right: &Scored) -> std::cmp::Ordering {
+    if metric.better(left.score, right.score) {
+        return std::cmp::Ordering::Less;
+    }
+    if metric.better(right.score, left.score) {
+        return std::cmp::Ordering::Greater;
+    }
+    left.score
+        .total_cmp(&right.score)
+        .then_with(|| left.rowid.cmp(&right.rowid))
+}
+
 /// 重新取分:粗排 `TopK` 只提供候选,分数一律用 f32 原向量在候选集内重算并
 /// **按 f32 分重排**(两阶段第二阶段;I12 / FC-QUANT-INV-015)。
 ///
@@ -332,15 +354,7 @@ fn rescore(params: &SearchParams<'_>, top: TopK<(RowId, SlotId)>, query_norm: f3
             Scored { slot, rowid, score }
         })
         .collect();
-    scored.sort_by(|left, right| {
-        if params.metric.better(left.score, right.score) {
-            std::cmp::Ordering::Less
-        } else if params.metric.better(right.score, left.score) {
-            std::cmp::Ordering::Greater
-        } else {
-            left.rowid.cmp(&right.rowid)
-        }
-    });
+    scored.sort_by(|left, right| compare_scored(params.metric, left, right));
     scored
 }
 
@@ -547,5 +561,32 @@ mod tests {
         assert_eq!(hits.len(), 4);
         let coarse = COARSE_CANDIDATES.with(std::cell::Cell::get);
         assert_eq!(coarse, 32, "粗排候选应为 top_k × oversample = 32");
+    }
+
+    /// FC-QUANT-INV-015(重排口径):精排排序键按度量方向 + `RowId` 去平,
+    /// 与粗排插入次序无关;分数含 `NaN` 时仍给出确定性全序(不破坏 `sort_by`
+    /// 的严格弱序要求)。
+    #[test]
+    fn rescore_ordering_is_metric_aware_and_total() {
+        let scored = |rowid: u64, score: f32| Scored {
+            slot: SlotId::new(rowid as u32),
+            rowid: RowId::new(rowid),
+            score,
+        };
+        let mut dot = [
+            scored(1, 0.5),
+            scored(2, 2.0),
+            scored(3, 2.0),
+            scored(4, f32::NAN),
+        ];
+        dot.sort_by(|left, right| compare_scored(Metric::Dot, left, right));
+        assert_eq!(
+            dot.iter().map(|hit| hit.rowid.get()).collect::<Vec<_>>(),
+            vec![2, 3, 1, 4],
+            "Dot:高分在前,同分按 RowId 升序,NaN 排末"
+        );
+        let mut euclidean = [scored(1, 0.5), scored(2, 2.0)];
+        euclidean.sort_by(|left, right| compare_scored(Metric::Euclidean, left, right));
+        assert_eq!(euclidean[0].rowid.get(), 1, "Euclidean:低分(更近)在前");
     }
 }

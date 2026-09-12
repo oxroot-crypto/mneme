@@ -71,6 +71,10 @@ fn dead_ratios(view: &ReaderView, now: i64) -> HashMap<u32, f32> {
 
 /// 汇总量化运行状态:`active` 取实际存在副本的格式(无副本 = `F32`,绝不回显
 /// 配置);`recall_est` 取各段建段抽样估计的最小值(重开库后为 `None`,I13)。
+///
+/// 多段格式混杂(如旧 i8 段 + 新 f16 段)时 `active` 取**首个非 `F32` 段**的
+/// 格式(按段序),单枚举无法同时表达两种生效格式;逐段真实格式以
+/// `stats().segments[*].quant` 为准。
 fn quant_stat(configured: VectorFormat, segments: &[SegmentStat]) -> QuantStat {
     let mut active = VectorFormat::F32;
     let mut recall_est: Option<f32> = None;

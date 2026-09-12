@@ -200,10 +200,10 @@ impl<'a> RecordRef<'a> {
     pub fn provenance(&self) -> Option<&Meta>;
     pub fn vector(&self) -> &[f32];      // 零拷贝
     pub fn to_record(&self) -> Record;   // 克隆为可写 Record(去重 Merge 回调等用)
-    pub fn to_stored(&self) -> StoredRecord; // 克隆为 owned 快照(跨线程 / async 门面用)
+    pub fn to_stored(&self) -> StoredRecord; // 克隆为 owned 快照(跨线程点读 / async 门面用)
 }
 
-/// 点读的 owned 快照(feature `async` 的 `AsyncNamespace` 用;同步读仍用 `RecordRef`)。
+/// 点读的 owned 快照(跨线程点读与 async 门面用;同步读仍可用 `RecordRef`)。
 /// 字段与 `RecordRef` 同口径,另含 `RowId`;可安全跨线程移动。
 pub struct StoredRecord { /* private */ }
 impl StoredRecord {
@@ -429,6 +429,11 @@ pub struct StorageStat { pub encryption: bool, pub compression: Compression, pub
 > 并标注 `#[non_exhaustive]`(统计字段随层扩展;外部可读但不得再以结构体字面量构造或穷尽匹配)。
 > 兼容口径:v0.1.0 未发布,下游无既有构造点;后续新增字段不再构成破坏性变更。正式 RFC
 > 流程(`CONTRIBUTING.md` §3)落地前,以本记录作为变更登记。
+>
+> **API 变更记录(L6,加法性)**:公开调参结构体 `Tuning` 新增 `rescore_oversample`(默认 4)
+> 与 `quant_recall_floor`(默认 0.98)两个字段(量化两阶段检索与建段回退,见 [08 §4](08-l6-quant.md));
+> `Tuning` 未标 `#[non_exhaustive]`,以结构体字面量构造的调用方需补 `..Tuning::default()`。
+> 兼容口径同上:v0.1.0 未发布,无既有构造点。
 
 ```rust
 /// 版本链/历史保留统计(见 [07 §4.2a](07-l5-life.md))。
@@ -461,6 +466,53 @@ pub struct AccessStat { pub last_access_ms: i64, pub access_count: u32 }
 
 `SnapshotHandle` 在自身存活期间看到**完全一致的过去**:即使后台 compaction 推进,
 它引用的段文件因 `Arc` 引用而不会被物理删除([07 §6](07-l5-life.md)、不变量 I17)。
+
+### 1.6.1 async 门面(feature `async`)
+
+`Namespace::into_async()` 返回 `AsyncNamespace`:与同步命名空间共享同一底层句柄与
+写锁,所有方法都是 `spawn_blocking(同步方法)` 的机械包装(核心库零 tokio 依赖),
+语义与错误同同步 API(`FC-QUANT-INV-014`)。
+
+```rust
+impl Namespace {
+    pub fn into_async(self) -> AsyncNamespace;
+}
+
+impl AsyncNamespace {
+    pub async fn insert(&self, rec: Record) -> Result<InsertOutcome>;
+    pub async fn insert_batch(&self, recs: Vec<Record>) -> Result<Vec<InsertOutcome>>;
+    pub async fn delete(&self, key: &str) -> Result<bool>;
+    pub async fn delete_by_rowid(&self, id: RowId) -> Result<bool>;
+    pub async fn update(&self, key: &str, patch: UpdatePatch) -> Result<UpdateOutcome>;
+    pub async fn update_by_rowid(&self, id: RowId, patch: UpdatePatch) -> Result<UpdateOutcome>;
+    pub async fn supersede(&self, key: &str, rec: Record) -> Result<UpdateOutcome>;
+    pub async fn get(&self, key: &str) -> Result<Option<StoredRecord>>;
+    pub async fn get_by_rowid(&self, id: RowId) -> Result<Option<StoredRecord>>;
+    pub async fn get_many(&self, keys: &[&str]) -> Result<Vec<Option<StoredRecord>>>;
+    pub async fn get_many_by_rowid(&self, ids: &[RowId]) -> Result<Vec<Option<StoredRecord>>>;
+    pub async fn exists(&self, key: &str) -> Result<bool>;
+    pub async fn get_vector(&self, id: RowId) -> Result<Option<Vec<f32>>>;
+    pub async fn count(&self, filter: Option<Expr>) -> Result<u64>;
+    pub async fn touch(&self, key: &str, boost: Option<f32>) -> Result<bool>;
+    pub async fn touch_by_rowid(&self, id: RowId, boost: Option<f32>) -> Result<bool>;
+    pub async fn feedback(&self, id: RowId, feedback: Feedback, query_id: QueryId) -> Result<bool>;
+    pub async fn relate(&self, from: RowId, to: RowId, kind: RelationKind, weight: f32) -> Result<()>;
+    pub async fn relate_with_options(&self, from: RowId, to: RowId, options: RelateOptions) -> Result<()>;
+    pub async fn unrelate(&self, from: RowId, to: RowId, kind: RelationKind) -> Result<bool>;
+    pub async fn neighbors(&self, from: RowId, kinds: &[RelationKind]) -> Result<Vec<Edge>>;
+    pub async fn predecessors(&self, to: RowId, kinds: &[RelationKind]) -> Result<Vec<Edge>>;
+    pub async fn forget(&self, filter: Expr) -> Result<usize>;
+    pub async fn retain(&self, policy: Retention) -> Result<RetainReport>;
+    pub async fn consolidate(&self, policy: ConsolidationPolicy) -> Result<ConsolidateReport>;
+}
+```
+
+- **借用返回的方法不在门面内**:`iter`/`iter_with` 的迭代器借自读视图,无法跨线程
+  移动;点读改为返回 owned `StoredRecord`(含 `RowId`),语义等价。
+- **取消语义**:阻塞任务一经派发不可取消;drop future 只丢弃等待结果,后台操作仍
+  会完成(写入照常生效)。需要协作取消应在业务层自行以标志控制。
+- `search()` 构建器本身是轻量内存操作,`execute()` 为阻塞调用;异步场景请由宿主
+  自行 `spawn_blocking`。`Mneme` 级操作(flush/close/backup/snapshot)不走本门面。
 
 ### 1.7 关闭与 `Drop`
 
@@ -750,6 +802,7 @@ pub struct Tuning {
 | `Config` | ❌ | 建库/查询配置非法(缺维度、无查询通道、MMR `lambda` 非有限值、`Fusion` 未同时启用双通道、`Weighted.alpha` 越界或非有限),策略参数含非有限值(`min_importance`/`access_weight`/`threshold`/`dedup_threshold`)或非法(如 `max_cluster = 0`) |
 | `Unsupported` | ❌ | 该能力延后到后续层,或对当前形态不适用(**纯内存库 `backup_to`**;纯内存库配量化;未开 `quant-f16` 的 f16 段;只读模式写);按版本/feature 调整 |
 | `Inconsistent` | ❌ | 内部不变量被破坏(应为 bug);上报并附上下文 |
+| `IdExhausted` | ❌ | `RowId`/`NsId`/`SeqNo` 整型表示空间耗尽(恢复出近上限水位后再写入);绝不回绕复用(FC-PERSIST-ERR-012) |
 | `UnsupportedVersion` | ❌ | 文件格式版本与当前定义不一致(未发布期无旧格式兼容);从备份恢复或重建 |
 | `Corrupted` | ❌ | 数据损坏:立即停止写入,跑 `db.check()`,按 §7 恢复 |
 

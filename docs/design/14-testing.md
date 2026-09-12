@@ -161,8 +161,8 @@ RowId 水位:回放含大 rowid 的 WAL → next_rowid > 该 rowid
 > 重开一致性(分数逐位)、计划器不漏报(大整数/类型污染/非数值 `exists`)与历史视图 TTL,
 > 已在 `tests/l4_contracts.rs` 与 `src/query/*` 单测落地并纳入追溯门禁。**L5 已补齐多段
 > 形态**(增量段 + 每段倒排合并 + 多图 ANN 归并,`tests/l5_contracts.rs`);§3 全流程 oracle 与
-> §3.4 跨未合并段的扩展断言可按需继续追加;**欠账**:`fuzz_dsl`(cargo-fuzz)仍待接线(§5),
-> 24h 长跑与 criterion 门槛仍待 CI(§6/§7)。
+> §3.4 跨未合并段的扩展断言可按需继续追加;**欠账**:`fuzz/` 五目标(含 `fuzz_dsl`)骨架已
+> 搭起,正式 1h/24h 长跑待 CI(§5),24h 长跑与 criterion 门槛仍待 CI(§6/§7)。
 
 ```text
 数据: 种子固定;随机均匀 64 维 10 万条 + 8 簇合成数据 10 万条(两套)
@@ -285,6 +285,10 @@ cargo-fuzz 目标:`fuzz_vsec`、`fuzz_msec`、`fuzz_hidx`、`fuzz_wal_replay`、
 **版本注入**(I18):在上述解码目标中随机改写文件头 `format_version` 为任意不同值,
 断言返回 `UnsupportedVersion` 而非继续解析;改写为魔数不符的值,断言 `Corrupted`。
 
+> **落地状态**:五目标当前只调用 `feature = "fuzzing"` 暴露的解析入口并由 libFuzzer
+> 捕获 panic/UB;带断言的版本注入与正式长跑一并接线(仓库内先由
+> `src/fuzzing.rs` 冒烟单测与各解码器单测覆盖版本/CRC 拒绝路径)。
+
 发布前本地连续跑:每个目标 ≥ 1h,且全部目标累计 ≥ 24h(可分多轮累计)。
 
 ### 5.1 确定性时间测试(Clock)
@@ -388,6 +392,10 @@ valid_time 过期不触发物理删除
 
 > **落地状态**:仓库**尚未提交 CI 配置文件**,上表为规划结构;`cargo-mutants` 与全量
 > 崩溃前缀属性测试尚未接线,L2 目前只有基于 `FsyncHook` 的定向崩溃测试(§2)。
+>
+> **跨 feature 用例(`FC-QUANT-ERR-002`)**:「建库带 f16 段 → 未开 `quant-f16` 的构建打开
+> 返回 `Unsupported`」需要两次不同 feature 的构建,单构建内无法端到端覆盖,登记为
+> CI 矩阵用例:先用 `--features quant-f16` 建库,再用默认构建执行打开断言。
 
 ---
 

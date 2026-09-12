@@ -357,43 +357,61 @@ fn load_hidx_indexes(
         else {
             continue;
         };
-        let Some(hidx) = segment.hidx.as_ref() else {
-            continue;
-        };
-        let quant = load_quant_copy(segment)?;
-        let format = quant.as_ref().map_or(VectorFormat::F32, |copy| copy.format);
-        match load_index(
-            input.factory,
-            hidx,
-            SlotRemap {
-                state,
-                remap: &remap.remap,
-            },
-            input.metric,
-            quant,
-        ) {
-            Ok(index) => {
-                let slots: Vec<SlotId> = remap
-                    .remap
-                    .iter()
-                    .map(|&global| SlotId::new(global))
-                    .collect();
-                indexes.push(crate::memory::index::SegmentIndex::new(
-                    segment.segment_id,
-                    index,
-                    slots,
-                    format,
-                    None,
-                ));
-            }
-            Err(error) if input.options.fail_fast_on_corruption => return Err(error),
-            // reason: 索引是查询加速器而非数据来源;hidx 损坏时降级为暴力扫描仍然
-            // 正确,`db.check()` 会校验 hidx 字节并报告损坏;节点数不匹配的降级可由
-            // `stats().segments[*].index_nodes == 0` 观测,绝不静默丢数据。
-            Err(_) => {}
+        if let Some(index) = build_segment_index(state, input, segment, remap)? {
+            indexes.push(index);
         }
     }
     Ok(Arc::new(indexes))
+}
+
+/// 载入单个段的 hidx 索引;无 hidx 或损坏且非 fail-fast 时返回 `None`
+/// (索引是查询加速器而非数据来源,`db.check()` 会校验并报告)。
+///
+/// # Errors
+/// 量化副本解析失败,或索引载入失败且 `fail_fast_on_corruption` 为真时
+/// 返回结构化错误。
+fn build_segment_index(
+    state: &WriterState,
+    input: &HidxxLoadInput<'_>,
+    segment: &recover::SegmentBytes,
+    remap: &recover::SegmentRemap,
+) -> Result<Option<crate::memory::index::SegmentIndex>> {
+    let Some(hidx) = segment.hidx.as_ref() else {
+        return Ok(None);
+    };
+    let quant = load_quant_copy(segment)?;
+    let format = quant.as_ref().map_or(VectorFormat::F32, |copy| copy.format);
+    let loaded = load_index(
+        input.factory,
+        hidx,
+        SlotRemap {
+            state,
+            remap: &remap.remap,
+        },
+        input.metric,
+        quant,
+    );
+    match loaded {
+        Ok(index) => {
+            let slots: Vec<SlotId> = remap
+                .remap
+                .iter()
+                .map(|&global| SlotId::new(global))
+                .collect();
+            Ok(Some(crate::memory::index::SegmentIndex::new(
+                segment.segment_id,
+                index,
+                slots,
+                format,
+                None,
+            )))
+        }
+        Err(error) if input.options.fail_fast_on_corruption => Err(error),
+        // reason: hidx 损坏时降级为暴力扫描仍然正确,`db.check()` 会校验 hidx 字节
+        // 并报告损坏;节点数不匹配的降级可由 `stats().segments[*].index_nodes == 0`
+        // 观测,绝不静默丢数据。
+        Err(_) => Ok(None),
+    }
 }
 
 /// 从段 vsec 还原量化副本(行顺序 = 段内槽位顺序 = hidx 节点顺序)。

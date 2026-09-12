@@ -94,6 +94,27 @@ pub(crate) fn build_segment(
     if decision.fallback {
         built_index = build_index(ws, config, input.slots, None)?;
     }
+    encode_segment(
+        config,
+        created_unix_ms,
+        ws,
+        input,
+        &built,
+        decision,
+        built_index,
+    )
+}
+
+/// 编码 vsec/msec/关系区并汇总为 [`EncodedSegment`]([`build_segment`] 的后半段)。
+fn encode_segment(
+    config: &Config,
+    created_unix_ms: i64,
+    ws: &WriterState,
+    input: &SegmentBuildInput<'_>,
+    built: &SegmentSlots<'_>,
+    decision: QuantDecision,
+    built_index: BuiltIndex,
+) -> Result<EncodedSegment> {
     let quant = decision
         .copy
         .as_ref()
@@ -253,6 +274,8 @@ fn estimate_recall(
     for &slot in included {
         alive.set(slot);
     }
+    // 注:`alive` 按本次物化的全部槽位置位(含墓碑/死行),与运行期「可见行」
+    // 口径不同;参考与候选两侧同口径,故一致率决策不受影响。
     let k = crate::quant::rescore::RECALL_TOP_K.min(node_count);
     let candidate_cap =
         crate::quant::rescore::coarse_candidates(k, config.tuning.rescore_oversample)

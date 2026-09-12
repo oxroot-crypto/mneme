@@ -276,6 +276,24 @@ impl StoredRecord {
     ///
     /// `Record` 无 `RowId` 字段,`RowId` 不随转换保留;绝对过期时刻亦因
     /// `Record` 只接受相对 TTL 而丢弃(`ttl = None`)。
+    ///
+    /// # Returns
+    /// 去掉 [`RowId`] 与绝对过期时刻的可写记录;其余字段逐项保留。
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use mneme::{Mneme, Record};
+    ///
+    /// let db = Mneme::in_memory(2).unwrap();
+    /// let ns = db.namespace("demo");
+    /// ns.insert(Record::new(vec![1.0, 0.0]).key("a")).unwrap();
+    /// let stored = ns.get("a").unwrap().unwrap().to_stored();
+    /// let record = stored.into_record();
+    /// // 转回的可写记录可再次写入,向量内容逐位保留(去掉 RowId 与绝对 TTL)。
+    /// ns.insert(record).unwrap();
+    /// assert_eq!(ns.get("a").unwrap().unwrap().vector(), &[1.0, 0.0]);
+    /// ```
     pub fn into_record(self) -> Record {
         Record {
             vector: self.vector,

@@ -77,7 +77,7 @@ impl Namespace {
                 weight: options.weight.clamp(0.0, 1.0),
                 metadata: options.metadata,
             };
-            ws.relate_edge(edge);
+            ws.relate_edge(edge)?;
             Ok(())
         })
     }
@@ -116,7 +116,7 @@ impl Namespace {
             if ws.closed {
                 return Err(MnemeError::Closed);
             }
-            Ok(ws.unrelate_edge(from, to, kind))
+            ws.unrelate_edge(from, to, kind)
         })
     }
 

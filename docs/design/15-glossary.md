@@ -203,8 +203,8 @@
 
 > **复杂度即契约**:上表主体复杂度由 [spec/contracts.md §9](../spec/contracts.md)
 > 的 `FC-*-CPLX-*` 契约保证(时间/空间上界、口径标注与回归门禁见该节 §9.3);
-> 规划能力(量化/加密/部署)对应的 `FC-QUANT-*`/`FC-SEC-*`/`FC-DEPLOY-*` 及
-> `FC-GLOBAL-CPLX-001` 当前仍为 `Planned/待补`,实现后回填。
+> 规划能力(加密/部署)对应的 `FC-SEC-*`/`FC-DEPLOY-*` 及 `FC-GLOBAL-CPLX-001`
+> 当前仍为 `Planned/待补`,实现后回填;量化 `FC-QUANT-*` 已随 L6 落地为 `Passed`。
 > 本表是阅读视图,冲突时以契约矩阵为准。
 
 **性能承诺汇总(目标;冷启动与 1M 门槛见 [14 §4](14-testing.md) 的未兑现标注)**:

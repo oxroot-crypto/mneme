@@ -16,13 +16,14 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use mneme::{
-    Builder, CompactionPolicy, Metric, Mneme, MnemeError, Record, Tuning, UpdatePatch, VectorFormat,
-};
+#[cfg(feature = "async")]
+use mneme::UpdatePatch;
+use mneme::{Builder, CompactionPolicy, Metric, Mneme, MnemeError, Record, Tuning, VectorFormat};
 
 mod common;
 
-/// 测试维度(32B 对齐边界外取 4 的倍数,覆盖行补齐)。
+/// 测试维度(16 维 = 64B 行步长,恰 32B 对齐;行补齐分支由
+/// `src/persist/vsec.rs` 的 4 维单测覆盖)。
 const DIM: u32 = 16;
 
 /// 强制 ANN + 关闭自动回退的竖控参数(抽样门槛 0 恒通过)。
@@ -294,6 +295,10 @@ fn i8_qvec_roundtrip_after_reopen() {
         stats.quant.active,
         VectorFormat::I8Rescored,
         "重开后量化仍生效"
+    );
+    assert!(
+        stats.quant.recall_est.is_none(),
+        "重开后无建段采样上下文,recall_est 必须为 None(设计 16 §1.3)"
     );
     let ns = db.namespace("n");
     for (row, expected) in original.iter().enumerate() {

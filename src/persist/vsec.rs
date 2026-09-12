@@ -189,8 +189,17 @@ pub(crate) fn encode(input: &VsecInput<'_>) -> Result<Vec<u8>> {
     };
     let quant_bytes = quant_len(&header)?;
     let header = encode_header(&header)?;
+    let data = encode_data(input, row_stride(input.dimension), quant_bytes);
 
-    let stride = row_stride(input.dimension);
+    let mut out = header.to_vec();
+    out.extend_from_slice(&data);
+    out.extend_from_slice(&crc32(&data).to_le_bytes());
+    Ok(out)
+}
+
+/// 编码数据区(向量区 + norm 区 + qvec 区 + 删除位图),不含头与尾 CRC。
+fn encode_data(input: &VsecInput<'_>, stride: usize, quant_bytes: usize) -> Vec<u8> {
+    let count = input.vectors.len();
     let mut data =
         Vec::with_capacity(count * stride + count * 4 + quant_bytes + bitmap_bytes(count as u64));
     for vector in input.vectors {
@@ -209,11 +218,7 @@ pub(crate) fn encode(input: &VsecInput<'_>) -> Result<Vec<u8>> {
         data.extend_from_slice(row);
     }
     data.extend_from_slice(&encode_bitmap(input.dead));
-
-    let mut out = header.to_vec();
-    out.extend_from_slice(&data);
-    out.extend_from_slice(&crc32(&data).to_le_bytes());
-    Ok(out)
+    data
 }
 
 /// 校验 qvec 输入与格式/行数匹配(FC-QUANT-ERR-001/003 的编码侧防线)。
@@ -237,25 +242,34 @@ fn validate_quant_input(input: &VsecInput<'_>, count: usize) -> Result<()> {
                     reason: "vsec 编码:i8 副本长度与维度/行数不符",
                 });
             }
+            // 与解析侧 `I8Params::from_table` 对称:编码侧也不得写出非有限/失序表。
+            for pair in input.quant_params.chunks_exact(2) {
+                if !pair[0].is_finite() || !pair[1].is_finite() || pair[0] > pair[1] {
+                    return Err(MnemeError::Config {
+                        reason: "vsec 编码:i8 参数表含非有限值或失序",
+                    });
+                }
+            }
             Ok(())
         }
         VectorFormat::F16 => {
             #[cfg(not(feature = "quant-f16"))]
             {
                 let _ = (codes_match, dimension);
-                return Err(MnemeError::Unsupported {
+                Err(MnemeError::Unsupported {
                     feature: "quant-f16",
-                });
+                })
             }
             #[cfg(feature = "quant-f16")]
             {
                 if !input.quant_params.is_empty() || !codes_match(dimension * F16_BYTES_PER_ELEMENT)
                 {
-                    return Err(MnemeError::Config {
+                    Err(MnemeError::Config {
                         reason: "vsec 编码:f16 副本长度与维度/行数不符",
-                    });
+                    })
+                } else {
+                    Ok(())
                 }
-                Ok(())
             }
         }
     }
@@ -315,6 +329,42 @@ fn set_bit(bitmap: &mut [u8], row: usize) {
     bitmap[index..index + 8].copy_from_slice(&value.to_le_bytes());
 }
 
+/// 数据区布局:向量步长、i8 参数表区间(起,长)、量化码区起、单行码长。
+struct VsecLayout {
+    stride: usize,
+    params_range: (usize, usize),
+    codes_offset: usize,
+    code_stride: usize,
+}
+
+/// 由头部计算数据区布局。
+///
+/// 文件总长已由 [`expected_file_len`] 以 checked 乘法校验,故此处无回绕风险。
+fn layout(header: &VsecHeader) -> VsecLayout {
+    let dimension = header.dimension as usize;
+    let rows = header.row_count as usize;
+    let stride = row_stride(header.dimension);
+    let vec_len = rows * stride;
+    let norm_len = if header.norm_col { rows * 4 } else { 0 };
+    let params_len = if header.quant == VectorFormat::I8Rescored {
+        dimension * I8_PARAMS_PER_DIM
+    } else {
+        0
+    };
+    let code_stride = match header.quant {
+        VectorFormat::F32 => 0,
+        VectorFormat::I8Rescored => dimension,
+        VectorFormat::F16 => dimension * F16_BYTES_PER_ELEMENT,
+    };
+    let params_start = vec_len + norm_len;
+    VsecLayout {
+        stride,
+        params_range: (params_start, params_len),
+        codes_offset: params_start + params_len,
+        code_stride,
+    }
+}
+
 /// 校验并解析向量段,返回对数据区的视图(不复制整个文件)。
 ///
 /// # Errors
@@ -336,7 +386,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<VsecView<'_>> {
             reason: format!("vsec: 文件长度 {} 应为 {expected}", bytes.len()),
         });
     }
-    let stride = row_stride(header.dimension);
+    let layout = layout(&header);
     let data = &bytes[HEADER_LEN as usize..bytes.len() - 4];
     let payload_crc = u32::from_le_bytes([
         bytes[bytes.len() - 4],
@@ -344,36 +394,20 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<VsecView<'_>> {
         bytes[bytes.len() - 2],
         bytes[bytes.len() - 1],
     ]);
-    let dimension = header.dimension as usize;
-    let rows = header.row_count as usize;
-    let vec_len = rows * stride;
-    let norm_len = if header.norm_col { rows * 4 } else { 0 };
-    let params_len = if header.quant == VectorFormat::I8Rescored {
-        dimension * I8_PARAMS_PER_DIM
-    } else {
-        0
-    };
-    let code_stride = match header.quant {
-        VectorFormat::F32 => 0,
-        VectorFormat::I8Rescored => dimension,
-        VectorFormat::F16 => dimension * F16_BYTES_PER_ELEMENT,
-    };
-    let params_start = vec_len + norm_len;
-    let codes_offset = params_start + params_len;
     let view = VsecView {
         header,
         data,
-        stride,
+        stride: layout.stride,
         payload_crc,
         payload_crc_ok: None,
-        params_range: (params_start, params_len),
-        codes_offset,
-        code_stride,
+        params_range: layout.params_range,
+        codes_offset: layout.codes_offset,
+        code_stride: layout.code_stride,
     };
     // i8 参数表畸形(失序/非有限/长度不符)在解析期即拒绝(FC-QUANT-ERR-003)。
     if header.quant == VectorFormat::I8Rescored {
         let table = view.quant_params();
-        crate::quant::scalar_i8::I8Params::from_table(&table, dimension)?;
+        crate::quant::scalar_i8::I8Params::from_table(&table, header.dimension as usize)?;
     }
     Ok(view)
 }
@@ -693,6 +727,20 @@ mod tests {
         let tail = bytes.len() - 4;
         bytes[tail..].copy_from_slice(&payload_crc.to_le_bytes());
         assert!(matches!(parse(&bytes), Err(MnemeError::Corrupted { .. })));
+    }
+
+    /// FC-QUANT-ERR-003:文件长度与头部布局不符(截断/多余字节)→ `Corrupted`,
+    /// 绝不按短读部分解析。
+    #[test]
+    fn vsec_rejects_length_mismatch() {
+        let bytes = encode_sample(2);
+        assert!(matches!(
+            parse(&bytes[..bytes.len() - 1]),
+            Err(MnemeError::Corrupted { .. })
+        ));
+        let mut longer = bytes;
+        longer.push(0);
+        assert!(matches!(parse(&longer), Err(MnemeError::Corrupted { .. })));
     }
 
     /// 跨块(> 1024 行)删除位图仍按位正确。

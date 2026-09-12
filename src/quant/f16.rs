@@ -65,10 +65,11 @@ pub(crate) fn coarse_dot_unchecked(query: &[f32], codes: &[u8]) -> f32 {
 mod tests {
     use super::*;
 
-    /// f16 往返:相对误差不超过 `2^-11`(规格相对精度)。
+    /// f16 往返:相对误差不超过 `2^-11`(规格相对精度);测试值故意取
+    /// 二进制不可精确表示者,确保真的发生舍入。
     #[test]
     fn roundtrip_within_half_precision() {
-        let vector: Vec<f32> = (0..64).map(|index| (index as f32 - 32.0) * 0.25).collect();
+        let vector: Vec<f32> = vec![0.1, -0.3, 1.2345, -12.345, 999.9, 1.0 / 3.0, 4096.5];
         let restored = decode_row(&encode_row(&vector)).expect("decode_row");
         for (original, approx) in vector.iter().zip(&restored) {
             let bound = original.abs() * 2.0_f32.powi(-11) + 1e-6;
@@ -77,6 +78,41 @@ mod tests {
                 "{original} → {approx} 超相对精度"
             );
         }
+    }
+
+    /// 极值往返:零(含 `-0.0`)、f16 最小 subnormal 与最小 normal、最大有限值
+    /// 精确可表示,往返逐位一致。
+    #[test]
+    fn extremes_are_exactly_representable() {
+        let exact: Vec<f32> = vec![
+            0.0,
+            -0.0,
+            2.0_f32.powi(-24),
+            2.0_f32.powi(-14),
+            65504.0,
+            -65504.0,
+        ];
+        let restored = decode_row(&encode_row(&exact)).expect("decode_row");
+        for (original, approx) in exact.iter().zip(&restored) {
+            assert_eq!(
+                original.to_bits(),
+                approx.to_bits(),
+                "{original} 应精确往返,得到 {approx}"
+            );
+        }
+    }
+
+    /// 特殊值透传与溢出饱和:`NaN`/`±Inf` 保持,超出 `±65504` 的有限值
+    /// 饱和为无穷(与 `half::f16::from_f32` 的 IEEE 语义一致)。
+    #[test]
+    fn special_values_are_preserved_and_overflow_saturates() {
+        let vector = [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1.0e6, -1.0e6];
+        let restored = decode_row(&encode_row(&vector)).expect("decode_row");
+        assert!(restored[0].is_nan());
+        assert_eq!(restored[1], f32::INFINITY);
+        assert_eq!(restored[2], f32::NEG_INFINITY);
+        assert_eq!(restored[3], f32::INFINITY, "超出范围的有限值饱和为 +Inf");
+        assert_eq!(restored[4], f32::NEG_INFINITY, "负向溢出饱和为 -Inf");
     }
 
     /// 粗排点积与解码后 f32 点积一致。
@@ -100,5 +136,20 @@ mod tests {
             coarse_dot(&[1.0, 2.0], &[0_u8; 2]),
             Err(MnemeError::DimensionMismatch { .. })
         ));
+    }
+
+    proptest::proptest! {
+        /// 任意有限 f32 的 f16 往返:相对误差上界 `2^-11`(规格相对精度),
+        /// 不因取值分布漂移。
+        #[test]
+        fn roundtrip_error_is_bounded_prop(value in -6.5e4f32..6.5e4) {
+            let restored = decode_row(&encode_row(&[value])).expect("decode_row");
+            let bound = value.abs() * 2.0_f32.powi(-11) + 1e-6;
+            proptest::prop_assert!(
+                (value - restored[0]).abs() <= bound,
+                "{value} → {} 超相对精度 {bound}",
+                restored[0]
+            );
+        }
     }
 }

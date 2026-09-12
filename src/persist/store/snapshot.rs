@@ -60,6 +60,20 @@ impl CopySink<'_> {
     }
 }
 
+/// 一次增量 flush 提交所需的输入(参数收敛,避免超长参数表)。
+struct CommitFlushInput {
+    /// 提交前的 MANIFEST。
+    previous: Manifest,
+    /// 本次物化的未落盘槽位。
+    slot_indices: Vec<usize>,
+    /// 跨段 delta 条目。
+    delta: Vec<crate::persist::msec::DeltaEntry>,
+    /// 是否全量重写关系表(首段)。
+    full_relations: bool,
+    /// 新段创建时刻(Unix 毫秒)。
+    now_ms: i64,
+}
+
 impl Store {
     /// 增量段 flush:物化未落盘槽位 + delta + 提交 MANIFEST + Checkpoint WAL。
     ///
@@ -84,7 +98,33 @@ impl Store {
         {
             return Ok(());
         }
+        self.commit_flush(
+            ws,
+            config,
+            CommitFlushInput {
+                previous,
+                slot_indices,
+                delta,
+                full_relations,
+                now_ms,
+            },
+        )
+    }
 
+    /// 编码新段(若有)并提交 MANIFEST,随后安装索引、清脏并发布新快照。
+    fn commit_flush(
+        &self,
+        ws: &mut WriterState,
+        config: &Config,
+        input: CommitFlushInput,
+    ) -> Result<()> {
+        let CommitFlushInput {
+            previous,
+            slot_indices,
+            delta,
+            full_relations,
+            now_ms,
+        } = input;
         let segment_id = previous.next_segment_id;
         // 有新数据/delta 时写新段;仅注册表变化时只提交 MANIFEST。
         let encoded = self.encode_flush_segment(

@@ -202,7 +202,7 @@ impl Table {
                     stat.last_access_ms = now_ms;
                 }
                 ws.mark_access_dirty_by(*rowid, *delta);
-                let seqno = ws.alloc_seqno();
+                let seqno = ws.alloc_seqno()?;
                 ws.pending.push(super::write_op::WriteOp::Access {
                     rowid: *rowid,
                     seqno,

@@ -39,7 +39,7 @@ pub fn replay_wal(bytes: &[u8]) {
     };
     let mut ws = db.table.write();
     // reason: fuzz 目标只断言"任意输入不 panic";回放结果与错误由返回值丢弃。
-    let _ = crate::persist::recover::replay_wal(&mut ws, bytes, 0);
+    let _ = crate::persist::recover::replay_wal(&mut ws, bytes, 0).ok();
 }
 
 /// 解析过滤 DSL 字节;非 UTF-8 输入直接拒绝。

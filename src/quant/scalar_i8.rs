@@ -284,4 +284,35 @@ mod tests {
             Err(MnemeError::Corrupted { .. })
         ));
     }
+
+    proptest::proptest! {
+        /// FC-QUANT-POST-001(属性):任意有限数据下,逐维误差恒 ≤ `Δ/2` + 浮点
+        /// 舍入余量,码流长度恒等于维度;不只靠固定样本。
+        #[test]
+        fn error_bound_holds_for_arbitrary_data_prop(
+            dims in 1usize..=8,
+            rows in 1usize..=6,
+            data in proptest::collection::vec(-1.0e4f32..1.0e4, 1..=48),
+        ) {
+            proptest::prop_assume!(data.len() >= dims * rows);
+            let vectors: Vec<Vec<f32>> = (0..rows)
+                .map(|row| data[row * dims..(row + 1) * dims].to_vec())
+                .collect();
+            let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+            let params = build_params(&refs, dims).expect("build_params");
+            for vector in &vectors {
+                let codes = encode_row(vector, &params);
+                proptest::prop_assert_eq!(codes.len(), dims);
+                let restored = decode_row(&codes, &params);
+                for (dim, (&original, &approx)) in vector.iter().zip(&restored).enumerate() {
+                    let bound = params.delta(dim) / 2.0;
+                    proptest::prop_assert!(
+                        (original - approx).abs() <= bound + 1e-2,
+                        "第 {dim} 维误差 {} 超上界 {bound}",
+                        (original - approx).abs()
+                    );
+                }
+            }
+        }
+    }
 }

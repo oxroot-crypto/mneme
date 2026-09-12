@@ -68,8 +68,9 @@ f32 像千分尺,记录每个分量到小数点后 7 位;i8 像厘米尺,只记 
 
 $$\Delta = \frac{v_{\max} - v_{\min}}{255}, \qquad q = \mathrm{round}\!\left(\frac{x - v_{\min}}{\Delta}\right) \in [0, 255], \qquad \hat{x} = v_{\min} + q\,\Delta$$
 
-存储:`q` 本身 1 字节(按 0–255 无符号编码存储,配合整数点积指令 `maddubs`
-的 u8×i8 语义;AVX-VNNI 则用 `dpbusd`;对外统称"i8 量化")
+存储:`q` 本身 1 字节(按 0–255 无符号编码存储;查询侧以 u8 零扩展 + FMA 加权,
+见 §2.3——每维独立 scale 无法直接喂给 `maddubs`/VNNI 类整数点积指令;对外统称
+"i8 量化")
 + 段头 $2 \times d$ 个 f32 的 $(v_{\min}, v_{\max})$ 表
 (1536 维共 12KB/段,均摊到每行可忽略)。
 
@@ -166,7 +167,8 @@ IEEE 754 half:1 位符号 + 5 位指数 + 10 位尾数。相对精度 $2^{-11} \
   `> 1` 恒回退(测试用)。离线 1 万查询基准与 1M×1536 门槛仍属 CI 收尾
   ([14 §4](14-testing.md));
 - 运行期监控:`stats().quant.recall_est` 暴露建段抽样一致率(各段取最小值;
-  重开库后为 `None`,可用 `FC-QUANT-POST-004` 的回归测试补测)。
+  重开库后无建段采样上下文,为 `None`,回归见
+  `tests/l6_contracts.rs::i8_qvec_roundtrip_after_reopen` 与 [16 §1.6](16-api-reference.md))。
 
 > **常见误区**:① 以为开量化后磁盘变小——f32 原向量始终保留,省的只是**查询带宽**;
 > ② 以为 `Hit.score` 是量化分——始终是 f32 精排分(I12);
@@ -234,11 +236,11 @@ impl AsyncNamespace {
 
 | 事项 | 标准 | 详见 |
 |---|---|---|
-| criterion 基准集 | 建库吞吐 / QPS-ef 曲线 / 过滤三档 / 混合 / compaction 停顿 / 冷启动 | [14 §4](14-testing.md) |
-| cargo-fuzz | 3 个段解码器 + WAL 回放 + DSL | [14 §5](14-testing.md) |
-| MSRV | 最新稳定版 − 2 | Cargo.toml |
+| criterion 基准集 | 已落地:建库吞吐(`benches/hnsw.rs`)与量化微缩对照(`benches/quant.rs`);QPS-ef 曲线 / 过滤三档 / 混合 / compaction 停顿 / 冷启动待 CI | [14 §4](14-testing.md) |
+| cargo-fuzz | 五目标骨架已搭起(`fuzz/`);1h/24h 长跑待 CI | [14 §5](14-testing.md) |
+| MSRV | `rust-version = 1.93`(edition 2024) | Cargo.toml |
 | 文档 | pub API 100% 文档覆盖;`#![deny(missing_docs)]` | — |
-| 发布 | `cargo publish --dry-run` + 变更日志 | — |
+| 发布 | `cargo publish --dry-run` + 变更日志(发布前执行) | — |
 
 ---
 

@@ -136,9 +136,7 @@ fn commit_recovered_slot(
     if seqno.get() > state.seqno.get() {
         state.seqno = seqno;
     }
-    if rowid.get() >= state.next_rowid {
-        state.next_rowid = rowid.get() + 1;
-    }
+    super::wal_replay::advance_rowid(state, rowid)?;
     if let Some((last_access_ms, access_count)) = access {
         Arc::make_mut(&mut state.access).insert(
             rowid,

@@ -58,6 +58,8 @@ const SRC_WAL: &str = include_str!("../src/persist/wal/mod.rs");
 const SRC_MANIFEST: &str = include_str!("../src/persist/manifest.rs");
 /// L2 恢复/锁源码(批原子校验、独占锁语义单测被契约引用)。
 const SRC_RECOVER_REPLAY: &str = include_str!("../src/persist/recover/replay.rs");
+/// L2 WAL 帧应用源码(极大 ID 水位推进拒绝单测被 ERR 契约引用)。
+const SRC_RECOVER_WAL_REPLAY: &str = include_str!("../src/persist/recover/wal_replay.rs");
 const SRC_STORAGE: &str = include_str!("../src/persist/storage.rs");
 /// 段读取后端源码(`read_whole`/`MmapSource` 单测被契约引用)。
 const SRC_SOURCE: &str = include_str!("../src/persist/source.rs");
@@ -131,7 +133,7 @@ const CONTRACT_TEST_FILES: [(&str, &str); 10] = [
 ];
 
 /// 契约引用的测试可能落在的全部文件(路径必须与 `contracts.md` 中书写一致)。
-const SOURCES: [(&str, &str); 52] = [
+const SOURCES: [(&str, &str); 53] = [
     ("tests/core_contracts.rs", CORE_TESTS),
     ("tests/memory_contracts.rs", MEMORY_TESTS),
     ("tests/query_contracts.rs", QUERY_TESTS),
@@ -154,6 +156,7 @@ const SOURCES: [(&str, &str); 52] = [
     ("src/persist/wal/mod.rs", SRC_WAL),
     ("src/persist/manifest.rs", SRC_MANIFEST),
     ("src/persist/recover/replay.rs", SRC_RECOVER_REPLAY),
+    ("src/persist/recover/wal_replay.rs", SRC_RECOVER_WAL_REPLAY),
     ("src/persist/storage.rs", SRC_STORAGE),
     ("src/persist/source.rs", SRC_SOURCE),
     ("src/core/simd.rs", SRC_CORE_SIMD),

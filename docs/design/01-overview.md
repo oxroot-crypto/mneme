@@ -146,7 +146,7 @@ flowchart LR
 | L3 | `index/` | 自研 HNSW、hidx 持久化、过滤三档搜索 | 同一 API 下暴力→ANN 无感升级;mmap 引入(可关) | Recall@10 ≥ 0.95 |
 | L4 | `query/` | 过滤 DSL 解析、zone map 下推、BM25+RRF、去重 | 混合检索可用 | 混合检索集成测试 |
 | L5 | `life/` | TTL、遗忘曲线、size-tiered compaction、命名空间、快照/备份、stats | **超长期闭环**:段数有界、安全遗忘 | 24h 长跑测试 |
-| L6 | `quant/` | i8/f16 量化+两阶段重打分、建段抽样回退、async 门面、基准、fuzz | 查询带宽 i8 ÷4;async 门面可用 | 召回损失 ≤2%、基准达标 |
+| L6 | `quant/` | i8/f16 量化+两阶段重打分、建段抽样回退、async 门面、基准、fuzz | 查询带宽 i8 ÷4;async 门面可用 | 召回损失 ≤2%;1M×1536 基准属 CI 收尾 |
 
 > **产品能力层(09–12)** 不改变 L0–L6 的建造顺序,而是横切其上:
 > 记忆模型/排序在 L1 冻结的 API 上追加类型与语义([09](09-memory-model.md)/[10](10-scoring.md)),

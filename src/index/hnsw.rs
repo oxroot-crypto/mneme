@@ -863,4 +863,70 @@ mod tests {
         assert_eq!(hits.len(), 1, "单节点图必须返回唯一节点");
         assert_eq!(hits[0].0.get(), 0);
     }
+
+    /// FC-INDEX-ERR-001 / FC-QUANT-ERR-003(量化副本校验):格式、行数、单行
+    /// 长度与 i8 参数表长度不符 → `Corrupted`,绝不静默按错误码流打分。
+    #[test]
+    fn validate_quant_rejects_malformed_copies() {
+        let corrupt = |copy: Option<QuantCopy>, count: usize, dimension: usize| {
+            assert!(
+                validate_quant(&copy, count, dimension).is_err(),
+                "应拒绝畸形副本: count={count} dimension={dimension}"
+            );
+        };
+        let i8_copy = |rows: Vec<Arc<[u8]>>, params: Vec<f32>| QuantCopy {
+            format: VectorFormat::I8Rescored,
+            params,
+            rows,
+        };
+        // F32 不允许携带副本。
+        corrupt(
+            Some(QuantCopy {
+                format: VectorFormat::F32,
+                params: Vec::new(),
+                rows: vec![Arc::from([0_u8; 2].as_slice())],
+            }),
+            1,
+            2,
+        );
+        // 行数与节点数不符。
+        corrupt(
+            Some(i8_copy(
+                vec![Arc::from([0_u8; 2].as_slice())],
+                vec![0.0, 1.0, 0.0, 1.0],
+            )),
+            2,
+            2,
+        );
+        // 单行长度与维度不符(码流 1 字节,维度 2 → 应 2 字节)。
+        corrupt(
+            Some(i8_copy(
+                vec![Arc::from([0_u8; 1].as_slice())],
+                vec![0.0, 1.0, 0.0, 1.0],
+            )),
+            1,
+            2,
+        );
+        // i8 参数表长度与维度不符(应 2d = 4)。
+        corrupt(
+            Some(i8_copy(
+                vec![Arc::from([0_u8; 2].as_slice())],
+                vec![0.0, 1.0],
+            )),
+            1,
+            2,
+        );
+        // 合法副本通过校验(正例,防过度拒绝)。
+        assert!(
+            validate_quant(
+                &Some(i8_copy(
+                    vec![Arc::from([0_u8; 2].as_slice())],
+                    vec![0.0, 1.0, 0.0, 1.0]
+                )),
+                1,
+                2
+            )
+            .is_ok()
+        );
+    }
 }

@@ -4,29 +4,21 @@
 //! (见 `docs/design/08-l6-quant.md` 落地状态),供 L2 段编码与 L3 索引打分直接复用。
 //! 高层编排(建段抽样回退、`stats()` 聚合、async 门面)留在各自所属层。
 
-use crate::core::error::{MnemeError, Result};
-use crate::core::options::VectorFormat;
-
 pub(crate) mod rescore;
 pub(crate) mod scalar_i8;
+mod support;
 
 #[cfg(feature = "quant-f16")]
 pub(crate) mod f16;
 
-/// 校验当前构建是否支持该量化格式:未开 `quant-f16` 时 `F16` 返回
-/// `Unsupported { feature: "quant-f16" }`,绝不静默降级(FC-QUANT-ERR-001)。
-pub(crate) fn ensure_format_supported(format: VectorFormat) -> Result<()> {
-    if format == VectorFormat::F16 && !cfg!(feature = "quant-f16") {
-        return Err(MnemeError::Unsupported {
-            feature: "quant-f16",
-        });
-    }
-    Ok(())
-}
+pub(crate) use support::ensure_format_supported;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(feature = "quant-f16"))]
+    use crate::core::error::MnemeError;
+    use crate::core::options::VectorFormat;
 
     /// FC-QUANT-ERR-001:feature 门控只拦 `F16`,`F32`/`I8Rescored` 恒可用。
     #[test]
