@@ -497,7 +497,7 @@ mod tests {
         assert!(matches!(parse(&bytes), Err(MnemeError::Corrupted { .. })));
     }
 
-    /// 更高主版本 → `UnsupportedVersion`(I18)。
+    /// 更高/更低版本 → `UnsupportedVersion`(I18)。
     #[test]
     fn vsec_rejects_version_mismatch() {
         // 高/低版本都必须拒绝(精确匹配,无旧格式兼容)。

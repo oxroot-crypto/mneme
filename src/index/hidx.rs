@@ -500,7 +500,7 @@ mod tests {
         assert!(matches!(decode(&bytes), Err(MnemeError::Corrupted { .. })));
     }
 
-    /// FC-INDEX-ERR-001:更高主版本 → `UnsupportedVersion`(I18)。
+    /// FC-INDEX-ERR-001:更高/更低版本 → `UnsupportedVersion`(I18)。
     #[test]
     fn hidx_rejects_version_mismatch() {
         for version in [0x0100_u16, crate::persist::FORMAT_VERSION - 1] {

@@ -473,7 +473,7 @@ mod tests {
         assert!(matches!(parse(&bytes), Err(MnemeError::Corrupted { .. })));
     }
 
-    /// 更高主版本 → `UnsupportedVersion`。
+    /// 更高/更低版本 → `UnsupportedVersion`。
     #[test]
     fn manifest_rejects_version_mismatch() {
         for version in [0x0100_u16, FORMAT_VERSION - 1] {

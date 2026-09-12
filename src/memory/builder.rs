@@ -288,7 +288,6 @@ impl Builder {
         Config {
             dimension,
             metric,
-            fsync: self.fsync,
             insert_mode: self.insert_mode,
             dedup: self.dedup,
             dedup_threshold: self.dedup_threshold,
@@ -307,8 +306,6 @@ impl Builder {
             // 时钟回拨单调钳制:TTL 只可能晚消失(FC-GLOBAL-PRE-005)。
             clock: Arc::new(MonotonicClock::new(self.clock)),
             read_only: self.read_only,
-            verify_on_open: self.verify_on_open,
-            fail_fast_on_corruption: self.fail_fast_on_corruption,
         }
     }
 }

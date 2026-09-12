@@ -95,6 +95,8 @@ const SRC_ANALYSIS_INV: &str = include_str!("../src/memory/analysis/inv.rs");
 const SRC_PERSIST_FLUSH: &str = include_str!("../src/persist/flush.rs");
 /// L2 msec delta 区源码(往返/畸形拒绝单测被 POST/ERR 契约引用)。
 const SRC_MSEC_DELTA: &str = include_str!("../src/persist/msec/delta.rs");
+/// L2 msec 记录体源码(字段标志畸形拒绝单测被 ERR 契约引用)。
+const SRC_MSEC_ENTRY: &str = include_str!("../src/persist/msec/entry.rs");
 /// L2 WAL 写入器源码(文件序号解析单测被 POST 契约引用)。
 const SRC_WAL_WRITER: &str = include_str!("../src/persist/store/wal_writer.rs");
 /// L5 调度源码(选段/幸存筛选单测被 CPLX 契约引用)。
@@ -122,7 +124,7 @@ const CONTRACT_TEST_FILES: [(&str, &str); 9] = [
 ];
 
 /// 契约引用的测试可能落在的全部文件(路径必须与 `contracts.md` 中书写一致)。
-const SOURCES: [(&str, &str); 48] = [
+const SOURCES: [(&str, &str); 49] = [
     ("tests/core_contracts.rs", CORE_TESTS),
     ("tests/memory_contracts.rs", MEMORY_TESTS),
     ("tests/query_contracts.rs", QUERY_TESTS),
@@ -166,6 +168,7 @@ const SOURCES: [(&str, &str); 48] = [
     ("src/persist/flush.rs", SRC_PERSIST_FLUSH),
     ("src/memory/pred_eval.rs", SRC_PRED_EVAL),
     ("src/persist/msec/delta.rs", SRC_MSEC_DELTA),
+    ("src/persist/msec/entry.rs", SRC_MSEC_ENTRY),
     ("src/persist/store/wal_writer.rs", SRC_WAL_WRITER),
     ("src/life/compact.rs", SRC_LIFE_COMPACT),
     ("src/persist/edges.rs", SRC_PERSIST_EDGES),

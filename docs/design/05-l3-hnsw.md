@@ -8,7 +8,7 @@
 > 复杂度(构建 O(N·d·ef_c·M_0) 等)→ 8 点手算算例 → 墓碑删除 → 过滤三档策略。
 
 模块:`index/{hnsw.rs, graph.rs, filtered.rs, rebuild.rs, hidx.rs, factory.rs}`
-(原计划的 `merge.rs` 在 L2 全量快照单图架构下退化为 L0 `TopK::merge`,不单设;
+(原计划的 `merge.rs` 在 L5 前单段单图架构下退化为 L0 `TopK::merge`,不单设;
 L5 引入多图 compaction 重建时恢复为独立模块。)
 参考:HNSW 原论文(Malkov & Yashunin, 2016)的思想,实现为纯 Rust 自研、适配墓碑删除与过滤。
 
@@ -362,7 +362,7 @@ $s = |\text{cand}| / N_{\text{alive}}$ 自适应三档:
 
 ## 9. 跨段归并:`merge.rs`
 
-> **落地状态**:L2 全量快照每次 flush 只保留一个活跃段,故 L3 的"多段图"退化为
+> **落地状态**:L5 之前每次 flush 只保留一个活跃段,故 L3 的"多段图"退化为
 > **单个索引前缀 + 未建树尾扫描**:查询 = 前缀 ANN(`filtered.rs`)+ 尾部暴力,
 > 二者以 L0 `TopK::merge` 归并(见 `src/memory/search.rs`)。L5 起多段并存已落地,
 > 查询按 MANIFEST 段序**串行**逐段归并(`merge` 仍由 `TopK::merge` 承担);

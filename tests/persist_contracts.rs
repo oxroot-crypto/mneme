@@ -69,7 +69,10 @@ fn reopen_after_drop_recovers_from_wal() {
     } // 不 close,直接 drop
 
     let db = Mneme::open(dir.path()).expect("reopen");
-    assert!(db.namespace("demo").get("x").expect("get").is_some());
+    let ns = db.namespace("demo");
+    let record = ns.get("x").expect("get").expect("已确认写入必须完整可见");
+    assert_eq!(record.key(), Some("x"));
+    assert_eq!(record.vector(), [1.0, 2.0, 3.0]);
     db.close().expect("close");
 }
 

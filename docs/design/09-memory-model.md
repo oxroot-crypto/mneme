@@ -78,7 +78,7 @@ let in_edges: Vec<Edge> = ns.predecessors(to, &[RelationKind::SUPPORTS])?;  // �
 | 形态 | 位置 |
 |---|---|
 | 内存增量 | `WriterState.relations`([03 §3](03-l1-memory.md)) |
-| 持久化 | 全量快照段的 relations 区([04 §2.2b](04-l2-persist.md),仅正向表;反向边恢复时在内存重建);变更经 WAL `Relate`/`Unrelate` 帧(delta 区属 L5,L2 恒空) |
+| 持久化 | 段文件的 relations 区([04 §2.2b](04-l2-persist.md),仅正向表;反向边恢复时在内存重建);变更经 WAL `Relate`/`Unrelate` 帧(delta 区随 L5 落地) |
 | 可见性 | 任一端被删除 → 边视为悬挂、不返回;compaction 物理清除 |
 
 - **不变量 I25**:`neighbors` 只返回两端都活着的边;删除/遗忘一端后,边**立即**在视图上失效

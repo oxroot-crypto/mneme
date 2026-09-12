@@ -504,7 +504,7 @@ mod tests {
                 load_disk_indexes(&mut state, &view, &[]),
                 Err(MnemeError::Corrupted { .. })
             ),
-            "半新半旧段必须按损坏拒绝,不得静默跳过校验"
+            "字段字典缺失或索引区畸形必须按损坏拒绝,不得静默跳过校验"
         );
     }
 

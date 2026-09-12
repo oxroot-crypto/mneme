@@ -131,7 +131,7 @@ impl Table {
                         *ws = snapshot;
                         return Err(error);
                     }
-                    // WAL 落盘即提交点:其后 flush 仅回收 WAL(全量快照),失败不回滚,
+                    // WAL 落盘即提交点:其后 flush 只回收已物化的 WAL 前缀(Checkpoint),失败不回滚,
                     // 否则内存回滚与重启后 WAL 重放会矛盾(「失败却持久」)。失败不丢:
                     // WAL 持续增长并由下次写重试,`stats().wal_bytes` 可观测(设计 04 §3.2)。
                     persist.maybe_flush(&mut ws, &self.config).ok();

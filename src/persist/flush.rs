@@ -476,8 +476,8 @@ mod tests {
     use crate::core::meta::json;
     use crate::core::metric::Metric;
     use crate::core::options::{
-        CompactionPolicy, Compression, Dimension, FsyncPolicy, HnswParams, InsertMode, Limits,
-        RelationIndex, SystemClock, Tuning, VectorFormat,
+        CompactionPolicy, Compression, Dimension, HnswParams, InsertMode, Limits, RelationIndex,
+        SystemClock, Tuning, VectorFormat,
     };
     use crate::core::types::{Key, NsId, RowId, SeqNo};
     use crate::memory::dedup::Dedup;
@@ -488,7 +488,6 @@ mod tests {
         Config {
             dimension: Dimension::new(2).expect("dimension"),
             metric: Metric::Cosine,
-            fsync: FsyncPolicy::default(),
             insert_mode: InsertMode::default(),
             dedup: Dedup::default(),
             dedup_threshold: 0.9,
@@ -506,8 +505,6 @@ mod tests {
             limits: Limits::default(),
             clock: Arc::new(SystemClock),
             read_only: false,
-            verify_on_open: false,
-            fail_fast_on_corruption: false,
         }
     }
 

@@ -288,7 +288,11 @@ mod tests {
     fn write_new_does_not_overwrite() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_new(dir.path(), "a", b"1").expect("first");
-        assert!(write_new(dir.path(), "a", b"2").is_err());
+        assert!(matches!(
+            write_new(dir.path(), "a", b"2"),
+            Err(crate::core::error::MnemeError::Io(_))
+        ));
+        assert_eq!(std::fs::read(dir.path().join("a")).expect("read"), b"1");
     }
 
     /// 路径穿越被拒绝。

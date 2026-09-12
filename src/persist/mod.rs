@@ -32,8 +32,7 @@ pub(crate) mod msec;
 pub(crate) mod recover;
 // L3 段读取后端(`SegmentSource`/`FileSource`/`MmapSource`,设计 04 §11):
 // `read_whole` 统一经此读取段字节;`FileSource`/`MmapSource` 随 feature `mmap`
-// 二选一,未启用分支在编译期可能未被使用,故保留 dead_code 豁免。
-#[allow(dead_code)]
+// 二选一(各后端个未用分支在模块内定点豁免)。
 pub(crate) mod source;
 pub(crate) mod storage;
 pub(crate) mod store;
