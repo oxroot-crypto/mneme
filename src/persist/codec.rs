@@ -13,9 +13,6 @@ use crate::core::error::{MnemeError, Result};
 /// 次版本 4:关系区带「全量/增量」标志;旧版本段一律视为全量关系表。
 pub(crate) const FORMAT_VERSION: u16 = 0x0004;
 
-/// 关系区「全量/增量」语义的分界次版本(≥ 该版本的段按 edges 标志判定)。
-pub(crate) const FULL_RELATIONS_VERSION: u16 = 0x0004;
-
 /// 库支持的最大主版本;`major(found) > MAX_MAJOR` 时拒绝打开(I18)。
 pub(crate) const MAX_MAJOR: u8 = 0x00;
 

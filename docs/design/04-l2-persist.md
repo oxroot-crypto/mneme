@@ -719,9 +719,10 @@ Windows 的 std `rename` 虽对应 `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`、�
 ```text
 open(dir):
  1. 读 current → 定位 MANIFEST.<v>;CRC 失败 → 扫描取最大合法版本;全坏 → 报 Corrupted
- 2. 校验各段头部 CRC(全量 CRC 视配置);头部损坏段 → 移入 trash/ 并从视图剔除
-    (可配 fail-fast 模式:`Builder::fail_fast_on_corruption(true)`,直接报错拒绝启动)。只读实例(`read_only`)不写盘,
-    仅跳过损坏段并从视图剔除,经 `stats()`/`check()` 报告
+ 2. 校验各段头部 CRC(全量 CRC 视配置);头部损坏段 → **仅在内存跳过并从视图剔除,文件保持原地**
+    (可配 fail-fast 模式:`Builder::fail_fast_on_corruption(true)`,直接报错拒绝启动)。绝不自动移入
+    `trash/`:MANIFEST 仍引用该段,移动后再次打开会因引用缺失拒启、隔离文件更会被 purge 删除;数据可能
+    仍可人工修复,损坏段经 `stats()`/`check()` 报告
  3. 打开唯一的 WAL 文件(`wal/wal_000001.log`),只重放 seqno > manifest.watermark_seqno 的帧(§3.3);
     遇撕裂帧 → 可写实例截断该文件尾部;只读实例(`read_only`)不写盘,仅在内存中忽略
     该帧及其后(见 §13 只读模式)
@@ -893,7 +894,7 @@ L3 恢复阶段仍需自有字节以重建内存表,真正的"零拷贝驻留"�
 | 只读文件系统 | 可写打开 | 创建锁文件失败 → `Io`(未创建任何数据) | 换可写目录或改用 `read_only(true)` |
 | 目录被占用 | 第二个实例打开 | `Busy` | 确保单进程独占([16 §3](16-api-reference.md)) |
 | 全部 MANIFEST 损坏 | 扫描 `MANIFEST.*` 无合法版本 | `Corrupted` | 从备份恢复([16 §7](16-api-reference.md)) |
-| 个别段头损坏 | 打开时校验失败 | 移入 `trash/` 并从视图剔除(可配 fail-fast,见 §7) | `db.check()` 复核;必要时从备份补段 |
+| 个别段头损坏 | 打开时校验失败 | 内存跳过并从视图剔除,文件保持原地(可配 fail-fast,见 §7) | `db.check()` 复核;必要时从备份补段 |
 | WAL 未知帧类型 | 回放遇到 `type` 不在定义内 | **停止回放并报错**(不静默跳过) | 升级库版本;切勿手工改 WAL |
 | mmap 失败 | 平台/文件系统不支持 | 自动退化为 `FileSource` | 无(功能不变,吞吐下降) |
 | 时钟回拨 | `Clock` 返回变小 | 以历史最大水位钳制(本章 §10.2) | 无 |

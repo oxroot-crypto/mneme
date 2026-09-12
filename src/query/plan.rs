@@ -21,13 +21,15 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn bump_row_evals() {
+fn row_evals() {
     ROW_EVALS.with(|evals| evals.set(evals.get() + 1));
 }
 
 #[cfg(test)]
-fn bump_ttl_checks() {
-    TTL_CHECKS.with(|checks| checks.set(checks.get() + 1));
+fn ttl_checks(unproven: bool) {
+    if unproven {
+        TTL_CHECKS.with(|checks| checks.set(checks.get() + 1));
+    }
 }
 
 /// 一次查询的执行计划。
@@ -61,9 +63,7 @@ pub(crate) fn compile(view: &ReaderView, ns_id: NsId, filter: Option<&Expr>, now
     for (index, slot) in view.slots.iter().enumerate() {
         let ttl_proven = ttl_unexpired.get(index / ZONE_BLOCK_ROWS);
         #[cfg(test)]
-        if !ttl_proven {
-            bump_ttl_checks();
-        }
+        ttl_checks(!ttl_proven);
         if view.dead.get(index)
             || slot.ns_id != ns_id
             || !slot.is_live_with_ttl(now_ms, !ttl_proven)
@@ -80,7 +80,7 @@ pub(crate) fn compile(view: &ReaderView, ns_id: NsId, filter: Option<&Expr>, now
                 access: view.access.get(&slot.rowid).copied(),
             };
             #[cfg(test)]
-            bump_row_evals();
+            row_evals();
             if !pred::matches(expr, &ctx) {
                 continue;
             }

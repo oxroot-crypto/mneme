@@ -309,6 +309,7 @@ impl Mneme {
     pub fn check(&self) -> Result<CheckReport>;  // fsck:key 索引 ↔ 最新版本对账 + 段 CRC/版本链 + 死比率与合并建议(FC-LIFE-POST-009)
     pub fn compact_control(&self) -> CompactionControl;  // pause()/resume()/state()
     pub fn compact(&self) -> Result<()>;         // 显式触发一轮 size-tiered compaction(无触发/暂停/纯内存库时空操作,见 07 §4)
+    pub fn maintenance_tick(&self) -> Result<()>; // 手动执行一轮后台维护(访问攒批/自动遗忘/自动 compaction,见 07 §2–§4)
     pub fn flush(&self) -> Result<()>;           // 把可变表落成增量段并 fsync WAL
     pub fn close(self) -> Result<()>;            // flush + 停后台维护 + 释放文件锁;幂等(对已关闭的库经其他句柄再调返回 Ok)
 }

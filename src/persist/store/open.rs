@@ -16,9 +16,7 @@ use crate::memory::table::WriterState;
 use crate::persist::hook::FsyncHook;
 use crate::persist::manifest::Manifest;
 use crate::persist::recover;
-use crate::persist::storage::{
-    self, FileLock, SEGMENTS_DIR, WAL_DIR, hidx_name, msec_name, vsec_name,
-};
+use crate::persist::storage::{self, FileLock, SEGMENTS_DIR, WAL_DIR};
 use crate::persist::trash;
 use crate::persist::wal;
 
@@ -291,7 +289,9 @@ fn load_write_state(
         options.verify_on_open,
         options.fail_fast_on_corruption,
     )?;
-    move_skipped_segments_to_trash(root, &recovered.skipped, options.read_only)?;
+    // 损坏段保持在原地、仅在内存跳过:MANIFEST 仍引用它们,绝不自动移到
+    // `trash/`(否则下次打开会因"引用段缺失"拒绝启动,隔离变成删数据)。
+    // 段数据可能仍可人工修复,`check()` 会报告损坏段。
     if let Some(factory) = options.index_factory.as_ref() {
         state.indexes = load_hidx_indexes(
             &state,
@@ -410,17 +410,6 @@ fn replay_all_wal(
 }
 
 /// 把被隔离的损坏段三件套移入 `trash/`(只读打开不动文件系统)。
-fn move_skipped_segments_to_trash(root: &Path, skipped: &[u32], read_only: bool) -> Result<()> {
-    if read_only || skipped.is_empty() {
-        return Ok(());
-    }
-    let names: Vec<String> = skipped
-        .iter()
-        .flat_map(|id| [vsec_name(*id), msec_name(*id), hidx_name(*id)])
-        .collect();
-    trash::move_to_trash(root, &names)
-}
-
 /// [`load_index`] 的槽位来源:恢复后的写状态与"段内槽位 → 全局槽位"重排映射。
 struct SlotRemap<'a> {
     /// 恢复后的写状态(hidx 节点按段内顺序取 `rowid`/向量)。

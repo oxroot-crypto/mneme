@@ -120,7 +120,11 @@ fn collect_versions<'a>(
     let mut parsed: Vec<(vsec::VsecView<'a>, msec::MsecView<'a>)> = Vec::new();
     let mut parsed_ids: Vec<u32> = Vec::new();
     let mut skipped: Vec<u32> = Vec::new();
-    for segment in segments {
+    // 显式按段号升序回放:全量关系段必须排在其覆盖的旧段之后(写路径恒追加新段,
+    // 此处排序是对手工修复/MANIFEST 乱序的防御,FC-PERSIST-POST-012)。
+    let mut ordered: Vec<&SegmentBytes> = segments.iter().collect();
+    ordered.sort_by_key(|segment| segment.segment_id);
+    for segment in ordered {
         let Some((vsec_view, msec_view)) = load_segment_views(segment, verify_payload, fail_fast)?
         else {
             skipped.push(segment.segment_id);

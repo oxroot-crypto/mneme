@@ -15,6 +15,7 @@
 //! * FC-LIFE-POST-003(增量段 flush)、FC-PERSIST-STA-004(多段 MANIFEST 提交)
 //! * FC-PERSIST-POST-010(delta 区往返/回放)、FC-PERSIST-POST-011(WAL 轮转)
 //! * FC-PERSIST-POST-012(槽位归属恢复)
+//! * FC-PERSIST-ERR-006(损坏段原地跳过)
 //! * FC-PERSIST-CPLX-011(增量 flush 复杂度)
 //! * FC-INDEX-INV-008(多段 ANN + 未落盘尾归并 ≡ 全量暴力)
 
@@ -669,17 +670,6 @@ fn ttl_expiry_survives_multi_segment_reopen() {
 }
 
 /// 轮询等待 `cond` 成立(后台维护为异步;注入时钟决定触发,真实时间只驱动线程)。
-fn wait_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if cond() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    cond()
-}
-
 /// FC-LIFE-POST-004:读路径命中攒批后落 WAL;崩溃(未 close)重开后访问计数仍在。
 #[test]
 fn access_hits_are_batched_and_flushed() {
@@ -713,14 +703,13 @@ fn access_hits_are_batched_and_flushed() {
             .execute()
             .expect("search again");
         assert_eq!(hits.len(), 1);
-        // 时钟推进越过 access_flush_interval,后台维护把缓冲合并并落 WAL。
+        // 手动推进一轮维护(确定性;不依赖后台线程调度):缓冲合并并落 WAL。
         clock.set(2_000);
-        assert!(
-            wait_until(Duration::from_secs(3), || {
-                ns.count(Some(mneme::Expr::field("access_count").eq(2)))
-                    .expect("count")
-                    == 1
-            }),
+        db.maintenance_tick().expect("maintenance tick");
+        assert_eq!(
+            ns.count(Some(mneme::Expr::field("access_count").eq(2)))
+                .expect("count"),
+            1,
             "读命中必须攒批落盘(同 RowId 累加)"
         );
     } // 不 close:模拟崩溃,只靠 WAL 回放
@@ -758,7 +747,7 @@ fn auto_retention_is_off_by_default() {
     ns.insert(Record::new(vec![1.0, 0.0]).key("a").importance(0.0))
         .expect("a");
     clock.set(10_000_000);
-    std::thread::sleep(Duration::from_millis(100));
+    db.maintenance_tick().expect("maintenance tick");
     assert!(
         db.stats().expect("stats").retain.is_none(),
         "未显式开启 retention 时绝不允许自动遗忘"
@@ -795,13 +784,13 @@ fn auto_retention_forgets_expired_records() {
     // 衰减时钟被刷新,保留分维持高位。
     clock.set(1_000_000);
     ns.touch("keep", None).expect("touch keep");
+    // 手动推进一轮维护(确定性;不依赖后台线程调度)。
+    db.maintenance_tick().expect("maintenance tick");
     assert!(
-        wait_until(Duration::from_secs(3), || {
-            db.stats()
-                .expect("stats")
-                .retain
-                .is_some_and(|report| report.forgotten >= 1)
-        }),
+        db.stats()
+            .expect("stats")
+            .retain
+            .is_some_and(|report| report.forgotten >= 1),
         "开启自动遗忘后必须产生可审计报告"
     );
     assert!(!ns.exists("drop").expect("exists"), "低分记录被遗忘");
@@ -841,12 +830,13 @@ fn auto_compaction_triggers_in_background() {
         db.flush().expect("flush");
     }
     assert_eq!(db.stats().expect("stats").segments.len(), 3);
+    // 手动推进一轮维护(确定性;不依赖后台线程调度)。
     clock.set(2_000);
-    assert!(
-        wait_until(Duration::from_secs(3), || {
-            db.stats().expect("stats").segments.len() == 2
-        }),
-        "后台维护必须自动触发同层合并"
+    db.maintenance_tick().expect("maintenance tick");
+    assert_eq!(
+        db.stats().expect("stats").segments.len(),
+        2,
+        "维护单轮必须触发同层合并"
     );
     for key in 0..12_u32 {
         assert!(ns.get(&format!("k{key}")).expect("get").is_some());
@@ -1728,5 +1718,115 @@ fn stale_wal_files_do_not_resurrect_unregistered_namespace() {
     );
     assert!(db.namespace("demo").get("a").expect("get").is_none());
     assert!(db.check().expect("check").ok);
+    db.close().expect("close");
+}
+
+/// FC-PERSIST-ERR-006:损坏段在非 fail-fast 下只在内存跳过、文件保持原地;
+/// 再次打开不得因"引用段缺失"而拒绝启动。
+#[test]
+fn skipped_corrupt_segment_keeps_library_openable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let db = build(dir.path(), 2);
+        let ns = db.namespace("demo");
+        ns.insert(Record::new(vec![1.0, 0.0]).key("a")).expect("a");
+        db.flush().expect("flush a");
+        ns.insert(Record::new(vec![0.0, 1.0]).key("b")).expect("b");
+        db.flush().expect("flush b");
+        db.close().expect("close");
+    }
+    // 破坏段 0 的 vsec 魔数。
+    let seg0 = dir.path().join("segments").join("seg_000000.vsec");
+    let mut bytes = std::fs::read(&seg0).expect("read seg0");
+    bytes[0] ^= 0xFF;
+    std::fs::write(&seg0, &bytes).expect("corrupt seg0");
+    assert!(seg0.exists());
+
+    // 第一次打开:内存跳过损坏段,其余数据可读;损坏段文件绝不被移走/删除。
+    {
+        let db = Mneme::open(dir.path()).expect("first open");
+        assert!(db.namespace("demo").get("b").expect("get b").is_some());
+        db.close().expect("close");
+    }
+    assert!(seg0.exists(), "损坏段文件必须保持原地");
+
+    // 第二次打开:仍成功(不会因 MANIFEST 引用缺失而拒启)。
+    let db = Mneme::open(dir.path()).expect("second open");
+    assert!(db.namespace("demo").get("b").expect("get b").is_some());
+    db.close().expect("close");
+}
+
+/// FC-PERSIST-POST-010:最新版本随合并段物化时,其已被版本行覆盖的 `Access`
+/// delta 不得再携带(否则恢复期重复累加)。
+#[test]
+fn compaction_latest_in_keep_drops_covered_delta() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clock = FakeClock::default();
+    clock.set(1_000);
+    {
+        let db = Builder::default()
+            .dimension(2)
+            .path(dir.path())
+            .compaction(tiered_policy())
+            .clock(Arc::new(clock.clone()))
+            .build()
+            .expect("build");
+        let ns = db.namespace("demo");
+        let a = ns.insert(Record::new(vec![1.0, 0.0]).key("a")).expect("a");
+        let a = match a {
+            mneme::InsertOutcome::Inserted(id) | mneme::InsertOutcome::Merged(id) => id,
+            other => panic!("期望写入,得到 {other:?}"),
+        };
+        db.flush().expect("flush a"); // 段 0(level 0,含 a)
+        clock.set(2_000);
+        assert!(ns.touch_by_rowid(a, None).expect("touch"));
+        ns.insert(Record::new(vec![0.0, 1.0]).key("b")).expect("b");
+        db.flush().expect("flush b"); // 段 1(level 0 + a 的 Access delta)
+        // 合并 [段 0, 段 1]:a 的最新版本随新段物化,其 delta 已被版本行覆盖。
+        db.compact().expect("compact level0");
+        db.close().expect("close");
+    }
+
+    let db = Mneme::open(dir.path()).expect("reopen");
+    let ns = db.namespace("demo");
+    assert_eq!(
+        ns.count(Some(mneme::Expr::field("access_count").eq(1)))
+            .expect("count"),
+        1,
+        "最新版本入段时不得重复携带已被覆盖的 Access delta"
+    );
+    assert_eq!(
+        ns.count(Some(mneme::Expr::field("access_count").ge(2)))
+            .expect("count"),
+        0
+    );
+    db.close().expect("close");
+}
+
+/// FC-LIFE-POST-006 / FC-PERSIST-POST-011:上次 flush 之后新注册的命名空间在
+/// 崩溃重开后仍可见(注册/注销 metadata 帧必须有真实 seqno 并参与水位)。
+#[test]
+fn namespace_registered_after_last_flush_survives_crash() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let db = build(dir.path(), 2);
+        db.namespace("a")
+            .insert(Record::new(vec![1.0, 0.0]).key("x"))
+            .expect("x");
+        db.flush().expect("flush a"); // watermark > 0
+        // flush 之后注册的新命名空间,未再 flush。
+        db.namespace("b")
+            .insert(Record::new(vec![0.0, 1.0]).key("y"))
+            .expect("y");
+    } // 不 close:模拟崩溃
+
+    let db = Mneme::open(dir.path()).expect("reopen");
+    assert!(
+        db.list_namespaces()
+            .expect("list")
+            .contains(&"b".to_string()),
+        "flush 之后的注册不得因水位判定丢失"
+    );
+    assert!(db.namespace("b").get("y").expect("get y").is_some());
     db.close().expect("close");
 }

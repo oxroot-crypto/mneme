@@ -150,9 +150,11 @@ fn commit_recovered_slot(
 
 /// 从单个段的 relations 区重建关系边(出边 + 入边)。
 ///
-/// 全量段(`FLAG_FULL`,或旧格式版本段)先重置关系表再应用;增量段仅 upsert,
-/// 其后由 delta 区施加关系变更。全量语义保证 compaction 后旧段的已删除边不会
-/// 因并集而"复活"(设计 04 §2.2b、FC-MODEL-POST-007)。
+/// 带 `FLAG_FULL` 的段(次版本 4 起由 compaction/首段写入)先重置关系表再应用;
+/// 其余段(含全部旧格式段)仅 upsert,其后由 delta 区施加关系变更。旧格式段一律
+/// upsert 而非全量:旧库恒为单段(重置与 upsert 等价),而 0x0003 开发期增量段
+/// 的 relations 区是空表,按全量重置会清掉先前段的边。全量语义保证 compaction
+/// 后旧段的已删除边不会因并集而"复活"(设计 04 §2.2b、FC-MODEL-POST-007)。
 ///
 /// `RelationIndex::Both` 的段带反向表:入边由反向表 + 正向表并集恢复
 /// (并集对损坏文件更稳健,upsert 幂等)。
@@ -161,9 +163,7 @@ pub(super) fn apply_relations(
     msec_view: &msec::MsecView<'_>,
 ) -> Result<()> {
     let edges = crate::persist::edges::parse(msec_view.relations_bytes())?;
-    // 旧版本段(L2 全量快照时代)没有全量标志,一律按全量处理。
-    let full = msec_view.format_version() < crate::persist::FULL_RELATIONS_VERSION || edges.full;
-    if full {
+    if edges.full {
         state.out_edges = Arc::new(std::collections::HashMap::new());
         state.in_edges = Arc::new(std::collections::HashMap::new());
     }
@@ -213,7 +213,8 @@ fn apply_delta_entry(state: &mut WriterState, entry: msec::DeltaEntry) {
                 .entry(RowId::new(rowid))
                 .or_default();
             stat.access_count = stat.access_count.saturating_add(access_delta);
-            stat.last_access_ms = last_access_ms;
+            // 时钟回拨下回放序可能倒退;保留更晚的访问时刻。
+            stat.last_access_ms = stat.last_access_ms.max(last_access_ms);
         }
         msec::DeltaEntry::Relate {
             from,

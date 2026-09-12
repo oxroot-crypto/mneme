@@ -11,10 +11,9 @@ use super::{
     Region, Regions, TOMBSTONE_DOC_OFFSET, VERSION_ROW_BYTES, VersionRow,
 };
 
-/// 头部解析结果:行数、格式版本、9 个数据区与 payload CRC。
+/// 头部解析结果:行数、9 个数据区与 payload CRC。
 struct HeaderLayout {
     row_count: u64,
-    format_version: u16,
     regions: Regions,
     payload_crc: u32,
 }
@@ -30,7 +29,6 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<MsecView<'_>> {
     validate_regions(&header.regions, data_start, data_end)?;
     Ok(MsecView {
         row_count: header.row_count,
-        format_version: header.format_version,
         data: &bytes[data_start..data_end],
         field_dict: slice_of(bytes, header.regions.field_dict),
         version_table: slice_of(bytes, header.regions.version),
@@ -81,7 +79,6 @@ fn parse_header(bytes: &[u8]) -> Result<HeaderLayout> {
     let row_count = cursor.u64()?;
     Ok(HeaderLayout {
         row_count,
-        format_version: version,
         regions: Regions {
             field_dict: read_pair(bytes, 16),
             version: read_pair(bytes, 32),
@@ -156,7 +153,6 @@ fn slice_of(bytes: &[u8], region: Region) -> &[u8] {
 /// 元数据段只读视图。
 pub(crate) struct MsecView<'a> {
     row_count: u64,
-    format_version: u16,
     data: &'a [u8],
     field_dict: &'a [u8],
     version_table: &'a [u8],
@@ -175,11 +171,6 @@ impl MsecView<'_> {
     /// 物理槽位数。
     pub(crate) const fn row_count(&self) -> u64 {
         self.row_count
-    }
-
-    /// 段格式版本(用于关系区语义判定:旧版本段一律为全量关系表)。
-    pub(crate) const fn format_version(&self) -> u16 {
-        self.format_version
     }
 
     /// 解析后的版本链表。

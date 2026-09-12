@@ -534,9 +534,12 @@ impl WriterState {
         false
     }
 
-    /// 整链清空时移除 `latest` 与 key/text 索引。
+    /// 整链清空时移除 `latest` 与 key/text/访问统计。
     fn purge_row_indexes(&mut self, rowid: RowId, index: usize) {
         Arc::make_mut(&mut self.latest).remove(&rowid);
+        // 访问统计与待落盘增量一并清理,避免幽灵条目在后续 delta 中复活。
+        Arc::make_mut(&mut self.access).remove(&rowid);
+        Arc::make_mut(&mut self.access_dirty).remove(&rowid);
         let slot_data = &self.slots[index];
         if let Some(key) = &slot_data.key {
             let key = (slot_data.ns_id, key.clone());

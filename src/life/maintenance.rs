@@ -13,6 +13,7 @@
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::Duration;
 
+use crate::core::error::{MnemeError, Result};
 use crate::memory::config::Config;
 use crate::memory::ops::CompactionControl;
 use crate::memory::table::Table;
@@ -207,6 +208,34 @@ fn run_tick(context: &MaintenanceContext, timers: &mut Timers, compact_interval:
         timers.compact_ms = now_ms;
     }
     true
+}
+
+impl Mneme {
+    /// 手动执行一轮后台维护(访问攒批、自动遗忘、自动 compaction)。
+    ///
+    /// 与后台维护线程的单轮逻辑一致;用于没有后台线程、线程未及唤醒或测试需要
+    /// 确定性推进的场景。纯内存库只执行访问攒批;`compact` 失败按显式调用口径
+    /// 向上传播。
+    ///
+    /// # Errors
+    /// 库已关闭时返回 [`MnemeError::Closed`];compaction I/O/编码失败时返回
+    /// 结构化错误(与显式 [`Mneme::compact`] 同口径)。
+    pub fn maintenance_tick(&self) -> Result<()> {
+        let view = self.table.view();
+        if view.closed {
+            return Err(MnemeError::Closed);
+        }
+        drop(view);
+        let now_ms = self.config.clock.now_unix_ms();
+        self.table.flush_access(now_ms);
+        if let Some(policy) = &self.config.retention {
+            run_retain(&self.table, &self.config, policy);
+        }
+        if self.store.is_some() && !self.control.is_paused() {
+            self.compact()?;
+        }
+        Ok(())
+    }
 }
 
 /// 对全部已注册命名空间执行一轮自动遗忘并记录聚合报告(I23 审计)。
