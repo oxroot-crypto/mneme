@@ -501,7 +501,7 @@ mod tests {
     #[test]
     fn vsec_rejects_higher_major() {
         let mut bytes = encode_sample(1);
-        bytes[4..6].copy_from_slice(&0x0200_u16.to_le_bytes());
+        bytes[4..6].copy_from_slice(&0x0100_u16.to_le_bytes());
         // 重新计算头部 CRC,使版本成为唯一错误来源。
         let crc = crc32(&bytes[0..32]);
         bytes[32..36].copy_from_slice(&crc.to_le_bytes());

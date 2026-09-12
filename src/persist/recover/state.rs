@@ -450,10 +450,10 @@ mod tests {
         }
     }
 
-    /// FC-MODEL-POST-007:无 `FLAG_FULL` 的关系区按 upsert 应用;旧格式增量段
-    /// (空关系表、无标志)不得清掉先前段建立的边。
+    /// FC-MODEL-POST-007:无 `FLAG_FULL` 的增量段按 upsert 应用(空关系表)
+    /// 不得清掉先前段建立的边。
     #[test]
-    fn relations_without_full_flag_are_upserted() {
+    fn incremental_relations_are_upserted() {
         let edge = crate::persist::edges::EdgeData {
             from: 7,
             to: 9,
@@ -476,7 +476,7 @@ mod tests {
             Some(1)
         );
 
-        // 旧格式增量段(空关系表、无 FULL 位):upsert 不得清掉先前个边。
+        // 增量段(空关系表、无 FULL 位):upsert 不得清掉先前个边。
         let seg1 = msec_only_segment(&empty);
         let view1 = msec::parse(&seg1).expect("parse seg1");
         apply_relations(&mut state, &view1).expect("apply seg1");
@@ -486,7 +486,7 @@ mod tests {
                 .get(&crate::core::types::RowId::new(7))
                 .map(Vec::len),
             Some(1),
-            "旧段 upsert 不得清掉先前段个边"
+            "增量段 upsert 不得清掉先前段个边"
         );
     }
 

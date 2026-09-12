@@ -7,17 +7,13 @@ use crate::core::error::{MnemeError, Result};
 
 /// 当前支持的文件格式版本:高 8 位主版本、低 8 位次版本(设计 04 §2、§12)。
 ///
-/// 主版本 1(L5):关系区引入「全量/增量」语义位(`FLAG_FULL`)。这属语义变化
-/// 而非可安全跳过的追加字段,按设计 04 §12 升主版本;主版本 0 的旧读者会拒绝
-/// 打开新库,而不是忽略该位按旧语义误读。
-///
-/// 主版本 0 的历次次版本:
-/// * 次版本 2:L4 起 msec 的 field_dict / zone map / bloom / 倒排四区实际写入。
-/// * 次版本 3:L5 起 msec 的 zmap 区尾追加 `ttl_map`(每块 `min(expires_at)`)。
-pub(crate) const FORMAT_VERSION: u16 = 0x0100;
+/// 次版本 2:L4 起 msec 的 field_dict / zone map / bloom / 倒排四区实际写入。
+/// 次版本 3:L5 起 msec 的 zmap 区尾追加 `ttl_map`(每块 `min(expires_at)`)。
+/// 次版本 4:L5 起关系区带「全量/增量」标志(`edges::FLAG_FULL`),无标志按增量处理。
+pub(crate) const FORMAT_VERSION: u16 = 0x0004;
 
 /// 库支持的最大主版本;`major(found) > MAX_MAJOR` 时拒绝打开(I18)。
-pub(crate) const MAX_MAJOR: u8 = 0x01;
+pub(crate) const MAX_MAJOR: u8 = 0x00;
 
 /// 取出版本号的主版本(高 8 位)。
 pub(crate) const fn major(version: u16) -> u8 {
@@ -176,12 +172,11 @@ mod tests {
         assert!(check_version("vsec", FORMAT_VERSION).is_ok());
         // 同主版本、更高次版本可按"忽略未知可选字段"读取。
         assert!(check_version("vsec", 0x00FF).is_ok());
-        assert!(check_version("vsec", 0x01FF).is_ok());
         assert!(matches!(
-            check_version("vsec", 0x0200),
+            check_version("vsec", 0x0100),
             Err(MnemeError::UnsupportedVersion {
                 file: "vsec",
-                found: 0x0200,
+                found: 0x0100,
                 max: FORMAT_VERSION,
             })
         ));

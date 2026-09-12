@@ -150,11 +150,10 @@ fn commit_recovered_slot(
 
 /// 从单个段的 relations 区重建关系边(出边 + 入边)。
 ///
-/// 带 `FLAG_FULL` 的段(次版本 4 起由 compaction/首段写入)先重置关系表再应用;
-/// 其余段(含全部旧格式段)仅 upsert,其后由 delta 区施加关系变更。旧格式段一律
-/// upsert 而非全量:旧库恒为单段(重置与 upsert 等价),而 0x0003 开发期增量段
-/// 的 relations 区是空表,按全量重置会清掉先前段的边。全量语义保证 compaction
-/// 后旧段的已删除边不会因并集而"复活"(设计 04 §2.2b、FC-MODEL-POST-007)。
+/// 带 `FLAG_FULL` 的段(首段/compaction 段)先重置关系表再应用;增量段仅 upsert,
+/// 其后由 delta 区施加关系变更——增量段的 relations 区是空表,按全量重置会清掉
+/// 先前段的边。全量语义保证 compaction 后已删除的边不会因并集而"复活"
+/// (设计 04 §2.2b、FC-MODEL-POST-007)。
 ///
 /// `RelationIndex::Both` 的段带反向表:入边由反向表 + 正向表并集恢复
 /// (并集对损坏文件更稳健,upsert 幂等)。
