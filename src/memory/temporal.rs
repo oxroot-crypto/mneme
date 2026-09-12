@@ -15,6 +15,34 @@ use crate::memory::table::ReaderView;
 /// 每个 `RowId` 取版本链中 `tx_ms ≤ t` 的最新版本;被墓碑遮蔽的版本不进入
 /// `key_index`/`text_index`,但物理槽位仍保留以便 `iter_with(_, true)` 审计。
 pub(crate) fn snapshot_at(view: &ReaderView, tx_ms: i64) -> ReaderView {
+    let latest = historical_latest(view, tx_ms);
+    let (dead, key_index, seqno) = history_visibility(view, &latest);
+    ReaderView {
+        slots: Arc::clone(&view.slots),
+        dead: Arc::new(dead),
+        key_index: Arc::new(key_index),
+        versions: Arc::clone(&view.versions),
+        latest: Arc::new(latest),
+        out_edges: Arc::clone(&view.out_edges),
+        in_edges: Arc::clone(&view.in_edges),
+        access: Arc::clone(&view.access),
+        ns_registry: Arc::clone(&view.ns_registry),
+        indexes: Arc::clone(&view.indexes),
+        slot_segment: Arc::clone(&view.slot_segment),
+        reclaimed_versions: view.reclaimed_versions,
+        inv: Arc::clone(&view.inv),
+        zones: Arc::clone(&view.zones),
+        key_bloom: Arc::clone(&view.key_bloom),
+        seqno,
+        closed: view.closed,
+    }
+}
+
+/// 历史时点每个 RowId 可见的最新版本(`tx_ms` 之前最后一个版本)。
+fn historical_latest(
+    view: &ReaderView,
+    tx_ms: i64,
+) -> HashMap<crate::core::types::RowId, crate::core::types::SlotId> {
     let mut latest: HashMap<crate::core::types::RowId, crate::core::types::SlotId> = HashMap::new();
     for (rowid, chain) in view.versions.iter() {
         let mut chosen = None;
@@ -30,14 +58,25 @@ pub(crate) fn snapshot_at(view: &ReaderView, tx_ms: i64) -> ReaderView {
             latest.insert(*rowid, slot);
         }
     }
+    latest
+}
 
+/// 历史视图的 `dead` 位图、`key` 索引与水位(墓碑不可见,活版本清除 `dead`)。
+fn history_visibility(
+    view: &ReaderView,
+    latest: &HashMap<crate::core::types::RowId, crate::core::types::SlotId>,
+) -> (
+    BitSet,
+    HashMap<(crate::core::types::NsId, crate::core::types::Key), crate::core::types::RowId>,
+    SeqNo,
+) {
     let mut dead = BitSet::default();
     for idx in 0..view.slots.len() {
         dead.set(idx);
     }
     let mut key_index = HashMap::new();
     let mut seqno = SeqNo::new(0);
-    for (rowid, slot) in &latest {
+    for (rowid, slot) in latest {
         let slot_data = &view.slots[slot.get() as usize];
         seqno = SeqNo::new(seqno.get().max(slot_data.seqno.get()));
         if slot_data.deleted {
@@ -48,24 +87,7 @@ pub(crate) fn snapshot_at(view: &ReaderView, tx_ms: i64) -> ReaderView {
             key_index.insert((slot_data.ns_id, key.clone()), *rowid);
         }
     }
-
-    ReaderView {
-        slots: Arc::clone(&view.slots),
-        dead: Arc::new(dead),
-        key_index: Arc::new(key_index),
-        versions: Arc::clone(&view.versions),
-        latest: Arc::new(latest),
-        out_edges: Arc::clone(&view.out_edges),
-        in_edges: Arc::clone(&view.in_edges),
-        access: Arc::clone(&view.access),
-        ns_registry: Arc::clone(&view.ns_registry),
-        index: view.index.clone(),
-        inv: Arc::clone(&view.inv),
-        zones: Arc::clone(&view.zones),
-        key_bloom: Arc::clone(&view.key_bloom),
-        seqno,
-        closed: view.closed,
-    }
+    (dead, key_index, seqno)
 }
 
 #[cfg(test)]
@@ -81,17 +103,18 @@ mod tests {
     #[test]
     fn snapshot_at_preserves_index_handle() {
         let mut ws = WriterState::new();
-        ws.index = Some(Arc::new(HnswIndex::build(
-            &[],
-            HnswParams::default(),
-            Metric::Dot,
-        )));
+        let built = Arc::new(HnswIndex::build(&[], HnswParams::default(), Metric::Dot));
+        Arc::make_mut(&mut ws.indexes).push(crate::memory::index::SegmentIndex::new(
+            0,
+            built,
+            Vec::new(),
+        ));
         let view = ws.snapshot();
-        assert!(view.index.is_some(), "构造的视图应携带索引");
+        assert!(!view.indexes.is_empty(), "构造的视图应携带索引");
 
         let snapshot = snapshot_at(&view, i64::MAX);
         assert!(
-            snapshot.index.is_some(),
+            !snapshot.indexes.is_empty(),
             "as_of 历史视图必须保留索引句柄(不得静默降级为暴力)"
         );
     }

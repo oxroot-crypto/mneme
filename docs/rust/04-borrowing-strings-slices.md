@@ -260,7 +260,7 @@ impl Key {
 }
 ```
 
-见 [`src/core/types.rs:220-247`](../../src/core/types.rs)。
+见 [`src/core/types.rs:221-247`](../../src/core/types.rs)。
 
 - `Arc<str>` 是**原子引用计数的共享字符串**。`Key` 被克隆时只增加引用计数,不复制字符串内容,
   非常适合"同一条记忆的 key 要在多处出现"的场景。
@@ -326,10 +326,10 @@ fn resolve_ns_id(&self, view: &ReaderView) -> Option<NsId> {
 }
 ```
 
-见 [`src/query/exec.rs:168-176`](../../src/query/exec.rs)。`ns_registry` 的值类型是 `Arc<str>`,
+见 [`src/query/exec.rs:195-202`](../../src/query/exec.rs)。`ns_registry` 的值类型是 `Arc<str>`,
 迭代给出 `path: &Arc<str>`,所以 `**path` 一路解到 `str`;`self.ns_path: Arc<str>`,`*self.ns_path`
 同样解到 `str`——两边比较的是字符内容。测试里 `**path == *"n"` 的 `*"n"` 也是把字面量 `&str`
-解一层得到 `str`(见 [`src/query/plan.rs:114-117`](../../src/query/plan.rs))。
+解一层得到 `str`(见 [`src/query/plan.rs:190`](../../src/query/plan.rs))。
 
 ### 3.4 原始字符串与"模式" API:L4 解析器的字符串日常
 
@@ -356,17 +356,17 @@ trimmed.starts_with(')')
 rest.strip_prefix(keyword)                                      // Option<&str>,不是"剩余切片"
 ```
 
-见 [`src/query/parse/mod.rs:110-121`](../../src/query/parse/mod.rs) 与
+见 [`src/query/parse.rs:110-121`](../../src/query/parse.rs) 与
 [`src/query/display.rs:133-140`](../../src/query/display.rs)。常用成员:
 `starts_with`/`ends_with`/`contains`/`find`/`split`/`trim_start_matches` 等。
 不带模式的 `trim_start()` / `trim_end()` / `trim()` 则去掉开头 / 结尾 / 两端的全部 Unicode 空白
 (与 `trim_start_matches` 要传模式不同);L4 解析器用它跳过关键字后面的空格,如
-`after.trim_start().starts_with('(')`,见 [`src/query/parse/mod.rs:123-133`](../../src/query/parse/mod.rs)。
+`after.trim_start().starts_with('(')`,见 [`src/query/parse.rs:123-133`](../../src/query/parse.rs)。
 
 > `str::strip_prefix` 返回 `Option<&str>`:匹配时是"去掉前缀后的借用",不匹配是 `None`,
 > 所以常配 `let ... else`(见 [05 §4.6](05-errors.md))做"匹配失败就早退"。L4 解析器
 > 用它判定 `true`/`now`/`ts`/`exists` 等关键字,既完成比较又顺手吃掉输入
-> (见 [`src/query/parse/mod.rs:111-121`](../../src/query/parse/mod.rs))。
+> (见 [`src/query/parse.rs:111-121`](../../src/query/parse.rs))。
 
 ---
 
@@ -431,7 +431,7 @@ pub(crate) struct QueryRef<'a> {
 - 它**不拥有**向量(字段类型是 `&'a [f32]`),所以实例不能活得比被借用的向量久——编译器保证;
 - 函数签名里用 `QueryRef<'_>`(省略具体名字)或 `QueryRef<'a>` 都行:
   `search_layer(&self, query: QueryRef<'_>, ...)`,见
-  [`src/index/hnsw.rs:224-230`](../../src/index/hnsw.rs);
+  [`src/index/hnsw.rs:243-249`](../../src/index/hnsw.rs);
 - 字段都是 `Copy`(引用与 `f32` 都 `Copy`),所以 `QueryRef` 自己也能 `derive(Copy)`,
   按值传递十分廉价——它像一个"带数据的借用凭证"。
 
@@ -458,7 +458,7 @@ impl<'a> Parser<'a> {
 }
 ```
 
-见 [`src/query/parse/mod.rs:61-82`](../../src/query/parse/mod.rs)。三个新知识点:
+见 [`src/query/parse.rs:61-82`](../../src/query/parse.rs)。三个新知识点:
 
 - **`impl<'a> Parser<'a>`**:为带生命周期参数的类型实现方法时,`impl` 块也要引入 `'a`;
   如果方法不返回 `'a`,也可以写 `impl Parser<'_>` 省去命名(见
@@ -472,7 +472,7 @@ impl<'a> Parser<'a> {
 
 > 这也解释了 `parse_at` 为什么可以建一个临时 `Parser`、拿完结果就丢:AST 里的
 > `String` / `Arc<str>` 都是拥有型(见 §3),不借解析器;真正借用输入的返回值都被
-> 限制在 `'a` 之内(见 [`src/query/parse/mod.rs:50-59`](../../src/query/parse/mod.rs))。
+> 限制在 `'a` 之内(见 [`src/query/parse.rs:50-59`](../../src/query/parse.rs))。
 
 ### 4.6 一个实用的记忆法
 
@@ -520,7 +520,7 @@ pub(crate) struct Table {
 }
 ```
 
-见 [`src/memory/table/state.rs`](../../src/memory/table/state.rs)。
+见 [`src/memory/table/handle.rs`](../../src/memory/table/handle.rs)。
 
 - `Mutex<T>`(互斥锁)保证同一时刻只有一个写者;`RwLock<T>`(读写锁)允许多个读者**并发**、
   写者独占。写路径慢且要串行,读路径要尽可能并发——所以各用一把合适的锁。
@@ -537,7 +537,7 @@ pub(crate) fn write(&self) -> MutexGuard<'_, WriterState> {
 }
 ```
 
-见 [`src/memory/table/state.rs`](../../src/memory/table/state.rs)。
+见 [`src/memory/table/handle.rs`](../../src/memory/table/handle.rs)。
 
 - `lock()` 返回 `LockResult`:持锁线程 panic 会让锁**中毒(poisoned)**,后续 `lock()` 得到 `Err`。
   mneme 的选择是**恢复数据继续**(不让一次 panic 永久废掉整库),所以用
@@ -559,7 +559,7 @@ let id = NEXT_QUERY_ID.fetch_add(1, Ordering::Relaxed);
 ```
 
 见 [`src/query/exec.rs:35`](../../src/query/exec.rs) 与
-[`src/query/exec.rs:262-265`](../../src/query/exec.rs)。要点:
+[`src/query/exec.rs:291`](../../src/query/exec.rs)。要点:
 
 - `static` 是**整个程序唯一**的变量(比 `const` 多一个固定地址);普通 `static mut` 的读写
   是 `unsafe`,而 `AtomicU64` 提供安全的原子读写,`&self` 也能改内部值——这是它版本的
@@ -574,6 +574,181 @@ let id = NEXT_QUERY_ID.fetch_add(1, Ordering::Relaxed);
 - 测试里的**假时钟**也是原子:`struct FakeClock(AtomicI64)` 用 `load`/`store` 在 `&self`
   下推进时间,既满足 `Clock` 签名,又能注入并发测试(见
   [`tests/l4_contracts.rs:31-38`](../../tests/l4_contracts.rs))。
+
+### 5.3 线程与跨线程共享:L5 的后台维护线程
+
+到 L4 为止所有代码都在调用方线程里跑;L5 要"后台每 30s 把访问计数落盘、必要时
+compaction",于是第一次真正创建线程。标准库把线程放在 `std::thread`:
+
+```rust
+let join = std::thread::Builder::new()
+    .name("mneme-maintenance".to_string())
+    .spawn(move || run(context, stop));
+```
+
+见 [`src/life/maintenance.rs:116-118`](../../src/life/maintenance.rs)。要点:
+
+- `spawn` 接收 `FnOnce + Send + 'static` 的闭包:线程活得可能比函数长,所以捕获
+  的东西必须**移动进去**(`move`)、能跨线程(`Send`,见 [06 §3.3](06-generics-traits.md))、
+  且不含短期借用(`'static`)。
+- `Builder::new().name(...)` 只给线程起名(调试/日志可见);线程创建失败(资源耗尽)
+  返回 `Err`,mneme 的处理是**降级为"仅显式调用"**,不影响正确性。
+- `JoinHandle::join()` 等待线程结束并取回闭包返回值;`JoinHandle` 自身 `Send + Sync`,
+  可存进结构体,由"最后一个库句柄"调用。
+
+**`Weak` + `Arc`:让后台线程不阻止库关闭**。后台线程若持有 `Arc<Table>`,强引用计数
+就永远 > 0,库关不掉。标准的破环手法是 `Arc::downgrade` 拿**弱引用**:
+
+```rust
+let context = MaintenanceContext {
+    table: Arc::downgrade(table),   // Weak<Table>,不增加强计数
+    ...
+};
+// 线程每轮工作:库已销毁 → 本轮返回 false,主循环据此退出
+let Some(table) = context.table.upgrade() else {
+    return false;
+};
+```
+
+见 [`src/life/maintenance.rs:104-109`](../../src/life/maintenance.rs) 与
+[`src/life/maintenance.rs:170-178`](../../src/life/maintenance.rs)(字段与 `Weak` 工具见
+[`src/life/maintenance.rs:9`](../../src/life/maintenance.rs) 的模块文档)。`Weak<T>` 不增加引用计数;
+`upgrade()` 在强引用归零后返回 `None`。库句柄反过来用 `Arc::strong_count` 判断
+"我是不是最后一个":`strong_count(&self.stop) <= 2`(见
+[`src/life/maintenance.rs:76-78`](../../src/life/maintenance.rs))。
+
+**`Condvar`:让线程睡到"有事干"再醒**。维护线程不能空转烧 CPU,又不能 `sleep` 死等
+(关闭时要立刻醒)。条件变量配一把 `Mutex<bool>`:
+
+```rust
+/// 停止信号 + 唤醒条件变量。
+stop: Arc<(Mutex<bool>, Condvar)>,
+
+// 睡:带超时醒来(每轮还要处理周期任务)
+let (lock, cvar) = &*self.stop;
+let guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+let _ = cvar.wait_timeout(guard, timeout);
+
+// 醒:改共享状态、发通知(在持锁时改)
+*lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+cvar.notify_all();
+```
+
+见 [`src/life/maintenance.rs:39`](../../src/life/maintenance.rs)、
+[`src/life/maintenance.rs:45-50`](../../src/life/maintenance.rs)(醒段)与
+[`src/life/maintenance.rs:81-86`](../../src/life/maintenance.rs)(睡段)。经典陷阱:
+
+- `wait_timeout` **先解锁再睡**,醒来**重新加锁**;返回 `(guard, WaitTimeoutResult)`。
+- 唤醒可能是**虚假唤醒(spurious wakeup)**:醒来必须重新检查谓词,不能"醒了就当真"。
+- 先改共享状态、再 `notify_all`(通常在同一把锁内),否则可能丢通知。
+- `Mutex` 中毒时 mneme 一律 `unwrap_or_else(|poisoned| poisoned.into_inner())` 恢复
+  (§5.1 的理由)。
+
+**`thread::scope`:借用非 `'static` 数据的并行**。L1 的并行暴力扫描要把 `&view` /
+`&query` 分给多个线程,但 `spawn` 要求 `'static`。`std::thread::scope` 允许线程借用
+作用域内的数据,作用域结束自动 join:
+
+```rust
+// ...(上部省略 `chunk` 计算)
+let partials = std::thread::scope(|scope| {
+    let handles: Vec<_> = params
+        .candidates
+        .chunks(chunk)
+        .map(|part| scope.spawn(move || scan_chunk(params, part)))
+        .collect();
+    handles
+        .into_iter()
+        .map(|handle| match handle.join() {
+            Ok(local) => Ok(local),
+            // 工作线程 panic:打分阶段的内部不变量被破坏,绝不静默吞掉
+            // (静默吞掉会返回偏少的结果,违反「拒绝静默失败」)。
+            Err(_) => Err(MnemeError::Inconsistent {
+                reason: "并行扫描工作线程异常终止",
+            }),
+        })
+        .collect::<Result<Vec<_>>>()
+})?;
+```
+
+见 [`src/memory/search.rs:326-354`](../../src/memory/search.rs)。要点:
+
+- 闭包返回什么,`scope` 就返回什么;`scope` 保证**所有线程在返回前 join**,所以借用
+  合法、不会泄漏线程。
+- `move` 闭包按值捕获 `params`(它本身是 `&ScanParams`,是个引用,复制它不会移动
+  原数据)。
+- `join()` 返回 `Result`:线程 panic 会被这里观察到——mneme 选择把它显式转成
+  `Inconsistent`,而不是当没看见(缺结果比报错更危险)。
+
+**CAS:无锁的"检查再更新"**。`fetch_add` 是"盲加";`MonotonicClock` 要"只在更大时
+更新"(时钟回拨保护),用 `compare_exchange_weak` 循环:
+
+```rust
+let mut last = self.last.load(Ordering::Relaxed);
+// CAS 循环:返回观测到的最大值;回拨时返回历史最大值。
+while now > last {
+    match self
+        .last
+        .compare_exchange_weak(last, now, Ordering::Relaxed, Ordering::Relaxed)
+    {
+        Ok(_) => return now,
+        Err(observed) => last = observed,
+    }
+}
+last
+```
+
+见 [`src/core/options/clock.rs:54-70`](../../src/core/options/clock.rs)。要点:
+
+- `compare_exchange_weak(current, new, ...)` 只有"内存里仍是 `current`"才写入 `new`;
+  否则返回 `Err(实际值)`,循环里用实际值重试。
+- **`weak` 版本可能伪失败**(值没变也返回 `Err`),所以必须循环;`compare_exchange`
+  不会伪失败,但允许伪失败的场合 `weak` 在部分架构上更快。
+- 这里只追求"单值单调",`Ordering::Relaxed` 够用(同 §5.2 的计数器);若要借原子写
+  向其他线程**发布**数据,才需要 `Acquire`/`Release` 配对。
+
+### 5.4 `Drop`:作用域结束时的自动清理
+
+Rust 没有 GC,但有**析构函数**:值离开作用域时自动调用 `Drop::drop`。锁的自动解锁
+(§5.1)、`Arc` 的引用计数递减、文件关闭,都靠它。自定义类型可以手写:
+
+```rust
+impl Drop for Mneme {
+    fn drop(&mut self) {
+        // 最后一个库句柄释放时同步停掉后台维护,保证独占锁随 `Store` Drop 及时释放;
+        // 其它句柄(命名空间/快照)仍存活时线程继续,由弱引用失效自行退出。
+        if let Some(maintenance) = &self.maintenance
+            && maintenance.is_last_handle()
+        {
+            maintenance.stop();
+        }
+    }
+}
+```
+
+见 [`src/memory/engine.rs:41-51`](../../src/memory/engine.rs)。要点:
+
+- `Drop::drop(&mut self)` 在值销毁前调用一次;不能手动调用,但可用 `drop(value)`
+  提前触发。
+- **`Drop` 不能返回错误、也不能阻止销毁**。所以"失败需要上报"的清理在 `Drop` 里
+  只能尽力而为:
+
+```rust
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // 显式解锁(等价于关闭句柄);锁文件保留,避免 inode 分裂破坏互斥。
+        // reason: `Drop` 无法传播错误;句柄随本结构体关闭也会由内核释放锁。
+        self._file.unlock().ok();
+    }
+}
+```
+
+见 [`src/persist/storage.rs:265-271`](../../src/persist/storage.rs)。正因如此,mneme
+把持久性承诺放在显式 `close()`(返回 `Ok` 才算已确认写入全部持久);`Drop` 只做
+"停线程、释放句柄、释放锁",不执行 flush。
+- **RAII(Resource Acquisition Is Initialization)**:把"获取资源"绑定到"对象构造",
+  "释放资源"绑定到"对象析构",编译器保证不漏。锁守卫(`MutexGuard`)、`File`、
+  `JoinHandle` 都是这个模式的实例。
+- `Arc` 唯一的泄漏场景是**循环强引用**;`Weak`(§5.3)正是打破循环的工具。
 
 ---
 
@@ -606,6 +781,13 @@ let id = NEXT_QUERY_ID.fetch_add(1, Ordering::Relaxed);
   `impl<'a> Parser<'a>` 为带生命周期参数的类型实现方法。
 - `&self` 只读,`&mut self` 可写;`static` + `AtomicU64` 则是无锁的共享计数器
   (`fetch_add` 返回旧值,`Ordering` 决定可见性强度)。
+- 线程:`thread::spawn` 的闭包必须 `move + Send + 'static`;`thread::scope` 允许借用
+  作用域数据并自动 join;`JoinHandle::join()` 返回 `Result`,线程 panic 在这里被观察。
+- `Weak`/`Arc::downgrade`/`upgrade` 打破强引用环(后台线程不阻止库 Drop);
+  `Condvar` + `Mutex<bool>` 实现"带超时睡眠 + 唤醒",注意虚假唤醒与丢通知。
+- `compare_exchange_weak` 是"检查再更新",可能伪失败,必须放在循环里重试。
+- `Drop` 在作用域结束时自动清理(RAII),但**不能返回错误**;持久性承诺放在显式
+  `close()`,`Drop` 只停线程、释放句柄与锁。
 
 ## 动手练习
 
@@ -614,6 +796,9 @@ let id = NEXT_QUERY_ID.fetch_add(1, Ordering::Relaxed);
 3. 试着同时创建两个 `&mut` 引用,读报错,用花括号缩小作用域修好。
 4. 定义 `struct Word<'a> { text: &'a str }`,实现 `fn tail(&self) -> &'a str`(返回去掉首字符的切片),
    并解释返回类型为什么不能省写 `'a`。
+5. 用 `std::thread::scope` 把一个 `Vec<u32>` 分成两半并行求和,比较与单线程版本的结果。
+6. 给一个结构体实现 `Drop`,在 `drop` 里打印日志;分别用作用域结束和 `drop(value)`
+   触发它,观察调用时机。
 
 ## 下一章
 

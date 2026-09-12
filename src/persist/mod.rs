@@ -15,7 +15,7 @@
 //! * `source` —— 段读取后端抽象(`SegmentSource` 与 `FileSource`/`MmapSource`)。
 //! * `storage` —— 目录布局、原子写入与独占文件锁。
 //! * `trash` —— 旧段文件的延迟删除。
-//! * `flush` —— 写状态 → 段文件(全量快照)。
+//! * `flush` —— 写状态 → 增量段文件(未落盘槽位 + delta)。
 //! * `recover` —— 段文件 + WAL → 写状态。
 //! * `store` —— 协调句柄 `Store`(实现 `PersistHook`、`flush`、`open`)。
 //!
@@ -32,8 +32,7 @@ pub(crate) mod msec;
 pub(crate) mod recover;
 // L3 段读取后端(`SegmentSource`/`FileSource`/`MmapSource`,设计 04 §11):
 // `read_whole` 统一经此读取段字节;`FileSource`/`MmapSource` 随 feature `mmap`
-// 二选一,未启用分支在编译期可能未被使用,故保留 dead_code 豁免。
-#[allow(dead_code)]
+// 二选一(各后端个未用分支在模块内定点豁免)。
 pub(crate) mod source;
 pub(crate) mod storage;
 pub(crate) mod store;

@@ -15,22 +15,30 @@ use std::sync::Mutex;
 /// 可直接零拷贝访问整段字节(`MmapSource`,L3),返回 `None` 时走 `read_at`。
 pub(crate) trait SegmentSource: Send + Sync {
     /// 若后端支持零拷贝,返回整段字节切片;否则返回 `None`。
+    // reason: 关闭 `mmap` 时无零拷贝后端,`slice` 仅保留接口形状(设计 04 §11)。
+    #[cfg_attr(not(feature = "mmap"), allow(dead_code))]
     fn slice(&self) -> Option<&[u8]>;
 
     /// 从偏移 `off` 起读满 `buf`。
     ///
     /// # Errors
     /// 底层文件读取失败或不足 `buf.len()` 字节时返回 [`std::io::Error`]。
+    // reason: 启用 `mmap` 时生产路径走零拷贝 `slice`,该回退读法仅 `FileSource` 使用。
+    #[cfg_attr(feature = "mmap", allow(dead_code))]
     fn read_at(&self, off: u64, buf: &mut [u8]) -> std::io::Result<()>;
 }
 
 /// 基于 `std::fs::File` 的段数据源(`seek + read`)。
 ///
 /// 文件句柄经 [`Mutex`] 串行化,满足 `Sync`;段文件不可变,故无写竞争。
+// reason: 启用 `mmap` 时生产路径走 `MmapSource`,`FileSource` 保留为显式回退后端
+// (设计 04 §11);`--no-default-features`(关闭 feature `mmap`)下启用。
+#[cfg_attr(feature = "mmap", allow(dead_code))]
 pub(crate) struct FileSource {
     file: Mutex<File>,
 }
 
+#[cfg_attr(feature = "mmap", allow(dead_code))]
 impl FileSource {
     /// 只读打开指定路径。
     ///
@@ -56,6 +64,7 @@ impl FileSource {
     }
 }
 
+#[cfg_attr(feature = "mmap", allow(dead_code))]
 impl SegmentSource for FileSource {
     fn slice(&self) -> Option<&[u8]> {
         None
@@ -127,7 +136,7 @@ impl SegmentSource for MmapSource {
 ///
 /// 开启 `mmap` 时用 [`MmapSource`] 的零拷贝切片(内核按页惰性载入)拷贝为 `Vec`;
 /// 关闭时用 [`FileSource`](`Read + Seek`)。L3 恢复阶段需要自有字节以重建内存表,
-/// 真正的"零拷贝驻留"随 L5/L6 的段句柄重构落地(设计 04 §11)。
+/// 真正的"零拷贝驻留"随 L6 的段句柄重构落地(设计 04 §11)。
 ///
 /// # Errors
 /// 文件不存在或读取失败时返回底层 [`std::io::Error`]。

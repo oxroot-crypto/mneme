@@ -16,14 +16,12 @@ use crate::memory::table::WriterState;
 use crate::persist::hook::FsyncHook;
 use crate::persist::manifest::Manifest;
 use crate::persist::recover;
-use crate::persist::storage::{
-    self, FileLock, SEGMENTS_DIR, WAL_DIR, hidx_name, msec_name, vsec_name,
-};
+use crate::persist::storage::{self, FileLock, SEGMENTS_DIR, WAL_DIR};
 use crate::persist::trash;
 use crate::persist::wal;
 
 use super::manifest_io;
-use super::wal_writer::{WAL_FILE, WalConfig, WalWriter};
+use super::wal_writer::{self, WalConfig, WalWriter};
 use super::{ManifestState, Store};
 
 /// 新建库时首个可分配的关系类型编号(内建关系占用 `0..16`)。
@@ -47,6 +45,8 @@ pub(crate) struct OpenOptions {
     pub(crate) hook: Option<Arc<dyn FsyncHook>>,
     /// 索引工厂(L3);`None` = 不载入 hidx(恒暴力)。
     pub(crate) index_factory: Option<Arc<dyn IndexFactory>>,
+    /// WAL 单文件轮转阈值(字节;`0` = 不轮转)。
+    pub(crate) wal_file_bytes: u64,
     /// 进阶调参(分词开关 / 字段上限 / bloom 误判率;恢复期重建加速结构用)。
     pub(crate) tuning: Tuning,
 }
@@ -131,6 +131,7 @@ fn wal_config(manifest: &Manifest, options: &OpenOptions) -> WalConfig {
         dimension: manifest.dimension,
         metric: manifest.metric,
         policy: options.fsync,
+        max_file_bytes: options.wal_file_bytes,
         hook: options.hook.clone(),
         read_only: options.read_only,
     }
@@ -171,16 +172,17 @@ fn load_or_init_manifest(root: &Path, options: &OpenOptions) -> Result<(Manifest
     }
 }
 
-/// WAL 是否含至少一个完整可应用帧(用于区分「首次 flush 崩溃」与「MANIFEST 丢失」)。
+/// WAL 文件集是否含至少一个完整可应用帧(区分「首次 flush 崩溃」与「MANIFEST 丢失」)。
 fn wal_has_frames(root: &Path) -> Result<bool> {
-    let Some(bytes) = storage::read_file_opt(root, WAL_FILE)? else {
-        return Ok(false);
-    };
-    match wal::visit_frames(&bytes, |_, _, _, _| Ok(())) {
-        Ok(valid_len) => Ok(valid_len > wal::FILE_HEADER_LEN),
-        // 头部损坏视作无可应用帧(来源不明,交由上层拒绝覆盖)。
-        Err(_) => Ok(false),
+    for rel in wal_writer::wal_files(root)? {
+        let bytes = storage::read_file(root, &rel)?;
+        match wal::visit_frames(&bytes, |_, _, _, _| Ok(())) {
+            Ok(valid_len) if valid_len > wal::FILE_HEADER_LEN => return Ok(true),
+            // 头部损坏视作无可应用帧(来源不明,交由上层拒绝覆盖)。
+            _ => {}
+        }
     }
+    Ok(false)
 }
 
 /// 校验调用方请求的维度/度量与既有 MANIFEST 一致。
@@ -208,15 +210,18 @@ fn verify_requested_identity(
     Ok(())
 }
 
-/// 无 MANIFEST 但可能有 WAL(崩溃在首次 flush 前):以 WAL 头为准初始化。
+/// 无 MANIFEST 但可能有 WAL(崩溃在首次 flush 前):以最早 WAL 文件头为准初始化。
 fn init_manifest_from_wal(
     root: &Path,
     requested_dimension: Option<u32>,
     requested_metric: Option<Metric>,
     stopwords: bool,
 ) -> Result<Manifest> {
-    let wal_header = storage::read_file_opt(root, WAL_FILE)?
-        .and_then(|bytes| wal::parse_file_header(&bytes).ok());
+    let wal_header = wal_writer::wal_files(root)?.into_iter().find_map(|rel| {
+        storage::read_file(root, &rel)
+            .ok()
+            .and_then(|bytes| wal::parse_file_header(&bytes).ok())
+    });
     let dimension = resolve_dimension(requested_dimension, wal_header.as_ref())?;
     let metric = resolve_metric(requested_metric, wal_header.as_ref())?;
     Ok(Manifest {
@@ -268,23 +273,15 @@ fn resolve_metric(
 
 /// 载入 MANIFEST 所列段并回放 WAL,重建写状态。
 ///
-/// 损坏段(头部不可解析)在非 fail-fast 下被移到 `trash/` 并跳过。
+/// 损坏段(头部/区级结构不可解析)在非 fail-fast 下仅内存跳过,文件原地保留
+/// (MANIFEST 仍引用,移动会使后续打开拒启)。
 fn load_write_state(
     root: &Path,
     manifest: &Manifest,
     options: &OpenOptions,
 ) -> Result<WriterState> {
     let mut state = recover::empty_state(manifest);
-    // 恢复期重建的加速结构必须与建库配置同口径(分词/字段上限/bloom 误判率):
-    // 停用词开关以 MANIFEST 为准(建库即锁定),否则查询分词与索引分词不一致会静默漏召回。
-    state.stopwords_enabled = manifest.stopwords;
-    state.index_fields_max = options.tuning.field_dict_max as usize;
-    state.bloom_fpp = options.tuning.bloom_fpp;
-    state.zones = Arc::new(ZoneIndex::new(options.tuning.field_dict_max as usize));
-    state.key_bloom = Arc::new(BloomSet::new(
-        BLOOM_INITIAL_CAPACITY,
-        options.tuning.bloom_fpp,
-    ));
+    prepare_rebuild_structures(&mut state, manifest, options);
     let segments =
         manifest_io::read_segment_bytes(root, manifest, options.fail_fast_on_corruption)?;
     let recovered = recover::load_segments(
@@ -293,50 +290,124 @@ fn load_write_state(
         options.verify_on_open,
         options.fail_fast_on_corruption,
     )?;
-    move_skipped_segments_to_trash(root, &recovered.skipped, options.read_only)?;
-    // 载入 hidx 并安装到写状态(索引是优化:损坏时降级暴力,`check()` 报告)。
-    if let Some(factory) = options.index_factory.as_ref()
-        && let Some(remap) = recovered.remap.as_ref()
-        && let Some(hidx) = segments.first().and_then(|segment| segment.hidx.as_ref())
-    {
+    // 损坏段保持在原地、仅在内存跳过:MANIFEST 仍引用它们,绝不自动移到
+    // `trash/`(否则下次打开会因"引用段缺失"拒绝启动,隔离变成删数据)。
+    // 段数据可能仍可人工修复,`check()` 会报告损坏段。
+    if let Some(factory) = options.index_factory.as_ref() {
+        state.indexes = load_hidx_indexes(
+            &state,
+            &HidxxLoadInput {
+                segments: &segments,
+                recovered: &recovered,
+                options,
+                factory,
+                metric: manifest.metric,
+            },
+        )?;
+    }
+    replay_all_wal(&mut state, root, manifest, options)?;
+    Ok(state)
+}
+
+/// 初始化恢复期重建加速结构所需的配置口径。
+///
+/// 必须与建库配置同口径(分词/字段上限/bloom 误判率):停用词开关以 MANIFEST 为准
+/// (建库即锁定),否则查询分词与索引分词不一致会静默漏召回。
+fn prepare_rebuild_structures(state: &mut WriterState, manifest: &Manifest, options: &OpenOptions) {
+    state.stopwords_enabled = manifest.stopwords;
+    state.index_fields_max = options.tuning.field_dict_max as usize;
+    state.bloom_fpp = options.tuning.bloom_fpp;
+    state.zones = Arc::new(ZoneIndex::new(options.tuning.field_dict_max as usize));
+    state.key_bloom = Arc::new(BloomSet::new(
+        BLOOM_INITIAL_CAPACITY,
+        options.tuning.bloom_fpp,
+    ));
+}
+
+/// [`load_hidx_indexes`] 的输入(参数收敛)。
+struct HidxxLoadInput<'a> {
+    /// 各段字节(含可选 hidx)。
+    segments: &'a [recover::SegmentBytes],
+    /// 恢复结果(重排映射与跳过段)。
+    recovered: &'a recover::RecoveredSegments,
+    /// 打开选项(fail-fast 等)。
+    options: &'a OpenOptions,
+    /// 图构建工厂。
+    factory: &'a Arc<dyn IndexFactory>,
+    /// 距离度量。
+    metric: Metric,
+}
+
+/// 载入各段 hidx 并安装为多段索引(索引是优化:损坏时降级暴力,`check()` 报告)。
+fn load_hidx_indexes(
+    state: &WriterState,
+    input: &HidxxLoadInput<'_>,
+) -> Result<Arc<Vec<crate::memory::index::SegmentIndex>>> {
+    let mut indexes = Vec::new();
+    for segment in input.segments {
+        if input.recovered.skipped.contains(&segment.segment_id) {
+            continue;
+        }
+        let Some(remap) = input
+            .recovered
+            .remaps
+            .iter()
+            .find(|remap| remap.segment_id == segment.segment_id)
+        else {
+            continue;
+        };
+        let Some(hidx) = segment.hidx.as_ref() else {
+            continue;
+        };
         match load_index(
-            factory,
+            input.factory,
             hidx,
             SlotRemap {
-                state: &state,
-                remap,
+                state,
+                remap: &remap.remap,
             },
-            manifest.metric,
+            input.metric,
         ) {
-            Ok(index) => state.index = Some(index),
-            Err(error) if options.fail_fast_on_corruption => return Err(error),
-            // reason: 索引是查询加速器而非数据来源;hidx 损坏时降级为暴力扫描仍然正确,
-            // `db.check()` 会校验 hidx 字节并报告损坏;节点数不匹配的降级可由
+            Ok(index) => {
+                let slots: Vec<SlotId> = remap
+                    .remap
+                    .iter()
+                    .map(|&global| SlotId::new(global))
+                    .collect();
+                indexes.push(crate::memory::index::SegmentIndex::new(
+                    segment.segment_id,
+                    index,
+                    slots,
+                ));
+            }
+            Err(error) if input.options.fail_fast_on_corruption => return Err(error),
+            // reason: 索引是查询加速器而非数据来源;hidx 损坏时降级为暴力扫描仍然
+            // 正确,`db.check()` 会校验 hidx 字节并报告损坏;节点数不匹配的降级可由
             // `stats().segments[*].index_nodes == 0` 观测,绝不静默丢数据。
             Err(_) => {}
         }
     }
-    // 回放 WAL(仅 seqno > watermark),并在可写打开时截断撕裂尾部。
-    if let Some(bytes) = storage::read_file_opt(root, WAL_FILE)? {
-        let valid_len = recover::replay_wal(&mut state, &bytes, manifest.watermark_seqno)?;
-        // 撕裂帧之后的字节会永久屏蔽后续追加,必须物理截断后再复用该 WAL。
-        if !options.read_only && valid_len < bytes.len() {
-            storage::truncate(root, WAL_FILE, valid_len as u64)?;
-        }
-    }
-    Ok(state)
+    Ok(Arc::new(indexes))
 }
 
-/// 把被隔离的损坏段三件套移入 `trash/`(只读打开不动文件系统)。
-fn move_skipped_segments_to_trash(root: &Path, skipped: &[u32], read_only: bool) -> Result<()> {
-    if read_only || skipped.is_empty() {
-        return Ok(());
+/// 回放全部 WAL 文件(仅 seqno > watermark),并截断最后一个文件的撕裂尾部。
+fn replay_all_wal(
+    state: &mut WriterState,
+    root: &Path,
+    manifest: &Manifest,
+    options: &OpenOptions,
+) -> Result<()> {
+    let wal_files = wal_writer::wal_files(root)?;
+    for (position, rel) in wal_files.iter().enumerate() {
+        let bytes = storage::read_file(root, rel)?;
+        let valid_len = recover::replay_wal(state, &bytes, manifest.watermark_seqno)?;
+        // 撕裂帧之后的字节会永久屏蔽后续追加,必须物理截断后再复用该 WAL;
+        // 只有最后一个文件可能带撕裂尾(轮转前该文件已完整 fsync)。
+        if position + 1 == wal_files.len() && !options.read_only && valid_len < bytes.len() {
+            storage::truncate(root, rel, valid_len as u64)?;
+        }
     }
-    let names: Vec<String> = skipped
-        .iter()
-        .flat_map(|id| [vsec_name(*id), msec_name(*id), hidx_name(*id)])
-        .collect();
-    trash::move_to_trash(root, &names)
+    Ok(())
 }
 
 /// [`load_index`] 的槽位来源:恢复后的写状态与"段内槽位 → 全局槽位"重排映射。
@@ -350,7 +421,7 @@ struct SlotRemap<'a> {
 /// 由 hidx 字节与恢复出的槽位构建索引。
 ///
 /// # Errors
-/// hidx 解析失败(损坏/版本过高)或重排映射越界时返回结构化错误。
+/// hidx 解析失败(损坏/版本不一致)或重排映射越界时返回结构化错误。
 fn load_index(
     factory: &Arc<dyn IndexFactory>,
     hidx: &[u8],
@@ -417,6 +488,7 @@ mod tests {
         fn build(
             &self,
             _nodes: &[IndexNode],
+            _slot_of: &[SlotId],
             _params: HnswParams,
             _metric: Metric,
         ) -> Arc<dyn VectorIndex> {

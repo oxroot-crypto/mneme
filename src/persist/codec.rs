@@ -5,29 +5,22 @@
 
 use crate::core::error::{MnemeError, Result};
 
-/// 当前支持的文件格式版本:高 8 位主版本、低 8 位次版本(设计 04 §2、§12)。
+/// 当前文件格式版本:高 8 位主版本、低 8 位次版本(设计 04 §2)。
 ///
-/// 次版本 2:L4 起 msec 的 field_dict / zone map / bloom / 倒排四区实际写入。
-pub(crate) const FORMAT_VERSION: u16 = 0x0002;
+/// 项目尚未发布,不存在需要读取的旧开发格式;任何版本差异都直接拒绝
+/// (不保留旧版本读取分支),详见 `AGENTS.md`「项目状态与兼容纪律」。
+pub(crate) const FORMAT_VERSION: u16 = 0x0004;
 
-/// 库支持的最大主版本;`major(found) > MAX_MAJOR` 时拒绝打开(I18)。
-pub(crate) const MAX_MAJOR: u8 = 0x00;
-
-/// 取出版本号的主版本(高 8 位)。
-pub(crate) const fn major(version: u16) -> u8 {
-    (version >> 8) as u8
-}
-
-/// 校验文件主版本是否可读;更高主版本返回 [`MnemeError::UnsupportedVersion`](I18)。
+/// 校验文件格式版本必须与 `expected` 完全一致(I18)。
 ///
-/// # Errors
-/// `major(found) > MAX_MAJOR` 时返回 [`MnemeError::UnsupportedVersion`]。
-pub(crate) fn check_version(file: &'static str, found: u16) -> Result<()> {
-    if major(found) > MAX_MAJOR {
+/// 项目未发布:主/次版本任何不一致都返回
+/// [`MnemeError::UnsupportedVersion`],不给旧开发格式留宽容读取路径。
+pub(crate) fn check_version(file: &'static str, found: u16, expected: u16) -> Result<()> {
+    if found != expected {
         return Err(MnemeError::UnsupportedVersion {
             file,
             found,
-            max: FORMAT_VERSION,
+            max: expected,
         });
     }
     Ok(())
@@ -165,13 +158,20 @@ pub(crate) fn put_bytes_u32(out: &mut Vec<u8>, bytes: &[u8]) {
 mod tests {
     use super::*;
 
+    /// I18:未发布期格式版本必须精确等于当前定义,任何差异都拒绝。
     #[test]
-    fn version_gate_rejects_higher_major() {
-        assert!(check_version("vsec", FORMAT_VERSION).is_ok());
-        // 同主版本、更高次版本可按"忽略未知可选字段"读取。
-        assert!(check_version("vsec", 0x00FF).is_ok());
+    fn version_gate_rejects_any_mismatch() {
+        assert!(check_version("vsec", FORMAT_VERSION, FORMAT_VERSION).is_ok());
         assert!(matches!(
-            check_version("vsec", 0x0100),
+            check_version("vsec", FORMAT_VERSION - 1, FORMAT_VERSION),
+            Err(MnemeError::UnsupportedVersion {
+                file: "vsec",
+                found: 0x0003,
+                max: FORMAT_VERSION,
+            })
+        ));
+        assert!(matches!(
+            check_version("vsec", 0x0100, FORMAT_VERSION),
             Err(MnemeError::UnsupportedVersion {
                 file: "vsec",
                 found: 0x0100,

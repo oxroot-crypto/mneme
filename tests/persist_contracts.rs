@@ -69,7 +69,10 @@ fn reopen_after_drop_recovers_from_wal() {
     } // 不 close,直接 drop
 
     let db = Mneme::open(dir.path()).expect("reopen");
-    assert!(db.namespace("demo").get("x").expect("get").is_some());
+    let ns = db.namespace("demo");
+    let record = ns.get("x").expect("get").expect("已确认写入必须完整可见");
+    assert_eq!(record.key(), Some("x"));
+    assert_eq!(record.vector(), [1.0, 2.0, 3.0]);
     db.close().expect("close");
 }
 
@@ -389,10 +392,10 @@ fn touch_boost_survives_crash() {
     db.close().expect("close");
 }
 
-/// **FC-PERSIST-ERR-002(I18)**:段主版本过新 → `UnsupportedVersion`,即使默认
-/// 非 fail-fast 也拒绝打开(绝不降级为跳过)。
+/// **FC-PERSIST-ERR-002(I18)**:段格式版本与当前定义不一致(无论高低)→
+/// `UnsupportedVersion`,即使默认非 fail-fast 也拒绝打开(绝不降级为跳过)。
 #[test]
-fn higher_major_segment_is_rejected() {
+fn segment_version_mismatch_is_rejected() {
     let dir = tempfile::tempdir().expect("tempdir");
     {
         let db = build(dir.path(), 2);
@@ -402,15 +405,21 @@ fn higher_major_segment_is_rejected() {
         db.close().expect("close");
     }
     let vsec = dir.path().join("segments").join("seg_000000.vsec");
-    let mut bytes = std::fs::read(&vsec).expect("read");
-    // 版本在 head 校验之前判定,故无需重算头部 CRC。
-    bytes[4..6].copy_from_slice(&0x0100_u16.to_le_bytes());
-    std::fs::write(&vsec, &bytes).expect("write");
-
-    assert!(matches!(
-        Mneme::open(dir.path()),
-        Err(mneme::MnemeError::UnsupportedVersion { .. })
-    ));
+    let original = std::fs::read(&vsec).expect("read");
+    // 版本在 head 校验之前判定,故无需重算头部 CRC;高/低版本都必须拒绝。
+    for version in [0x0100_u16, 0x0003] {
+        let mut bytes = original.clone();
+        bytes[4..6].copy_from_slice(&version.to_le_bytes());
+        std::fs::write(&vsec, &bytes).expect("write");
+        assert!(
+            matches!(
+                Mneme::open(dir.path()),
+                Err(mneme::MnemeError::UnsupportedVersion { .. })
+            ),
+            "版本 {version:#06x} 必须拒绝"
+        );
+    }
+    std::fs::write(&vsec, &original).expect("restore");
 }
 
 /// **FC-PERSIST-ERR-003**:只读打开不创建/改写 WAL 文件,且可读既有数据。
@@ -553,10 +562,10 @@ fn backup_is_independently_openable() {
     db.close().expect("close");
 }
 
-/// **FC-PERSIST-INV-004(I4)**:WAL 达到 `wal_bytes` 上限自动触发全量快照 flush,
+/// **FC-PERSIST-INV-004(I4)**:WAL 达到 `wal_bytes` 上限自动触发增量段 flush,
 /// WAL 有界、数据不丢。
 #[test]
-fn wal_capacity_triggers_snapshot_flush() {
+fn wal_capacity_triggers_incremental_flush() {
     let dir = tempfile::tempdir().expect("tempdir");
     let compaction = mneme::CompactionPolicy {
         wal_bytes: 2048,

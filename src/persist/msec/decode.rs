@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::core::error::{MnemeError, Result};
-use crate::persist::{Cursor, check_version, crc32};
+use crate::persist::{Cursor, FORMAT_VERSION, check_version, crc32};
 
 use super::entry::decode_entry;
 use super::{
@@ -37,6 +37,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<MsecView<'_>> {
         ns_stats: slice_of(bytes, header.regions.ns_stats),
         zmap: slice_of(bytes, header.regions.zmap),
         bloom: slice_of(bytes, header.regions.bloom),
+        delta: slice_of(bytes, header.regions.delta),
         relations: slice_of(bytes, header.regions.rel),
         payload_crc: header.payload_crc,
         payload_crc_ok: None,
@@ -52,7 +53,8 @@ fn parse_header(bytes: &[u8]) -> Result<HeaderLayout> {
             reason: "msec: 魔数不符".to_string(),
         });
     }
-    check_version("msec", cursor.u16()?)?;
+    let version = cursor.u16()?;
+    check_version("msec", version, FORMAT_VERSION)?;
     let header_len = cursor.u16()?;
     if header_len != HEADER_LEN {
         return Err(MnemeError::Corrupted {
@@ -159,6 +161,7 @@ pub(crate) struct MsecView<'a> {
     ns_stats: &'a [u8],
     zmap: &'a [u8],
     bloom: &'a [u8],
+    delta: &'a [u8],
     relations: &'a [u8],
     payload_crc: u32,
     payload_crc_ok: Option<bool>,
@@ -245,27 +248,32 @@ impl MsecView<'_> {
         Ok(rows)
     }
 
-    /// relations 区原始字节(可能为空)。
+    /// relations 区原始字节(空表也带 `EDG1` 头)。
     pub(crate) const fn relations_bytes(&self) -> &[u8] {
         self.relations
     }
 
-    /// 字段字典区原始字节(L4;无索引字段时为空)。
+    /// delta 区原始字节(空区 = 本段无跨段变更)。
+    pub(crate) const fn delta_bytes(&self) -> &[u8] {
+        self.delta
+    }
+
+    /// 字段字典区原始字节(恒非空)。
     pub(crate) const fn field_dict_bytes(&self) -> &[u8] {
         self.field_dict
     }
 
-    /// zone map 区原始字节(L4;无索引字段时为空)。
+    /// zone map 区原始字节(含区尾 `ttl_map`)。
     pub(crate) const fn zmap_bytes(&self) -> &[u8] {
         self.zmap
     }
 
-    /// bloom 区原始字节(L4;无 `key` 字段时为空)。
+    /// bloom 区原始字节(`key` 字段)。
     pub(crate) const fn bloom_bytes(&self) -> &[u8] {
         self.bloom
     }
 
-    /// 倒排区原始字节(L4;无文本记录时为空)。
+    /// 倒排区原始字节(空表也带版头)。
     pub(crate) const fn inverted_bytes(&self) -> &[u8] {
         self.inverted
     }

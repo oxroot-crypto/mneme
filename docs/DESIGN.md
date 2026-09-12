@@ -23,8 +23,8 @@ Mneme 采用**渐进式分层设计**:自底向上共 7 层(L0–L6),每层只�
 
 ```mermaid
 flowchart TD
-    F["门面层 lib.rs<br/>Mneme / Namespace / Builder<br/>(feature: async)"]
-    Q["L6 打磨层 quant/<br/>量化 + 重打分 · async 门面 · 基准"]
+    F["门面层 lib.rs<br/>Mneme / Namespace / Builder<br/>(async 门面为 L6 规划)"]
+    Q["L6 打磨层 quant/<br/>量化 + 重打分 · async 门面 · 基准<br/>(规划)"]
     L["L5 生命周期层 life/<br/>TTL · 遗忘曲线 · compaction<br/>命名空间 · 快照备份"]
     QL["L4 检索层 query/<br/>过滤 DSL · BM25 · RRF 融合 · 去重"]
     H["L3 索引层 index/<br/>自研 HNSW · 过滤感知搜索 · mmap"]
@@ -33,10 +33,10 @@ flowchart TD
     C["L0 原语层 core/<br/>类型 · 错误 · SIMD 距离 · TopK 堆 · varint"]
 
     subgraph 产品能力层
-        MD["model/ 记忆模型<br/>关系 · 双时态 · 沉淀"]
-        SC["score/ 排序层<br/>综合打分 · 联想 · 反馈 · MMR"]
-        SEC["crypto+compress/ 可选<br/>静态加密 · 压缩"]
-        DEP["deploy+obs/ 部署<br/>只读共享 · WASM · 可观测"]
+        MD["model/ 记忆模型(规划)<br/>关系 · 双时态 · 沉淀"]
+        SC["score/ 排序层(规划)<br/>综合打分 · 联想 · 反馈 · MMR"]
+        SEC["crypto+compress/ 可选(规划)<br/>静态加密 · 压缩"]
+        DEP["deploy+obs/ 部署(规划)<br/>只读共享 · WASM · 可观测"]
     end
 
     F --> Q --> L --> QL --> H --> P --> M --> C
@@ -91,14 +91,14 @@ flowchart TD
 | [15-glossary.md](design/15-glossary.md) | 术语表(中英对照)、符号表、复杂度速查总表 | 所有人 |
 | [16-api-reference.md](design/16-api-reference.md) | 完整公开 API、配置总表、打开校验、错误/重试、线程安全、集成、备份恢复 runbook、数据限额 | 所有人 |
 | [spec/contracts.md](spec/contracts.md) | 形式化契约矩阵(FC-Matrix)与测试追溯 | 贡献者 |
-| [rust/README.md](rust/README.md) | **Rust 零基础教学**(10 章):以 mneme 源码为教材,覆盖读懂 L0、L1、L3 与 L4 所需的全部 Rust 语法(L1/L3/L4 新特性回填至各章) | 无 Rust 基础者 |
+| [rust/README.md](rust/README.md) | **Rust 零基础教学**(10 章):以 mneme 源码为教材,覆盖读懂 L0 与 L1–L5 各层新引入的全部 Rust 语法(L1–L5 新特性回填至各章) | 无 Rust 基础者 |
 
 ---
 
 ## 阅读路线
 
 **我完全没写过 Rust**(零基础,约 6–10 小时):
-先读 [Rust 零基础教学](rust/README.md) 的 10 章(以 `src/core/` 源码为教材、L1/L3/L4 新特性回填至各章,边读边敲),
+先读 [Rust 零基础教学](rust/README.md) 的 10 章(以 `src/core/` 源码为教材、L1–L5 新特性回填至各章,边读边敲),
 再回到这里按"贡献者"路线阅读。教学文档与源码的映射总表见
 [rust/README.md §4](rust/README.md)。
 

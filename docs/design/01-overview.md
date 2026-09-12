@@ -142,7 +142,7 @@ flowchart LR
 |---|---|---|---|---|
 | L0 | `core/` | 类型/错误/ID、SIMD 距离、TopK 堆、varint | 无 I/O 数学库 | 距离函数对照测试 |
 | L1 | `memory/` | 全内存引擎、暴力扫描、过滤 AST、去重预检 | **纯内存向量库**(易失,可用于测试/缓存);**公开 API 在此冻结** | 全 API 集成测试 |
-| L2 | `persist/` | WAL、vsec/msec 段、MANIFEST、恢复、墓碑删除 | 重启不丢数据;WAL 超限自动全量快照兜底 | 崩溃注入测试全绿 |
+| L2 | `persist/` | WAL、vsec/msec 段、MANIFEST、恢复、墓碑删除 | 重启不丢数据;WAL 超限自动增量段 flush 兜底 | 崩溃注入测试全绿 |
 | L3 | `index/` | 自研 HNSW、hidx 持久化、过滤三档搜索 | 同一 API 下暴力→ANN 无感升级;mmap 引入(可关) | Recall@10 ≥ 0.95 |
 | L4 | `query/` | 过滤 DSL 解析、zone map 下推、BM25+RRF、去重 | 混合检索可用 | 混合检索集成测试 |
 | L5 | `life/` | TTL、遗忘曲线、size-tiered compaction、命名空间、快照/备份、stats | **超长期闭环**:段数有界、安全遗忘 | 24h 长跑测试 |
@@ -155,14 +155,16 @@ flowchart LR
 
 **渐进式的两个关键手段**:
 
-> **落地状态**:L0–L4 已实现(L3 = `src/index/` 自研 HNSW + `hidx` 持久化 + 过滤三档,
+> **落地状态**:L0–L5 已实现(L3 = `src/index/` 自研 HNSW + `hidx` 持久化 + 过滤三档,
 > 验收 `tests/hnsw_contracts.rs`;L4 = `src/query/` 过滤 DSL + zone map/bloom 计划器 +
-> BM25/RRF 融合 + msec 四区落盘,验收 `tests/l4_contracts.rs`);L5–L6 尚无代码。
+> BM25/RRF 融合 + msec 四区落盘,验收 `tests/l4_contracts.rs`;L5 = `src/life/` 多段
+> size-tiered compaction + 后台维护 + TTL 块剪枝 + 命名空间/快照/备份/统计运维面,
+> 验收 `tests/l5_contracts.rs`);L6 尚无代码。
 
 1. **接口先于实现**:公开 API 在 L1 冻结(暴力与 HNSW 同签名),L3 **引入内部 trait
    `memory::index::{VectorIndex, IndexFactory}`** 作为暴力→HNSW 的替换缝;L2 的段文件头从第一天就带 `format_version` 字段。
    (L1/L2 直接在引擎内实现公开语义,不下沉该内部 trait;见 [03 §8](03-l1-memory.md)。)
-2. **每层有兜底**:L2 阶段(还没有 compaction)用"WAL 总量超 256MB 自动全量快照兜底"([04 §3.2](04-l2-persist.md));
+2. **每层有兜底**:L2 阶段用"WAL 总量超 256MB 自动 flush 兜底"(L5 起为增量段,[04 §3.2](04-l2-persist.md));
    L3 永远保留暴力扫描作为过滤极端选择性时的第三档策略。
    系统在每一层都是"完整能跑"的,性能和功能是逐层叠加的。
 
@@ -183,17 +185,17 @@ mneme/
 │   ├── memory/         # L1:engine.rs engine_ops.rs builder/ namespace/ analysis/ table/ snapshot.rs snapshot_scan.rs search_builder.rs expand.rs rerank.rs index.rs search.rs pred.rs pred_eval.rs record.rs write_helpers.rs mutate_helpers.rs dedup.rs relation.rs temporal.rs score.rs lifecycle.rs ops.rs config.rs
 │   ├── persist/        # L2:mod.rs codec.rs hook.rs wal/ msec/ recover/ store/ vsec.rs manifest.rs edges.rs flush.rs source.rs storage.rs trash.rs
 │   ├── index/          # L3:hnsw.rs graph.rs filtered.rs rebuild.rs hidx.rs factory.rs
-│   ├── query/          # L4:parse/{mod,literal}.rs display.rs json.rs iso.rs plan.rs zmap.rs bm25.rs fusion.rs exec.rs
-│   ├── life/           # L5:ttl.rs retain.rs access.rs namespace.rs compact.rs backup.rs stats.rs
-│   ├── quant/          # L6:scalar_i8.rs f16.rs rescore.rs
-│   ├── model/          # 记忆模型:relation.rs temporal.rs provenance.rs consolidate.rs   (09)
-│   ├── score/          # 排序层:formula.rs expand.rs feedback.rs diversify.rs           (10)
-│   ├── crypto/         # feature encrypt:aead.rs keyring.rs                              (11)
-│   ├── compress/       # feature compress:codec.rs lz4.rs                                (11)
-│   ├── deploy/         # readonly.rs                                                    (12)
-│   └── obs/            # observer.rs                                                      (12)
+│   ├── query/          # L4:parse.rs parse/literal.rs display.rs json.rs iso.rs plan.rs zmap.rs bm25.rs fusion.rs exec.rs
+│   ├── life/           # L5:compact.rs(选段/幸存版本)maintenance.rs(后台维护)
+│   ├── (L6 规划) quant/    # 量化:scalar_i8.rs f16.rs rescore.rs(当前无此目录)
+│   ├── (规划) model/       # 记忆模型;当前实现见 memory/{relation,temporal}.rs、score.rs、namespace/life.rs (09)
+│   ├── (规划) score/       # 排序层;当前实现见 memory/{score,expand,rerank}.rs               (10)
+│   ├── (规划) crypto/      # feature encrypt:aead.rs keyring.rs                               (11)
+│   ├── (规划) compress/    # feature compress:codec.rs lz4.rs                                 (11)
+│   ├── (规划) deploy/      # readonly.rs                                                      (12)
+│   └── (规划) obs/         # observer.rs                                                      (12)
 ├── benches/            # criterion 基准(L3 起)
-├── fuzz/               # cargo-fuzz 目标(L6 起)
+├── fuzz/               # cargo-fuzz 目标(L6 起;当前无此目录)
 ├── tests/              # 契约验收 + contract_traceability.rs 追溯门禁
 ├── docs/               # 本文档
 │   └── spec/           # FC-Matrix 形式化契约
@@ -239,6 +241,11 @@ dev-dependencies(不进入发布产物):`proptest`、`tempfile`、`criterion`。
 | feature | 默认 | 引入 | 说明 |
 |---|---|---|---|
 | `mmap` | ✅ 开 | `memmap2` | 关闭后段文件走 `FileSource`(`Read + Seek`),功能不变、稍慢 |
+
+> **当前 `Cargo.toml` 仅定义 `mmap`**;下表其余 feature 为规划项(对应层落地时才引入依赖),`cargo` 暂不识别。
+
+| feature(规划) | 默认 | 引入 | 说明 |
+|---|---|---|---|
 | `async` | ❌ 关 | `tokio` | 提供 `insert().await` 等 async API |
 | `quant-f16` | ❌ 关 | `half` | 提供 f16 量化副本;关闭时只有 f32/i8 |
 | `encrypt` | ❌ 关 | `aes-gcm` | 静态加密([11 §2](11-security-storage.md)) |
@@ -284,7 +291,7 @@ ns.update("mem_001", UpdatePatch::new().text(Some("用户偏好深色模式".int
 let hits: Vec<Hit> = ns.search().vector(&q)
     .top_k(10).ef(128)
     .filter(filter!(r#"kind == "preference" && importance > 0.5"#))
-    .score(Scoring::new().w_recency(0.2).w_importance(0.3))   // 见 10
+    .score(Scoring { w_recency: 0.2, w_importance: 0.3, ..Scoring::default() })   // 见 10
     .diversify(Diversity::Mmr { lambda: 0.7 })
     .execute()?;
 
@@ -326,13 +333,14 @@ ns.retain(Retention::new()
 
 // ---- 命名空间 / 运维 ----
 let names = db.list_namespaces()?;
-db.drop_namespace("agent-42/session-88")?;                // 含子命名空间
+db.drop_namespace("agent-42/session-88")?;                // 含子命名空间,返回墓碑行数
 let snap = db.snapshot();                                 // 钉住当前版本的只读句柄
 let s = db.stats()?;        // 段数/行数/WAL 尺寸/延迟直方图/每 NS 统计
-db.check()?;                // fsck:校验 CRC 与索引一致性
-db.backup_to("./backup")?;  // 一致性快照备份
-db.flush()?;                // 显式落盘(把可变表写成段)
-db.close()?;                // flush + 释放文件锁;Drop 只尽力 flush
+db.check()?;                // fsck:校验 CRC 与索引一致性,并给出合并建议
+db.backup_to("./backup")?;  // 一致性快照备份(同盘优先硬链接)
+db.compact()?;              // 显式触发一轮 size-tiered compaction
+db.flush()?;                // 显式落盘(把可变表写成增量段)
+db.close()?;                // flush + 停后台维护 + 释放文件锁;Drop 不 flush、不保证持久
 ```
 
 > 示例中的 `json!` / `filter!` 由库导出;`ts("2024-03-01")` 为 ISO 8601 → Unix 毫秒的示意辅助函数。
@@ -359,17 +367,17 @@ db.close()?;                // flush + 释放文件锁;Drop 只尽力 flush
 | `Scoring` / `ScoreBreakdown` / `Diversity` / `RelationExpand` / `TimeAxis` | 综合打分及其因子分解 / MMR / 联想扩展 / 时间轴(见 10) |
 | `RelationKind` / `RelationIndex` / `Edge` / `Feedback` / `QueryId` | 记忆关系、反向索引与检索反馈(见 09/10) |
 | `ConsolidationPolicy` / `Summarizer` / `ConsolidateReport` | 记忆沉淀(见 09) |
-| `Encryption` / `KeyProvider` / `Cipher` / `Compression` / `Codec` | 静态加密与压缩(见 11,可选 feature) |
-| `Storage` / `Observer` / `Event` / `WriteOp` | 存储抽象与可观测(见 12) |
-| `VectorFormat` | `F32 / F16 / I8Rescored`(L6 量化) |
+| `Encryption` / `KeyProvider` / `Cipher` / `Compression` / `Codec` | 静态加密与压缩(见 11;**L11 规划**,`Compression` 配置已接线、实现未落地) |
+| `Storage` / `Observer` / `Event` / `WriteOp` | 存储抽象与可观测(见 12;**L12 规划**,当前无此 API) |
+| `VectorFormat` | `F32 / F16 / I8Rescored`(**L6 未落地**,当前仅记录配置、不生效) |
 | `HnswParams` / `CompactionPolicy` / `Tuning` / `Limits` | 索引 / 合并 / 进阶调参 / 数据限额配置 |
 | `Clock` | 时间源注入(测试确定性) |
 | `SnapshotHandle` | 钉住某 ReaderView(段集 + 可变表快照)的只读句柄;经 `namespace()` 取命名空间视图(时间旅行读) |
 | `SnapshotNamespace` | 快照上的命名空间只读视图,提供 `search`/`get`/`iter` 等读取面 |
-| `AsyncNamespace` | async 门面(feature `async`),共享同一底层句柄 |
+| `AsyncNamespace` | async 门面(**L6 规划**,feature `async` 尚未定义),共享同一底层句柄 |
 | `Reranker` / `QueryCtx` | 精排回调钩子及其查询上下文 |
 | `Stats` / `SegmentStat` / `NsStat` / `Histogram` / `QuantStat` / `StorageStat` / `HistoryStat` | 运行统计(段/WAL/延迟/每命名空间/量化/合并/存储安全/版本链) |
-| `CheckReport` / `BackupReport` / `RetainReport` / `SnapshotStats`(L5 规划) | 运维报告(前三者已落地,`backup_to` 持久库自 L2 可用、纯内存库 `Unsupported`;`SnapshotStats` 待 L5) |
+| `CheckReport` / `BackupReport` / `RetainReport` / `SnapshotStats` | 运维报告(`SnapshotStats` 为快照钉住视图的段数/行数/水位) |
 | `CompactionState` / `CompactionControl` | 后台合并状态与 pause/resume 控制 |
 | `AccessStat` | 单条记录的访问统计(`last_access_ms` / `access_count`) |
 | `MnemeError` | 统一错误(见 [02 §2](02-l0-core.md)) |

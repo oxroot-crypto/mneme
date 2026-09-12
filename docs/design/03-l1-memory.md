@@ -133,8 +133,9 @@ impl Mneme {
 ```
 
 - `flush` 是 `FsyncPolicy::OnFlush` 的显式触发点,也是备份/compaction 的一致性点;
-- `close` 返回 `Ok` 即代表所有已确认写入持久(I16);`Drop` 只**尽力** `flush`
-  并忽略错误,需要确保持久性时必须显式 `close`。崩溃场景的恢复见
+- `close` 返回 `Ok` 即代表所有已确认写入持久(I16);`Drop` **不做 flush**,只停止后台
+  维护线程并释放句柄(锁随 `Store` 释放)——已确认写入靠 WAL 恢复
+  (`FC-PERSIST-POST-003`),需要确保持久性时必须显式 `close`。崩溃场景的恢复见
   [04 §7](04-l2-persist.md),用户侧 runbook 见 [16 §7](16-api-reference.md);
 - **克隆与关闭**:`Mneme` 克隆共享同一底层库;`close(self)` 关闭的是**共享库**而非单个
   句柄——首个 `close` 完成 `flush` 并释放文件锁,此后所有克隆(及其派生的 `Namespace`)
@@ -168,7 +169,10 @@ SlotData { rowid, ns_id, ns_path, seqno, key, vector: Arc<[f32]>, norm_sq,
            text, text_hash, meta, created_at, expires_at, importance, confidence,
            valid_from, valid_to, provenance, tx_ms, deleted }
 ReaderView = WriterState 的不可变快照(仅克隆 Arc 句柄):slots / dead / key_index /
-             versions / latest / out_edges / in_edges / access / ns_registry / seqno / closed
+             versions / latest / out_edges / in_edges / access / ns_registry /
+             indexes(各段向量索引) / slot_segment(槽位 → 所属段) /
+             reclaimed_versions(累计回收版本数) / inv(内存倒排) /
+             zones(块级 zone map) / key_bloom / seqno / closed
 ```
 
 - **一个 RowId 是一条版本链**:`versions[RowId]` 按 seqno 升序保存全部保留版本(记录体或墓碑),
@@ -310,7 +314,9 @@ impl FieldBuilder {
 
 求值器位于 `pred_eval.rs`(AST 与组合器在 `pred.rs`)。
 单行求值 $O(|E|)$;短路求值:`And` 左支 false 即停,`Or` 左支 true 即停——
-AST 构造时**把高选择性条件放左边**(L4 计划器自动做重排,见 [06 §2](06-l4-query.md))。
+建议 AST 构造时把高选择性条件放左边;注意**残余谓词的选择性重排尚未落地**
+(计划器当前按原 AST 三值求值,见 [06 §2](06-l4-query.md)),块级下推已剪掉
+大多数不相关块,重排只影响残余部分的工作量。
 
 ---
 

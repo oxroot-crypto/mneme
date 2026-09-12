@@ -57,32 +57,51 @@ fn tokenize_segment(segment: &str, stopwords_enabled: bool, out: &mut Vec<String
     let mut chars = segment.chars().peekable();
     while let Some(c) = chars.next() {
         if is_cjk(c) {
-            let mut run = String::new();
-            run.push(c);
-            while let Some(&next) = chars.peek() {
-                if is_cjk(next) {
-                    run.push(next);
-                    chars.next();
-                } else {
-                    break;
-                }
-            }
-            push_cjk_run(&run, stopwords_enabled, out);
+            consume_cjk_run(c, &mut chars, stopwords_enabled, out);
         } else {
-            let mut run = String::new();
-            run.push(c);
-            while let Some(&next) = chars.peek() {
-                if is_cjk(next) {
-                    break;
-                }
-                run.push(next);
-                chars.next();
-            }
-            let token = run.to_lowercase();
-            if !(stopwords_enabled && is_stopword(&token)) {
-                out.push(token);
-            }
+            consume_word_run(c, &mut chars, stopwords_enabled, out);
         }
+    }
+}
+
+/// 消费一段连续 CJK 字符并产出 bigram。
+fn consume_cjk_run(
+    first: char,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    stopwords_enabled: bool,
+    out: &mut Vec<String>,
+) {
+    let mut run = String::new();
+    run.push(first);
+    while let Some(&next) = chars.peek() {
+        if !is_cjk(next) {
+            break;
+        }
+        run.push(next);
+        chars.next();
+    }
+    push_cjk_run(&run, stopwords_enabled, out);
+}
+
+/// 消费一段连续非 CJK 字符并小写化输出(可选停用词过滤)。
+fn consume_word_run(
+    first: char,
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    stopwords_enabled: bool,
+    out: &mut Vec<String>,
+) {
+    let mut run = String::new();
+    run.push(first);
+    while let Some(&next) = chars.peek() {
+        if is_cjk(next) {
+            break;
+        }
+        run.push(next);
+        chars.next();
+    }
+    let token = run.to_lowercase();
+    if !(stopwords_enabled && is_stopword(&token)) {
+        out.push(token);
     }
 }
 

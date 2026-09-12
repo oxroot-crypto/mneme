@@ -36,6 +36,8 @@ const PERSIST_TESTS: &str = include_str!("persist_contracts.rs");
 const HNSW_TESTS: &str = include_str!("hnsw_contracts.rs");
 /// L4 契约验收测试(DSL/BM25/融合/计划器/四区落盘)。
 const L4_TESTS: &str = include_str!("l4_contracts.rs");
+/// L5 契约验收测试(多段增量 flush/delta/WAL 轮转/多图检索)。
+const L5_TESTS: &str = include_str!("l5_contracts.rs");
 /// 承载操作计数单测的源码文件。
 const SRC_SEARCH: &str = include_str!("../src/memory/search.rs");
 const SRC_TABLE: &str = include_str!("../src/memory/table/state.rs");
@@ -68,7 +70,7 @@ const SRC_STORE_OPEN: &str = include_str!("../src/persist/store/open.rs");
 /// L4 计划器源码(块级剪枝等价性单测被契约引用)。
 const SRC_QUERY_PLAN: &str = include_str!("../src/query/plan.rs");
 /// L4 解析器源码(越界/位置错误单测被契约引用)。
-const SRC_QUERY_PARSE: &str = include_str!("../src/query/parse/mod.rs");
+const SRC_QUERY_PARSE: &str = include_str!("../src/query/parse.rs");
 /// L4 BM25 源码(公式/可见性单测被契约引用)。
 const SRC_QUERY_BM25: &str = include_str!("../src/query/bm25.rs");
 /// L4 融合源码(RRF/加权单测被契约引用)。
@@ -91,11 +93,25 @@ const SRC_QUERY_ISO: &str = include_str!("../src/query/iso.rs");
 const SRC_ANALYSIS_INV: &str = include_str!("../src/memory/analysis/inv.rs");
 /// L2 flush 段编码源码(字段字典 `key` 去重单测被 POST 契约引用)。
 const SRC_PERSIST_FLUSH: &str = include_str!("../src/persist/flush.rs");
+/// L2 msec delta 区源码(往返/畸形拒绝单测被 POST/ERR 契约引用)。
+const SRC_MSEC_DELTA: &str = include_str!("../src/persist/msec/delta.rs");
+/// L2 msec 记录体源码(字段标志畸形拒绝单测被 ERR 契约引用)。
+const SRC_MSEC_ENTRY: &str = include_str!("../src/persist/msec/entry.rs");
+/// L2 WAL 写入器源码(文件序号解析单测被 POST 契约引用)。
+const SRC_WAL_WRITER: &str = include_str!("../src/persist/store/wal_writer.rs");
+/// L5 调度源码(选段/幸存筛选单测被 CPLX 契约引用)。
+const SRC_LIFE_COMPACT: &str = include_str!("../src/life/compact.rs");
+/// L2 关系区源码(正/反向表往返单测被 POST 契约引用)。
+const SRC_PERSIST_EDGES: &str = include_str!("../src/persist/edges.rs");
 /// L1 谓词求值源码(保留字段清单同步单测被 POST 契约引用)。
 const SRC_PRED_EVAL: &str = include_str!("../src/memory/pred_eval.rs");
+/// L5 运维源码(compaction 状态机转移单测被 STA 契约引用)。
+const SRC_MEMORY_OPS: &str = include_str!("../src/memory/ops.rs");
+/// L2 增量 flush/备份源码(硬链接回退单测被 POST 契约引用)。
+const SRC_STORE_SNAPSHOT: &str = include_str!("../src/persist/store/snapshot.rs");
 
 /// 契约测试文件(孤立检查与覆盖声明检查的范围)。
-const CONTRACT_TEST_FILES: [(&str, &str); 8] = [
+const CONTRACT_TEST_FILES: [(&str, &str); 9] = [
     ("tests/core_contracts.rs", CORE_TESTS),
     ("tests/memory_contracts.rs", MEMORY_TESTS),
     ("tests/query_contracts.rs", QUERY_TESTS),
@@ -104,10 +120,11 @@ const CONTRACT_TEST_FILES: [(&str, &str); 8] = [
     ("tests/persist_contracts.rs", PERSIST_TESTS),
     ("tests/hnsw_contracts.rs", HNSW_TESTS),
     ("tests/l4_contracts.rs", L4_TESTS),
+    ("tests/l5_contracts.rs", L5_TESTS),
 ];
 
 /// 契约引用的测试可能落在的全部文件(路径必须与 `contracts.md` 中书写一致)。
-const SOURCES: [(&str, &str); 41] = [
+const SOURCES: [(&str, &str); 49] = [
     ("tests/core_contracts.rs", CORE_TESTS),
     ("tests/memory_contracts.rs", MEMORY_TESTS),
     ("tests/query_contracts.rs", QUERY_TESTS),
@@ -116,6 +133,7 @@ const SOURCES: [(&str, &str); 41] = [
     ("tests/persist_contracts.rs", PERSIST_TESTS),
     ("tests/hnsw_contracts.rs", HNSW_TESTS),
     ("tests/l4_contracts.rs", L4_TESTS),
+    ("tests/l5_contracts.rs", L5_TESTS),
     ("src/memory/search.rs", SRC_SEARCH),
     ("src/memory/table/state.rs", SRC_TABLE),
     ("src/memory/lifecycle.rs", SRC_LIFECYCLE),
@@ -135,7 +153,7 @@ const SOURCES: [(&str, &str); 41] = [
     ("src/persist/recover/state.rs", SRC_RECOVER_STATE),
     ("src/persist/store/open.rs", SRC_STORE_OPEN),
     ("src/query/plan.rs", SRC_QUERY_PLAN),
-    ("src/query/parse/mod.rs", SRC_QUERY_PARSE),
+    ("src/query/parse.rs", SRC_QUERY_PARSE),
     ("src/query/bm25.rs", SRC_QUERY_BM25),
     ("src/query/fusion.rs", SRC_QUERY_FUSION),
     ("src/persist/msec/inverted.rs", SRC_MSEC_INVERTED),
@@ -149,6 +167,13 @@ const SOURCES: [(&str, &str); 41] = [
     ("src/memory/analysis/inv.rs", SRC_ANALYSIS_INV),
     ("src/persist/flush.rs", SRC_PERSIST_FLUSH),
     ("src/memory/pred_eval.rs", SRC_PRED_EVAL),
+    ("src/persist/msec/delta.rs", SRC_MSEC_DELTA),
+    ("src/persist/msec/entry.rs", SRC_MSEC_ENTRY),
+    ("src/persist/store/wal_writer.rs", SRC_WAL_WRITER),
+    ("src/life/compact.rs", SRC_LIFE_COMPACT),
+    ("src/persist/edges.rs", SRC_PERSIST_EDGES),
+    ("src/memory/ops.rs", SRC_MEMORY_OPS),
+    ("src/persist/store/snapshot.rs", SRC_STORE_SNAPSHOT),
 ];
 
 /// 契约编号的类型段(五维 + CPLX,见 `contracts.md` §0)。

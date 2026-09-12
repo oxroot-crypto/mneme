@@ -18,4 +18,4 @@ mod state;
 mod wal_replay;
 
 pub(crate) use replay::replay_wal;
-pub(crate) use state::{SegmentBytes, empty_state, load_segments};
+pub(crate) use state::{RecoveredSegments, SegmentBytes, empty_state, load_segments};

@@ -251,3 +251,18 @@ pub(crate) fn decode_ns_register(payload: &[u8]) -> Result<(u32, Arc<str>)> {
     })?;
     Ok((ns_id, Arc::from(path)))
 }
+
+/// 编码 `NsUnregister` 负载 `[NsId]`。
+pub(crate) fn encode_ns_unregister(ns_id: u32) -> Vec<u8> {
+    let mut out = Vec::new();
+    put_u32(&mut out, ns_id);
+    out
+}
+
+/// 解码 `NsUnregister` 负载。
+///
+/// # Errors
+/// 长度不足时返回 [`MnemeError::Corrupted`]。
+pub(crate) fn decode_ns_unregister(payload: &[u8]) -> Result<u32> {
+    Cursor::new(payload, "wal ns_unregister").u32()
+}

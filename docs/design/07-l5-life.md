@@ -6,7 +6,17 @@
 > **本章你将学到**:TTL 双阶段过期 → 访问统计的零写放大设计 → 指数遗忘曲线推导 →
 > compaction 写放大分析 → 命名空间 → 快照备份 → stats/fsck。
 
-模块:`life/{ttl.rs, retain.rs, access.rs, namespace.rs, compact.rs, backup.rs, stats.rs}`
+模块:`life/{compact.rs, maintenance.rs}`(调度与幸存版本筛选)+ 既有挂点
+(`memory/{ttl 逻辑过期, namespace, snapshot, engine_ops}`, `persist/{flush, compact, wal 轮转, delta 区}`);
+`Mneme::maintenance_tick()` 提供手动单轮维护入口(后台线程不可用/测试确定性推进时用);
+公开契约验收见 [`tests/l5_contracts.rs`](../../tests/l5_contracts.rs)。
+
+> **落地状态**:本节语义已随 L5 落地——TTL 两阶段(逻辑过期 + compaction 物理回收,
+> msec `ttl_map` 块级剪枝)、访问攒批后台落盘、自动遗忘(默认关闭)、size-tiered
+> compaction(多段增量段 + MANIFEST 原子替换 + `history_horizon`)、命名空间规范化与
+> 注销持久化、`SnapshotStats`/硬链接备份/死比率 fsck。已知取舍:压缩后的物理槽位从
+> 版本链剪除并标死,但**内存槽位不重排**(零拷贝段句柄属后续层),RSS 回收待段句柄重构;
+> `history_horizon = None`(默认)时墓碑/历史永久保留,物理回收仅在有限窗口下发生。
 
 ---
 
@@ -38,20 +48,21 @@
 **设计:内存累积 + 批量落盘**:
 
 ```text
-查询命中 → 读者把 RowId 追加进线程本地缓冲 → 攒批后合并进
-  Mutex<HashMap<RowId, AccessStat>>     (内存,写者锁外;AccessStat 见 [16 §1.6](16-api-reference.md))
-后台每 30s(默认): 把增量以 WAL Touch/TouchRow 帧落盘(一帧合并多次命中,`access_delta` 记合并后的次数)
+查询命中 → 读者把 RowId 追加进内存访问缓冲(Mutex<HashMap<RowId, u32>>,写者锁外,
+          条目数有上限,超限后新 RowId 丢弃;缓冲只在有持久层或开启自动遗忘时启用)
+         → 攒批时合并进 access 统计(AccessStat 见 [16 §1.6](16-api-reference.md))
+后台每 30s(默认): 把增量以 WAL TouchRow 帧落盘(一帧合并多次命中,`access_delta` 记合并后的次数)
 compaction: 把 Touch 历史并入新 msec 的 last_access / access_count 列([04 §2.2](04-l2-persist.md) entry 格式)
 ```
 
 - 读路径热区只有一次内存 `push`,**写放大 = 0**;
 - 崩溃最多丢 30s 的访问计数——它只影响遗忘速度的估计,不影响正确性,可接受;
-- `ns.touch(key, boost)` 是显式强化:立即 WAL Touch 帧,`boost = Some(d)` 时附带 `importance` 提升
+- `ns.touch(key, boost)` 是显式强化:立即 WAL TouchRow 帧,`boost = Some(d)` 时附带 `importance` 提升
   (Agent 明确说"这点很重要"时)。
 
 ---
 
-## 3. 遗忘曲线:`retain.rs`
+## 3. 遗忘曲线:`memory/lifecycle.rs`
 
 ### 3.1 【直觉】人脑怎么忘
 
@@ -169,44 +180,51 @@ RowId 的版本链:
 保留窗口内,**活跃段数仍有界**(I8),但磁盘随历史版本数线性增长——这是"保留历史"的必然代价。
 
 **版本链物化**:compaction 把同一 RowId 跨段的多版本合并进新段的一条 version_table 记录序列
-(§2.2),墓碑并入 delta;合并只重排物理布局,不改变可见性结果(同快照语义)。
+([04 §2.2](04-l2-persist.md)),墓碑以 version_table 的墓碑行承载、访问/关系变更以
+delta 区承载([04 §2.2a](04-l2-persist.md));合并只重排物理布局,不改变可见性结果(同快照语义)。
 
 ### 4.3 触发条件(任一满足)
 
 | 条件 | 默认阈值 | 针对的问题 |
 |---|---|---|
 | 同层段数 | ≥ 4 | 段数蔓延 |
-| 墓碑+过期占比 | > 25% | 空间/召回浪费(死节点穿越成本,见 [05 §7](05-l3-hnsw.md)) |
-| WAL 压力 | WAL > 256MB | flush 频率过高(小段过多) |
+| 墓碑+过期占比 | > 25% | 空间/召回浪费(死节点穿越成本,见 [05 §7](05-l3-hnsw.md);**仅计 `history_horizon` 窗口外的可回收死行**,默认 `horizon = None` 时无回收收益、不触发,避免无限重写) |
+| WAL 压力 | WAL > 256MB | flush 频率过高(小段过多);**由 WAL 容量兜底触发增量 flush(04 §3.2),不进入 compaction 计划** |
 
 ### 4.4 流程(与崩溃安全)
 
+> **当前实现口径(L5)**:过滤/重建为**单线程顺序**执行,`io_budget` 仅建库校验、
+> 尚未接入限速(并行与配额留后续层);旧段在 MANIFEST 提交后立即 `rename → trash/`
+> 并清理——本层读者只持内存 `Arc` 视图、不长期持有段句柄,无需"最后一个读者释放后
+> 删除"(mmap 惰性驻留属后续层);任何清理失败只遗留孤儿文件,由下次启动清理。
+
 ```text
-1. 调度线程选段组(最少写入热度的优先)→ 生成合并计划(登记,可取消)
-2. scoped threads 并行: 逐版本过滤(墓碑/TTL/retain 评分/history_horizon 超期回收)
+1. 调度线程选段组 → 生成合并计划(登记,可取消)
+2. 顺序执行:逐版本过滤(墓碑/TTL/retain 评分/history_horizon 超期回收)
    → 幸存版本按 RowId 合并成版本链 → 写新 vsec/msec
-3. 对幸存版本并行重建 HNSW(05 §4 的 build,分块并行)+ 重建倒排/zone map
-4. 提交: 新段写完 + CRC → 新 MANIFEST(原子,04 §6)→ 旧段进 trash(04 §9)
+3. 对幸存版本重建 HNSW(05 §4 的 build)+ 重建倒排/zone map
+4. 提交: 新段写完 + CRC → 新 MANIFEST(原子,04 §6)→ 旧段进 trash(04 §9)→ purge
 失败: 任意一步崩溃 → 新段是孤儿(下次启动清理), 旧 MANIFEST 完好, 无损回滚
 ```
 
 ```mermaid
 flowchart LR
-    A["选段组<br/>同层段数 / 死比率 / WAL 压力"] --> B["并行过滤<br/>墓碑 · TTL · retain · horizon"]
+    A["选段组<br/>同层段数 / 死比率 / WAL 压力"] --> B["过滤<br/>墓碑 · TTL · retain · horizon"]
     B --> C["按 RowId 合并版本链<br/>写新 vsec/msec"]
     C --> D["重建 HNSW + 倒排 + zone map"]
     D --> E{"新段 CRC 校验"}
     E -->|通过| F["提交新 MANIFEST<br/>原子替换 current"]
     E -->|失败| G["孤儿段<br/>启动时清理"]
     F --> H["旧段 rename → trash/"]
-    H --> I["最后一个读者释放后删除"]
+    H --> I["立即 purge<br/>(读者只持内存视图)"]
 ```
 
-- **限速**:合并 IO 与前台共享配额(默认磁盘预算 30%),写竞争时主动让路
-  (`db.compact_control()` 的 `pause()` / `resume()`,见 [16 §1.6](16-api-reference.md)),保证查询 P99 不被 compaction 拖爆;
+- **限速**:`pause()` / `resume()` 可在步骤边界中止(见
+  [16 §1.6](16-api-reference.md));`io_budget` 的磁盘配额限速尚未落地(当前为
+  "尽力而为、提交点前可暂停"),查询可见性不受影响;
 - **查询可见性**:合并期间新旧段同时在 MANIFEST 里吗?不——旧段保持到提交瞬间,
   新段在提交后可见,中间的读者要么看旧要么看新(快照语义),永不看到半成品;
-- **结果稳定性**:重建会重排 HNSW 邻接(并行构建 + 新段布局),故同一数据在合并前后
+- **结果稳定性**:重建会重排 HNSW 邻接(新段布局),故同一数据在合并前后
   的近似检索结果可能不同——这是 [05 §6.2](05-l3-hnsw.md) 明示的确定性边界,
   快照句柄(I17)保证的只是"钉住的视图内不变",不保证跨 compaction 相同。
 
@@ -237,7 +255,7 @@ flowchart LR
 
 ```rust
 db.namespace("a/b");            // 不存在则隐式创建(空命名空间不占物理空间)
-db.list_namespaces()?;          // 按前缀树顺序列出全部路径
+db.list_namespaces()?;          // 按规范化路径字典序列出全部路径
 db.drop_namespace("a/b")?;      // 墓碑该路径及其子命名空间下的所有记录,返回行数;
                                 // 按 `/` 段边界匹配("a/b" 不含 "a/bc");物理回收留给 compaction
 ns.iter(None)?;                 // 遍历/导出一个命名空间的全部活记录
@@ -255,7 +273,7 @@ ns.iter(None)?;                 // 遍历/导出一个命名空间的全部活�
 
 ---
 
-## 6. 快照与备份:`backup.rs`
+## 6. 快照与备份:`memory/snapshot.rs` + `persist/store/snapshot.rs`
 
 ```text
 db.snapshot()  → SnapshotHandle: 钉住当前 ReaderView(该时刻的 MANIFEST 段集 +
@@ -283,7 +301,7 @@ neighbors / iter`)见 [16 §1.6](16-api-reference.md);二者均 `Send + Sync`,�
 
 ---
 
-## 7. stats 与 fsck:`stats.rs`
+## 7. stats 与 fsck:`memory/engine_ops.rs`
 
 ```rust
 db.stats()?  -> Stats {
@@ -292,11 +310,11 @@ db.stats()?  -> Stats {
     query_latency: Histogram(固定桶: 1ms..1s, 32 桶),
     per_namespace: HashMap<String, NsStat>,   // 键为命名空间路径(经 MANIFEST 注册表解析)
     quant: QuantStat,              // 配置/生效量化格式 + 召回估计(08 §4.3)
-    compaction: CompactionState,   // Idle | Running{progress, segments},定义见 [16 §1.6](16-api-reference.md)
+    compaction: CompactionState,   // Idle | Running{progress, segments} | Paused,定义见 [16 §1.6](16-api-reference.md)
     retain: Option<RetainReport>,  // 最近一次后台遗忘(未开启则 None,§3.4)
     relations: u64,                // 关系边数(09 §2)
     history: HistoryStat,          // 版本链/历史保留统计(§4.2a)
-    storage: StorageStat,          // 加密/压缩生效状态与迁移进度(11)
+    storage: StorageStat,          // 存储安全配置与迁移进度(压缩实现待 L11;11)
 }
 db.check()?   // fsck: 全量 CRC + version_table/RowId 版本链一致性 + key 索引 ↔ entries 对账
               //           + 墓碑/TTL 占比报告 + 建议动作(如 "建议合并 3 个 25MB 段")

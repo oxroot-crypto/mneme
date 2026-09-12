@@ -5,11 +5,14 @@
 //! * FC-MEM-CPLX-001..003/005(暴力扫描、过滤求值、并行归并、iter 过滤/排序)
 //! * FC-MEM-PRE-003/004、FC-MEM-POST-005、FC-MEM-INV-003
 //! * FC-INDEX-INV-005、FC-INDEX-POST-003、FC-QUERY-ERR-002、FC-QUERY-POST-001
-//! * FC-SCORE-INV-027、FC-SCORE-POST-001、FC-SCORE-POST-002、FC-GLOBAL-PRE-001/004
+//! * FC-SCORE-INV-027、FC-SCORE-POST-001、FC-SCORE-POST-002、FC-SCORE-POST-004/005、FC-GLOBAL-PRE-001/004
+//! * FC-SCORE-CPLX-001..003
 
 use std::sync::Arc;
 
-use mneme::{Diversity, Expr, Feedback, Metric, Mneme, Record, Scoring};
+use mneme::{
+    Diversity, Expr, Feedback, Metric, Mneme, Record, RelationExpand, ResultDedup, Scoring,
+};
 use proptest::prelude::*;
 
 mod common;
@@ -434,6 +437,108 @@ fn scoring_composite_factors_clamped() {
             ns.search()
                 .vector(&[1.0, 0.0])
                 .diversify(Diversity::Mmr { lambda })
+                .execute(),
+            Err(mneme::MnemeError::Config { .. })
+        ));
+    }
+}
+
+/// FC-SCORE-POST-004 / FC-SCORE-CPLX-002(联想扩展只沿同命名空间边推进;
+/// 跨命名空间边即使经 `relate` 记录也视为不存在)
+#[test]
+fn expansion_does_not_cross_namespaces() {
+    use mneme::RelationKind;
+
+    let db = mem(4);
+    let a = db.namespace("a");
+    let b = db.namespace("b");
+    let seed = inserted(
+        a.insert(Record::new(vec![1.0, 0.0, 0.0, 0.0]).key("seed"))
+            .expect("insert"),
+    );
+    let same_ns = inserted(
+        a.insert(Record::new(vec![0.0, 0.0, 1.0, 0.0]).key("same"))
+            .expect("insert"),
+    );
+    let other_ns = inserted(
+        b.insert(Record::new(vec![0.0, 1.0, 0.0, 0.0]).key("other"))
+            .expect("insert"),
+    );
+    a.relate(seed, same_ns, RelationKind::RELATED, 1.0)
+        .expect("relate same ns");
+    a.relate(seed, other_ns, RelationKind::RELATED, 1.0)
+        .expect("relate cross ns");
+
+    let hits = a
+        .search()
+        .vector(&[1.0, 0.0, 0.0, 0.0])
+        .top_k(8)
+        .expand(RelationExpand::default())
+        .execute()
+        .expect("search");
+    let rowids: Vec<u64> = hits.iter().map(|hit| hit.rowid.get()).collect();
+    assert!(rowids.contains(&seed.get()), "种子本身应命中");
+    assert!(rowids.contains(&same_ns.get()), "同命名空间边应扩展命中");
+    assert!(
+        !rowids.contains(&other_ns.get()),
+        "跨命名空间边必须视为不存在(FC-SCORE-POST-004)"
+    );
+}
+
+/// FC-SCORE-POST-005(结果级去重三模式与阈值校验)
+#[test]
+fn result_dedup_modes_and_threshold_validation() {
+    let db = mem(4);
+    let ns = db.namespace("n");
+    ns.insert(Record::new(vec![1.0, 0.0, 0.0, 0.0]).key("a"))
+        .expect("insert");
+    ns.insert(Record::new(vec![1.0, 0.0, 0.0, 0.0]).key("b"))
+        .expect("insert");
+    let query = [1.0, 0.0, 0.0, 0.0];
+
+    // Off(默认):两条同向记录都返回。
+    let hits = ns
+        .search()
+        .vector(&query)
+        .top_k(10)
+        .execute()
+        .expect("search");
+    assert_eq!(hits.len(), 2);
+
+    // ById:RowId 唯一(单通道下结果集不变)。
+    let hits = ns
+        .search()
+        .vector(&query)
+        .top_k(10)
+        .dedup(ResultDedup::ById)
+        .execute()
+        .expect("search");
+    assert_eq!(hits.len(), 2);
+    assert_ne!(hits[0].rowid, hits[1].rowid);
+
+    // Near 0.99:同向重复(余弦 1.0)只保留最高分一条。
+    let hits = ns
+        .search()
+        .vector(&query)
+        .top_k(10)
+        .dedup(ResultDedup::Near { threshold: 0.99 })
+        .execute()
+        .expect("search");
+    assert_eq!(hits.len(), 1);
+
+    // 边界 0.0/1.0 合法;NaN 与越界值在入口拒绝(绝不静默空转)。
+    for threshold in [0.0_f32, 1.0] {
+        ns.search()
+            .vector(&query)
+            .dedup(ResultDedup::Near { threshold })
+            .execute()
+            .expect("边界阈值合法");
+    }
+    for threshold in [f32::NAN, f32::INFINITY, -0.1, 1.1] {
+        assert!(matches!(
+            ns.search()
+                .vector(&query)
+                .dedup(ResultDedup::Near { threshold })
                 .execute(),
             Err(mneme::MnemeError::Config { .. })
         ));

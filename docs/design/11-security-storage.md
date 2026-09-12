@@ -8,8 +8,14 @@
 >
 > 两者均为**可选 feature**,默认关闭时磁盘布局与
 > [04](04-l2-persist.md) 完全一致,依赖白名单不扩大。
+>
+> **落地状态(2026-09)**:**本章尚未落地**——`src/` 无 `crypto/`/`compress/` 模块,
+> feature `encrypt`/`compress` 尚未定义;`Builder` 无加密/密钥相关 API,`Config` 中的
+> `Compression` 仅记录配置、尚未接线压缩实现;磁盘格式仅按 [04 §2.5](04-l2-persist.md)
+> 预留扩展区(`key_id`/`codec` 当前恒 0)。`FC-SEC-*` 契约均为 `Planned`;真实威胁
+> 模型与接口见下文目标设计。
 
-模块:`crypto/{aead.rs, keyring.rs}`(feature `encrypt`)、`compress/{codec.rs, lz4.rs}`(feature `compress`)
+模块:`crypto/{aead.rs, keyring.rs}`(feature `encrypt`)、`compress/{codec.rs, lz4.rs}`(feature `compress`)(规划)
 
 ---
 
@@ -89,8 +95,8 @@ pub struct Encryption { pub provider: Arc<dyn KeyProvider>, pub cipher: Cipher }
 3. 全部段迁移完成后,旧 key_id 可退役
 ```
 
-轮换复用 [04 §12](04-l2-persist.md) 的"在线迁移、混合版本"机制,不阻塞读写;
-`db.stats().storage` 暴露"已迁移段/总段"。
+轮换复用 compaction 的逐段重写流程(尚未落地,属后续层);项目未发布期不保留
+混合版本兼容,`db.stats().storage` 的"已迁移段/总段"随该能力一并落地。
 
 ### 2.5 复杂度与不变量
 
@@ -119,7 +125,7 @@ pub enum Compression { None, Lz4, Zstd }   // 默认 None;`Lz4` 为内置自研�
 
 - 压缩作用于**记录体内的 `text` 与 `meta` 字段**(`[04 §2.2](04-l2-persist.md)` entry 的变长区),
   按字段独立压缩并带 `uncompressed_len` 前缀;向量/norm 不压缩(已定长且量化另有手段);
-- 每段头部记录所用 codec(头部扩展区定义见 [04 §2.5](04-l2-persist.md));`Compression::None` 时字节布局与旧格式一致(向后兼容);
+- 每段头部记录所用 codec(头部扩展区定义见 [04 §2.5](04-l2-persist.md));`Compression::None` 时字节布局与未压缩定义逐字节一致;
 - 可选 feature `compress-zstd` 允许接入更强 codec,默认不引入依赖。
 
 ### 3.3 与 BM25 / 过滤的交互
@@ -147,7 +153,7 @@ pub enum Compression { None, Lz4, Zstd }   // 默认 None;`Lz4` 为内置自研�
 
 1. `Encryption` + `KeyProvider`(feature `encrypt`)与密钥轮换;
 2. `Compression` + `Codec`(feature `compress`)与内置 codec;
-3. `Stats.storage` 暴露加密/压缩生效状态与迁移进度。
+3. `Stats.storage` 暴露加密/压缩的配置值与迁移进度(压缩实现随 L11;见 [16 §5](16-api-reference.md))。
 
 **依赖**:L0(类型)、L2(段/WAL/MANIFEST 布局、`SegmentSource`)、L5(后台迁移复用 compaction)。
 

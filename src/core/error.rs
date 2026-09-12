@@ -91,14 +91,14 @@ pub enum MnemeError {
         /// 实际深度。
         got: usize,
     },
-    /// 文件格式主版本过新,拒绝打开(不变量 I18)。
-    #[error("不支持的文件版本: {file} 发现 {found},最高支持 {max}")]
+    /// 文件格式版本与当前定义不一致,拒绝打开(不变量 I18)。
+    #[error("不支持的文件版本: {file} 发现 {found},当前仅支持 {max}")]
     UnsupportedVersion {
         /// 文件类型名。
         file: &'static str,
         /// 文件中的格式版本。
         found: u16,
-        /// 本库支持的最高格式版本。
+        /// 本库当前支持的格式版本。
         max: u16,
     },
     /// 库已关闭后经任意句柄读写。

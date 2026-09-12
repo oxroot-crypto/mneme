@@ -5,8 +5,14 @@
 > **前置阅读**:[03 §4.3](03-l1-memory.md)(带宽下限分析)、[05 §6](05-l3-hnsw.md)(查询复杂度)、[02 §4](02-l0-core.md)(SIMD)。
 > **本章你将学到**:为什么带宽是瓶颈 → i8 标量量化的公式与误差分析 → f16 →
 > 两阶段检索(粗排 + 重打分)→ 自动回退 → async 门面。
+>
+> **落地状态(2026-09)**:**本章尚未落地**——`src/` 无 `quant/` 模块,feature
+> `quant-f16` 尚未定义;`Builder::quantization` 仅记录用户配置,存储与检索实际恒为
+> f32,`stats().quant.active` 亦恒为 `F32`(绝不回显配置);`FC-QUANT-*` 契约(含
+> 「未开 feature 时构造期返回 `Unsupported`」)均为 `Planned`。本章描述的是 L6
+> 目标设计,实现与设计差异以本节为准。
 
-模块:`quant/{scalar_i8.rs, f16.rs, rescore.rs}`
+模块:`quant/{scalar_i8.rs, f16.rs, rescore.rs}`(规划)
 
 ---
 
@@ -102,9 +108,11 @@ IEEE 754 half:1 位符号 + 5 位指数 + 10 位尾数。相对精度 $2^{-11} \
 定位:i8 的**保守替代**(对误差敏感的库)。
 **F16 同样走两阶段重打分**([08 §4](08-l6-quant.md)):粗排用 f16 副本,精排回 f32——
 因此 `Hit.score` 的口径与 i8 一致(不变量 I12),不是"f16 分数直接返回"。
-`half` crate 只在 `quant-f16` 下编译。**未开启该 feature 时**:`Builder::quantization(VectorFormat::F16)`
-在构造期即返回 `Unsupported { feature: "quant-f16" }`,绝不静默降级;`F32` 与 `I8Rescored`
-不依赖任何 feature。
+`half` crate 只在 `quant-f16` 下编译(L6 目标设计)。**落地前**:`Builder::quantization`
+仅记录配置、不影响存储与检索(实际恒为 f32);待 L6 落地后,**未开启该 feature 时**
+`Builder::quantization(VectorFormat::F16)` 必须于构造期返回
+`Unsupported { feature: "quant-f16" }`,绝不静默降级(契约 `FC-QUANT-ERR-001`,当前
+`Planned`);`F32` 与 `I8Rescored` 不依赖任何 feature。
 
 ---
 
@@ -138,8 +146,8 @@ IEEE 754 half:1 位符号 + 5 位指数 + 10 位尾数。相对精度 $2^{-11} \
 
 > **常见误区**:① 以为开量化后磁盘变小——f32 原向量始终保留,省的只是**查询带宽**;
 > ② 以为 `Hit.score` 是量化分——始终是 f32 精排分(I12);
-> ③ 配置了 `VectorFormat::F16` 却未开 `quant-f16` feature——构造期即返回 `Unsupported`,
-> 不会静默降级。
+> ③ 配置了 `VectorFormat::F16` 却未开 `quant-f16` feature——L6 落地后构造期即返回
+> `Unsupported`,不会静默降级(目标行为,见 §3 落地注)。
 
 ---
 

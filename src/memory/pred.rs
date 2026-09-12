@@ -133,6 +133,9 @@ impl Expr {
     /// # Arguments
     /// * `name` - 字段名;内置保留字段优先于同名 metadata。
     ///
+    /// # Returns
+    /// 绑定 `name` 的 [`FieldBuilder`],供继续构造比较或集合条件。
+    ///
     /// # Examples
     /// ```
     /// use mneme::Expr;
@@ -157,6 +160,9 @@ impl FieldBuilder {
     ///
     /// # Arguments
     /// * `val` - 比较取值;经 `Into<Val>` 转换,类型规则见 `FC-QUERY-POST-001`。
+    ///
+    /// # Returns
+    /// 表示 `field == val` 的过滤表达式。
     pub fn eq(self, val: impl Into<Val>) -> Expr {
         Expr::Cmp {
             op: CmpOp::Eq,
@@ -169,6 +175,9 @@ impl FieldBuilder {
     ///
     /// # Arguments
     /// * `val` - 比较取值;经 `Into<Val>` 转换。
+    ///
+    /// # Returns
+    /// 表示 `field != val` 的过滤表达式。
     pub fn ne(self, val: impl Into<Val>) -> Expr {
         Expr::Cmp {
             op: CmpOp::Ne,
@@ -181,6 +190,9 @@ impl FieldBuilder {
     ///
     /// # Arguments
     /// * `val` - 比较取值;经 `Into<Val>` 转换。
+    ///
+    /// # Returns
+    /// 表示 `field > val` 的过滤表达式。
     pub fn gt(self, val: impl Into<Val>) -> Expr {
         Expr::Cmp {
             op: CmpOp::Gt,
@@ -193,6 +205,9 @@ impl FieldBuilder {
     ///
     /// # Arguments
     /// * `val` - 比较取值;经 `Into<Val>` 转换。
+    ///
+    /// # Returns
+    /// 表示 `field >= val` 的过滤表达式。
     pub fn ge(self, val: impl Into<Val>) -> Expr {
         Expr::Cmp {
             op: CmpOp::Ge,
@@ -205,6 +220,9 @@ impl FieldBuilder {
     ///
     /// # Arguments
     /// * `val` - 比较取值;经 `Into<Val>` 转换。
+    ///
+    /// # Returns
+    /// 表示 `field < val` 的过滤表达式。
     pub fn lt(self, val: impl Into<Val>) -> Expr {
         Expr::Cmp {
             op: CmpOp::Lt,
@@ -217,6 +235,9 @@ impl FieldBuilder {
     ///
     /// # Arguments
     /// * `val` - 比较取值;经 `Into<Val>` 转换。
+    ///
+    /// # Returns
+    /// 表示 `field <= val` 的过滤表达式。
     pub fn le(self, val: impl Into<Val>) -> Expr {
         Expr::Cmp {
             op: CmpOp::Le,
@@ -229,6 +250,9 @@ impl FieldBuilder {
     ///
     /// # Arguments
     /// * `vs` - 候选值集合;重复值自动去重。
+    ///
+    /// # Returns
+    /// 表示 `field ∈ {vs}` 的过滤表达式;候选值按首次出现顺序去重。
     pub fn is_in(self, vs: impl IntoIterator<Item = Val>) -> Expr {
         let mut vals: Vec<Val> = Vec::new();
         for val in vs {
