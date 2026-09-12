@@ -517,7 +517,7 @@ pub struct Scoring {
     pub time_axis: TimeAxis,// 新鲜度时间轴,默认 ValidTime(见 10 §2.1)
     pub bias_routing: bool, // HNSW 遍历按重要性偏置(只改访问顺序),默认 false(见 10 §2.3)
 }
-impl Scoring { pub fn new() -> Self; /* 链式 setter */ }
+impl Scoring { pub fn new() -> Self; }  // 字段公开,按需用结构体字面量覆盖
 // `Scoring` 亦实现 `Default`:`Scoring::default()` 等价于 `Scoring::new()`
 //(w_sim=1.0,其余权重 0),见 10 §2.5 与 FC-SCORE-POST-001。
 

@@ -305,7 +305,7 @@ HNSW 的剪枝只依赖**向量距离**;而 [10](10-scoring.md) 的综合排序�
 | 墓碑位图 | 段级 `dead` 位图(vsec 内,[04 §2.1](04-l2-persist.md));O(1) 判定 |
 | 搜索期 | **遍历可以穿过死节点**(保持图连通性),**结果**只收活节点(`W.push` 前查位图) |
 | 版本可见性 | 每个保留的物理版本(含历史版本)都是一个 HNSW 节点;搜索传入的 **alive 位图**决定可见版本:当前搜索 = 每个 RowId 的最新可见版本,`as_of(T)` = 每个 RowId 中 `tx_ms ≤ T` 的最新可见版本([04 §2.2](04-l2-persist.md))。历史版本可穿越、仅当被 alive 位图选中才可入选 |
-| 入口点死亡 | 每段在 MANIFEST 的 `SegmentEntry.entry_*` 与 hidx 头部各存一个段内入口([04 §2.4](04-l2-persist.md)、[§10](05-l3-hnsw.md))。**L3 落地**:入口节点不保证存活,搜索靠"可穿死节点"仍正确;死亡入口的就近改选/重建留待 L5 compaction 整体重建,MANIFEST 的 `entry_*` 当前只是信息登记,载入以 hidx 头部为准 |
+| 入口点死亡 | 每段在 MANIFEST 的 `SegmentEntry.entry_*` 与 hidx 头部各存一个段内入口([04 §2.4](04-l2-persist.md)、[§10](05-l3-hnsw.md))。**L3 落地**:入口节点不保证存活,搜索靠"可穿死节点"仍正确;死亡入口由 L5 compaction 整体重建(`src/index/rebuild.rs`)随幸存槽位重选,MANIFEST 的 `entry_*` 仍只是信息登记,载入以 hidx 头部为准 |
 | 图修复 | **不做单点重连**(易碎且贵);物理清理交给 compaction 时的整体重建([07 §4](07-l5-life.md)),重建即重新执行 §4 构建,并行化 |
 
 失效模式分析:死节点比例 $t$ 时,搜索多走的"废路"以 $O(t \cdot ef)$ 计,
@@ -372,7 +372,7 @@ $s = |\text{cand}| / N_{\text{alive}}$ 自适应三档:
 
 ```text
 逐段(当前实现:串行;目标形态:scoped threads 并行):
-    每段 → 选择 HNSW / 暴力(段行数 < 2048 恒暴力) → 段内 TopK(k)
+    每段 → 选择 HNSW / 暴力(段行数 ≤ 2048 恒暴力) → 段内 TopK(k)
 归并: k 路分数归并([02 §5 TopK.merge]) → 全局 top-k
 ```
 
@@ -426,7 +426,7 @@ adj_blob:   逐点逐层 u32 邻居槽位数组(层0 ≤ M0 个,上层按 level 
 > **默认值与召回门槛**:`ef=64` 是延迟优先的默认值;要达到
 > [14 §4](14-testing.md) 的 Recall@10 ≥ 0.95 门槛,基准与验收显式使用 `ef=128`
 > (文档算例与示例亦如此)。调用方按"召回/延迟"需求在 [64, 512] 区间自调。
-> 段内行数低于 `Tuning::brute_force_max_rows`(默认 2048)时查询恒走暴力扫描
+> 段内行数不超过 `Tuning::brute_force_max_rows`(默认 2048)时查询恒走暴力扫描(严格大于才走图)
 > ([16 §2](16-api-reference.md));**图可能仍随 flush 预建**(节省首次查询的构建停顿),
 > 但查询路径不读它,`stats().segments[*].index_nodes` 因此可能非 0(设计 05 §11)。
 >
@@ -450,7 +450,7 @@ adj_blob:   逐点逐层 u32 邻居槽位数组(层0 ≤ M0 个,上层按 level 
 2. 把 `ef` 当成"返回条数"——返回由 `top_k` 决定,`ef` 只控制探查宽度;
 3. 期待 compaction 前后近似结果一致——图重建会改变邻接(§6.2 确定性边界);
 4. 用默认 `history_horizon=None` 却频繁 `update`——历史节点会拖累当前搜索(§7);
-5. 段行数低于 `brute_force_max_rows` 时以为 HNSW 生效——实际恒走暴力扫描(§11)。
+5. 段行数不超过 `brute_force_max_rows` 时以为 HNSW 生效——实际恒走暴力扫描(§11)。
 
 ---
 
