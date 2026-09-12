@@ -162,7 +162,7 @@ RowId 水位:回放含大 rowid 的 WAL → next_rowid > 该 rowid
 > 已在 `tests/l4_contracts.rs` 与 `src/query/*` 单测落地并纳入追溯门禁。**L5 已补齐多段
 > 形态**(增量段 + 每段倒排合并 + 多图 ANN 归并,`tests/l5_contracts.rs`);§3 全流程 oracle 与
 > §3.4 跨未合并段的扩展断言可按需继续追加;**欠账**:`fuzz/` 五目标(含 `fuzz_dsl`)骨架已
-> 搭起,正式 1h/24h 长跑待 CI(§5),24h 长跑与 criterion 门槛仍待 CI(§6/§7)。
+> 搭起,正式 1h/24h 长跑待 CI(§5);criterion 正式门槛(§4)与全量崩溃注入(§2)同样待 CI 接线。
 
 ```text
 数据: 种子固定;随机均匀 64 维 10 万条 + 8 簇合成数据 10 万条(两套)

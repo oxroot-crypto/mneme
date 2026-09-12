@@ -17,8 +17,10 @@ use std::collections::HashMap;
 use std::path::Path;
 
 #[cfg(feature = "async")]
-use mneme::UpdatePatch;
-use mneme::{Builder, CompactionPolicy, Metric, Mneme, MnemeError, Record, Tuning, VectorFormat};
+use mneme::{AsyncNamespace, Namespace, UpdatePatch};
+use mneme::{
+    Builder, CompactionPolicy, Hit, Metric, Mneme, MnemeError, Record, Tuning, VectorFormat,
+};
 
 mod common;
 
@@ -95,6 +97,32 @@ fn overlap(left: &[u64], right: &[u64]) -> usize {
     left.iter().filter(|id| right.contains(id)).count()
 }
 
+/// 在 `n` 命名空间上执行确定性 top-k 查询。
+fn top_k(db: &Mneme, query: &[f32], k: usize) -> Vec<Hit> {
+    db.namespace("n")
+        .search()
+        .vector(query)
+        .top_k(k)
+        .ef(64)
+        .execute()
+        .expect("search")
+}
+
+/// 建库、写入给定记录并 flush。
+fn flushed_db_with(dir: &Path, format: VectorFormat, batch: &[Record]) -> Mneme {
+    let db = build(dir, format, ann_tuning());
+    db.namespace("n")
+        .insert_batch(batch.to_vec())
+        .expect("insert_batch");
+    db.flush().expect("flush");
+    db
+}
+
+/// 建库、写入 `rows` 条确定性记录并 flush。
+fn flushed_db(dir: &Path, format: VectorFormat, rows: usize) -> Mneme {
+    flushed_db_with(dir, format, &records(rows))
+}
+
 /// 取出建库错误(`Mneme` 未实现 `Debug`,`expect_err` 不适用)。
 fn build_error(result: mneme::Result<Mneme>, context: &str) -> MnemeError {
     match result {
@@ -159,18 +187,8 @@ fn invalid_tuning_rejects_quantization_knobs() {
 fn quantized_hit_score_matches_f32_exact() {
     let quant_dir = tempfile::tempdir().expect("tempdir");
     let exact_dir = tempfile::tempdir().expect("tempdir");
-    let quant = build(quant_dir.path(), VectorFormat::I8Rescored, ann_tuning());
-    let exact = build(exact_dir.path(), VectorFormat::F32, ann_tuning());
-    quant
-        .namespace("n")
-        .insert_batch(records(128))
-        .expect("insert_batch");
-    exact
-        .namespace("n")
-        .insert_batch(records(128))
-        .expect("insert_batch");
-    quant.flush().expect("flush");
-    exact.flush().expect("flush");
+    let quant = flushed_db(quant_dir.path(), VectorFormat::I8Rescored, 128);
+    let exact = flushed_db(exact_dir.path(), VectorFormat::F32, 128);
 
     let stats = quant.stats().expect("stats");
     assert_eq!(stats.quant.configured, VectorFormat::I8Rescored);
@@ -178,22 +196,8 @@ fn quantized_hit_score_matches_f32_exact() {
     assert!(stats.quant.recall_est.is_some(), "建段会话应给出召回估计");
 
     let query = vector(9_999, DIM as usize);
-    let quant_hits = quant
-        .namespace("n")
-        .search()
-        .vector(&query)
-        .top_k(10)
-        .ef(64)
-        .execute()
-        .expect("search");
-    let exact_hits = exact
-        .namespace("n")
-        .search()
-        .vector(&query)
-        .top_k(10)
-        .ef(64)
-        .execute()
-        .expect("search");
+    let quant_hits = top_k(&quant, &query, 10);
+    let exact_hits = top_k(&exact, &query, 10);
     assert!(!quant_hits.is_empty());
     let exact_scores: HashMap<u64, f32> = exact_hits
         .iter()
@@ -397,11 +401,8 @@ fn compaction_rewrites_quantized_copies() {
     assert_eq!(stats.segments[0].quant, VectorFormat::I8Rescored);
 }
 
-/// FC-QUANT-POST-004:小规模确定性数据上,量化两阶段的 Recall@10 相对 f32 的
-/// Recall@10 损失不超过 2%(离线 1M 基准另见设计 14 §4)。
-#[test]
-fn quantized_two_stage_recall_loss_within_two_percent() {
-    // 48 个簇、每簇 8 条近邻;查询取前 10 个簇心。
+/// 48 个簇、每簇 8 条近邻的确定性数据。
+fn clustered_records() -> Vec<Record> {
     let mut records: Vec<Record> = Vec::new();
     for cluster in 0..48_u64 {
         let center = vector(1_000 + cluster, DIM as usize);
@@ -415,7 +416,12 @@ fn quantized_two_stage_recall_loss_within_two_percent() {
             records.push(Record::new(point).key(format!("c{cluster}_m{member}")));
         }
     }
-    let queries: Vec<Vec<f32>> = (0..10_u64)
+    records
+}
+
+/// 取前 10 个簇心附近的确定性查询。
+fn cluster_queries() -> Vec<Vec<f32>> {
+    (0..10_u64)
         .map(|cluster| {
             let center = vector(1_000 + cluster, DIM as usize);
             let noise = vector(90_000 + cluster, DIM as usize);
@@ -425,58 +431,44 @@ fn quantized_two_stage_recall_loss_within_two_percent() {
                 .map(|(base, jitter)| base + jitter * 0.005)
                 .collect()
         })
+        .collect()
+}
+
+/// 单查询的量化 Recall@10(相对暴力参考)。
+fn recall_at_10(db: &Mneme, query: &[f32]) -> f64 {
+    let reference = brute_top(&db.namespace("n"), query, 10);
+    let hits: Vec<u64> = top_k(db, query, 10)
+        .iter()
+        .map(|hit| hit.rowid.get())
         .collect();
+    overlap(&reference, &hits) as f64 / 10.0
+}
+
+/// FC-QUANT-POST-004:小规模确定性数据上,量化两阶段的 Recall@10 相对 f32 的
+/// Recall@10 损失不超过 2%(离线 1M 基准另见设计 14 §4)。
+#[test]
+fn quantized_two_stage_recall_loss_within_two_percent() {
+    let records = clustered_records();
+    let queries = cluster_queries();
 
     let exact_dir = tempfile::tempdir().expect("tempdir");
     let quant_dir = tempfile::tempdir().expect("tempdir");
-    let exact = build(exact_dir.path(), VectorFormat::F32, ann_tuning());
-    let quant = build(quant_dir.path(), VectorFormat::I8Rescored, ann_tuning());
-    exact
-        .namespace("n")
-        .insert_batch(records.clone())
-        .expect("insert exact");
-    quant
-        .namespace("n")
-        .insert_batch(records)
-        .expect("insert quant");
-    exact.flush().expect("flush exact");
-    quant.flush().expect("flush quant");
+    let exact = flushed_db_with(exact_dir.path(), VectorFormat::F32, &records);
+    let quant = flushed_db_with(quant_dir.path(), VectorFormat::I8Rescored, &records);
     assert_eq!(
         quant.stats().expect("stats").quant.active,
         VectorFormat::I8Rescored
     );
 
-    let mut recall_exact = 0.0_f64;
-    let mut recall_quant = 0.0_f64;
-    for query in &queries {
-        let reference = brute_top(&exact.namespace("n"), query, 10);
-        let exact_hits: Vec<u64> = exact
-            .namespace("n")
-            .search()
-            .vector(query)
-            .top_k(10)
-            .ef(64)
-            .execute()
-            .expect("search")
+    let mean = |db: &Mneme| {
+        queries
             .iter()
-            .map(|hit| hit.rowid.get())
-            .collect();
-        let quant_hits: Vec<u64> = quant
-            .namespace("n")
-            .search()
-            .vector(query)
-            .top_k(10)
-            .ef(64)
-            .execute()
-            .expect("search")
-            .iter()
-            .map(|hit| hit.rowid.get())
-            .collect();
-        recall_exact += overlap(&reference, &exact_hits) as f64 / 10.0;
-        recall_quant += overlap(&reference, &quant_hits) as f64 / 10.0;
-    }
-    recall_exact /= queries.len() as f64;
-    recall_quant /= queries.len() as f64;
+            .map(|query| recall_at_10(db, query))
+            .sum::<f64>()
+            / queries.len() as f64
+    };
+    let recall_exact = mean(&exact);
+    let recall_quant = mean(&quant);
     assert!(
         recall_quant + 0.02 >= recall_exact,
         "量化召回损失超 2%:quant={recall_quant}, exact={recall_exact}"
@@ -548,48 +540,46 @@ fn f16_roundtrip_when_feature_enabled() {
     assert!(db.check().expect("check").ok);
 }
 
-/// FC-QUANT-INV-014:同一操作序列下 async 门面与同步 API 产生等价状态
-/// (无部分写入、返回结果一致),且错误语义一致。
-#[test]
+/// async 契约测试共用的种子记录。
 #[cfg(feature = "async")]
-fn async_and_sync_namespace_sequences_are_equivalent() {
-    let sync_db = Mneme::in_memory(DIM).expect("sync db");
-    let async_db = Mneme::in_memory(DIM).expect("async db");
-    let sync_ns = sync_db.namespace("n");
-    let async_ns = async_db.namespace("n").into_async();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("runtime");
+fn seed(key: &str, text: &str) -> Record {
+    Record::new(vector(key.len() as u64 + 1, DIM as usize))
+        .key(key)
+        .text(text)
+}
 
-    let seed = |key: &str, text: &str| {
-        Record::new(vector(key.len() as u64 + 1, DIM as usize))
-            .key(key)
-            .text(text)
-    };
-
-    // 同步序列。
-    sync_ns.insert(seed("a", "one")).expect("insert a");
-    sync_ns.insert(seed("b", "two")).expect("insert b");
-    sync_ns.insert(seed("c", "three")).expect("insert c");
-    sync_ns
-        .update("a", UpdatePatch::new().text(Some("uno".to_string())))
+/// 同步操作序列(插入 / 更新 / 删除 / 触碰)。
+#[cfg(feature = "async")]
+fn run_sync_sequence(ns: &Namespace) {
+    ns.insert(seed("a", "one")).expect("insert a");
+    ns.insert(seed("b", "two")).expect("insert b");
+    ns.insert(seed("c", "three")).expect("insert c");
+    ns.update("a", UpdatePatch::new().text(Some("uno".to_string())))
         .expect("update a");
-    sync_ns.delete("b").expect("delete b");
-    sync_ns.touch("c", None).expect("touch c");
+    ns.delete("b").expect("delete b");
+    ns.touch("c", None).expect("touch c");
+}
 
-    // 异步序列(逐步 await)。
-    runtime.block_on(async {
-        async_ns.insert(seed("a", "one")).await.expect("insert a");
-        async_ns.insert(seed("b", "two")).await.expect("insert b");
-        async_ns.insert(seed("c", "three")).await.expect("insert c");
-        async_ns
-            .update("a", UpdatePatch::new().text(Some("uno".to_string())))
-            .await
-            .expect("update a");
-        async_ns.delete("b").await.expect("delete b");
-        async_ns.touch("c", None).await.expect("touch c");
-    });
+/// 与 [`run_sync_sequence`] 等价的异步序列(逐步 await)。
+#[cfg(feature = "async")]
+async fn run_async_sequence(ns: &AsyncNamespace) {
+    ns.insert(seed("a", "one")).await.expect("insert a");
+    ns.insert(seed("b", "two")).await.expect("insert b");
+    ns.insert(seed("c", "three")).await.expect("insert c");
+    ns.update("a", UpdatePatch::new().text(Some("uno".to_string())))
+        .await
+        .expect("update a");
+    ns.delete("b").await.expect("delete b");
+    ns.touch("c", None).await.expect("touch c");
+}
 
+/// 逐 key 断言同步/异步两个命名空间的状态与存在性一致。
+#[cfg(feature = "async")]
+fn assert_namespaces_equivalent(
+    sync_ns: &Namespace,
+    async_ns: &AsyncNamespace,
+    runtime: &tokio::runtime::Runtime,
+) {
     assert_eq!(
         sync_ns.count(None).expect("count"),
         runtime.block_on(async_ns.count(None)).expect("count")
@@ -616,6 +606,25 @@ fn async_and_sync_namespace_sequences_are_equivalent() {
             runtime.block_on(async_ns.exists(key)).expect("exists")
         );
     }
+}
+
+/// FC-QUANT-INV-014:同一操作序列下 async 门面与同步 API 产生等价状态
+/// (无部分写入、返回结果一致),且错误语义一致。
+#[test]
+#[cfg(feature = "async")]
+fn async_and_sync_namespace_sequences_are_equivalent() {
+    let sync_db = Mneme::in_memory(DIM).expect("sync db");
+    let async_db = Mneme::in_memory(DIM).expect("async db");
+    let sync_ns = sync_db.namespace("n");
+    let async_ns = async_db.namespace("n").into_async();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("runtime");
+
+    run_sync_sequence(&sync_ns);
+    runtime.block_on(run_async_sequence(&async_ns));
+    assert_namespaces_equivalent(&sync_ns, &async_ns, &runtime);
+
     // 错误语义一致:重复 key 在默认去重策略下产生同类结果。
     let sync_dup = sync_ns.insert(seed("a", "again"));
     let async_dup = runtime.block_on(async_ns.insert(seed("a", "again")));

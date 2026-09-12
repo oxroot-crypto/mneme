@@ -276,6 +276,23 @@ mod tests {
         assert!(!Metric::Euclidean.better(0.9, 0.1));
     }
 
+    /// FC-CORE-POST-002:`score_order` 为全序——`NaN`(正负号一视同仁)恒排
+    /// 最后、`±0` 由 `total_cmp` 区分、其余按度量方向。
+    #[test]
+    fn score_order_is_total_for_nan_and_signed_zero() {
+        use std::cmp::Ordering;
+        for metric in [Metric::Cosine, Metric::Dot, Metric::Euclidean] {
+            assert_eq!(metric.score_order(1.0, f32::NAN), Ordering::Less);
+            assert_eq!(metric.score_order(f32::NAN, 1.0), Ordering::Greater);
+            assert_eq!(metric.score_order(-f32::NAN, f32::NAN), Ordering::Equal);
+            assert_eq!(metric.score_order(0.0, -0.0), Ordering::Greater);
+            assert_eq!(metric.score_order(-0.0, 0.0), Ordering::Less);
+        }
+        assert_eq!(Metric::Dot.score_order(0.9, 0.1), Ordering::Less);
+        assert_eq!(Metric::Euclidean.score_order(0.1, 0.9), Ordering::Less);
+        assert_eq!(Metric::Cosine.score_order(0.5, 0.5), Ordering::Equal);
+    }
+
     #[test]
     fn needs_norm_only_dot_is_false() {
         assert!(!Metric::Dot.needs_norm());
