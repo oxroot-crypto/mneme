@@ -88,7 +88,7 @@ impl<T: Ord> TopK<T> {
 `T: Ord` 读作"T 必须实现 `Ord` trait"。为什么需要?因为 `TopK` 在分数相同时要按载荷
 `a_payload < b_payload` 排序,`<` 来自 `Ord`。没有这个约束,编译器不知道 `T` 能否比较大小。
 
-见 [`src/core/heap.rs:51`](../../src/core/heap.rs) 与 [`src/core/heap.rs:193`](../../src/core/heap.rs)。
+见 [`src/core/heap.rs:51`](../../src/core/heap.rs) 与 [`src/core/heap.rs:201`](../../src/core/heap.rs)。
 
 等价写法(更复杂时用 `where`):
 
@@ -121,6 +121,32 @@ pub fn new<T: Into<Arc<str>>>(value: T) -> Self { ... }
 >   也不能要求多个参数是"同一类型"。
 > - 泛型参数可以写 `fn f<T: Trait>(a: T, b: T)` 强制 `a`、`b` 同类型;`impl Trait` 写不出来。
 > - 多个复杂约束用 `where` 更易读。
+
+**`impl AsRef<Path>`:让路径参数吃 `&str`、`String`、`PathBuf`**。凡是要传文件路径的
+公开函数,mneme 都写成:
+
+```rust
+pub(crate) fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
+```
+
+见 [`src/persist/source.rs:100`](../../src/persist/source.rs)。`AsRef<T>` 是"能借出
+`&T`"的转换 trait;`&str`/`String`/`PathBuf`/`Path` 都实现了 `AsRef<Path>`,所以调用方
+传什么都行,函数体里 `.as_ref()` 拿到统一的 `&Path`。这是标准库与社区广泛采用的参数
+惯例(比 `impl Into<PathBuf>` 少一次分配)。
+
+**`PhantomData`:类型参数没存在字段里时用它占位**。L1 的 `RecordRef<'a>` 实际数据用
+`Arc` 持有、并不直接存 `&'a` 引用,但签名又需要生命周期参数 `'a`:
+
+```rust
+pub struct RecordRef<'a> {
+    slot_data: Arc<SlotData>,
+    _marker: PhantomData<&'a ()>,
+}
+```
+
+见 [`src/memory/record.rs:179-182`](../../src/memory/record.rs)。`PhantomData<T>` 不占
+空间,只在类型层面声明"逻辑上借用/拥有 `T`",从而参与借用检查与 auto trait
+(`Send`/`Sync`)推断;去掉它,编译器会报"生命周期参数 `'a` 未被使用"。
 
 ---
 
@@ -187,6 +213,22 @@ impl fmt::Display for RowId {
 
 见 [`src/core/types.rs:48-52`](../../src/core/types.rs)。`write!` 与 `println!` 用法一致,
 只是写到 `f` 而不是标准输出。
+
+`Debug` 通常 `derive`,但想**隐藏内部字段**时手写,并用 `finish_non_exhaustive()`
+收尾——打印会以 `..` 表示"还有未展示的字段":
+
+```rust
+impl std::fmt::Debug for Mneme {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Mneme")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+```
+
+见 [`src/memory/engine.rs:33-39`](../../src/memory/engine.rs)。库导出的日志/错误类型常
+这样处理(`Vec`/`HashMap` 内部状态不适合全部打印,泄漏实现细节又冗长)。
 
 ### 3.3 `Send` / `Sync`:线程安全标记
 
@@ -279,7 +321,7 @@ decode_field_val(value, Expr::Contains);
 - `Expr::Exists` 不是方法调用,而是把**变体构造器**当函数指针值传递:元组变体的构造器
   签名就是它的参数列表。
 - 需要显式类型时写 `Expr::Exists as fn(String) -> Expr` 强转(见
-  [`src/query/parse/mod.rs:249`](../../src/query/parse/mod.rs));
+  [`src/query/parse.rs:249`](../../src/query/parse.rs));
 - 构造器**不能捕获环境**,天然满足 `fn` 指针签名,所以适合当"无状态工厂"传来传去;
 - 同一个构造器也能喂给泛型方法:`Option::map` / `Result::map` 要的正是 `FnOnce(T) -> U`,
   于是 JSON 解码里直接写 `value.as_bool().map(Val::Bool)`、
@@ -320,7 +362,7 @@ impl std::ops::BitAnd for Expr {
 let expr = Expr::field("importance").gt(0.5_f32) & Expr::field("rank").lt(1028_i64);
 ```
 
-见 [`src/query/plan.rs:152`](../../src/query/plan.rs)。要点:
+见 [`src/memory/pred.rs:243-257`](../../src/memory/pred.rs)。要点:
 
 - `a & b` 只是 `a.bitand(b)` 的**语法糖**,`|` 同理;重载不改变优先级,也不能凭空造运算符。
 - **关联类型 vs 泛型参数**:`Output` 由 `Self` 唯一决定,所以用关联类型;如果要允许同一个类型

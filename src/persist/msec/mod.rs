@@ -22,17 +22,19 @@ use crate::core::meta::Meta;
 use crate::core::types::{Key, NsId, RowId, SeqNo};
 
 mod decode;
+mod delta;
 mod encode;
 mod entry;
 mod index;
 mod inverted;
 
 pub(crate) use decode::{MsecView, parse};
+pub(crate) use delta::{DeltaEntry, decode_delta, encode_delta};
 pub(crate) use encode::{encode, encode_entry};
 pub(crate) use entry::entry_from_prefix;
 pub(crate) use index::{
-    FieldKind, decode_bloom, decode_field_dict, encode_bloom, encode_field_dict, encode_zmap,
-    validate_zmap,
+    FieldDef, FieldKind, decode_bloom, decode_field_dict, decode_ttl_map, encode_bloom,
+    encode_field_dict, encode_ttl_map, encode_zmap, validate_zmap,
 };
 pub(crate) use inverted::{decode_inverted, encode_inverted};
 
@@ -153,17 +155,17 @@ pub(crate) struct MsecInput<'a> {
     pub(crate) slots: &'a [SlotMeta],
     /// 命名空间统计。
     pub(crate) ns_stats: &'a [NsStatRow],
-    /// 预编码的 delta(跨段覆盖)区;L2 全量快照恒为 `&[]`,该区保留给 L5 compaction。
+    /// 预编码的 delta(跨段覆盖)区;空区表示本段无跨段变更。
     pub(crate) delta: &'a [u8],
-    /// 预编码的 relations 区(见 [`crate::persist::edges`]);无边时为 `&[]`。
+    /// 预编码的 relations 区(见 [`crate::persist::edges`]);空表也带 `EDG1` 头。
     pub(crate) relations: &'a [u8],
-    /// 字段字典区(L4;无索引字段时为空)。
+    /// 字段字典区;段内至少含保留字段 `key`,恒非空。
     pub(crate) field_dict: &'a [u8],
-    /// zone map 区(L4;无索引字段时为空)。
+    /// zone map 区(含区尾 `ttl_map`),恒非空。
     pub(crate) zmap: &'a [u8],
-    /// bloom 区(L4;无 `key` 字段时为空)。
+    /// bloom 区(`key` 字段的布隆过滤器),恒非空。
     pub(crate) bloom: &'a [u8],
-    /// 倒排区(L4;无文本记录时为空)。
+    /// 倒排区(空表也带版头),恒非空。
     pub(crate) inverted: &'a [u8],
 }
 

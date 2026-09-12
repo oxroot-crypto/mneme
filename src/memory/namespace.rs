@@ -19,6 +19,25 @@ pub(crate) use query::point_get;
 
 /// `search` 的 `top_k` 缺省值。
 pub(crate) const DEFAULT_TOP_K: usize = 10;
+
+/// 规范化命名空间路径:去除首尾 `/`、合并连续 `/`;空串表示根命名空间。
+///
+/// `namespace()` 不返回 `Result`,故此处只做无损规范化;深度/非法字符在首次
+/// 写入时以 `Config` 报告(FC-LIFE-POST-005)。
+pub(crate) fn normalize_path(path: &str) -> String {
+    let mut normalized = String::new();
+    for segment in path.split('/') {
+        if segment.is_empty() {
+            continue;
+        }
+        if !normalized.is_empty() {
+            normalized.push('/');
+        }
+        normalized.push_str(segment);
+    }
+    normalized
+}
+
 /// 命名空间句柄;键唯一性按命名空间隔离。
 #[derive(Clone)]
 pub struct Namespace {

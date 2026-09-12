@@ -112,16 +112,16 @@ view.ns_registry.iter().find_map(|(id, path)| {
 })
 ```
 
-见 [`src/query/exec.rs:168-176`](../../src/query/exec.rs)。闭包返回 `Option`,所以既能"过滤掉
+见 [`src/query/exec.rs:195-202`](../../src/query/exec.rs)。闭包返回 `Option`,所以既能"过滤掉
 不关心的项",又能顺手做转换;`**path` 的双重解引用见 [04 §3.3](04-borrowing-strings-slices.md)。
 
 另外两个不属于迭代器、但总在链尾露脸的 `Vec` 方法:
 
 - `Vec::extend(iter)`:把另一个迭代器(或 `Vec`)的元素追加进来。L4 解析器把第一个子表达式与
   收集到的其余项合并成一个列表再 `into_boxed_slice`,见
-  [`src/query/parse/mod.rs:191-194`](../../src/query/parse/mod.rs);
+  [`src/query/parse.rs:191-194`](../../src/query/parse.rs);
 - `Vec::truncate(n)`:只保留前 `n` 个元素(多出的直接丢掉)。L4 执行管线在融合排序后按 `top_k`
-  截断,见 [`src/query/exec.rs:338`](../../src/query/exec.rs)。
+  截断,见 [`src/query/exec.rs:369`](../../src/query/exec.rs)。
 
 ### 3.1 `enumerate` 的例子
 
@@ -168,6 +168,65 @@ let max = oriented.iter().copied().fold(f64::NEG_INFINITY, f64::max);
   极端输入(`±f32::MAX`)的极差会在 `f32` 下溢出成 `inf`,再算 `inf/inf` 就得到 `NaN`。
   先把中间量升到 `f64` 再降回 `f32`,既不溢出也不丢序(见
   [`src/query/fusion.rs:76-106`](../../src/query/fusion.rs))。
+
+### 3.4 再补几个高频组合子
+
+维护代码时还会反复遇到这几个(知道"有它、长什么样"即可):
+
+- **`HashMap` 的 `or_default()`**:entry API 的另一种收尾。`or_insert(v)` 要手写默认值,
+  `or_default()` 直接用 `V::default()`(计数/列表就是 `0`/空容器):
+
+  ```rust
+  let bucket = self.terms.entry(ns_id).or_default();
+  let postings = bucket.entry(Arc::from(token.as_str())).or_default();
+  ```
+
+  见 [`src/memory/analysis/inv.rs:48-52`](../../src/memory/analysis/inv.rs);默认值构造有
+  成本时用惰性的 `or_insert_with(f)`。
+
+- **`sort_by_key`**:按"提取出来的键"排序,比 `sort_by` 少写比较样板;键是元组时按
+  字典序逐字段比较:
+
+  ```rust
+  versions.sort_by_key(|(row, _)| (row.rowid, row.seqno));
+  ```
+
+  见 [`src/persist/recover/state.rs:81`](../../src/persist/recover/state.rs)。要求键类型
+  实现 `Ord`;键里含 `f32` 时不能直接用,得换成 `total_cmp` 版的 `sort_by`(见
+  [03 §4.1](03-structs-enums-impl.md))。
+
+- **`binary_search`**:在**已排序**切片上二分定位,返回 `Ok(下标)` 或 `Err(插入点)`;
+  L5 的 compaction 用它把"按槽位排序的幸存列表"定位到目标槽位(见
+  [`src/memory/engine_ops.rs:397`](../../src/memory/engine_ops.rs))。
+
+- **`filter_map`**:`filter` + `map` 合一,闭包返回 `Option`,`None` 直接丢弃:
+
+  ```rust
+  self.slot_segment
+      .iter()
+      .enumerate()
+      .filter_map(|(index, segment)| segment.is_none().then_some(index))
+      .collect()
+  ```
+
+  见 [`src/memory/table/state.rs:495-499`](../../src/memory/table/state.rs)。和 `find_map`
+  (§3)的区别是:它消费**整个**迭代器,而不是拿到第一个 `Some` 就停。
+
+- **`windows(n)`**:滑动窗口,每次产出连续的 `n` 个元素的切片;CJK bigram 分词靠它:
+
+  ```rust
+  for pair in chars.windows(2) {
+      let token: String = pair.iter().collect();
+      ...
+  }
+  ```
+
+  见 [`src/core/text.rs:47`](../../src/core/text.rs)。窗口是只读切片,不复制数据;
+  `n = 0` 会 panic,`n > len` 时产出空迭代器(循环体一次也不执行)。
+
+- **`peekable()`**(表里已列):包成"可偷看下一个而不消费"的 `Peekable`,适合解析器
+  判断"还有没有下一个"。CJK 分词按连续字符成段时也先用它,再 `while let` 逐个消费
+  (见 [`src/core/text.rs:57`](../../src/core/text.rs))。
 
 ---
 
@@ -253,7 +312,7 @@ pub(crate) fn write_tx<T>(&self, f: impl FnOnce(&mut WriterState) -> Result<T>) 
 }
 ```
 
-见 [`src/memory/table/state.rs`](../../src/memory/table/state.rs)。`impl FnOnce(...)` 是 `F: FnOnce(...)`
+见 [`src/memory/table/handle.rs`](../../src/memory/table/handle.rs)。`impl FnOnce(...)` 是 `F: FnOnce(...)`
 的简写(见 [06 §2.3](06-generics-traits.md)):闭包只调用一次,所以用**最宽松**的 `FnOnce`;
 若写成 `Fn`,那些会移动捕获值的闭包反而用不了。
 
@@ -342,7 +401,7 @@ while let Some(current) = frontier.pop() {
 }
 ```
 
-见 [`src/index/hnsw.rs:232-266`](../../src/index/hnsw.rs)。两个堆的分工:
+见 [`src/index/hnsw.rs:243-266`](../../src/index/hnsw.rs)。两个堆的分工:
 
 - `frontier`(最大堆):按"越近键越大",每次弹**最有希望**的候选继续扩展——best-first;
 - `results`(最小堆 + `Reverse`):固定大小 `ef`,只淘汰**最差**。`Reverse` 让"堆顶 =
@@ -366,7 +425,7 @@ if !visited.insert(neighbor) {
 }
 ```
 
-见 [`src/index/hnsw.rs:250-252`](../../src/index/hnsw.rs)。对照 `Vec<u32>` 的 `contains`
+见 [`src/index/hnsw.rs:250-271`](../../src/index/hnsw.rs)。对照 `Vec<u32>` 的 `contains`
 是 $O(n)$ 线性扫描;需要反复问"在不在集合里"时,`HashSet` 的期望 $O(1)$ 是数量级差别
 (代价是哈希与额外内存)。要放进 `HashSet` 的类型必须实现 `Hash + Eq`(见
 [03 §4](03-structs-enums-impl.md))。

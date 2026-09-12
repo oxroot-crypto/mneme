@@ -136,18 +136,37 @@ fn roll_level(rng: &mut Rng, ml: f32) -> u8 {
 }
 
 impl HnswIndex {
-    /// 由节点构建 HNSW 图。
+    /// 由节点构建 HNSW 图(节点 id = 全局槽位 `0..nodes.len()` 的恒等映射)。
     ///
-    /// 参数防御性钳制到 `[1, MAX_INDEX_DEGREE]`:`Builder` 已在入口校验
-    /// (FC-INDEX-PRE-001),此处保证内部构造与 `u16` 序列化永不失真。
+    /// 仅测试与解析证明使用;生产路径经 [`build_with_slots`](Self::build_with_slots)。
+    #[cfg(test)]
     pub(crate) fn build(nodes: &[IndexNode], params: HnswParams, metric: Metric) -> Self {
+        let slot_of: Vec<SlotId> = (0..nodes.len()).map(|id| SlotId::new(id as u32)).collect();
+        Self::build_with_slots(nodes, &slot_of, params, metric)
+    }
+
+    /// 由节点与显式槽位映射构建 HNSW 图(增量段用;`slot_of` 与 `nodes` 等长)。
+    pub(crate) fn build_with_slots(
+        nodes: &[IndexNode],
+        slot_of: &[SlotId],
+        params: HnswParams,
+        metric: Metric,
+    ) -> Self {
+        // 调用方(增量段装配)始终同源构造两个等长切片;取短边只是防御性兜底,
+        // 保证 release 下绝不因内部装配失误越界 panic(FC-GLOBAL-ERR-001 口径)。
+        debug_assert_eq!(
+            nodes.len(),
+            slot_of.len(),
+            "节点数与槽位映射必须等长(FC-INDEX-INV-007)"
+        );
+        let count = nodes.len().min(slot_of.len());
         let m = (params.m.max(2) as usize).min(MAX_INDEX_DEGREE as usize);
         let m0 = (params.m0 as usize).max(m).min(MAX_INDEX_DEGREE as usize);
         let ef_construction = params.ef_construction.max(1) as usize;
         let ml = 1.0 / (m as f32).ln();
         let mut index = Self {
-            nodes: Vec::with_capacity(nodes.len()),
-            slot_of: Vec::with_capacity(nodes.len()),
+            nodes: Vec::with_capacity(count),
+            slot_of: Vec::with_capacity(count),
             graph: Graph::new(),
             m,
             m0,
@@ -156,10 +175,10 @@ impl HnswIndex {
             metric,
         };
         let mut rng = Rng::new(BUILD_SEED);
-        for (position, node) in nodes.iter().enumerate() {
+        for position in 0..count {
             let level = roll_level(&mut rng, ml);
-            index.nodes.push(node.clone());
-            index.slot_of.push(SlotId::new(position as u32));
+            index.nodes.push(nodes[position].clone());
+            index.slot_of.push(slot_of[position]);
             index.graph.push_node(level);
             index.link_node(position as u32, level);
         }

@@ -1,20 +1,36 @@
-//! 全量快照 flush:把可变表写成新段(设计 04 §3.2 的 L2 兜底)。
+//! 增量段物化:把未落盘槽位写成新段(设计 04 §3.2、07 §4)。
 //!
-//! L2 尚无 compaction,`flush` 将整个 `WriterState` 物化为一个不可变段的
-//! `vsec` + `msec` 两个文件;旧段在 MANIFEST 提交后进入 `trash/`。每条写入已先
-//! 追加 WAL,故 flush 只是把已确认状态转成段文件、推进水位并重置 WAL。
+//! `flush` 只物化 `slot_segment == None` 的槽位与自上次 flush 的访问/关系 delta;
+//! 旧段保持活跃、不改写、不入 `trash/`。`watermark` 推进后 WAL 方可 Checkpoint。
+//! 每条写入已先追加 WAL,故 flush 只是把已确认状态转成段文件。
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::core::bitset::BitSet;
 use crate::core::error::Result;
-use crate::memory::analysis::ZONE_BLOCK_ROWS;
+use crate::core::types::SlotId;
+use crate::memory::analysis::{
+    BLOOM_INITIAL_CAPACITY, BloomSet, InvertedIndex, ZONE_BLOCK_ROWS, ZoneIndex,
+};
 use crate::memory::config::Config;
 use crate::memory::index::{IndexNode, VectorIndex};
 use crate::memory::table::{SlotData, WriterState};
 use crate::persist::edges::EdgeData;
-use crate::persist::msec::{self, EntryData, FieldKind, MsecInput, NsStatRow, SlotMeta};
+use crate::persist::msec::{
+    self, DeltaEntry, EntryData, FieldKind, MsecInput, NsStatRow, SlotMeta,
+};
 use crate::persist::vsec::{self, VsecInput};
+
+/// 一次段物化的输入:要写入的全局槽位(升序)与跨段 delta。
+pub(crate) struct SegmentBuildInput<'a> {
+    /// 要物化的全局槽位下标(升序);空 = 纯 delta 段。
+    pub(crate) slots: &'a [usize],
+    /// 跨段覆盖条目(访问/关系);`full_relations` 为真时忽略关系部分。
+    pub(crate) delta: &'a [DeltaEntry],
+    /// 是否全量重写关系表(首个段或 compaction);否则关系变更走 delta。
+    pub(crate) full_relations: bool,
+}
 
 /// 段内槽位及其对应的向量/范数/删除位(向量借用自写状态)。
 struct SegmentSlots<'a> {
@@ -40,7 +56,7 @@ pub(crate) struct EncodedSegment {
     pub(crate) entry_level: u8,
 }
 
-/// 把一个写状态编码为 `vsec`/`msec`/`hidx` 与内存索引。
+/// 把写状态中指定槽位编码为 `vsec`/`msec`/`hidx` 与内存索引。
 ///
 /// # Errors
 /// 任一编解码、限额或索引构建失败时返回结构化错误。
@@ -48,8 +64,9 @@ pub(crate) fn build_segment(
     ws: &WriterState,
     config: &Config,
     created_unix_ms: i64,
+    input: &SegmentBuildInput<'_>,
 ) -> Result<EncodedSegment> {
-    let built = build_slots(ws);
+    let built = build_slots(ws, input.slots);
     let vsec_bytes = vsec::encode(&VsecInput {
         dimension: config.dimension.get(),
         metric: config.metric,
@@ -59,14 +76,21 @@ pub(crate) fn build_segment(
         dead: &built.dead,
     })?;
 
-    let ns_stats = build_ns_stats(ws, config);
-    let relations = build_relations(ws);
-    let relations_bytes = crate::persist::edges::encode(&relations, false);
-    let indexes = build_indexes(ws, config, built.slots.len())?;
+    let ns_stats = build_ns_stats(ws, config, input.slots);
+    let relations = if input.full_relations {
+        build_relations(ws)
+    } else {
+        Vec::new()
+    };
+    let write_reverse = config.relation_index == crate::core::options::RelationIndex::Both;
+    let relations_bytes =
+        crate::persist::edges::encode(&relations, write_reverse, input.full_relations)?;
+    let indexes = build_indexes(ws, config, input.slots)?;
+    let delta_bytes = msec::encode_delta(input.delta)?;
     let msec_bytes = msec::encode(&MsecInput {
         slots: &built.slots,
         ns_stats: &ns_stats,
-        delta: &[],
+        delta: &delta_bytes,
         relations: &relations_bytes,
         field_dict: &indexes.field_dict,
         zmap: &indexes.zmap,
@@ -74,7 +98,7 @@ pub(crate) fn build_segment(
         inverted: &indexes.inverted,
     })?;
 
-    let built_index = build_index(ws, config)?;
+    let built_index = build_index(ws, config, input.slots)?;
     Ok(EncodedSegment {
         vsec: vsec_bytes,
         msec: msec_bytes,
@@ -85,15 +109,133 @@ pub(crate) fn build_segment(
     })
 }
 
-/// 由写状态的加速结构构建 msec 四区(字段字典 / zone map / bloom / 倒排)。
+/// 由写状态构造本次段物化需要的 delta 条目(访问计数 + 关系边净变更)。
 ///
-/// 字段字典包含 zone 已索引的数值/时间字段与 `key`(bloom 字段),总数受
-/// `Tuning.field_dict_max` 约束;超出的 metadata 字段查询期仍走行级求值。
+/// `full_relations` 为真(首段/compaction)时关系表全量重写,不再产出关系 delta;
+/// `included` 中已有最新版本的 RowId,其访问统计随记录体列落盘,无需 Access 条目。
+pub(crate) fn build_delta(
+    ws: &WriterState,
+    included: &[usize],
+    now_ms: i64,
+    full_relations: bool,
+) -> Vec<DeltaEntry> {
+    let mut in_segment = BitSet::default();
+    for &idx in included {
+        in_segment.set(idx);
+    }
+    let mut entries = Vec::new();
+    collect_access_deltas(ws, &in_segment, now_ms, &mut entries);
+    if !full_relations {
+        collect_edge_deltas(ws, now_ms, &mut entries);
+    }
+    entries
+}
+
+/// 访问增量条目:最新版本随本段物化时跳过(记录体已携带统计)。
+fn collect_access_deltas(
+    ws: &WriterState,
+    in_segment: &BitSet,
+    now_ms: i64,
+    entries: &mut Vec<DeltaEntry>,
+) {
+    for (&rowid, &access_delta) in ws.access_dirty.iter() {
+        // 最新版本随本段落盘时,记录体的 access 列已携带最新统计。
+        if let Some(latest) = ws.latest.get(&rowid)
+            && in_segment.get(latest.get() as usize)
+        {
+            continue;
+        }
+        let stat = ws.access.get(&rowid).copied().unwrap_or_default();
+        let ns_id = ns_of(ws, rowid);
+        entries.push(DeltaEntry::Access {
+            seqno: ws.seqno.get(),
+            tx_ms: now_ms,
+            ns_id,
+            rowid: rowid.get(),
+            last_access_ms: stat.last_access_ms,
+            access_delta,
+            importance_delta: 0.0,
+        });
+    }
+}
+
+/// 关系净变更条目(全量重写关系表时不需要)。
+fn collect_edge_deltas(ws: &WriterState, now_ms: i64, entries: &mut Vec<DeltaEntry>) {
+    for &(from, to, kind) in ws.edge_dirty.iter() {
+        let edge = ws.out_edges.get(&from).and_then(|edges| {
+            edges
+                .iter()
+                .find(|edge| edge.to == to && edge.kind.0 == kind)
+        });
+        let ns_id = ns_of(ws, from);
+        entries.push(match edge {
+            Some(edge) => DeltaEntry::Relate {
+                seqno: ws.seqno.get(),
+                tx_ms: now_ms,
+                ns_id,
+                from: from.get(),
+                to: to.get(),
+                kind,
+                weight: edge.weight,
+                meta: edge.metadata.clone(),
+            },
+            None => DeltaEntry::Unrelate {
+                seqno: ws.seqno.get(),
+                tx_ms: now_ms,
+                ns_id,
+                from: from.get(),
+                to: to.get(),
+                kind,
+            },
+        });
+    }
+}
+
+/// 该 RowId 最新版本所属命名空间;不存在时为 0。
+fn ns_of(ws: &WriterState, rowid: crate::core::types::RowId) -> u32 {
+    ws.latest
+        .get(&rowid)
+        .map_or(0, |slot| ws.slots[slot.get() as usize].ns_id.get())
+}
+
+/// 由本次物化的槽位构建局部 zone map / bloom / 倒排在段内局部编号上编码。
+///
+/// 全局加速结构(`ws.zones`/`ws.inv`/`ws.key_bloom`)覆盖全部槽位,块编号与
+/// 段内块不一致,不可直接编码;增量段按局部槽位重建这三区(代价正比于本段行数)。
 ///
 /// # Errors
 /// 倒排编码超 `u32` 长度或 postings 违背升序不变量时返回结构化错误。
-fn build_indexes(ws: &WriterState, config: &Config, row_count: usize) -> Result<SegmentIndexBlobs> {
+fn build_indexes(
+    ws: &WriterState,
+    config: &Config,
+    included: &[usize],
+) -> Result<SegmentIndexBlobs> {
     let max_fields = (config.tuning.field_dict_max as usize).max(1);
+    let IndexFields {
+        fields,
+        key_field_id,
+    } = index_fields(ws, max_fields)?;
+    let local = observe_included(ws, config, max_fields, included);
+    let mut zmap = msec::encode_zmap(&local.zones, &fields, local.block_count);
+    zmap.extend_from_slice(&msec::encode_ttl_map(&local.min_expires));
+    Ok(SegmentIndexBlobs {
+        field_dict: msec::encode_field_dict(&fields),
+        zmap,
+        bloom: msec::encode_bloom(&local.bloom, key_field_id),
+        inverted: msec::encode_inverted(&local.inv)?,
+    })
+}
+
+/// 字段字典条目与 bloom 字段编号。
+struct IndexFields {
+    /// 字段定义 `(名称, 类型)`,按名称排序。
+    fields: Vec<(Arc<str>, FieldKind)>,
+    /// `key` 字段编号(bloom 使用)。
+    key_field_id: u16,
+}
+
+/// 字段字典条目与 bloom 字段编号(给 `key` 保留唯一槽位)。
+fn index_fields(ws: &WriterState, max_fields: usize) -> Result<IndexFields> {
     let mut fields: Vec<(Arc<str>, FieldKind)> = ws
         .zones
         .fields_iter()
@@ -112,14 +254,60 @@ fn build_indexes(ws: &WriterState, config: &Config, row_count: usize) -> Result<
             got: fields.len(),
         }
     })?;
-
-    let block_count = row_count.div_ceil(ZONE_BLOCK_ROWS);
-    Ok(SegmentIndexBlobs {
-        field_dict: msec::encode_field_dict(&fields),
-        zmap: msec::encode_zmap(&ws.zones, &fields, block_count),
-        bloom: msec::encode_bloom(&ws.key_bloom, key_field_id),
-        inverted: msec::encode_inverted(&ws.inv)?,
+    Ok(IndexFields {
+        fields,
+        key_field_id,
     })
+}
+
+/// 段内局部索引观察结果。
+struct LocalIndexes {
+    zones: ZoneIndex,
+    bloom: BloomSet,
+    inv: InvertedIndex,
+    min_expires: Vec<i64>,
+    block_count: usize,
+}
+
+/// 在本段局部槽位编号上观察 zone map / bloom / 倒排与 TTL 块最小值。
+fn observe_included(
+    ws: &WriterState,
+    config: &Config,
+    max_fields: usize,
+    included: &[usize],
+) -> LocalIndexes {
+    let block_count = included.len().div_ceil(ZONE_BLOCK_ROWS);
+    let mut local = LocalIndexes {
+        zones: ZoneIndex::new(max_fields),
+        bloom: BloomSet::new(BLOOM_INITIAL_CAPACITY, config.tuning.bloom_fpp),
+        inv: InvertedIndex::default(),
+        min_expires: vec![i64::MAX; block_count],
+        block_count,
+    };
+    for (local_slot, &idx) in included.iter().enumerate() {
+        let slot_data = &ws.slots[idx];
+        if slot_data.deleted {
+            continue;
+        }
+        local.zones.observe(local_slot, slot_data);
+        if let Some(text) = &slot_data.text {
+            local.inv.insert_text(
+                SlotId::new(local_slot as u32),
+                slot_data.ns_id,
+                text,
+                ws.stopwords_enabled,
+            );
+        }
+        if let Some(key) = &slot_data.key {
+            local.bloom.insert(key.as_str());
+        }
+        // TTL 块级剪枝:块内 min(expires_at),无 TTL 行记 +∞。
+        if let Some(expires) = slot_data.expires_at {
+            let block = local_slot / ZONE_BLOCK_ROWS;
+            local.min_expires[block] = local.min_expires[block].min(expires);
+        }
+    }
+    local
 }
 
 /// 一次段索引编码的产物(四个区字节)。
@@ -138,11 +326,11 @@ struct BuiltIndex {
     entry_level: u8,
 }
 
-/// 构建 HNSW 图并序列化为 hidx(无工厂或空表时各字段为空/零)。
+/// 构建 HNSW 图并序列化为 hidx(无工厂或空段时各字段为空/零)。
 ///
 /// # Errors
 /// 图序列化失败(hidx 长度字段超出格式上限)时返回结构化错误。
-fn build_index(ws: &WriterState, config: &Config) -> Result<BuiltIndex> {
+fn build_index(ws: &WriterState, config: &Config, included: &[usize]) -> Result<BuiltIndex> {
     let Some(factory) = config.index_factory.as_ref() else {
         return Ok(BuiltIndex {
             bytes: None,
@@ -151,7 +339,7 @@ fn build_index(ws: &WriterState, config: &Config) -> Result<BuiltIndex> {
             entry_level: 0,
         });
     };
-    if ws.slots.is_empty() {
+    if included.is_empty() {
         return Ok(BuiltIndex {
             bytes: None,
             index: None,
@@ -159,16 +347,25 @@ fn build_index(ws: &WriterState, config: &Config) -> Result<BuiltIndex> {
             entry_level: 0,
         });
     }
-    let nodes: Vec<IndexNode> = ws
-        .slots
+    let nodes: Vec<IndexNode> = included
         .iter()
-        .map(|slot| IndexNode {
-            rowid: slot.rowid,
-            vector: Arc::clone(&slot.vector),
-            norm_sq: slot.norm_sq,
+        .map(|&idx| {
+            let slot = &ws.slots[idx];
+            IndexNode {
+                rowid: slot.rowid,
+                vector: Arc::clone(&slot.vector),
+                norm_sq: slot.norm_sq,
+            }
         })
         .collect();
-    let index = factory.build(&nodes, config.hnsw, config.metric);
+    let slot_of: Vec<SlotId> = included
+        .iter()
+        .map(|&idx| {
+            // 槽位下标 ≤ u32::MAX(FC-MEM-INV-004),转换可证明不会失败。
+            SlotId::new(u32::try_from(idx).expect("槽位下标必可转入 u32(FC-MEM-INV-004)"))
+        })
+        .collect();
+    let index = factory.build(&nodes, &slot_of, config.hnsw, config.metric);
     let entry = index.entry();
     let bytes = index.serialize()?;
     Ok(BuiltIndex {
@@ -179,16 +376,16 @@ fn build_index(ws: &WriterState, config: &Config) -> Result<BuiltIndex> {
     })
 }
 
-/// 由写状态构造段内槽位与 vsec 输入列。
-fn build_slots(ws: &WriterState) -> SegmentSlots<'_> {
-    let count = ws.slots.len();
+/// 由写状态与指定槽位构造段内槽位与 vsec 输入列(向量借用自 `ws`)。
+fn build_slots<'a>(ws: &'a WriterState, included: &[usize]) -> SegmentSlots<'a> {
     let mut built = SegmentSlots {
-        slots: Vec::with_capacity(count),
-        vectors: Vec::with_capacity(count),
-        norms: Vec::with_capacity(count),
-        dead: Vec::with_capacity(count),
+        slots: Vec::with_capacity(included.len()),
+        vectors: Vec::with_capacity(included.len()),
+        norms: Vec::with_capacity(included.len()),
+        dead: Vec::with_capacity(included.len()),
     };
-    for (index, slot) in ws.slots.iter().enumerate() {
+    for &index in included {
+        let slot = &ws.slots[index];
         built.dead.push(ws.dead.get(index) || slot.deleted);
         built.slots.push(SlotMeta {
             rowid: slot.rowid,
@@ -207,10 +404,10 @@ fn entry_body(slot: &SlotData, ws: &WriterState) -> Option<EntryData> {
     if slot.deleted {
         return None;
     }
-    let access = ws
-        .access
-        .get(&slot.rowid)
-        .map(|stat| (stat.last_access_ms, stat.access_count));
+    // 访问统计**始终**写出(缺省 0):版本行的 `access` 列是写入时刻的累计快照,
+    // 缺失会让恢复按"未携带"跳过覆盖,把更旧版本的值留在表里,delta 再累加即
+    // 重复计数(FC-PERSIST-POST-010)。写 0 明确表示"该版本时点为 0 次"。
+    let stat = ws.access.get(&slot.rowid).copied().unwrap_or_default();
     Some(EntryData {
         rowid: slot.rowid,
         seqno: slot.seqno,
@@ -221,7 +418,7 @@ fn entry_body(slot: &SlotData, ws: &WriterState) -> Option<EntryData> {
         created_at_ms: slot.created_at,
         expires_at_ms: slot.expires_at,
         importance: Some(slot.importance),
-        access,
+        access: Some((stat.last_access_ms, stat.access_count)),
         valid_time: Some((slot.valid_from, slot.valid_to)),
         confidence: Some(slot.confidence),
         provenance: slot.provenance.clone(),
@@ -230,10 +427,11 @@ fn entry_body(slot: &SlotData, ws: &WriterState) -> Option<EntryData> {
 
 /// 统计各命名空间的活行数与文本**字节**总长(msec `ns_stats` 区;查询期不消费,
 /// BM25 的长度口径以倒排 doc 区的词数为准,见 `FC-QUERY-POST-003`)。
-fn build_ns_stats(ws: &WriterState, config: &Config) -> Vec<NsStatRow> {
+fn build_ns_stats(ws: &WriterState, config: &Config, included: &[usize]) -> Vec<NsStatRow> {
     let now = config.clock.now_unix_ms();
     let mut stats: HashMap<u32, (u64, u64)> = HashMap::new();
-    for (index, slot) in ws.slots.iter().enumerate() {
+    for &index in included {
+        let slot = &ws.slots[index];
         if ws.dead.get(index) || !slot.is_live(now) {
             continue;
         }
@@ -278,8 +476,8 @@ mod tests {
     use crate::core::meta::json;
     use crate::core::metric::Metric;
     use crate::core::options::{
-        CompactionPolicy, Compression, Dimension, FsyncPolicy, HnswParams, InsertMode, Limits,
-        RelationIndex, SystemClock, Tuning, VectorFormat,
+        CompactionPolicy, Compression, Dimension, HnswParams, InsertMode, Limits, RelationIndex,
+        SystemClock, Tuning, VectorFormat,
     };
     use crate::core::types::{Key, NsId, RowId, SeqNo};
     use crate::memory::dedup::Dedup;
@@ -290,7 +488,6 @@ mod tests {
         Config {
             dimension: Dimension::new(2).expect("dimension"),
             metric: Metric::Cosine,
-            fsync: FsyncPolicy::default(),
             insert_mode: InsertMode::default(),
             dedup: Dedup::default(),
             dedup_threshold: 0.9,
@@ -308,8 +505,6 @@ mod tests {
             limits: Limits::default(),
             clock: Arc::new(SystemClock),
             read_only: false,
-            verify_on_open: false,
-            fail_fast_on_corruption: false,
         }
     }
 
@@ -345,7 +540,7 @@ mod tests {
         let slot = slot_with_numeric_key();
         Arc::make_mut(&mut ws.slots).push(Arc::clone(&slot));
         Arc::make_mut(&mut ws.zones).observe(0, &slot);
-        let blobs = build_indexes(&ws, &test_config(), 1).expect("build_indexes");
+        let blobs = build_indexes(&ws, &test_config(), &[0]).expect("build_indexes");
         let defs = msec::decode_field_dict(&blobs.field_dict).expect("field_dict");
         let key_fields: Vec<_> = defs
             .iter()

@@ -850,3 +850,29 @@ proptest! {
         prop_assert_eq!(got, common::reference_dot(&query, &expected, k));
     }
 }
+
+/// FC-MEM-ERR-002:未落地的 `Scoring::bias_routing` 设置即返回 `Unsupported`,
+/// 绝不静默忽略(未接线的语义不得参与运行)。
+#[test]
+fn bias_routing_unsupported_is_explicit() {
+    let ns = mem(2).namespace("n");
+    ns.insert(Record::new(vec![1.0, 0.0]).key("a")).expect("a");
+    let error = ns
+        .search()
+        .vector(&[1.0, 0.0])
+        .score(mneme::Scoring {
+            bias_routing: true,
+            ..mneme::Scoring::default()
+        })
+        .execute()
+        .expect_err("bias_routing 必须显式拒绝");
+    assert!(
+        matches!(
+            error,
+            mneme::MnemeError::Unsupported {
+                feature: "Scoring::bias_routing"
+            }
+        ),
+        "必须是 Unsupported 且指出特性名,实际 {error:?}"
+    );
+}

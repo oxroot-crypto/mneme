@@ -66,7 +66,7 @@ pub use lifecycle::{RetainReport, Retention};
 pub use namespace::Namespace;
 pub use ops::{
     BackupReport, CheckReport, CompactionControl, CompactionState, Histogram, HistoryStat, NsStat,
-    QuantStat, SegmentStat, Stats, StorageStat,
+    QuantStat, SegmentStat, SnapshotStats, Stats, StorageStat,
 };
 pub use pred::{CmpOp, Expr, FieldBuilder, Val};
 pub use record::{Hit, InsertOutcome, Record, RecordRef, UpdateOutcome};

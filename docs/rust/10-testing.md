@@ -32,7 +32,7 @@ mod tests {
 }
 ```
 
-见 [`src/core/types.rs:267-278`](../../src/core/types.rs)。(`...` 处源码里还有
+见 [`src/core/types.rs:268-278`](../../src/core/types.rs)。(`...` 处源码里还有
 `SeqNo` / `SegmentId` / `NsId` 三个断言,此处节选。)
 
 - `#[cfg(test)]` 让这个模块**只在 `cargo test` 时编译**,不会进发布产物。
@@ -73,7 +73,7 @@ fn expired_session_is_invalid() {
 
 生产代码禁止 `unwrap`,但**测试里允许**——测试失败就该炸,且 `unwrap` 的报错信息够用。
 mneme 的集成测试用 `.expect("下界合法")` 让失败信息更清楚,见
-[`tests/core_contracts.rs:45`](../../tests/core_contracts.rs)。
+[`tests/core_contracts.rs:45-49`](../../tests/core_contracts.rs)。
 
 ### 1.4 测试替身:可注入的假时钟
 
@@ -101,8 +101,10 @@ impl Clock for FakeClock {
 - 这是"外部状态必须通过参数注入"(见 [CONTRIBUTING.md](../../CONTRIBUTING.md))的落地;
   随机数、环境变量同理,不要直接读全局。
 
-> 仓库里还有一份共享的 `FakeClock(Arc<Mutex<i64>>)`,放在 [`tests/common/mod.rs`](../../tests/common/mod.rs),
-> 供其余契约测试复用;两种写法都行,关键是"测试能控制时间"。
+> **两种假时钟的分工**:L4 契约测试用文件内私有的 `FakeClock(AtomicI64)`(上文的写法);
+> [`tests/common/mod.rs`](../../tests/common/mod.rs) 另有一份共享的
+> `FakeClock(Arc<Mutex<i64>>)`,供 L5/life/memory/model/query 等其余契约测试复用
+> (L4 未使用共享版)。两种写法都行,关键是"测试能控制时间"。
 
 ---
 
@@ -122,7 +124,10 @@ use mneme::simd::{dot, dot_scalar};
 - 多个集成测试要共享辅助函数时,把它们放进 `tests/common/mod.rs`,各测试文件用 `mod common;`
   引入(目录入口 `mod.rs` 不会被单独当成一个测试 crate)。L4 契约测试就复用了其中的建库助手:
   `mod common; use common::{inserted, mem};`,见
-  [`tests/l4_contracts.rs:27-29`](../../tests/l4_contracts.rs)。
+  [`tests/l4_contracts.rs:27-29`](../../tests/l4_contracts.rs)。共享模块现有四类助手
+  (见 [`tests/common/mod.rs`](../../tests/common/mod.rs)):`FakeClock`(假时钟)、
+  `mem(dim)`(建内存库)、`inserted(outcome)`(解包出 `RowId`)、`reference_dot`(暴力参考实现);
+  L5/life/memory/model/query 各契约测试都经 `mod common;` 复用。
 
 ---
 
@@ -209,7 +214,16 @@ proptest! {
         let b = &b[..len];
         let vectorized = dot(a, b);
         let scalar = dot_scalar(a, b);
-        let tolerance = 1e-4 * (1.0 + scalar.abs());
+        // 两种实现的差异来自 f32 累加的舍入顺序,上界 ≈ γ_n · Σ|a_i·b_i|
+        // (γ_n = n·ε/(1 − n·ε));固定容差在长向量下会偶发误报,按 4 倍余量随长度缩放。
+        let sum_abs: f32 = a
+            .iter()
+            .zip(b.iter())
+            .map(|(x, y)| x.abs() * y.abs())
+            .sum();
+        let n = a.len() as f32;
+        let gamma = (n * f32::EPSILON) / (1.0 - n * f32::EPSILON);
+        let tolerance = 4.0 * gamma * sum_abs + 1e-5;
         prop_assert!(
             (vectorized - scalar).abs() <= tolerance,
             "dot={vectorized} scalar={scalar}"
@@ -218,7 +232,7 @@ proptest! {
 }
 ```
 
-见 [`tests/core_contracts.rs:221-244`](../../tests/core_contracts.rs)。这是优化代码最有力的正确性保障。
+见 [`tests/core_contracts.rs:219-244`](../../tests/core_contracts.rs)。这是优化代码最有力的正确性保障。
 
 ### 4.4 参照实现:验证数据结构
 
@@ -269,7 +283,7 @@ fn mutated_valid_hidx_strategy() -> impl Strategy<Value = Vec<u8>> {
 }
 ```
 
-见 [`src/index/hidx.rs:727-767`](../../src/index/hidx.rs)。三个新工具:
+见 [`src/index/hidx.rs:730-770`](../../src/index/hidx.rs)。三个新工具:
 
 - **`impl Strategy<Value = T>`**:策略也是值,可以写成函数返回。`impl Trait` 返回类型让调用者
   不必关心具体策略类型(见 [06 §2.3](06-generics-traits.md));
@@ -299,7 +313,7 @@ proptest! {
 }
 ```
 
-见 [`src/index/hidx.rs:769-801`](../../src/index/hidx.rs)。要点:
+见 [`src/index/hidx.rs:771-801`](../../src/index/hidx.rs)。要点:
 
 - `prop_oneof![a, b, c]` 每次从几个策略中随机挑一个执行,适合"混合来源"的输入;
 - `return Ok(())` 在 `proptest!` 宏里表示"本用例通过"——测试体返回
@@ -354,7 +368,7 @@ assert!(r1 < 4.0, "200→500 增长过快(疑似二次):{r1}");
 assert!(r2 < 4.0, "500→1200 增长过快(疑似二次):{r2}");
 ```
 
-见 [`src/index/hnsw.rs:534-549`](../../src/index/hnsw.rs)。要点:
+见 [`src/index/hnsw.rs:553-568`](../../src/index/hnsw.rs)。要点:
 
 - 断言的是**规模之间的比值**,不是绝对次数——常数随实现微调而变,但"线性时 2.5 倍节点
   对应约 2.5 倍操作数,二次时约 6.25 倍"这个结构性质稳定;
@@ -362,11 +376,18 @@ assert!(r2 < 4.0, "500→1200 增长过快(疑似二次):{r2}");
 - 探针代码全部在 `#[cfg(test)]` 下,发布产物里一行不剩。测试里先重置计数
   (`DIST_CALLS.with(|calls| calls.set(0))`)再执行,读取时把 `Cell::get` 当函数指针传给
   `with`(`DIST_CALLS.with(std::cell::Cell::get)`),见
-  [`src/index/hnsw.rs:496-500`](../../src/index/hnsw.rs)。
+  [`src/index/hnsw.rs:515-518`](../../src/index/hnsw.rs)。
 
 > 同类探针在 `filtered.rs` 里记录"最近一次搜索命中的档位与 `ef`",用于把档位分派公式
 > 逐值钉死;`thread_local!` 保证并行测试互不干扰(见
 > [`src/index/filtered.rs:37-63`](../../src/index/filtered.rs))。
+>
+> 如果被测状态会**跨线程共享**,`thread_local!` + `Cell` 就不适用了(每个线程一份,
+> 加不到一起),要换成原子。例如 `FsyncHook` 要求实现 `Send + Sync`——回调可能由后台
+> 维护线程触发,测试里的故障注入计数器因此用 `AtomicUsize` +
+> `.fetch_add(1, Ordering::Relaxed)`(见
+> [`src/persist/store/wal_writer.rs:415-427`](../../src/persist/store/wal_writer.rs)),
+> 原子类型见 [04 §5.2](04-borrowing-strings-slices.md)。
 
 ---
 
@@ -474,14 +495,17 @@ cargo test --release                # release 模式跑(测优化后的行为)
 ## 结语
 
 到这里,你已经掌握了读懂 mneme L0 所需的全部 Rust 基础。L1( [`src/memory/`](../../src/memory) )
-新引入的共享所有权、锁与写事务等特性,L3( [`src/index/`](../../src/index) )
+新引入的共享所有权、锁与写事务等特性,L2( [`src/persist/`](../../src/persist) )
+新引入的文件 I/O、`ErrorKind` 分类与 mmap 的 `unsafe`,L3( [`src/index/`](../../src/index) )
 新引入的手写 `Ord`、`BinaryHeap`、`TryFrom`/受检运算、字节切片操作、let 链与 `let...else`、
-`thread_local!` 探针、proptest 自定义策略,以及 L4( [`src/query/`](../../src/query) )
+`thread_local!` 探针、proptest 自定义策略,L4( [`src/query/`](../../src/query) )
 新引入的递归枚举与 `Box`、生命周期参数化解析器、`HashMap` entry API、原子类型、
-运算符重载与 `fmt::Write`、可注入假时钟等,都已回填到 01–08 与 10 章的对应小节
-(回填总表见 [README §4](README.md))。建议现在从头再读一遍
+运算符重载与 `fmt::Write`、可注入假时钟,以及 L5( [`src/life/`](../../src/life) )
+新引入的 `std::thread`/`JoinHandle`、`Weak`、`Condvar`、CAS 循环与 `Drop`/RAII 等,
+都已回填到 01–10 章的对应小节(回填总表见 [README §4](README.md))。建议现在从头再读一遍
 [`src/core/`](../../src/core) 的源码,把每处语法对应回相应章节;有余力再按需读
-[`src/memory/`](../../src/memory)、[`src/index/`](../../src/index) 与
-[`src/query/`](../../src/query)。之后可以按
+[`src/memory/`](../../src/memory)、[`src/persist/`](../../src/persist)、
+[`src/index/`](../../src/index)、[`src/query/`](../../src/query) 与
+[`src/life/`](../../src/life)。之后可以按
 [DESIGN.md](../DESIGN.md) 的分层路线,从 [03 L1 内存引擎](../design/03-l1-memory.md)
 起继续读各层设计文档,并参考 [README 的通用资料](README.md#5-学完之后的下一步通用资料)继续深入 Rust。

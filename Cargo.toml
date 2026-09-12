@@ -33,7 +33,8 @@ proptest = "1"
 # 持久层测试用临时目录(白名单内,见 docs/design/01-overview.md §5)。
 tempfile = "3"
 # L3 起的 criterion 基准(设计 14 §4);仅 dev-dependency,不进入发布产物。
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# `black_box` 自 0.6 起改由 `std::hint` 提供,bench 不再从 criterion 引入。
+criterion = { version = "0.8", default-features = false }
 
 [[bench]]
 name = "hnsw"

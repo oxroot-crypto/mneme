@@ -4,11 +4,11 @@
 //! - 所有元数据文件先写 `.tmp` 再 `rename` 提交,绝不原地覆盖(设计 04 §6);
 //! - [`FileLock`] 提供单写者独占(设计 16 §3):基于 `std::fs::File::try_lock` 的
 //!   OS 咨询锁,进程异常终止由内核自动释放,无需租约/接管;
-//! - [`Store`] 协调 WAL 追加、全量快照 flush 与恢复,是 L2 持久化的核心句柄。
+//! - [`Store`] 协调 WAL 追加、增量段 flush 与恢复,是 L2 持久化的核心句柄。
 //!
-//! > L2 采用**全量快照 flush**(设计 04 §3.2 的 L2 兜底):`flush` 把整个可变表写成
-//! > 一个新段并重提 MANIFEST,旧段进入 `trash/`;增量段与 compaction 由 L5 取代。
-//! > 每条写入先追加 WAL(WAL-before-visible),按 [`FsyncPolicy`] 决定持久确认时机。
+//! > `flush` 为**增量段**(L5 起):只把未落盘槽位与跨段 delta 写成新段,旧段保持活跃、
+//! > MANIFEST 追加提交,段数由 compaction 控制;每条写入先追加 WAL(WAL-before-visible),
+//! > 按 [`FsyncPolicy`] 决定持久确认时机。
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
@@ -288,7 +288,11 @@ mod tests {
     fn write_new_does_not_overwrite() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_new(dir.path(), "a", b"1").expect("first");
-        assert!(write_new(dir.path(), "a", b"2").is_err());
+        assert!(matches!(
+            write_new(dir.path(), "a", b"2"),
+            Err(crate::core::error::MnemeError::Io(_))
+        ));
+        assert_eq!(std::fs::read(dir.path().join("a")).expect("read"), b"1");
     }
 
     /// 路径穿越被拒绝。

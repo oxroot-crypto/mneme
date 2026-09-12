@@ -122,11 +122,11 @@
 | 快照句柄 | SnapshotHandle | 钉住某 ReaderView(段集 + 可变表快照)的只读视图,时间旅行读(I17) | [16 §1.6](16-api-reference.md) |
 | 快照命名空间视图 | SnapshotNamespace | 快照句柄上按命名空间读取的只读视图(键唯一性按命名空间隔离) | [16 §1.6](16-api-reference.md) |
 | 查询标识 | QueryId | 一次检索的幂等标识,随 `Hit` 返回、供 `feedback` 去重 | [10 §4](10-scoring.md) |
-| 优雅关闭 | graceful close | `close()` 返回 Ok 即已持久;`Drop` 仅尽力(I16) | [16 §1.7](16-api-reference.md) |
+| 优雅关闭 | graceful close | `close()` 返回 Ok 即已持久;`Drop` 不执行 flush、不保证持久(I16) | [16 §1.7](16-api-reference.md) |
 | 时间源 | Clock | 可注入的 Unix 毫秒时钟,保证 TTL/遗忘可测 | [04 §10.2](04-l2-persist.md) |
-| 格式版本 | format_version | 文件头版本号;过新则拒绝打开(I18) | [04 §12](04-l2-persist.md) |
+| 格式版本 | format_version | 文件头版本号;与当前定义不一致即拒绝打开(I18) | [04 §12](04-l2-persist.md) |
 | 数据限额 | limits | key/text/meta 等硬上限,超限拒绝 | [16 §8](16-api-reference.md) |
-| 时间点恢复 | PITR (point-in-time recovery) | 把 `current` 指回上一 MANIFEST 版本以回滚一个提交点 | [16 §7.2](16-api-reference.md) |
+| 时间点恢复 | PITR (point-in-time recovery) | 实时库保留最近 2 版 MANIFEST,可把 `current` 指回上一版本回滚一个提交点;备份不支持指针回滚,靠定期 `backup_to` | [16 §7.2](16-api-reference.md) |
 | 结果去重 | ResultDedup | 只作用于单次查询命中列表的去重策略 | [06 §6](06-l4-query.md) |
 | 压缩控制 | compaction control | `compact_control()` 的 pause/resume,让后台合并让路 | [16 §1.6](16-api-reference.md) |
 
@@ -172,16 +172,19 @@
 | CRC-32 | $O(n)$(查表,~GB/s) | 8KB 表 | [04 §4](04-l2-persist.md) |
 | WAL 提交(组) | $O(1)$ 内存 + 1 次 fsync/批 | 顺序追加 | [04 §3](04-l2-persist.md) |
 | WAL 回放 | $O(\text{unflushed frames})$ | — | [04 §3.3](04-l2-persist.md) |
-| zone map 剪枝 | $O(\lceil N/1024\rceil \times \text{predicates})$ | 16B/块/字段 | [04 §5.2](04-l2-persist.md) |
+| zone map 剪枝 | $O(\lceil N/1024\rceil \times \text{predicates})$ | 17B/块/字段 | [04 §5.2](04-l2-persist.md) |
 | bloom 判定 | $O(k) = O(7)$ | $1.44\log_2(1/p)$ bit/元素 | [04 §5.3](04-l2-persist.md) |
 | MANIFEST 提交 | $O(\text{segments})$ 写新文件 | 保留 2 版 | [04 §6](04-l2-persist.md) |
-| 恢复(open) | $O(\text{段总字节} + \text{WAL 字节})$(逐段读入校验 + 回放) | $O(\text{段总字节} + \text{WAL 字节})$;L2/L3 仍整段载入,mmap 读路径优化已在 L3,惰性驻留待 L5/L6 | [04 §7](04-l2-persist.md) |
+| 恢复(open) | $O(\text{段总字节} + \text{WAL 字节})$(逐段读入校验 + 回放) | $O(\text{段总字节} + \text{WAL 字节})$;恢复期仍整段载入,mmap 读路径优化已在 L3,惰性驻留待 L6 | [04 §7](04-l2-persist.md) |
 | HNSW 构建 | $O(N \cdot d \cdot ef_c \cdot M_0)$ | ≈$(8M+20)$ B/节点 | [05 §4/§6.3](05-l3-hnsw.md) |
 | HNSW 查询 | 上界 $O(d \cdot ef \cdot M_0)$;实测 ≈ (2–5)·ef 次点积 | — | [05 §6.1](05-l3-hnsw.md) |
 | 层级分布 | $P(\ge l) = (1/M)^l$;层高 $O(\log_M N)$ | — | [05 §3.2](05-l3-hnsw.md) |
 | DSL 解析 | $O(L)$ 单遍 | $O(\|E\|)$ | [06 §1](06-l4-query.md) |
 | BM25 打分 | $O(\sum_{t \in Q} df_t)$ postings 访问 + 堆操作 | 静态倒排 | [06 §3.4](06-l4-query.md) |
 | RRF/加权融合 | $O(k)$ | $O(k)$ | [06 §4](06-l4-query.md) |
+| 综合重排(Scoring) | $O(m\log m)$(m = 候选数;因子计算 + 排序) | $O(m)$ | [10 §2.5](10-scoring.md) |
+| 联想扩展 | $O(\text{seeds}\cdot\text{max\_nodes}\cdot\text{avg\_degree})$ | $O(\text{max\_nodes}+\text{seeds})$ | [10 §3.2](10-scoring.md) |
+| MMR 贪心 | $O(m\cdot k^2\cdot d)$(冗余相似度未缓存) | $O(k)$ | [10 §5.1](10-scoring.md) |
 | TTL 逻辑过期 | $O(\text{blocks})$(块级 min 剪枝) | 8B/块 | [07 §1](07-l5-life.md) |
 | retain 扫描 | $O(N_{\text{cand}})$ | — | [07 §3.4](07-l5-life.md) |
 | compaction 单轮 | $O(S \cdot d \cdot ef_c \cdot M_0)$(建图主导) | 峰值 +$O(S)$ | [07 §4.5](07-l5-life.md) |
@@ -198,12 +201,15 @@
 | backup_to | 同盘 $O(\text{files})$;跨盘 $O(\text{bytes})$ | 目标目录 | [07 §6](07-l5-life.md) |
 | check(fsck) | $O(\text{total bytes})$ CRC + 对账 | — | [07 §7](07-l5-life.md) |
 
-> **复杂度即契约**:上表每条复杂度均由 [spec/contracts.md §9](../spec/contracts.md)
+> **复杂度即契约**:上表主体复杂度由 [spec/contracts.md §9](../spec/contracts.md)
 > 的 `FC-*-CPLX-*` 契约保证(时间/空间上界、口径标注与回归门禁见该节 §9.3);
+> 规划能力(量化/加密/部署)对应的 `FC-QUANT-*`/`FC-SEC-*`/`FC-DEPLOY-*` 及
+> `FC-GLOBAL-CPLX-001` 当前仍为 `Planned/待补`,实现后回填。
 > 本表是阅读视图,冲突时以契约矩阵为准。
 
-**性能承诺汇总**:Recall@10 ≥ 0.95(ef=128);1M×1536 量化后 P99 < 10ms;
-批量插入 ≥ 50k 向量/秒;冷启动 < 1s;活跃段数有界。验收方法见 [14](14-testing.md)。
+**性能承诺汇总(目标;冷启动与 1M 门槛见 [14 §4](14-testing.md) 的未兑现标注)**:
+Recall@10 ≥ 0.95(ef=128);1M×1536 量化后 P99 < 10ms;批量插入 ≥ 50k 向量/秒;
+冷启动 < 1s;活跃段数有界。验收方法见 [14](14-testing.md)。
 
 ---
 
@@ -231,7 +237,7 @@
 | I15 | `insert_batch` 整批原子(可见数 ∈ {0, n}) | [16 §9](16-api-reference.md) | [14 §2.1](14-testing.md) |
 | I16 | `close()` 返回 `Ok` 后已确认写入持久 | [16 §9](16-api-reference.md) | [14 §2.2](14-testing.md) |
 | I17 | `SnapshotHandle` 视图一致,后台 compaction 不影响 | [07 §8](07-l5-life.md) | [14 §6.1](14-testing.md) |
-| I18 | 拒绝打开更高主版本的文件 | [04 §14](04-l2-persist.md) | [14 §5](14-testing.md) |
+| I18 | 只接受版本与当前定义精确一致的文件,不一致即拒绝打开 | [04 §14](04-l2-persist.md) | [14 §5](14-testing.md) |
 | I19 | 覆盖持久性:删除不复活、更新不丢 | [04 §14](04-l2-persist.md) | [14 §2.4](14-testing.md) |
 | I20 | 注册与水位可恢复,NsId/RowId 永不复用 | [04 §14](04-l2-persist.md) | [14 §2.5](14-testing.md) |
 | I21 | BM25 统计按查询命名空间跨全部活跃段全局聚合(df/N/avgdl),只计活行,跨 NS 互不影响 | [04 §5.6](04-l2-persist.md) | [14 §3.4](14-testing.md) |

@@ -59,24 +59,26 @@ mneme 的 `core` 模块用目录:
 
 ```text
 src/
-  lib.rs          # crate 根,声明 pub mod core;
-  query/          # L4 检索层(内部模块)
-  core/
-    mod.rs        # 声明子模块:error, heap, meta, ...
-    types.rs
-    error.rs
-    metric.rs
-    simd.rs
-    heap.rs
-    varint.rs
-    meta.rs
-    bitset.rs     # L4 计划器/BM25 共用的候选位图
-    text.rs       # L4 BM25 与倒排共用的分词
+  lib.rs          # crate 根:pub mod core/memory;私有 mod index/life/persist/query
+  core/           # L0 原语层(公开)
+    mod.rs        # 声明子模块
+    types.rs error.rs metric.rs simd.rs heap.rs varint.rs meta.rs bitset.rs text.rs
     options/
       mod.rs
-      clock.rs
-      dimension.rs
-      ...
+      clock.rs dimension.rs ...
+  memory/         # L1 内存引擎(公开)
+    mod.rs engine.rs engine_ops.rs config.rs record.rs search.rs pred.rs ...
+    table/ namespace/ analysis/ ...
+  persist/        # L2 持久层(crate 内部;门面经 memory 暴露)
+    mod.rs vsec.rs manifest.rs edges.rs flush.rs source.rs storage.rs
+    codec.rs hook.rs trash.rs
+    wal/ msec/ recover/ store/
+  index/          # L3 索引层(crate 内部)
+    mod.rs hnsw.rs graph.rs filtered.rs rebuild.rs hidx.rs factory.rs
+  query/          # L4 检索层(crate 内部)
+    mod.rs parse/ display.rs json.rs iso.rs plan.rs zmap.rs bm25.rs fusion.rs exec.rs
+  life/           # L5 生命周期层(crate 内部)
+    mod.rs compact.rs maintenance.rs
 ```
 
 `src/core/mod.rs` 只做模块声明与文档:
@@ -99,6 +101,19 @@ pub mod varint;
 > `bitset` 是 `pub(crate)`(见下节):它只服务 crate 内部的索引与计划器,不对外暴露。
 
 见 [`src/core/mod.rs`](../../src/core/mod.rs)。**规范要求 `mod.rs` 只做组织与 `pub use`,不写业务逻辑。**
+
+> **条件模块/条件项**:`mod` 声明与其他项一样能用 `#[cfg]` 控制。L2 的 `source.rs` 里
+> `MmapSource` 整个类型只在 `feature = "mmap"` 时存在:
+>
+> ```rust
+> #[cfg(feature = "mmap")]
+> pub(crate) struct MmapSource {
+>     map: memmap2::Mmap,
+> }
+> ```
+>
+> 见 [`src/persist/source.rs:89-92`](../../src/persist/source.rs)。关闭 feature 时该类型
+> 与相关方法都不参与编译,由 `FileSource` 兜底(见 [09 §4.2](09-cfg-unsafe-simd.md))。
 
 ---
 
@@ -150,7 +165,7 @@ mod factory;
 pub(crate) use factory::default_factory;
 ```
 
-见 [`src/index/mod.rs:26-28`](../../src/index/mod.rs)。`pub(crate) use` 是"仅在本 crate 内重导出":
+见 [`src/index/mod.rs:27`](../../src/index/mod.rs)。`pub(crate) use` 是"仅在本 crate 内重导出":
 门面(`memory::Builder`)能用,下游用户看不到——这正是 [AGENTS.md](../../AGENTS.md) 里
 "门面可注入 `IndexFactory`"的可见性边界。
 

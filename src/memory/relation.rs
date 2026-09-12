@@ -51,6 +51,11 @@ impl RelateOptions {
     ///
     /// * `kind` - 关系类型。
     /// * `weight` - 边权;越界值在写入入口钳制到 `[0,1]`。
+    ///
+    /// # Returns
+    ///
+    /// `metadata` 为 [`Meta::Null`] 的选项,可经 [`metadata`](Self::metadata)
+    /// 覆盖。
     pub fn new(kind: RelationKind, weight: f32) -> Self {
         Self {
             kind,
@@ -60,6 +65,14 @@ impl RelateOptions {
     }
 
     /// 设置边元数据(链式)。
+    ///
+    /// # Arguments
+    ///
+    /// * `metadata` - 边元数据(开放 JSON);覆盖缺省 [`Meta::Null`]。
+    ///
+    /// # Returns
+    ///
+    /// 携带边元数据的选项(链式)。
     pub fn metadata(mut self, metadata: Meta) -> Self {
         self.metadata = metadata;
         self
@@ -75,7 +88,9 @@ pub struct RelationExpand {
     pub kinds: Vec<RelationKind>,
     /// 每跳衰减系数,默认 0.5。
     pub decay: f32,
-    /// 扩展节点数上限,默认 4096。
+    /// 扩展过程的访问上限,默认 4096:`visited` 集合总量上限(种子预置其中、
+    /// 结果为其子集),被命名空间/存活/过滤拒绝的节点也计入;达到上限即停止
+    /// 后续扩展(`FC-SCORE-CPLX-002`)。
     pub max_nodes: usize,
 }
 

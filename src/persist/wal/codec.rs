@@ -39,7 +39,7 @@ pub(crate) fn parse_file_header(bytes: &[u8]) -> Result<WalHeader> {
         });
     }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-    check_version("wal", version)?;
+    check_version("wal", version, FORMAT_VERSION)?;
     let stored_crc = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
     if crc32(&bytes[0..12]) != stored_crc {
         return Err(MnemeError::Corrupted {
@@ -54,7 +54,10 @@ pub(crate) fn parse_file_header(bytes: &[u8]) -> Result<WalHeader> {
 
 /// 编码一帧。
 pub(crate) fn encode_frame(seqno: u64, kind: FrameKind, payload: &[u8]) -> Vec<u8> {
-    let payload_len = payload.len() as u32;
+    // 单帧负载有界(记录体限额:文本 1 MiB + 向量 ≤ 512 KiB + metadata 64 KiB),
+    // 远小于 u32::MAX,转换可证明不会失败;静默截断会破坏帧布局。
+    let payload_len =
+        u32::try_from(payload.len()).expect("WAL 单帧负载远小于 u32::MAX(FC-GLOBAL-PRE-003 限额)");
     let mut covered = Vec::with_capacity(4 + 8 + 1 + payload.len());
     covered.extend_from_slice(&payload_len.to_le_bytes());
     covered.extend_from_slice(&seqno.to_le_bytes());

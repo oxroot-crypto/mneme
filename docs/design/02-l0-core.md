@@ -5,7 +5,7 @@
 > **前置阅读**:[00 §3–§4](00-fundamentals.md)(嵌入向量与相似度)、[00 §7](00-fundamentals.md)(大 O)。
 > **本章你将学到**:ID/错误设计 → 距离度量的完整数学与 SIMD 实现 → TopK 堆 → varint 编码。
 
-模块清单:`core/{types.rs, error.rs, metric.rs, simd.rs, varint.rs, meta.rs, heap.rs, options/}`
+模块清单:`core/{types.rs, error.rs, metric.rs, simd.rs, varint.rs, meta.rs, heap.rs, bitset.rs, text.rs, options/}`
 (`options/` 为按主题拆分的模块目录,见 §8)
 
 ---
@@ -18,7 +18,7 @@
 | 类型 | 角色 / 范围 | 含义 | 生命周期 |
 |---|---|---|---|
 | `RowId(u64)` | **全局稳定逻辑标识**,首次写入时分配 | 公开 API 的稳定句柄(`Hit.rowid`、`get_by_rowid`);访问统计、关系边均以它为主键;更新/upsert **保留 RowId**(写新物理版本) | 永不复用;跨更新、跨段、跨 compaction 稳定不变 |
-| `SlotId(u32)` | **内部**段内物理槽位(每物理版本一个) | vectors 下标 / 删除位图 bit / HNSW 节点 id;仅存储与索引层内部使用,**不对外暴露** | 段内追加写、永不复用;仅 compaction 重建新段时按新段重新编号(见 [03 §3](03-l1-memory.md)) |
+| `SlotId(u32)` | **内部**段内物理槽位(每物理版本一个) | vectors 下标 / 删除位图 bit / HNSW 节点 id;仅库根 re-export 类型名,当前公开签名不使用其数值,调用方不得依赖 | 段内追加写、永不复用;仅 compaction 重建新段时按新段重新编号(见 [03 §3](03-l1-memory.md)) |
 | `SeqNo(u64)` | 全局提交序号,单调递增 | MVCC 快照的基石([00 §6.6](00-fundamentals.md)) | 永不复用 |
 | `SegmentId(u32)` | 段文件编号 | 与文件名 `seg_000042.vsec` 对应 | 永不复用 |
 | `NsId(u32)` | 命名空间编号 | `(NsId, Key)` 是复合主键;WAL 帧、key_index 均引用 | 永不复用 |
@@ -57,7 +57,7 @@ pub enum MnemeError {
     TooLarge { field: &'static str, limit: usize, got: usize }, // 数据超限额,见 16 §8
     LimitExceeded { field: &'static str, limit: usize, got: usize }, // 参数越上限(维度/top_k/ef)
     MetaTooDeep { limit: usize, got: usize },           // metadata 嵌套过深
-    UnsupportedVersion { file: &'static str, found: u16, max: u16 }, // 文件格式过新
+    UnsupportedVersion { file: &'static str, found: u16, max: u16 }, // 文件格式与当前定义不一致
     Closed,                                             // 库已关闭后经任意句柄读写
     NonFinite,                                          // 向量分量或标量因子 NaN/±Inf
     Config { reason: &'static str },                    // 建库/查询配置或策略参数非法
@@ -376,9 +376,11 @@ L0 向上提供,且**只**提供:
    标量参考实现,同时用于非 SIMD 架构回退)及其薄封装 `metric::{cosine, euclidean_sq}`
    (均归结为一次点积;两切片等长由调用方保证);
 3. 容器:`TopK<T: Ord>`(同分按载荷升序,见 §5.1):`TopK::{new, push, merge, len,
-   is_empty, capacity, into_sorted_vec}`;编解码:
-   `varint::{encode_u32, encode_u64, decode_u32, decode_u64}`;
-4. 错误:`MnemeError` 与 `Result`。
+   is_empty, capacity, into_sorted_vec}`;`BitSet`(存活/删除/块级位图共用);
+   编解码:`varint::{encode_u32, encode_u64, decode_u32, decode_u64}`;
+4. 文本:`text::tokenize`(按 Unicode 空白切词 + CJK bigram + 可选停用词,
+   口径见 [06 §3.5](06-l4-query.md);契约 `FC-CORE-POST-008`);
+5. 错误:`MnemeError` 与 `Result`。
 
 **禁止**:任何 I/O、任何全局状态、任何锁、任何 `unsafe`(除 `simd.rs` 的 arch 内联)、
 对 `serde` 的直接使用(只经 `meta.rs`)。所有函数必须是无 panic 的 `Result` 或

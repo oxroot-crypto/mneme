@@ -91,6 +91,29 @@ impl InvertedIndex {
     pub(crate) fn insert_doc(&mut self, ns_id: NsId, slot: SlotId, doc_len: u32) {
         self.docs.entry(ns_id).or_default().insert(slot, doc_len);
     }
+
+    /// 合并另一倒排索引(多段恢复用):同一命名空间内按槽位升序合并 posting。
+    ///
+    /// 各段槽位互斥(一个全局槽位只属于一个段),故不存在同一槽位的 tf 叠并。
+    pub(crate) fn merge_from(&mut self, other: InvertedIndex) {
+        for (ns_id, docs) in other.docs {
+            self.docs.entry(ns_id).or_default().extend(docs);
+        }
+        for (ns_id, terms) in other.terms {
+            let bucket = self.terms.entry(ns_id).or_default();
+            for (term, mut postings) in terms {
+                match bucket.get_mut(&term) {
+                    Some(existing) => {
+                        existing.append(&mut postings);
+                        existing.sort_by_key(|posting| posting.slot);
+                    }
+                    None => {
+                        bucket.insert(term, postings);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

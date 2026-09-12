@@ -1,18 +1,21 @@
 //! Mneme:面向 AI Agent 超长期记忆层的嵌入型向量存储引擎。
 //!
 //! 本 crate 采用 L0–L6 渐进式分层;当前实现为 **L0 原语层**([`core`])、
-//! **L1 内存引擎**([`memory`])、**L2 持久层**(`persist`)、**L3 索引层**(`index`)
-//! 与 **L4 检索层**(`query`)。L1 提供全内存的完整公开 API(易失);L2 以
-//! `Builder::path` 或 [`Mneme::open`] 打开本地目录库,提供 WAL、段文件、
-//! MANIFEST 与崩溃恢复;L3 引入自研 HNSW;L4 补齐过滤 DSL、BM25 与 RRF 融合。
+//! **L1 内存引擎**([`memory`])、**L2 持久层**(`persist`)、**L3 索引层**(`index`)、
+//! **L4 检索层**(`query`)与 **L5 生命周期层**(`life`)。L1 提供全内存的完整公开
+//! API(易失);L2 以 `Builder::path` 或 [`Mneme::open`] 打开本地目录库,提供 WAL、
+//! 段文件、MANIFEST 与崩溃恢复;L3 引入自研 HNSW;L4 补齐过滤 DSL、BM25 与 RRF
+//! 融合;L5 提供多段增量 flush、size-tiered compaction、WAL 轮转/Checkpoint、TTL
+//! 块级剪枝、后台维护、快照与备份。
 //!
 //! # 模块
 //!
 //! * [`core`] —— 标识类型、错误、距离度量、SIMD 点积、TopK 堆、位图、varint、元数据与配置类型。
 //! * [`memory`] —— 内存表、暴力检索、过滤 AST、去重与记忆生命周期,并承载公开门面。
-//! * `persist`(内部)—— L2 持久层:WAL、段文件、MANIFEST、恢复与全量快照 flush。
+//! * `persist`(内部)—— L2 持久层:WAL、段文件、MANIFEST、恢复与增量段 flush。
 //! * `index`(内部)—— L3 索引层:自研 HNSW、过滤三档、hidx 编解码与 mmap 段读取。
 //! * `query`(内部)—— L4 检索层:过滤 DSL、查询计划器、BM25、融合与执行管线。
+//! * `life`(内部)—— L5 生命周期层:compaction 计划、后台维护线程与自动遗忘。
 //!
 //! # 示例
 //!
@@ -38,6 +41,7 @@ pub mod core;
 pub mod memory;
 
 mod index;
+mod life;
 mod persist;
 mod query;
 
@@ -59,8 +63,8 @@ pub use crate::memory::{
     ConsolidateReport, ConsolidationPolicy, Dedup, Edge, Expr, FieldBuilder, Fusion, Histogram,
     HistoryStat, Hit, InsertOutcome, Mneme, Namespace, NsStat, QuantStat, QueryCtx, Record,
     RecordRef, RelateOptions, RelationExpand, Reranker, ResultDedup, RetainReport, Retention,
-    ScoreBreakdown, SearchBuilder, SegmentStat, SnapshotHandle, SnapshotNamespace, Stats,
-    StorageStat, Summarizer, UpdateOutcome, Val,
+    ScoreBreakdown, SearchBuilder, SegmentStat, SnapshotHandle, SnapshotNamespace, SnapshotStats,
+    Stats, StorageStat, Summarizer, UpdateOutcome, Val,
 };
 pub use crate::persist::hook::{FsyncHook, IoAction};
 
@@ -88,6 +92,8 @@ pub use crate::persist::hook::{FsyncHook, IoAction};
 #[macro_export]
 macro_rules! filter {
     ($expr:expr) => {
+        // reason: 宏仅用于写死常量,字面量非法属编码错误;此处 panic 是文档化例外
+        // (见设计 06 §1),运行时输入请用 `Expr::from_str`。
         $crate::Expr::from_str($expr).expect("filter!: 过滤表达式字面量非法")
     };
 }

@@ -2,10 +2,12 @@
 //!
 //! 从 `search_builder.rs` 拆出的检索后处理:沿关系边逐跳扩展候选,
 //! 以及对 `execute()` 结果做 `ResultDedup` 去重。不构成公开 API。
+//! 扩展只沿同命名空间的边推进,绝不把其他命名空间的记忆引入结果
+//! (`FC-SCORE-POST-004`):即使 `relate` 记录了跨命名空间边,扩展也视其不存在。
 
 use std::collections::HashSet;
 
-use crate::core::types::RowId;
+use crate::core::types::{NsId, RowId};
 use crate::memory::dedup::ResultDedup;
 use crate::memory::pred::{self, EvalCtx, Expr};
 use crate::memory::relation::{Edge, MAX_EXPAND_HOPS, RelationExpand};
@@ -16,6 +18,8 @@ use crate::memory::table::ReaderView;
 /// 联想扩展的输入上下文。
 pub(crate) struct ExpandCtx<'a> {
     pub(crate) view: &'a ReaderView,
+    /// 发起检索的命名空间;扩展只在本命名空间内推进(`FC-SCORE-POST-004`)。
+    pub(crate) ns_id: NsId,
     pub(crate) expand: &'a RelationExpand,
     pub(crate) filter: Option<&'a Expr>,
     pub(crate) now: i64,
@@ -24,6 +28,7 @@ pub(crate) struct ExpandCtx<'a> {
 /// 逐节点推进的关系扩展器。
 struct Expander<'a> {
     view: &'a ReaderView,
+    ns_id: NsId,
     expand: &'a RelationExpand,
     filter: Option<&'a Expr>,
     now: i64,
@@ -35,6 +40,7 @@ impl<'a> Expander<'a> {
     fn new(ctx: &ExpandCtx<'a>, seeds: &[Scored]) -> Self {
         Self {
             view: ctx.view,
+            ns_id: ctx.ns_id,
             expand: ctx.expand,
             filter: ctx.filter,
             now: ctx.now,
@@ -69,7 +75,12 @@ impl<'a> Expander<'a> {
             if !self.expand.kinds.is_empty() && !self.expand.kinds.contains(&edge.kind) {
                 continue;
             }
-            if self.result.len() >= self.expand.max_nodes {
+            // `visited` 与 `result` 同受 `max_nodes` 封顶:否则大量被命名空间/存活/
+            // 过滤拒绝的边会持续占用 `visited`,空间上界退化为 O(边数)
+            // (FC-SCORE-CPLX-002 声明空间 O(max_nodes))。
+            if self.result.len() >= self.expand.max_nodes
+                || self.visited.len() >= self.expand.max_nodes
+            {
                 return;
             }
             if !self.visited.insert(edge.to) {
@@ -79,6 +90,9 @@ impl<'a> Expander<'a> {
                 continue;
             };
             let slot_data = &self.view.slots[slot.get() as usize];
+            if slot_data.ns_id != self.ns_id {
+                continue;
+            }
             if !slot_data.is_live(self.now) {
                 continue;
             }

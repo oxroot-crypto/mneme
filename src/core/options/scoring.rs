@@ -31,6 +31,9 @@ pub struct Scoring {
     /// 新鲜度时间轴,默认 [`TimeAxis::ValidTime`]。
     pub time_axis: TimeAxis,
     /// HNSW 遍历是否按重要性偏置(只改访问顺序),默认 `false`。
+    ///
+    /// **尚未落地**:查询入口对 `true` 返回 `Unsupported`(拒绝静默忽略),
+    /// 见设计 10 §2.3 与 `FC-MEM-ERR-002`。
     pub bias_routing: bool,
 }
 
