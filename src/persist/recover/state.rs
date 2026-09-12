@@ -59,8 +59,9 @@ pub(crate) fn empty_state(manifest: &Manifest) -> WriterState {
 
 /// 把各段记录重建成写状态(调用前请先用 [`empty_state`] 载入注册表/水位)。
 ///
-/// 返回被隔离(跳过)的段 id 与各段重排映射,供调用方移入 `trash/` 并按需载入 hidx。
-/// 段按 MANIFEST 所列顺序处理:关系表与 delta 逐段交错回放,保证时序正确。
+/// 返回被隔离(跳过)的段 id 与各段重排映射,供调用方按需载入 hidx。
+/// 段按编号升序处理(防御 MANIFEST 乱序):版本链全局排序,关系表与 delta
+/// 逐段交错回放,保证时序正确。
 ///
 /// # Errors
 /// 段头/记录体损坏且 `fail_fast` 时返回错误;否则损坏段被跳过并计入返回值。
@@ -78,6 +79,14 @@ pub(crate) fn load_segments(
     let parsed_ids = collected.parsed_ids;
     let skipped = collected.skipped;
     versions.sort_by_key(|(row, _)| (row.rowid, row.seqno));
+    // 记录被隔离(损坏)的段:compaction 计划必须排除它们,绝不把损坏段当活跃段
+    // 合并清除(FC-PERSIST-ERR-006)。
+    state.unavailable_segments = Arc::new(
+        skipped
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<u32>>(),
+    );
 
     // 每段构建"段内槽位 → 全局槽位"重排映射(倒排载入与 hidx 载入均需要)。
     let row_counts: Vec<usize> = parsed
@@ -130,6 +139,16 @@ fn collect_versions<'a>(
             skipped.push(segment.segment_id);
             continue;
         };
+        // 区级结构预校验:版本表/关系区/delta 区畸形在非 fail-fast 下按段隔离,
+        // 避免单段区损坏令整库拒启(与 vsec/msec 解析同口径,FC-PERSIST-ERR-006);
+        // fail-fast 时补上段号便于定位。
+        if let Err(error) = precheck_segment(&msec_view) {
+            if fail_fast {
+                return Err(with_segment(error, segment.segment_id));
+            }
+            skipped.push(segment.segment_id);
+            continue;
+        }
         let index = parsed.len();
         for row in msec_view.version_rows()? {
             versions.push((row, index));
@@ -143,6 +162,25 @@ fn collect_versions<'a>(
         parsed_ids,
         skipped,
     })
+}
+
+/// 预校验区级结构(版本表 / 关系区 / delta 区)。
+fn precheck_segment(msec_view: &msec::MsecView<'_>) -> Result<()> {
+    msec_view.version_rows()?;
+    crate::persist::edges::parse(msec_view.relations_bytes())?;
+    msec::decode_delta(msec_view.delta_bytes())?;
+    Ok(())
+}
+
+/// 给区级损坏错误补上段号(仅改写 `Corrupted`,其余原样)。
+fn with_segment(error: MnemeError, segment_id: u32) -> MnemeError {
+    match error {
+        MnemeError::Corrupted { reason, .. } => MnemeError::Corrupted {
+            segment: Some(crate::core::types::SegmentId::new(segment_id)),
+            reason,
+        },
+        other => other,
+    }
 }
 
 /// 回填"槽位 → 所属段"归属。
@@ -349,7 +387,13 @@ fn build_remaps(
             });
         }
         occupied[*segment][index] = true;
-        remap[index] = position as u32;
+        // 槽位总数受 `slot_id_for`(FC-MEM-INV-004)约束在 u32 内,可证明转换安全;
+        // 仍用 checked 形式避免静默截断。
+        remap[index] = u32::try_from(position).map_err(|_| MnemeError::LimitExceeded {
+            field: "remap position",
+            limit: u32::MAX as usize,
+            got: position,
+        })?;
     }
     for used in &occupied {
         if used.iter().any(|&slot| !slot) {
@@ -371,6 +415,88 @@ mod tests {
     use super::*;
     use crate::core::error::MnemeError;
     use crate::persist::msec::VersionRow;
+
+    /// 构造只带 relations 区的空 msec 段(无槽位)。
+    fn msec_only_segment(relations: &[u8]) -> Vec<u8> {
+        msec::encode(&msec::MsecInput {
+            slots: &[],
+            ns_stats: &[],
+            delta: &[],
+            relations,
+            field_dict: &[],
+            zmap: &[],
+            bloom: &[],
+            inverted: &[],
+        })
+        .expect("encode")
+    }
+
+    /// 构造一个空的合法段字节(用于恢复顺序测试)。
+    fn empty_segment_bytes(id: u32) -> SegmentBytes {
+        let vsec = vsec::encode(&vsec::VsecInput {
+            dimension: 2,
+            metric: crate::core::metric::Metric::Cosine,
+            created_unix_ms: 0,
+            vectors: &[],
+            norms: &[],
+            dead: &[],
+        })
+        .expect("vsec");
+        SegmentBytes {
+            segment_id: id,
+            vsec,
+            msec: msec_only_segment(&[]),
+            hidx: None,
+        }
+    }
+
+    /// FC-MODEL-POST-007:无 `FLAG_FULL` 的关系区按 upsert 应用;旧格式增量段
+    /// (空关系表、无标志)不得清掉先前段建立的边。
+    #[test]
+    fn relations_without_full_flag_are_upserted() {
+        let edge = crate::persist::edges::EdgeData {
+            from: 7,
+            to: 9,
+            kind: 1,
+            weight: 0.5,
+            meta: crate::core::meta::Meta::Null,
+        };
+        let with_edge = crate::persist::edges::encode(&[edge], false, false).expect("encode");
+        let empty = crate::persist::edges::encode(&[], false, false).expect("encode");
+
+        let mut state = WriterState::new();
+        let seg0 = msec_only_segment(&with_edge);
+        let view0 = msec::parse(&seg0).expect("parse seg0");
+        apply_relations(&mut state, &view0).expect("apply seg0");
+        assert_eq!(
+            state
+                .out_edges
+                .get(&crate::core::types::RowId::new(7))
+                .map(Vec::len),
+            Some(1)
+        );
+
+        // 旧格式增量段(空关系表、无 FULL 位):upsert 不得清掉先前个边。
+        let seg1 = msec_only_segment(&empty);
+        let view1 = msec::parse(&seg1).expect("parse seg1");
+        apply_relations(&mut state, &view1).expect("apply seg1");
+        assert_eq!(
+            state
+                .out_edges
+                .get(&crate::core::types::RowId::new(7))
+                .map(Vec::len),
+            Some(1),
+            "旧段 upsert 不得清掉先前段个边"
+        );
+    }
+
+    /// FC-PERSIST-POST-012:恢复按段号升序回放(防御 MANIFEST 乱序/手工修复)。
+    #[test]
+    fn collect_versions_orders_segments_by_id() {
+        let segments = [empty_segment_bytes(1), empty_segment_bytes(0)];
+        let collected = collect_versions(&segments, false, false).expect("collect");
+        assert_eq!(collected.parsed_ids, vec![0, 1], "段必须按编号升序回放");
+    }
 
     /// 构造旧格式(0x0001)空段:头部合法、四区全部为空。
     fn empty_legacy_msec() -> Vec<u8> {

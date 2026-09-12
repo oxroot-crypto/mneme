@@ -8,6 +8,7 @@
 
 模块:`life/{compact.rs, maintenance.rs}`(调度与幸存版本筛选)+ 既有挂点
 (`memory/{ttl 逻辑过期, namespace, snapshot, engine_ops}`, `persist/{flush, compact, wal 轮转, delta 区}`);
+`Mneme::maintenance_tick()` 提供手动单轮维护入口(后台线程不可用/测试确定性推进时用);
 公开契约验收见 [`tests/l5_contracts.rs`](../../tests/l5_contracts.rs)。
 
 > **落地状态**:本节语义已随 L5 落地——TTL 两阶段(逻辑过期 + compaction 物理回收,

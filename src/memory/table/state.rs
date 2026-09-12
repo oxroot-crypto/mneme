@@ -100,6 +100,11 @@ pub(crate) struct WriterState {
     pub(crate) indexes: Arc<Vec<SegmentIndex>>,
     /// 与 `slots` 平行的"槽位 → 所属段编号";`None` = 尚未落盘的尾部槽位。
     pub(crate) slot_segment: Arc<Vec<Option<u32>>>,
+    /// 恢复期因损坏被隔离(内存跳过、文件原地保留)的段编号。
+    ///
+    /// 这些段仍在 MANIFEST 中,但内容不可用;compaction 计划必须排除它们,
+    /// 否则会把损坏段当活跃段合并、移入 trash 并清除(FC-PERSIST-ERR-006)。
+    pub(crate) unavailable_segments: Arc<HashSet<u32>>,
     /// 自上次 flush 以来访问计数增量(按 RowId;delta 区 Access 条目来源)。
     pub(crate) access_dirty: Arc<HashMap<RowId, u32>>,
     /// 自上次 flush 以来关系边变更(按 `(from, to, kind)`;delta 区 Relate/Unrelate 来源)。
@@ -150,6 +155,7 @@ impl WriterState {
             ns_by_path: Arc::new(HashMap::new()),
             indexes: Arc::new(Vec::new()),
             slot_segment: Arc::new(Vec::new()),
+            unavailable_segments: Arc::new(HashSet::new()),
             access_dirty: Arc::new(HashMap::new()),
             edge_dirty: Arc::new(HashSet::new()),
             reclaimed_versions: 0,

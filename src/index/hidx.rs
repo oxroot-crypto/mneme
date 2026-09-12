@@ -504,7 +504,7 @@ mod tests {
     #[test]
     fn hidx_rejects_higher_major() {
         let mut bytes = encode(&sample_graph(), GRAPH_PARAMS).expect("encode");
-        bytes[4..6].copy_from_slice(&0x0100_u16.to_le_bytes());
+        bytes[4..6].copy_from_slice(&0x0200_u16.to_le_bytes());
         let crc = crc32(&bytes[0..36]);
         bytes[36..40].copy_from_slice(&crc.to_le_bytes());
         assert!(matches!(

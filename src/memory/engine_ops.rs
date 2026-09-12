@@ -366,6 +366,9 @@ impl Mneme {
         let infos: Vec<SegmentInfo> = manifest
             .segments
             .iter()
+            // 损坏隔离段(内存跳过、文件原地保留)绝不参与合并,否则会被当活跃段
+            // 清除,数据同修复机会一齐冇(FC-PERSIST-ERR-006)。
+            .filter(|segment| !ws.unavailable_segments.contains(&segment.segment_id))
             .map(|segment| SegmentInfo {
                 id: segment.segment_id,
                 rows: segment.row_count,

@@ -273,7 +273,8 @@ fn resolve_metric(
 
 /// 载入 MANIFEST 所列段并回放 WAL,重建写状态。
 ///
-/// 损坏段(头部不可解析)在非 fail-fast 下被移到 `trash/` 并跳过。
+/// 损坏段(头部/区级结构不可解析)在非 fail-fast 下仅内存跳过,文件原地保留
+/// (MANIFEST 仍引用,移动会使后续打开拒启)。
 fn load_write_state(
     root: &Path,
     manifest: &Manifest,
@@ -409,7 +410,7 @@ fn replay_all_wal(
     Ok(())
 }
 
-/// 把被隔离的损坏段三件套移入 `trash/`(只读打开不动文件系统)。
+/// (已移除)损坏段不再移入 `trash/`:MANIFEST 仍引用它们,移动会使后续打开拒启。
 /// [`load_index`] 的槽位来源:恢复后的写状态与"段内槽位 → 全局槽位"重排映射。
 struct SlotRemap<'a> {
     /// 恢复后的写状态(hidx 节点按段内顺序取 `rowid`/向量)。

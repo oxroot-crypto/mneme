@@ -67,7 +67,11 @@ pub(crate) fn plan(
     let mut levels: Vec<u32> = by_level.keys().copied().collect();
     levels.sort_unstable();
     for level in levels {
-        let group = by_level.get_mut(&level)?;
+        // level 来自 `by_level.keys()`,键必然存在;缺失即内部不变量被破坏,
+        // 防御性跳过该层(不产计划)而非 panic。
+        let Some(group) = by_level.get_mut(&level) else {
+            continue;
+        };
         let threshold = policy.tier_count.max(2) as usize;
         if group.len() >= threshold {
             group.sort_by_key(|segment| segment.rows);

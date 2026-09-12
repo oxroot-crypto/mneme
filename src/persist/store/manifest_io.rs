@@ -133,7 +133,10 @@ pub(super) fn commit_manifest(
         CURRENT_FILE,
         manifest.manifest_version.to_string().as_bytes(),
     )?;
-    prune_manifests(root)?;
+    // reason: 提交点已过(新的 `MANIFEST.<v>` 已写、`current` 已原子切换);裁剪旧
+    // 版本失败只遗留历史文件,不影响已提交状态,绝不因此让调用方以为提交失败
+    // (避免"磁盘已换、内存未换"半同步)。
+    let _ = prune_manifests(root);
     Ok(())
 }
 

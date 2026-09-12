@@ -404,7 +404,7 @@ fn higher_major_segment_is_rejected() {
     let vsec = dir.path().join("segments").join("seg_000000.vsec");
     let mut bytes = std::fs::read(&vsec).expect("read");
     // 版本在 head 校验之前判定,故无需重算头部 CRC。
-    bytes[4..6].copy_from_slice(&0x0100_u16.to_le_bytes());
+    bytes[4..6].copy_from_slice(&0x0200_u16.to_le_bytes());
     std::fs::write(&vsec, &bytes).expect("write");
 
     assert!(matches!(

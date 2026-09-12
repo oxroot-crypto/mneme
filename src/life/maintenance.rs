@@ -187,11 +187,13 @@ fn run_tick(context: &MaintenanceContext, timers: &mut Timers, compact_interval:
             .retain_interval
             .unwrap_or(policy.half_life / RETAIN_INTERVAL_DIVISOR);
         if elapsed(now_ms, timers.retain_ms) >= interval {
-            run_retain(&table, &context.config, policy);
+            // reason: 后台维护尽力而为;retain 失败由下一轮重试,不影响前台读写正确性。
+            let _ = run_retain(&table, &context.config, policy);
             timers.retain_ms = now_ms;
         }
     }
-    if !context.control.is_paused()
+    if !context.config.read_only
+        && !context.control.is_paused()
         && elapsed(now_ms, timers.compact_ms) >= compact_interval
         && let Some(store) = context.store.as_ref().and_then(Weak::upgrade)
     {
@@ -213,13 +215,27 @@ fn run_tick(context: &MaintenanceContext, timers: &mut Timers, compact_interval:
 impl Mneme {
     /// 手动执行一轮后台维护(访问攒批、自动遗忘、自动 compaction)。
     ///
-    /// 与后台维护线程的单轮逻辑一致;用于没有后台线程、线程未及唤醒或测试需要
-    /// 确定性推进的场景。纯内存库只执行访问攒批;`compact` 失败按显式调用口径
+    /// 与后台维护线程的单轮逻辑一致(不受周期阈值约束,三项无条件执行);用于
+    /// 没有后台线程、线程未及唤醒或测试需要确定性推进的场景。纯内存库只执行
+    /// 访问攒批与遗忘;只读库跳过 compaction;`compact` 失败按显式调用口径
     /// 向上传播。
     ///
+    /// # Returns
+    /// 完成一轮维护返回 `()`;无触发条件时同样成功。
+    ///
     /// # Errors
-    /// 库已关闭时返回 [`MnemeError::Closed`];compaction I/O/编码失败时返回
-    /// 结构化错误(与显式 [`Mneme::compact`] 同口径)。
+    /// 库已关闭时返回 [`MnemeError::Closed`];遗忘或 compaction I/O/编码失败时
+    /// 返回结构化错误(与显式 [`Mneme::compact`] 同口径)。
+    ///
+    /// # Examples
+    /// ```
+    /// use mneme::{Mneme, Record};
+    /// let db = Mneme::in_memory(2).unwrap();
+    /// db.namespace("demo")
+    ///     .insert(Record::new(vec![1.0, 0.0]).key("a"))
+    ///     .unwrap();
+    /// db.maintenance_tick().unwrap();
+    /// ```
     pub fn maintenance_tick(&self) -> Result<()> {
         let view = self.table.view();
         if view.closed {
@@ -229,9 +245,10 @@ impl Mneme {
         let now_ms = self.config.clock.now_unix_ms();
         self.table.flush_access(now_ms);
         if let Some(policy) = &self.config.retention {
-            run_retain(&self.table, &self.config, policy);
+            run_retain(&self.table, &self.config, policy)?;
         }
-        if self.store.is_some() && !self.control.is_paused() {
+        // 只读库无写权限,跳过 compaction(与后台线程同口径)。
+        if self.store.is_some() && !self.config.read_only && !self.control.is_paused() {
             self.compact()?;
         }
         Ok(())
@@ -239,7 +256,11 @@ impl Mneme {
 }
 
 /// 对全部已注册命名空间执行一轮自动遗忘并记录聚合报告(I23 审计)。
-fn run_retain(table: &Arc<Table>, config: &Arc<Config>, policy: &Retention) {
+///
+/// # Errors
+/// 任一命名空间的 `retain` 失败(参数非法/已关闭/I/O)时返回结构化错误,
+/// 绝不静默吞掉(`maintenance_tick` 直接传播;后台线程按尽力而为重试)。
+fn run_retain(table: &Arc<Table>, config: &Arc<Config>, policy: &Retention) -> Result<()> {
     let paths: Vec<Arc<str>> = table.view().ns_registry.values().cloned().collect();
     let mut report = RetainReport::default();
     for path in paths {
@@ -248,14 +269,14 @@ fn run_retain(table: &Arc<Table>, config: &Arc<Config>, policy: &Retention) {
             config: Arc::clone(config),
             ns_path: path,
         };
-        if let Ok(partial) = namespace.retain(policy.clone()) {
-            report.scanned += partial.scanned;
-            report.forgotten += partial.forgotten;
-            report.sampled_ids.extend(partial.sampled_ids);
-        }
+        let partial = namespace.retain(policy.clone())?;
+        report.scanned += partial.scanned;
+        report.forgotten += partial.forgotten;
+        report.sampled_ids.extend(partial.sampled_ids);
     }
     report.sampled_ids.truncate(MAX_SAMPLED_IDS);
     table.set_retain_report(report);
+    Ok(())
 }
 
 /// 两次维护之间的实际经过时长(毫秒,负值按 0)。

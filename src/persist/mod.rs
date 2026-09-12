@@ -15,7 +15,7 @@
 //! * `source` —— 段读取后端抽象(`SegmentSource` 与 `FileSource`/`MmapSource`)。
 //! * `storage` —— 目录布局、原子写入与独占文件锁。
 //! * `trash` —— 旧段文件的延迟删除。
-//! * `flush` —— 写状态 → 段文件(全量快照)。
+//! * `flush` —— 写状态 → 增量段文件(未落盘槽位 + delta)。
 //! * `recover` —— 段文件 + WAL → 写状态。
 //! * `store` —— 协调句柄 `Store`(实现 `PersistHook`、`flush`、`open`)。
 //!

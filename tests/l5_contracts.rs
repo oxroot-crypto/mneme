@@ -1830,3 +1830,93 @@ fn namespace_registered_after_last_flush_survives_crash() {
     assert!(db.namespace("b").get("y").expect("get y").is_some());
     db.close().expect("close");
 }
+
+/// FC-PERSIST-POST-010:最新版本同批次物化时,访问增量已入版本行快照,
+/// 不得再产出 `Access` delta(否则重开重复累加)。
+#[test]
+fn touch_then_update_single_flush_does_not_double_count() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let clock = FakeClock::default();
+    clock.set(1_000);
+    {
+        let db = Builder::default()
+            .dimension(2)
+            .path(dir.path())
+            .clock(Arc::new(clock.clone()))
+            .build()
+            .expect("build");
+        let ns = db.namespace("demo");
+        let a = ns.insert(Record::new(vec![1.0, 0.0]).key("a")).expect("a");
+        let a = match a {
+            mneme::InsertOutcome::Inserted(id) | mneme::InsertOutcome::Merged(id) => id,
+            other => panic!("期望写入,得到 {other:?}"),
+        };
+        db.flush().expect("flush base");
+        clock.set(2_000);
+        assert!(ns.touch_by_rowid(a, None).expect("touch"));
+        // touch 后立即 update:新版本与访问统计同批物化。
+        ns.update("a", UpdatePatch::new().importance(0.9))
+            .expect("update");
+        db.flush().expect("flush touch+update");
+    }
+
+    let db = Mneme::open(dir.path()).expect("reopen");
+    let ns = db.namespace("demo");
+    assert_eq!(
+        ns.count(Some(mneme::Expr::field("access_count").eq(1)))
+            .expect("count"),
+        1,
+        "同批次物化时版本行已含访问增量,不得再产出 delta"
+    );
+    assert_eq!(
+        ns.count(Some(mneme::Expr::field("access_count").ge(2)))
+            .expect("count"),
+        0
+    );
+    db.close().expect("close");
+}
+
+/// FC-PERSIST-ERR-006:损坏隔离段不得被 compaction(含后台维护)当活跃段合并
+/// 清除——否则数据同修复机会一齐冇,`check()` 反而转绿。
+#[test]
+fn corrupt_segment_is_never_compacted_away() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let db = Builder::default()
+            .dimension(2)
+            .path(dir.path())
+            .compaction(tiered_policy())
+            .build()
+            .expect("build");
+        let ns = db.namespace("demo");
+        for batch in 0..3_u32 {
+            let records: Vec<Record> = (0..4_u32)
+                .map(|row| Record::new(vec![row as f32, 1.0]).key(format!("k{}", batch * 4 + row)))
+                .collect();
+            ns.insert_batch(records).expect("batch");
+            db.flush().expect("flush");
+        }
+        db.close().expect("close");
+    }
+    let seg0 = dir.path().join("segments").join("seg_000000.vsec");
+    let mut bytes = std::fs::read(&seg0).expect("read seg0");
+    bytes[0] ^= 0xFF;
+    std::fs::write(&seg0, &bytes).expect("corrupt seg0");
+
+    let db = Builder::default()
+        .dimension(2)
+        .path(dir.path())
+        .compaction(tiered_policy())
+        .build()
+        .expect("reopen");
+    assert!(!db.check().expect("check").ok, "损坏段必须被报告");
+    // 显式与后台同路径的 compaction 都不得把损坏段合并清除。
+    db.compact().expect("compact");
+    db.maintenance_tick().expect("maintenance tick");
+    assert!(seg0.exists(), "损坏段文件必须原地保留");
+    assert!(
+        !db.check().expect("check").ok,
+        "compaction 后损坏段仍必须被报告"
+    );
+    db.close().expect("close");
+}

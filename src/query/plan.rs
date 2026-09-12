@@ -75,13 +75,15 @@ pub(crate) fn compile(view: &ReaderView, ns_id: NsId, filter: Option<&Expr>, now
             continue;
         }
         if let Some(expr) = filter {
-            let ctx = EvalCtx {
-                slot,
-                access: view.access.get(&slot.rowid).copied(),
-            };
             #[cfg(test)]
             row_evals();
-            if !pred::matches(expr, &ctx) {
+            if !pred::matches(
+                expr,
+                &EvalCtx {
+                    slot,
+                    access: view.access.get(&slot.rowid).copied(),
+                },
+            ) {
                 continue;
             }
         }
