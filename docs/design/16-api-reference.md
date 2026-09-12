@@ -646,7 +646,7 @@ pub struct Tuning {
     pub parallel_block: usize,          // 默认 8192  暴力扫描的计算分块粒度(03 §4.2)
     pub field_dict_max: u16,            // 默认 16    每段可索引字段上限(04 §5.1)
     pub bloom_fpp: f32,                 // 默认 0.01  布隆过滤器目标误判率(04 §5.3)
-    pub brute_force_max_rows: u32,      // 默认 2048  段行数低于此值恒用暴力(05 §9)
+    pub brute_force_max_rows: u32,      // 默认 2048  段行数不超过此值恒用暴力(严格 > 才走图;05 §9)
     pub filter_post_threshold: f32,     // 默认 0.10  过滤三档:后过滤/放大后过滤分界(05 §8)
     pub filter_brute_threshold: f32,    // 默认 0.001 过滤三档:放大后过滤/候选暴力分界(05 §8)
     pub stopwords: bool,                // 默认 true  启用内置停用词表(06 §3.5;建库即锁定,既存库以 MANIFEST 为准)

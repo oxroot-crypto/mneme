@@ -57,7 +57,7 @@ pub enum MnemeError {
     TooLarge { field: &'static str, limit: usize, got: usize }, // 数据超限额,见 16 §8
     LimitExceeded { field: &'static str, limit: usize, got: usize }, // 参数越上限(维度/top_k/ef)
     MetaTooDeep { limit: usize, got: usize },           // metadata 嵌套过深
-    UnsupportedVersion { file: &'static str, found: u16, max: u16 }, // 文件格式过新
+    UnsupportedVersion { file: &'static str, found: u16, max: u16 }, // 文件格式与当前定义不一致
     Closed,                                             // 库已关闭后经任意句柄读写
     NonFinite,                                          // 向量分量或标量因子 NaN/±Inf
     Config { reason: &'static str },                    // 建库/查询配置或策略参数非法

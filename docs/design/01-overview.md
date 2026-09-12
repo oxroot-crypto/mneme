@@ -241,6 +241,11 @@ dev-dependencies(不进入发布产物):`proptest`、`tempfile`、`criterion`。
 | feature | 默认 | 引入 | 说明 |
 |---|---|---|---|
 | `mmap` | ✅ 开 | `memmap2` | 关闭后段文件走 `FileSource`(`Read + Seek`),功能不变、稍慢 |
+
+> **当前 `Cargo.toml` 仅定义 `mmap`**;下表其余 feature 为规划项(对应层落地时才引入依赖),`cargo` 暂不识别。
+
+| feature(规划) | 默认 | 引入 | 说明 |
+|---|---|---|---|
 | `async` | ❌ 关 | `tokio` | 提供 `insert().await` 等 async API |
 | `quant-f16` | ❌ 关 | `half` | 提供 f16 量化副本;关闭时只有 f32/i8 |
 | `encrypt` | ❌ 关 | `aes-gcm` | 静态加密([11 §2](11-security-storage.md)) |
@@ -286,7 +291,7 @@ ns.update("mem_001", UpdatePatch::new().text(Some("用户偏好深色模式".int
 let hits: Vec<Hit> = ns.search().vector(&q)
     .top_k(10).ef(128)
     .filter(filter!(r#"kind == "preference" && importance > 0.5"#))
-    .score(Scoring::new().w_recency(0.2).w_importance(0.3))   // 见 10
+    .score(Scoring { w_recency: 0.2, w_importance: 0.3, ..Scoring::default() })   // 见 10
     .diversify(Diversity::Mmr { lambda: 0.7 })
     .execute()?;
 

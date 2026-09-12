@@ -133,7 +133,7 @@ key 索引:   随机 key 集写入 → 重启 → 每个存活 key 的 get(key) 
 ```text
 对"记录在旧段"的场景:
   写记录 → flush 成段 → delete(key) / update(key,patch) / touch(key,boost) →
-  在 WAL 重置之前/之后任意点崩溃(L2:全量快照 flush 提交 MANIFEST 后再重置 WAL) → 重开:
+  在 WAL 重置之前/之后任意点崩溃(增量段 flush 提交 MANIFEST 后再重置 WAL) → 重开:
     删除的记录永不复活;update 的字段与 touch 的 importance 提升仍生效
   再触发多轮 compaction 后重复断言(L5)
 反例保护:在覆盖条目物化(随快照段落盘)前截断 WAL → 必须拒绝(FC-PERSIST-POST-002)
@@ -254,7 +254,7 @@ as_of(删除前) 在 compaction 回收该版本前仍能看到 A→B(双时态�
 > **L3 落地状态**:`benches/hnsw.rs` 已提供建库吞吐与查询延迟两项 criterion 基准
 > (当前为 1k/8k×64 维微缩样本,1M×1536 门槛待 heavy 档);召回门槛由
 > `tests/hnsw_contracts.rs` 以微缩双分布验收(见 §3)。**冷启动门槛尚未兑现**——L3 的
-> mmap 只是段读取路径优化,恢复仍整段载入,真正"惰性驻留"待 L5/L6 段句柄重构
+> mmap 只是段读取路径优化,恢复仍整段载入,真正"惰性驻留"待 L6 段句柄重构
 > (见 [05 §10](05-l3-hnsw.md))。
 
 基线入库(`benches/` + 夜间趋势图),回归 > 10% 阻断合并。

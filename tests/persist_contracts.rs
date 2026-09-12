@@ -562,10 +562,10 @@ fn backup_is_independently_openable() {
     db.close().expect("close");
 }
 
-/// **FC-PERSIST-INV-004(I4)**:WAL 达到 `wal_bytes` 上限自动触发全量快照 flush,
+/// **FC-PERSIST-INV-004(I4)**:WAL 达到 `wal_bytes` 上限自动触发增量段 flush,
 /// WAL 有界、数据不丢。
 #[test]
-fn wal_capacity_triggers_snapshot_flush() {
+fn wal_capacity_triggers_incremental_flush() {
     let dir = tempfile::tempdir().expect("tempdir");
     let compaction = mneme::CompactionPolicy {
         wal_bytes: 2048,

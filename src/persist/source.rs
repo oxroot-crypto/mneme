@@ -32,7 +32,7 @@ pub(crate) trait SegmentSource: Send + Sync {
 ///
 /// 文件句柄经 [`Mutex`] 串行化,满足 `Sync`;段文件不可变,故无写竞争。
 // reason: 启用 `mmap` 时生产路径走 `MmapSource`,`FileSource` 保留为显式回退后端
-// (设计 04 §11);`Builder::mmap(false)` 或 `--no-default-features` 下启用。
+// (设计 04 §11);`--no-default-features`(关闭 feature `mmap`)下启用。
 #[cfg_attr(feature = "mmap", allow(dead_code))]
 pub(crate) struct FileSource {
     file: Mutex<File>,
@@ -136,7 +136,7 @@ impl SegmentSource for MmapSource {
 ///
 /// 开启 `mmap` 时用 [`MmapSource`] 的零拷贝切片(内核按页惰性载入)拷贝为 `Vec`;
 /// 关闭时用 [`FileSource`](`Read + Seek`)。L3 恢复阶段需要自有字节以重建内存表,
-/// 真正的"零拷贝驻留"随 L5/L6 的段句柄重构落地(设计 04 §11)。
+/// 真正的"零拷贝驻留"随 L6 的段句柄重构落地(设计 04 §11)。
 ///
 /// # Errors
 /// 文件不存在或读取失败时返回底层 [`std::io::Error`]。

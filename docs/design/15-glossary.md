@@ -124,7 +124,7 @@
 | 查询标识 | QueryId | 一次检索的幂等标识,随 `Hit` 返回、供 `feedback` 去重 | [10 §4](10-scoring.md) |
 | 优雅关闭 | graceful close | `close()` 返回 Ok 即已持久;`Drop` 仅尽力(I16) | [16 §1.7](16-api-reference.md) |
 | 时间源 | Clock | 可注入的 Unix 毫秒时钟,保证 TTL/遗忘可测 | [04 §10.2](04-l2-persist.md) |
-| 格式版本 | format_version | 文件头版本号;过新则拒绝打开(I18) | [04 §12](04-l2-persist.md) |
+| 格式版本 | format_version | 文件头版本号;与当前定义不一致即拒绝打开(I18) | [04 §12](04-l2-persist.md) |
 | 数据限额 | limits | key/text/meta 等硬上限,超限拒绝 | [16 §8](16-api-reference.md) |
 | 时间点恢复 | PITR (point-in-time recovery) | 把 `current` 指回上一 MANIFEST 版本以回滚一个提交点 | [16 §7.2](16-api-reference.md) |
 | 结果去重 | ResultDedup | 只作用于单次查询命中列表的去重策略 | [06 §6](06-l4-query.md) |
@@ -172,10 +172,10 @@
 | CRC-32 | $O(n)$(查表,~GB/s) | 8KB 表 | [04 §4](04-l2-persist.md) |
 | WAL 提交(组) | $O(1)$ 内存 + 1 次 fsync/批 | 顺序追加 | [04 §3](04-l2-persist.md) |
 | WAL 回放 | $O(\text{unflushed frames})$ | — | [04 §3.3](04-l2-persist.md) |
-| zone map 剪枝 | $O(\lceil N/1024\rceil \times \text{predicates})$ | 16B/块/字段 | [04 §5.2](04-l2-persist.md) |
+| zone map 剪枝 | $O(\lceil N/1024\rceil \times \text{predicates})$ | 17B/块/字段 | [04 §5.2](04-l2-persist.md) |
 | bloom 判定 | $O(k) = O(7)$ | $1.44\log_2(1/p)$ bit/元素 | [04 §5.3](04-l2-persist.md) |
 | MANIFEST 提交 | $O(\text{segments})$ 写新文件 | 保留 2 版 | [04 §6](04-l2-persist.md) |
-| 恢复(open) | $O(\text{段总字节} + \text{WAL 字节})$(逐段读入校验 + 回放) | $O(\text{段总字节} + \text{WAL 字节})$;L2/L3 仍整段载入,mmap 读路径优化已在 L3,惰性驻留待 L5/L6 | [04 §7](04-l2-persist.md) |
+| 恢复(open) | $O(\text{段总字节} + \text{WAL 字节})$(逐段读入校验 + 回放) | $O(\text{段总字节} + \text{WAL 字节})$;恢复期仍整段载入,mmap 读路径优化已在 L3,惰性驻留待 L6 | [04 §7](04-l2-persist.md) |
 | HNSW 构建 | $O(N \cdot d \cdot ef_c \cdot M_0)$ | ≈$(8M+20)$ B/节点 | [05 §4/§6.3](05-l3-hnsw.md) |
 | HNSW 查询 | 上界 $O(d \cdot ef \cdot M_0)$;实测 ≈ (2–5)·ef 次点积 | — | [05 §6.1](05-l3-hnsw.md) |
 | 层级分布 | $P(\ge l) = (1/M)^l$;层高 $O(\log_M N)$ | — | [05 §3.2](05-l3-hnsw.md) |

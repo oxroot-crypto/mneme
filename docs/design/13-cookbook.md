@@ -52,7 +52,7 @@ fn main() -> mneme::Result<()> {
         .vector(&q)
         .text("界面风格")
         .filter(filter!(r#"kind == "preference""#))
-        .score(Scoring::new().w_recency(0.2).w_importance(0.3))
+        .score(Scoring { w_recency: 0.2, w_importance: 0.3, ..Scoring::default() })
         .diversify(Diversity::Mmr { lambda: 0.7 })
         .top_k(10)
         .execute()?;
@@ -121,7 +121,7 @@ session.insert(mem)?;
 
 ```rust
 let hits = session.search().vector(&q).text(&q_text).top_k(10)
-    .score(Scoring::new().w_recency(0.3).half_life(Duration::from_secs(3*86400)))
+    .score(Scoring { w_recency: 0.3, half_life: Duration::from_secs(3 * 86400), ..Scoring::default() })
     .execute()?;
 ```
 
@@ -218,8 +218,13 @@ let hits = profile.search()
     .vector(&embed("他喜欢什么界面风格")?)
     .text("界面风格")
     .filter(filter!(r#"confidence > 0.6"#))
-    .score(Scoring::new()
-        .w_recency(0.2).w_importance(0.3).w_access(0.1).w_confidence(0.2))
+    .score(Scoring {
+        w_recency: 0.2,
+        w_importance: 0.3,
+        w_access: 0.1,
+        w_confidence: 0.2,
+        ..Scoring::default()
+    })
     .diversify(Diversity::Mmr { lambda: 0.7 })
     .expand(RelationExpand { hops: 1, kinds: vec![RelationKind::SUPPORTS, RelationKind::RELATED],
                              decay: 0.5, max_nodes: 64 })

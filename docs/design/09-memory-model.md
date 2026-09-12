@@ -129,7 +129,7 @@ old.namespace("agent-42/profile").get("os")?;   // → Windows
   底层由**版本链**支撑:compaction 按 `CompactionPolicy.history_horizon` 保留历史版本
   (默认 `None` = **永久**,[07 §4.2a](07-l5-life.md));仅当显式设置有限 horizon 时,
   超出窗口的历史才不可回溯;
-- `as_of` 与 `Scoring::recency` 使用不同的时间轴:前者是事务时间过滤,后者默认用有效时间
+- `as_of` 与 `Scoring` 的新鲜度因子(`w_recency`)使用不同的时间轴:前者是事务时间过滤,后者默认用有效时间
   ([10 §2](10-scoring.md)),二者正交;
 - **`valid_time` 只影响查询过滤与打分,不触发物理删除**:一条"已过期"的有效时间记忆
   仍可被历史查询召回;需要真正遗忘时用 TTL/`forget`。

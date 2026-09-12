@@ -50,13 +50,13 @@
 ```text
 查询命中 → 读者把 RowId 追加进线程本地缓冲 → 攒批后合并进
   Mutex<HashMap<RowId, AccessStat>>     (内存,写者锁外;AccessStat 见 [16 §1.6](16-api-reference.md))
-后台每 30s(默认): 把增量以 WAL Touch/TouchRow 帧落盘(一帧合并多次命中,`access_delta` 记合并后的次数)
+后台每 30s(默认): 把增量以 WAL TouchRow 帧落盘(一帧合并多次命中,`access_delta` 记合并后的次数)
 compaction: 把 Touch 历史并入新 msec 的 last_access / access_count 列([04 §2.2](04-l2-persist.md) entry 格式)
 ```
 
 - 读路径热区只有一次内存 `push`,**写放大 = 0**;
 - 崩溃最多丢 30s 的访问计数——它只影响遗忘速度的估计,不影响正确性,可接受;
-- `ns.touch(key, boost)` 是显式强化:立即 WAL Touch 帧,`boost = Some(d)` 时附带 `importance` 提升
+- `ns.touch(key, boost)` 是显式强化:立即 WAL TouchRow 帧,`boost = Some(d)` 时附带 `importance` 提升
   (Agent 明确说"这点很重要"时)。
 
 ---
@@ -253,7 +253,7 @@ flowchart LR
 
 ```rust
 db.namespace("a/b");            // 不存在则隐式创建(空命名空间不占物理空间)
-db.list_namespaces()?;          // 按前缀树顺序列出全部路径
+db.list_namespaces()?;          // 按规范化路径字典序列出全部路径
 db.drop_namespace("a/b")?;      // 墓碑该路径及其子命名空间下的所有记录,返回行数;
                                 // 按 `/` 段边界匹配("a/b" 不含 "a/bc");物理回收留给 compaction
 ns.iter(None)?;                 // 遍历/导出一个命名空间的全部活记录

@@ -6,9 +6,9 @@
 //!   OS 咨询锁,进程异常终止由内核自动释放,无需租约/接管;
 //! - [`Store`] 协调 WAL 追加、增量段 flush 与恢复,是 L2 持久化的核心句柄。
 //!
-//! > L2 采用**全量快照 flush**(设计 04 §3.2 的 L2 兜底):`flush` 把整个可变表写成
-//! > 一个新段并重提 MANIFEST,旧段进入 `trash/`;增量段与 compaction 由 L5 取代。
-//! > 每条写入先追加 WAL(WAL-before-visible),按 [`FsyncPolicy`] 决定持久确认时机。
+//! > `flush` 为**增量段**(L5 起):只把未落盘槽位与跨段 delta 写成新段,旧段保持活跃、
+//! > MANIFEST 追加提交,段数由 compaction 控制;每条写入先追加 WAL(WAL-before-visible),
+//! > 按 [`FsyncPolicy`] 决定持久确认时机。
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};

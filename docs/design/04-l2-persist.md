@@ -244,7 +244,7 @@ seqno 为该写操作分配的全局单调序号(§3.1);回放据此跳过已落
 type: 1=Insert 2=Delete 3=Touch 4=Checkpoint 5=BatchBegin 6=BatchCommit
       7=DeleteRow 8=TouchRow 9=NsRegister 10=Update 11=UpdateRow 12=Relate 13=Unrelate
       14=RelKindRegister 15=NsUnregister
-Insert     = 记录体(同 msec entry 格式,含 NsId)[u32 dim][f32 × dim][i64 tx_ms]  # 记录体不含向量,故附向量副本供崩溃恢复
+Insert     = 记录体(同 msec entry 格式,含 NsId)[i64 tx_ms][u32 dim][f32 × dim]  # 记录体不含向量,故附向量副本供崩溃恢复
 Delete     = [NsId u32][key len+bytes]
 DeleteRow  = [RowId u64][i64 tx_ms]               # 无 key 记录按 RowId 删除
 Touch      = [NsId u32][key len+bytes][i64 at_ms][u32 access_delta][f32 importance_delta]
@@ -265,7 +265,7 @@ Checkpoint = [u64 watermark_seqno]
 > **实际发出的帧**:`Insert`、`DeleteRow`、`TouchRow`、`Relate`、`Unrelate`、`NsRegister`、
 > `NsUnregister`,以及批量包裹 `BatchBegin`/`BatchCommit`。`Delete`(按 key)、`Touch`(按 key)、
 > `Update`、`UpdateRow`、`Checkpoint`、`RelKindRegister` 为**保留帧类型**:编号已分配、
-> 回放器可解析,但当前实现**不发出**(分别对应按 key 覆盖、局部更新与检查点能力;
+> 回放时识别为合法帧并按忽略处理,当前实现**不发出**(分别对应按 key 覆盖、局部更新与检查点能力;
 > 检查点由增量段 flush + WAL 重置实现,§3.2)。
 
 > **`NsRegister` 的位置保证**:向一个新命名空间写入的**第一批** WAL 必须先写
@@ -279,7 +279,8 @@ Checkpoint = [u64 watermark_seqno]
 `BatchBegin`/`BatchCommit` 让 `insert_batch` 的整批写入在崩溃后要么全部重放、
 要么整批丢弃(不变量 I15,回放规则见 §3.3)。
 `forget(filter)` / `retain(...)` / `drop_namespace(path)` 的批量墓碑以
-`BatchBegin` + 若干 `Delete`/`DeleteRow` + `BatchCommit` 落盘(整批原子);
+`BatchBegin` + 若干 `DeleteRow` + `BatchCommit` 落盘(整批原子;按 key 的 `Delete`
+为保留帧,当前不发出);
 纯 TTL 过期不写帧——回放后由记录自带的 `expires_at` 逻辑判定,无需持久化墓碑。
 
 ### 2.4 MANIFEST
@@ -864,8 +865,8 @@ pub trait SegmentSource: Send + Sync {
 L2 提供 `FileSource`(std,`seek+read`);`MmapSource`(feature `mmap`,memmap2)按依赖
 白名单([01 §5](01-overview.md))**自 L3 起已实现**:段读取经 `source::read_whole` 统一走
 `MmapSource`(默认开)或 `FileSource`(feature 关闭)。索引层与恢复层只依赖此 trait——
-mmap 是**优化**而非功能依赖,任何平台不支持时可整体退化为 `FileSource`(读吞吐降,正确性不变)。
-L3 恢复阶段仍需自有字节以重建内存表,真正的"零拷贝驻留"随 L5/L6 的段句柄重构落地。
+mmap 是**优化**而非功能依赖,按 feature `mmap` 二选一(关闭后编译为 `FileSource`,读吞吐降、正确性不变)。
+L3 恢复阶段仍需自有字节以重建内存表,真正的"零拷贝驻留"随 L6 的段句柄重构落地。
 
 ---
 
@@ -899,7 +900,7 @@ L3 恢复阶段仍需自有字节以重建内存表,真正的"零拷贝驻留"�
 | 全部 MANIFEST 损坏 | 扫描 `MANIFEST.*` 无合法版本 | `Corrupted` | 从备份恢复([16 §7](16-api-reference.md)) |
 | 个别段头损坏 | 打开时校验失败 | 内存跳过并从视图剔除,文件保持原地(可配 fail-fast,见 §7) | `db.check()` 复核;必要时从备份补段 |
 | WAL 未知帧类型 | 回放遇到 `type` 不在定义内 | **停止回放并报错**(不静默跳过) | 视为损坏:从备份恢复并检查磁盘,切勿手工改 WAL |
-| mmap 失败 | 平台/文件系统不支持 | 返回 `Io`(不静默降级;可用 `Builder::mmap(false)` 显式改走 `FileSource`) | 关 mmap 或用 `FileSource` 重开 |
+| mmap 失败 | 平台/文件系统不支持 | 返回 `Io`(不静默降级) | 关闭 feature `mmap` 重编译(走 `FileSource`) |
 | 时钟回拨 | `Clock` 返回变小 | 以历史最大水位钳制(本章 §10.2) | 无 |
 | 崩溃残留锁文件 | 上次进程未正常退出 | OS 咨询锁随进程终止由内核自动释放(`File::try_lock`),下次打开直接获取;`LOCK` 文件保留不删([16 §3](16-api-reference.md)) | 无(自动释放) |
 
