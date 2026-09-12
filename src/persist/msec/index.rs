@@ -8,7 +8,7 @@
 //! zmap:       [u32 field_count][u64 block_count]
 //!             每数值字段: [u32 field_id][block × (f64 min, f64 max, u8 flags)]
 //!                       flags: bit0=has_value bit1=has_null;±∞ 表示"区间未知"
-//!             [i64 × block_count](可选,0x0003 起)每块 min(expires_at),无 TTL 记 +∞
+//!             [i64 × block_count]每块 min(expires_at),无 TTL 记 +∞
 //!                       —— 块级 TTL 剪枝:min > now ⇒ 整块记录全未过期,免逐行判定
 //! bloom:      [u32 count] 每条: [u16 field_id][u32 bit_len][u32 k][u64 × bit_len/64]
 //! ```
@@ -167,7 +167,7 @@ pub(crate) fn encode_ttl_map(min_expires: &[i64]) -> Vec<u8> {
 /// 解码 `ttl_map`(须给定与编码一致的字段字典与块数)。
 ///
 /// # Errors
-/// zone map 区结构不符、尾部长度既非 0 也非 `block_count × 8` 时返回
+/// zone map 区结构不符、尾部长度不等于 `block_count × 8` 时返回
 /// [`MnemeError::Corrupted`]。
 pub(crate) fn decode_ttl_map(
     bytes: &[u8],
@@ -195,9 +195,6 @@ pub(crate) fn decode_ttl_map(
         }
     }
     let tail = cursor.take(cursor.remaining())?;
-    if tail.is_empty() {
-        return Ok(Vec::new());
-    }
     if tail.len() != block_count * 8 {
         return Err(corrupted("zmap: ttl_map 尾部长度不符"));
     }
@@ -252,8 +249,8 @@ pub(crate) fn validate_zmap(bytes: &[u8], fields: &[FieldDef], block_count: usiz
         }
     }
     let tail = cursor.remaining();
-    // 0x0002 旧段无 `ttl_map`;0x0003 起尾部为 `block_count × 8` 字节 min(expires_at)。
-    if tail != 0 && tail != block_count * 8 {
+    // 尾部必须恰为 `block_count × 8` 字节的 min(expires_at)。
+    if tail != block_count * 8 {
         return Err(corrupted("zmap: ttl_map 尾部长度不符"));
     }
     Ok(())
@@ -359,7 +356,8 @@ mod tests {
         let mut zones = ZoneIndex::new(16);
         zones.observe(0, &slot_data(0, json!({"rank": 7})));
         zones.observe(1, &slot_data(1, json!({"rank": 3})));
-        let bytes = encode_zmap(&zones, &fields, 1);
+        let mut bytes = encode_zmap(&zones, &fields, 1);
+        bytes.extend_from_slice(&encode_ttl_map(&[i64::MAX]));
         let defs = decode_field_dict(&encode_field_dict(&fields)).expect("defs");
         validate_zmap(&bytes, &defs, 1).expect("valid");
         // 截断与块数不符必须被检出。
@@ -367,30 +365,28 @@ mod tests {
         assert!(validate_zmap(&bytes, &defs, 2).is_err());
     }
 
-    /// FC-LIFE-CPLX-001(`ttl_map` 往返:尾部 0 兼容旧段;`block_count × 8` 有效)
+    /// FC-LIFE-CPLX-001(`ttl_map` 往返;尾部长度必须恰为 `block_count × 8`)
     #[test]
-    fn ttl_map_roundtrip_and_legacy_tail() {
+    fn ttl_map_roundtrip_and_invalid_tail() {
         let fields = vec![
             (Arc::from("created_at"), FieldKind::Ts),
             (Arc::from("key"), FieldKind::Str),
         ];
         let zones = ZoneIndex::new(16);
-        let legacy = encode_zmap(&zones, &fields, 2);
+        let mut with_ttl = encode_zmap(&zones, &fields, 2);
         let defs = decode_field_dict(&encode_field_dict(&fields)).expect("defs");
-        assert!(
-            decode_ttl_map(&legacy, &defs, 2)
-                .expect("旧段无 ttl_map")
-                .is_empty()
-        );
-        validate_zmap(&legacy, &defs, 2).expect("旧段尾长 0 必须兼容");
-
-        let mut with_ttl = legacy.clone();
         with_ttl.extend_from_slice(&encode_ttl_map(&[1_700_000_000_000, i64::MAX]));
         let decoded = decode_ttl_map(&with_ttl, &defs, 2).expect("decode");
         assert_eq!(decoded, vec![1_700_000_000_000, i64::MAX]);
         validate_zmap(&with_ttl, &defs, 2).expect("valid");
 
-        // 尾部长度既非 0 也非 blocks×8 → Corrupted。
+        // 缺尾 / 尾长不符 → Corrupted。
+        let missing = encode_zmap(&zones, &fields, 2);
+        assert!(matches!(
+            decode_ttl_map(&missing, &defs, 2),
+            Err(MnemeError::Corrupted { .. })
+        ));
+        assert!(validate_zmap(&missing, &defs, 2).is_err());
         let mut bad = with_ttl.clone();
         bad.push(0);
         assert!(matches!(
@@ -439,6 +435,7 @@ mod tests {
         let fields = vec![(Arc::from("created_at"), FieldKind::Ts)];
         let defs = decode_field_dict(&encode_field_dict(&fields)).expect("defs");
         let mut zmap = encode_zmap(&ZoneIndex::new(16), &fields, 1);
+        zmap.extend_from_slice(&encode_ttl_map(&[i64::MAX]));
         assert!(validate_zmap(&zmap, &defs, 1).is_ok());
         zmap.push(0);
         assert!(validate_zmap(&zmap, &defs, 1).is_err());

@@ -1920,3 +1920,54 @@ fn corrupt_segment_is_never_compacted_away() {
     );
     db.close().expect("close");
 }
+
+/// FC-PERSIST-ERR-006:区级结构畸形(关系区魔数损坏)在非 fail-fast 下按段
+/// 隔离,`fail-fast` 下上报且错误带段号。
+#[test]
+fn malformed_region_is_isolated_or_reported_with_segment() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let db = build(dir.path(), 2);
+        let ns = db.namespace("demo");
+        ns.insert(Record::new(vec![1.0, 0.0]).key("a")).expect("a");
+        db.flush().expect("flush a");
+        ns.insert(Record::new(vec![0.0, 1.0]).key("b")).expect("b");
+        db.flush().expect("flush b");
+        db.close().expect("close");
+    }
+    // 破坏段 0 的 relations 区魔数(区级畸形,非段头损坏):头部 [144..152]
+    // 为该区偏移;payload CRC 默认不校验,恰好检验 precheck 的结构解析。
+    let msec_path = dir.path().join("segments").join("seg_000000.msec");
+    let mut bytes = std::fs::read(&msec_path).expect("read msec");
+    let rel_offset = u64::from_le_bytes(bytes[144..152].try_into().expect("rel offset")) as usize;
+    bytes[rel_offset + 1] ^= 0xFF;
+    std::fs::write(&msec_path, &bytes).expect("write msec");
+
+    // 非 fail-fast:按段隔离,其余段可读,损坏段被 check 报告。
+    {
+        let db = Mneme::open(dir.path()).expect("tolerant open");
+        let ns = db.namespace("demo");
+        assert!(ns.get("b").expect("get b").is_some());
+        assert!(ns.get("a").expect("get a").is_none(), "畸形段必须被隔离");
+        assert!(!db.check().expect("check").ok, "畸形段必须被报告");
+        db.close().expect("close");
+    }
+
+    // fail-fast:上报 `Corrupted` 且带损坏段号。
+    let error = Builder::default()
+        .dimension(2)
+        .path(dir.path())
+        .fail_fast_on_corruption(true)
+        .build()
+        .expect_err("fail-fast 必须上报");
+    assert!(
+        matches!(
+            error,
+            mneme::MnemeError::Corrupted {
+                segment: Some(id),
+                ..
+            } if id.get() == 0
+        ),
+        "fail-fast 错误必须带损坏段号,实际 {error:?}"
+    );
+}

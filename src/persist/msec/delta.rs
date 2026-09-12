@@ -220,7 +220,7 @@ pub(crate) fn decode_delta(bytes: &[u8]) -> Result<Vec<DeltaEntry>> {
     if cursor.take(4)? != MAGIC {
         return Err(corrupted("delta: 魔数不符"));
     }
-    check_version("delta", cursor.u16()?)?;
+    check_version("delta", cursor.u16()?, FORMAT_VERSION)?;
     let count = cursor.u16()? as usize;
     let stored_crc = cursor.u32()?;
     let body = cursor.take(cursor.remaining())?;

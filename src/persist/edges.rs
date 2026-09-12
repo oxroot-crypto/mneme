@@ -135,7 +135,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<EdgeView> {
             reason: "relations: 魔数不符".to_string(),
         });
     }
-    check_version("relations", cursor.u16()?)?;
+    check_version("relations", cursor.u16()?, FORMAT_VERSION)?;
     let flags = cursor.u16()?;
     let forward_count = cursor.u32()? as usize;
     let reverse_count = cursor.u32()? as usize;

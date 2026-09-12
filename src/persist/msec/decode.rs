@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use crate::core::error::{MnemeError, Result};
-use crate::persist::{Cursor, check_version, crc32};
+use crate::persist::{Cursor, FORMAT_VERSION, check_version, crc32};
 
 use super::entry::decode_entry;
 use super::{
@@ -54,7 +54,7 @@ fn parse_header(bytes: &[u8]) -> Result<HeaderLayout> {
         });
     }
     let version = cursor.u16()?;
-    check_version("msec", version)?;
+    check_version("msec", version, FORMAT_VERSION)?;
     let header_len = cursor.u16()?;
     if header_len != HEADER_LEN {
         return Err(MnemeError::Corrupted {

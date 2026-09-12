@@ -89,8 +89,8 @@ pub struct Encryption { pub provider: Arc<dyn KeyProvider>, pub cipher: Cipher }
 3. 全部段迁移完成后,旧 key_id 可退役
 ```
 
-轮换复用 [04 §12](04-l2-persist.md) 的"在线迁移、混合版本"机制,不阻塞读写;
-`db.stats().storage` 暴露"已迁移段/总段"。
+轮换复用 compaction 的逐段重写流程(尚未落地,属后续层);项目未发布期不保留
+混合版本兼容,`db.stats().storage` 的"已迁移段/总段"随该能力一并落地。
 
 ### 2.5 复杂度与不变量
 
@@ -119,7 +119,7 @@ pub enum Compression { None, Lz4, Zstd }   // 默认 None;`Lz4` 为内置自研�
 
 - 压缩作用于**记录体内的 `text` 与 `meta` 字段**(`[04 §2.2](04-l2-persist.md)` entry 的变长区),
   按字段独立压缩并带 `uncompressed_len` 前缀;向量/norm 不压缩(已定长且量化另有手段);
-- 每段头部记录所用 codec(头部扩展区定义见 [04 §2.5](04-l2-persist.md));`Compression::None` 时字节布局与旧格式一致(向后兼容);
+- 每段头部记录所用 codec(头部扩展区定义见 [04 §2.5](04-l2-persist.md));`Compression::None` 时字节布局与未压缩定义逐字节一致;
 - 可选 feature `compress-zstd` 允许接入更强 codec,默认不引入依赖。
 
 ### 3.3 与 BM25 / 过滤的交互

@@ -23,23 +23,14 @@ pub(super) struct PendingFrame<'a> {
 
 /// 仅应用 `seqno > watermark` 的帧,并推进内存水位。
 ///
-/// 旧格式的注册/注销帧没有真实 seqno(恒 0),仅当 `watermark == 0`
-/// (首次 flush 之前)时按旧语义应用;否则一律跳过——已物化到 MANIFEST 的
-/// 注册表是权威状态,残留旧 WAL 不得让已注销命名空间复活
-/// (FC-PERSIST-POST-011、FC-LIFE-POST-006)。新格式的 metadata 帧带真实
-/// seqno,与数据帧同样受水位约束。
+/// 所有帧(含注册/注销 metadata)都带真实 seqno 并统一受水位约束:已物化到
+/// MANIFEST 的注册表是权威状态,残留旧 WAL 不得让已注销命名空间复活
+/// (FC-PERSIST-POST-011、FC-LIFE-POST-006)。
 pub(super) fn apply_if_after_watermark(
     state: &mut WriterState,
     frame: PendingFrame<'_>,
     watermark: u64,
 ) -> Result<()> {
-    if frame.seqno == 0 {
-        // 旧格式 metadata 帧(seqno 恒 0):仅首次 flush 前有效。
-        if watermark == 0 && is_metadata(frame.kind) {
-            apply_frame(state, frame.seqno, frame.kind, frame.payload)?;
-        }
-        return Ok(());
-    }
     if frame.seqno <= watermark {
         return Ok(());
     }
@@ -48,14 +39,6 @@ pub(super) fn apply_if_after_watermark(
         state.seqno = SeqNo::new(frame.seqno);
     }
     Ok(())
-}
-
-/// 是否为注册表元数据帧(旧格式下 seqno 恒 0,需特殊兼容)。
-fn is_metadata(kind: FrameKind) -> bool {
-    matches!(
-        kind,
-        FrameKind::NsRegister | FrameKind::NsUnregister | FrameKind::RelKindRegister
-    )
 }
 
 /// 应用单帧到写状态。

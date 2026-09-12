@@ -30,11 +30,9 @@ pub(crate) const HEADER_LEN: u16 = 72;
 /// 单个段条目的定长字节数(见 [`parse_segments`] 字段顺序)。
 const SEGMENT_ENTRY_BYTES: usize = 55;
 
-/// `header[17]` 的 stopwords 三态:旧版未记录(按默认 `true`)。
-const STOPWORDS_UNRECORDED: u8 = 0;
-/// `header[17]` 的 stopwords 三态:显式关闭。
+/// `header[17]` 的 stopwords 标志:显式关闭。
 const STOPWORDS_DISABLED: u8 = 1;
-/// `header[17]` 的 stopwords 三态:显式开启。
+/// `header[17]` 的 stopwords 标志:显式开启。
 const STOPWORDS_ENABLED: u8 = 2;
 
 /// 命名空间注册项(`path ↔ NsId`)。
@@ -288,7 +286,11 @@ fn validate_header(bytes: &[u8]) -> Result<()> {
             reason: "manifest: 魔数不符".to_string(),
         });
     }
-    check_version("manifest", u16::from_le_bytes([bytes[4], bytes[5]]))?;
+    check_version(
+        "manifest",
+        u16::from_le_bytes([bytes[4], bytes[5]]),
+        FORMAT_VERSION,
+    )?;
     let header_len = u16::from_le_bytes([bytes[6], bytes[7]]);
     if header_len != HEADER_LEN {
         return Err(MnemeError::Corrupted {
@@ -306,10 +308,10 @@ fn validate_header(bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// 解析 `stopwords` 标志(旧库未记录按启用处理)。
+/// 解析 `stopwords` 标志;仅接受显式开/关,其余值按损坏拒绝。
 fn decode_stopwords(flag: u8) -> Result<bool> {
     match flag {
-        STOPWORDS_ENABLED | STOPWORDS_UNRECORDED => Ok(true),
+        STOPWORDS_ENABLED => Ok(true),
         STOPWORDS_DISABLED => Ok(false),
         _ => Err(MnemeError::Corrupted {
             segment: None,
@@ -430,9 +432,9 @@ mod tests {
         assert_eq!(parse(&bytes).expect("parse"), manifest);
     }
 
-    /// FC-PERSIST-POST-009(stopwords 三态:显式开/关往返;旧版 0 按默认开;非法值拒绝)
+    /// FC-PERSIST-POST-009(stopwords 显式开/关往返;非法值拒绝)
     #[test]
-    fn stopwords_tristate_roundtrip() {
+    fn stopwords_flag_roundtrip() {
         for stopwords in [true, false] {
             let mut manifest = sample();
             manifest.stopwords = stopwords;
@@ -441,19 +443,17 @@ mod tests {
             assert_eq!(decoded.stopwords, stopwords);
         }
 
-        // 旧版未记录(0)→ 默认 true。
-        let mut bytes = encode(&sample()).expect("encode");
-        bytes[17] = 0;
-        let crc = header_crc(&bytes[..HEADER_LEN as usize]);
-        bytes[8..12].copy_from_slice(&crc.to_le_bytes());
-        assert!(parse(&bytes).expect("legacy parse").stopwords);
-
-        // 未知值 → Corrupted。
-        let mut bytes = encode(&sample()).expect("encode");
-        bytes[17] = 9;
-        let crc = header_crc(&bytes[..HEADER_LEN as usize]);
-        bytes[8..12].copy_from_slice(&crc.to_le_bytes());
-        assert!(matches!(parse(&bytes), Err(MnemeError::Corrupted { .. })));
+        // 未知值(含 0)→ Corrupted。
+        for flag in [0_u8, 9] {
+            let mut bytes = encode(&sample()).expect("encode");
+            bytes[17] = flag;
+            let crc = header_crc(&bytes[..HEADER_LEN as usize]);
+            bytes[8..12].copy_from_slice(&crc.to_le_bytes());
+            assert!(
+                matches!(parse(&bytes), Err(MnemeError::Corrupted { .. })),
+                "stopwords 标志 {flag} 必须拒绝"
+            );
+        }
     }
 
     /// 头部 CRC 损坏被检出。

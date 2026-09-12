@@ -278,7 +278,7 @@ fn parse_header(bytes: &[u8]) -> Result<VsecHeader> {
             reason: "vsec: 魔数不符".to_string(),
         });
     }
-    check_version("vsec", cursor.u16()?)?;
+    check_version("vsec", cursor.u16()?, FORMAT_VERSION)?;
     let header_len = cursor.u16()?;
     if header_len != HEADER_LEN {
         return Err(MnemeError::Corrupted {

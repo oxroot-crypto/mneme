@@ -39,7 +39,7 @@ pub(crate) fn parse_file_header(bytes: &[u8]) -> Result<WalHeader> {
         });
     }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-    check_version("wal", version)?;
+    check_version("wal", version, FORMAT_VERSION)?;
     let stored_crc = u32::from_le_bytes([bytes[12], bytes[13], bytes[14], bytes[15]]);
     if crc32(&bytes[0..12]) != stored_crc {
         return Err(MnemeError::Corrupted {

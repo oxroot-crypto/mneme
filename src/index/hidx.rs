@@ -185,7 +185,7 @@ fn parse_header(bytes: &[u8]) -> Result<HidxHeader> {
         return Err(corrupt("魔数不符"));
     }
     let version = u16::from_le_bytes([bytes[4], bytes[5]]);
-    check_version("hidx", version)?;
+    check_version("hidx", version, FORMAT_VERSION)?;
     let header_len = u16::from_le_bytes([bytes[6], bytes[7]]);
     if header_len != HEADER_LEN {
         return Err(corrupt("header_len 不符"));
