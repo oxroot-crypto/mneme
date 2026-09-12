@@ -298,7 +298,7 @@ fn i8_qvec_roundtrip_after_reopen() {
     );
     assert!(
         stats.quant.recall_est.is_none(),
-        "重开后无建段采样上下文,recall_est 必须为 None(设计 16 §1.3)"
+        "重开后无建段采样上下文,recall_est 必须为 None(设计 16 §1.6)"
     );
     let ns = db.namespace("n");
     for (row, expected) in original.iter().enumerate() {

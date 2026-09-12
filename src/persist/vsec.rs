@@ -224,53 +224,65 @@ fn encode_data(input: &VsecInput<'_>, stride: usize, quant_bytes: usize) -> Vec<
 /// 校验 qvec 输入与格式/行数匹配(FC-QUANT-ERR-001/003 的编码侧防线)。
 fn validate_quant_input(input: &VsecInput<'_>, count: usize) -> Result<()> {
     let dimension = input.dimension as usize;
-    let codes_match = |stride: usize| {
-        input.quant_codes.len() == count && input.quant_codes.iter().all(|row| row.len() == stride)
-    };
     match input.quant {
-        VectorFormat::F32 => {
-            if !input.quant_params.is_empty() || !input.quant_codes.is_empty() {
-                return Err(MnemeError::Config {
-                    reason: "vsec 编码:F32 不得携带量化副本",
-                });
-            }
-            Ok(())
+        VectorFormat::F32 => validate_f32_input(input),
+        VectorFormat::I8Rescored => validate_i8_input(input, count, dimension),
+        VectorFormat::F16 => validate_f16_input(input, count, dimension),
+    }
+}
+
+/// 码流行数与单行长度是否匹配。
+fn codes_match(input: &VsecInput<'_>, count: usize, stride: usize) -> bool {
+    input.quant_codes.len() == count && input.quant_codes.iter().all(|row| row.len() == stride)
+}
+
+/// `F32` 不得携带量化副本。
+fn validate_f32_input(input: &VsecInput<'_>) -> Result<()> {
+    if !input.quant_params.is_empty() || !input.quant_codes.is_empty() {
+        return Err(MnemeError::Config {
+            reason: "vsec 编码:F32 不得携带量化副本",
+        });
+    }
+    Ok(())
+}
+
+/// i8 副本长度与参数表定义域校验。
+fn validate_i8_input(input: &VsecInput<'_>, count: usize, dimension: usize) -> Result<()> {
+    if input.quant_params.len() != dimension * 2 || !codes_match(input, count, dimension) {
+        return Err(MnemeError::Config {
+            reason: "vsec 编码:i8 副本长度与维度/行数不符",
+        });
+    }
+    // 与解析侧 `I8Params::from_table` 对称:编码侧也不得写出非有限/失序表。
+    for pair in input.quant_params.chunks_exact(2) {
+        if !pair[0].is_finite() || !pair[1].is_finite() || pair[0] > pair[1] {
+            return Err(MnemeError::Config {
+                reason: "vsec 编码:i8 参数表含非有限值或失序",
+            });
         }
-        VectorFormat::I8Rescored => {
-            if input.quant_params.len() != dimension * 2 || !codes_match(dimension) {
-                return Err(MnemeError::Config {
-                    reason: "vsec 编码:i8 副本长度与维度/行数不符",
-                });
-            }
-            // 与解析侧 `I8Params::from_table` 对称:编码侧也不得写出非有限/失序表。
-            for pair in input.quant_params.chunks_exact(2) {
-                if !pair[0].is_finite() || !pair[1].is_finite() || pair[0] > pair[1] {
-                    return Err(MnemeError::Config {
-                        reason: "vsec 编码:i8 参数表含非有限值或失序",
-                    });
-                }
-            }
+    }
+    Ok(())
+}
+
+/// f16 副本长度与 feature 门控校验。
+fn validate_f16_input(input: &VsecInput<'_>, count: usize, dimension: usize) -> Result<()> {
+    #[cfg(not(feature = "quant-f16"))]
+    {
+        let _ = (input, count, dimension);
+        Err(MnemeError::Unsupported {
+            feature: "quant-f16",
+        })
+    }
+    #[cfg(feature = "quant-f16")]
+    {
+        if !input.quant_params.is_empty()
+            || !codes_match(input, count, dimension * F16_BYTES_PER_ELEMENT)
+        {
+            Err(MnemeError::Config {
+                reason: "vsec 编码:f16 副本长度与维度/行数不符",
+            })
+        } else {
             Ok(())
-        }
-        VectorFormat::F16 => {
-            #[cfg(not(feature = "quant-f16"))]
-            {
-                let _ = (codes_match, dimension);
-                Err(MnemeError::Unsupported {
-                    feature: "quant-f16",
-                })
-            }
-            #[cfg(feature = "quant-f16")]
-            {
-                if !input.quant_params.is_empty() || !codes_match(dimension * F16_BYTES_PER_ELEMENT)
-                {
-                    Err(MnemeError::Config {
-                        reason: "vsec 编码:f16 副本长度与维度/行数不符",
-                    })
-                } else {
-                    Ok(())
-                }
-            }
         }
     }
 }

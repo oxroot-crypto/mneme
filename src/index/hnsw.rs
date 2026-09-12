@@ -143,10 +143,11 @@ fn roll_level(rng: &mut Rng, ml: f32) -> u8 {
     }
 }
 
-/// 校验量化副本行数/单行长度与图节点、维度一致。
+/// 校验量化副本行数/单行长度/维度与图节点一致。
 ///
 /// # Errors
-/// 副本格式为 `F32`、行数或单行长度不符、i8 参数表长度与维度不符时返回
+/// 副本格式为 `F32`、行数或单行长度不符、i8 参数表长度与维度不符,或 f16
+/// 副本自推维度与索引节点维度不符时返回
 /// [`MnemeError::Corrupted`](crate::core::error::MnemeError::Corrupted)。
 fn validate_quant(quant: &Option<QuantCopy>, count: usize, dimension: usize) -> Result<()> {
     let Some(copy) = quant else {
@@ -166,6 +167,9 @@ fn validate_quant(quant: &Option<QuantCopy>, count: usize, dimension: usize) -> 
     match copy.format {
         VectorFormat::I8Rescored if copy.params.len() != dimension * 2 => {
             Err(corrupt("i8 参数表长度与维度不符"))
+        }
+        VectorFormat::F16 if copy.dimension() != dimension => {
+            Err(corrupt("f16 副本维度与索引节点不符"))
         }
         _ => Ok(()),
     }
@@ -865,68 +869,63 @@ mod tests {
     }
 
     /// FC-INDEX-ERR-001 / FC-QUANT-ERR-003(量化副本校验):格式、行数、单行
-    /// 长度与 i8 参数表长度不符 → `Corrupted`,绝不静默按错误码流打分。
+    /// 长度、i8 参数表长度与 f16 维度不符 → `Corrupted`,绝不静默按错误码流打分。
     #[test]
     fn validate_quant_rejects_malformed_copies() {
-        let corrupt = |copy: Option<QuantCopy>, count: usize, dimension: usize| {
+        for (copy, count, dimension) in malformed_quant_copies() {
             assert!(
-                validate_quant(&copy, count, dimension).is_err(),
+                validate_quant(&Some(copy), count, dimension).is_err(),
                 "应拒绝畸形副本: count={count} dimension={dimension}"
             );
-        };
+        }
+        // 正例:合法 i8 副本通过校验(防过度拒绝)。
+        assert!(validate_quant(&Some(legal_i8_copy()), 1, 2).is_ok());
+    }
+
+    /// 合法 i8 副本(2 维、1 行、参数表 2d 项)。
+    fn legal_i8_copy() -> QuantCopy {
+        QuantCopy {
+            format: VectorFormat::I8Rescored,
+            params: vec![0.0, 1.0, 0.0, 1.0],
+            rows: vec![Arc::from([0_u8; 2].as_slice())],
+        }
+    }
+
+    /// 各畸形副本及调用维度的用例集。
+    fn malformed_quant_copies() -> Vec<(QuantCopy, usize, usize)> {
         let i8_copy = |rows: Vec<Arc<[u8]>>, params: Vec<f32>| QuantCopy {
             format: VectorFormat::I8Rescored,
             params,
             rows,
         };
-        // F32 不允许携带副本。
-        corrupt(
-            Some(QuantCopy {
-                format: VectorFormat::F32,
-                params: Vec::new(),
-                rows: vec![Arc::from([0_u8; 2].as_slice())],
-            }),
-            1,
-            2,
-        );
-        // 行数与节点数不符。
-        corrupt(
-            Some(i8_copy(
-                vec![Arc::from([0_u8; 2].as_slice())],
-                vec![0.0, 1.0, 0.0, 1.0],
-            )),
-            2,
-            2,
-        );
-        // 单行长度与维度不符(码流 1 字节,维度 2 → 应 2 字节)。
-        corrupt(
-            Some(i8_copy(
-                vec![Arc::from([0_u8; 1].as_slice())],
-                vec![0.0, 1.0, 0.0, 1.0],
-            )),
-            1,
-            2,
-        );
-        // i8 参数表长度与维度不符(应 2d = 4)。
-        corrupt(
-            Some(i8_copy(
-                vec![Arc::from([0_u8; 2].as_slice())],
-                vec![0.0, 1.0],
-            )),
-            1,
-            2,
-        );
-        // 合法副本通过校验(正例,防过度拒绝)。
-        assert!(
-            validate_quant(
-                &Some(i8_copy(
-                    vec![Arc::from([0_u8; 2].as_slice())],
-                    vec![0.0, 1.0, 0.0, 1.0]
-                )),
+        let row = |len: usize| vec![Arc::from(vec![0_u8; len])];
+        vec![
+            // F32 不允许携带副本。
+            (
+                QuantCopy {
+                    format: VectorFormat::F32,
+                    params: Vec::new(),
+                    rows: row(2),
+                },
                 1,
-                2
-            )
-            .is_ok()
-        );
+                2,
+            ),
+            // 行数与节点数不符。
+            (i8_copy(row(2), vec![0.0, 1.0, 0.0, 1.0]), 2, 2),
+            // 单行长度与维度不符。
+            (i8_copy(row(1), vec![0.0, 1.0, 0.0, 1.0]), 1, 2),
+            // i8 参数表长度与维度不符(应 2d = 4)。
+            (i8_copy(row(2), vec![0.0, 1.0]), 1, 2),
+            // f16 副本自推维度(2)与索引节点维度(1)不符。
+            (
+                QuantCopy {
+                    format: VectorFormat::F16,
+                    params: Vec::new(),
+                    rows: row(4),
+                },
+                1,
+                1,
+            ),
+        ]
     }
 }

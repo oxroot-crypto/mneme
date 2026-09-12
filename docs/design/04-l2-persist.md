@@ -384,7 +384,7 @@ HNSW 入口是**每段一个**(与 [05 §7/§9](05-l3-hnsw.md) 的"每段独立�
 ```text
 偏移   内容
 0      "VSC1" = 56 53 43 31
-4      04 00                        format_version = 0x0004
+4      05 00                        format_version = 0x0005
 6      40 00                        header_len = 64
 8      04 00 00 00                  dimension = 4
 12     00                           metric = 0(Cosine)

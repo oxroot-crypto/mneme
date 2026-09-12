@@ -321,17 +321,12 @@ fn plan_scan(params: &SearchParams<'_>) -> (usize, usize) {
     (chunk, threads)
 }
 
-/// 两阶段精排排序键:先按 [`Metric::better`] 方向,分数不可比(含 `NaN`)时用
-/// `total_cmp` 给出确定性全序,最后按 `RowId` 升序去平。
+/// 两阶段精排排序键:先按 [`Metric::score_order`] 的全序(`NaN` 恒排最后),
+/// 再按 `RowId` 升序去平。与 [`TopK`] 选用同一全序,保证「入选集合」与
+/// 「最终排序」一致。
 fn compare_scored(metric: Metric, left: &Scored, right: &Scored) -> std::cmp::Ordering {
-    if metric.better(left.score, right.score) {
-        return std::cmp::Ordering::Less;
-    }
-    if metric.better(right.score, left.score) {
-        return std::cmp::Ordering::Greater;
-    }
-    left.score
-        .total_cmp(&right.score)
+    metric
+        .score_order(left.score, right.score)
         .then_with(|| left.rowid.cmp(&right.rowid))
 }
 

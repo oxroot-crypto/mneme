@@ -391,6 +391,13 @@ mod tests {
     /// FC-PERSIST-ERR-011(魔数/CRC/未知 kind/尾部残留/截断/长度越界 → Corrupted)
     #[test]
     fn malformed_delta_is_rejected() {
+        rejects_magic_crc_and_truncation();
+        rejects_unknown_kind_and_residual_tail();
+        rejects_oversized_meta_and_arbitrary_bytes();
+    }
+
+    /// 魔数、尾部 CRC 与截断输入必须拒绝。
+    fn rejects_magic_crc_and_truncation() {
         let bytes = encode_delta(&sample()).expect("encode");
         let mut bad_magic = bytes.clone();
         bad_magic[0] = b'X';
@@ -407,13 +414,17 @@ mod tests {
             Err(MnemeError::Corrupted { .. })
         ));
 
-        let mut truncated = bytes.clone();
+        let mut truncated = bytes;
         truncated.truncate(HEADER_LEN + 1);
         assert!(matches!(
             decode_delta(&truncated),
             Err(MnemeError::Corrupted { .. })
         ));
+    }
 
+    /// 未知 kind 与条目区尾部残留必须拒绝(重算 CRC 后仍按结构校验拦下)。
+    fn rejects_unknown_kind_and_residual_tail() {
+        let bytes = encode_delta(&sample()).expect("encode");
         // 未知 kind:改写第一条公共前缀后重算 CRC。
         let mut unknown = bytes.clone();
         unknown[HEADER_LEN] = 3;
@@ -425,7 +436,7 @@ mod tests {
         ));
 
         // 尾部残留:在合法条目区后追加一个字节并重算 CRC。
-        let mut residual = bytes.clone();
+        let mut residual = bytes;
         residual.push(0xAB);
         let crc = crc32(&residual[HEADER_LEN..]);
         residual[8..12].copy_from_slice(&crc.to_le_bytes());
@@ -433,7 +444,10 @@ mod tests {
             decode_delta(&residual),
             Err(MnemeError::Corrupted { .. })
         ));
+    }
 
+    /// 长度字段越界必须拒绝;任意前缀字节不得 panic。
+    fn rejects_oversized_meta_and_arbitrary_bytes() {
         // 长度越界:Relate 的 meta 长度字段改成超大值(挑 kinds 里的 Relate 条目)。
         let relate_bytes = encode_delta(&[sample().remove(2)]).expect("单条 Relate");
         let mut oversized = relate_bytes.clone();
@@ -447,6 +461,7 @@ mod tests {
         ));
 
         // 任意字节不 panic。
+        let bytes = encode_delta(&sample()).expect("encode");
         for len in 0..bytes.len() {
             let _ = decode_delta(&bytes[..len]);
         }

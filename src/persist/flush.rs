@@ -105,7 +105,7 @@ pub(crate) fn build_segment(
     )
 }
 
-/// 编码 vsec/msec/关系区并汇总为 [`EncodedSegment`]([`build_segment`] 的后半段)。
+/// 编码 vsec/msec 并汇总为 [`EncodedSegment`]([`build_segment`] 的后半段)。
 fn encode_segment(
     config: &Config,
     created_unix_ms: i64,
@@ -115,6 +115,30 @@ fn encode_segment(
     decision: QuantDecision,
     built_index: BuiltIndex,
 ) -> Result<EncodedSegment> {
+    let vsec_bytes = encode_vsec(config, created_unix_ms, built, &decision)?;
+    let msec_bytes = encode_msec(config, ws, input, built)?;
+    Ok(EncodedSegment {
+        vsec: vsec_bytes,
+        msec: msec_bytes,
+        hidx: built_index.bytes,
+        index: built_index.index,
+        entry_slot: built_index.entry_slot,
+        entry_level: built_index.entry_level,
+        quant: decision
+            .copy
+            .as_ref()
+            .map_or(VectorFormat::F32, |copy| copy.format),
+        recall_est: decision.recall_est,
+    })
+}
+
+/// 编码 vsec:量化副本参数/码流与 f32 原向量同源写出。
+fn encode_vsec(
+    config: &Config,
+    created_unix_ms: i64,
+    built: &SegmentSlots<'_>,
+    decision: &QuantDecision,
+) -> Result<Vec<u8>> {
     let quant = decision
         .copy
         .as_ref()
@@ -128,7 +152,7 @@ fn encode_segment(
         .as_ref()
         .map(|copy| copy.rows.iter().map(AsRef::as_ref).collect())
         .unwrap_or_default();
-    let vsec_bytes = vsec::encode(&VsecInput {
+    vsec::encode(&VsecInput {
         dimension: config.dimension.get(),
         metric: config.metric,
         created_unix_ms,
@@ -138,8 +162,16 @@ fn encode_segment(
         quant,
         quant_params,
         quant_codes: &code_refs,
-    })?;
+    })
+}
 
+/// 编码 msec:命名空间统计、关系区、轻量索引四区与 delta 区。
+fn encode_msec(
+    config: &Config,
+    ws: &WriterState,
+    input: &SegmentBuildInput<'_>,
+    built: &SegmentSlots<'_>,
+) -> Result<Vec<u8>> {
     let ns_stats = build_ns_stats(ws, config, input.slots);
     let relations = if input.full_relations {
         build_relations(ws)
@@ -151,7 +183,7 @@ fn encode_segment(
         crate::persist::edges::encode(&relations, write_reverse, input.full_relations)?;
     let indexes = build_indexes(ws, config, input.slots)?;
     let delta_bytes = msec::encode_delta(input.delta)?;
-    let msec_bytes = msec::encode(&MsecInput {
+    msec::encode(&MsecInput {
         slots: &built.slots,
         ns_stats: &ns_stats,
         delta: &delta_bytes,
@@ -160,17 +192,6 @@ fn encode_segment(
         zmap: &indexes.zmap,
         bloom: &indexes.bloom,
         inverted: &indexes.inverted,
-    })?;
-
-    Ok(EncodedSegment {
-        vsec: vsec_bytes,
-        msec: msec_bytes,
-        hidx: built_index.bytes,
-        index: built_index.index,
-        entry_slot: built_index.entry_slot,
-        entry_level: built_index.entry_level,
-        quant,
-        recall_est: decision.recall_est,
     })
 }
 

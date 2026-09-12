@@ -802,7 +802,7 @@ pub struct Tuning {
 | `Config` | ❌ | 建库/查询配置非法(缺维度、无查询通道、MMR `lambda` 非有限值、`Fusion` 未同时启用双通道、`Weighted.alpha` 越界或非有限),策略参数含非有限值(`min_importance`/`access_weight`/`threshold`/`dedup_threshold`)或非法(如 `max_cluster = 0`) |
 | `Unsupported` | ❌ | 该能力延后到后续层,或对当前形态不适用(**纯内存库 `backup_to`**;纯内存库配量化;未开 `quant-f16` 的 f16 段;只读模式写);按版本/feature 调整 |
 | `Inconsistent` | ❌ | 内部不变量被破坏(应为 bug);上报并附上下文 |
-| `IdExhausted` | ❌ | `RowId`/`NsId`/`SeqNo` 整型表示空间耗尽(恢复出近上限水位后再写入);绝不回绕复用(FC-PERSIST-ERR-012) |
+| `IdExhausted` | ❌ | `RowId`/`NsId`/`SeqNo` 或段号/MANIFEST 版本的整型表示空间耗尽(恢复出近上限水位后再写入/提交);绝不回绕复用(FC-PERSIST-ERR-012) |
 | `UnsupportedVersion` | ❌ | 文件格式版本与当前定义不一致(未发布期无旧格式兼容);从备份恢复或重建 |
 | `Corrupted` | ❌ | 数据损坏:立即停止写入,跑 `db.check()`,按 §7 恢复 |
 

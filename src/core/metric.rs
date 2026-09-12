@@ -109,6 +109,32 @@ impl Metric {
         }
     }
 
+    /// 分数的**全序**比较:`Metric::better` 方向;`NaN` 恒排最后(两个符号一视同仁),
+    /// 数值相等时用 `total_cmp` 区分 `±0`;完全相等返回 `Ordering::Equal`。
+    ///
+    /// 供 `TopK` 淘汰与两阶段精排共用,保证含 `NaN` 分数时「入选集合」与「最终排序」
+    /// 一致(FC-CORE-POST-002/004)。
+    ///
+    /// # Arguments
+    ///
+    /// * `a`、`b` - 待比较的两个分数。
+    ///
+    /// # Returns
+    ///
+    /// `a` 在最优序中位于 `b` 之前返回 `Less`;两者完全相等返回 `Equal`。
+    pub(crate) fn score_order(&self, a: Score, b: Score) -> std::cmp::Ordering {
+        if a.is_nan() || b.is_nan() {
+            return a.is_nan().cmp(&b.is_nan());
+        }
+        if self.better(a, b) {
+            std::cmp::Ordering::Less
+        } else if self.better(b, a) {
+            std::cmp::Ordering::Greater
+        } else {
+            a.total_cmp(&b)
+        }
+    }
+
     /// 是否需要范数列:`Cosine` / `Euclidean` 为 `true`,仅 `Dot` 为 `false`。
     ///
     /// # Returns

@@ -192,4 +192,35 @@ mod tests {
             Err(MnemeError::Corrupted { .. })
         ));
     }
+
+    /// FC-PERSIST-ERR-012:`Insert` 帧同样经 checked 水位推进拒绝 `rowid = u64::MAX`。
+    #[test]
+    fn wal_replay_rejects_max_rowid_on_insert() {
+        use crate::core::meta::Meta;
+        use crate::core::types::{NsId, SeqNo};
+        use crate::persist::msec::EntryData;
+        let entry = EntryData {
+            rowid: RowId::new(u64::MAX),
+            seqno: SeqNo::new(1),
+            ns_id: NsId::new(1),
+            key: None,
+            text: None,
+            meta: Meta::Null,
+            created_at_ms: 0,
+            expires_at_ms: None,
+            importance: None,
+            access: None,
+            valid_time: None,
+            confidence: None,
+            provenance: None,
+        };
+        let payload = wal::encode_insert(&entry, &[1.0, 0.0], 0).expect("encode_insert");
+        let mut bytes = wal::encode_file_header(1, Metric::Cosine).to_vec();
+        bytes.extend_from_slice(&wal::encode_frame(1, FrameKind::Insert, &payload));
+        let mut state = WriterState::new();
+        assert!(matches!(
+            crate::persist::recover::replay_wal(&mut state, &bytes, 0),
+            Err(MnemeError::Corrupted { .. })
+        ));
+    }
 }

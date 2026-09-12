@@ -189,7 +189,7 @@
 | retain 扫描 | $O(N_{\text{cand}})$ | — | [07 §3.4](07-l5-life.md) |
 | compaction 单轮 | $O(S \cdot d \cdot ef_c \cdot M_0)$(建图主导) | 峰值 +$O(S)$ | [07 §4.5](07-l5-life.md) |
 | compaction 摊还 | 每字节重写平均 ≈ $\log_r(N/B)$ ≈ 7 次(上界 ≈ 9) | 段数 $O(\log_r N)$ | [07 §4.2](07-l5-life.md) |
-| i8 量化点积 | 带宽 ÷4;VNNI 再 ~4× 指令 | 粗排副本 $d$ B/行(f32 原向量另存) | [08 §2](08-l6-quant.md) |
+| i8 量化点积 | 读侧带宽 ÷4(u8 零扩展 + FMA,不用 `maddubs`/VNNI;见 [08 §2.3](08-l6-quant.md)) | 粗排副本 $d$ B/行(f32 原向量另存) | [08 §2](08-l6-quant.md) |
 | 单点写(insert) | $O(1)$ 内存 + WAL 追加;fsync 按策略 | $O(d)$ | [04 §3](04-l2-persist.md) |
 | 单点读(get key) | $O(\log n)$(key 索引二分)+ 一次记录读 | — | [04 §5.5](04-l2-persist.md) |
 | 单点读(get_by_rowid) | $O(\log n)$(版本链定位) | — | [04 §2.2](04-l2-persist.md) |

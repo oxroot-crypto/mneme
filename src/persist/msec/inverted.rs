@@ -350,8 +350,14 @@ mod tests {
     /// FC-PERSIST-ERR-010(畸形倒排区 → `Corrupted`,不 panic)
     #[test]
     fn malformed_inverted_is_rejected_without_panic() {
+        rejects_out_of_range_offsets();
+        rejects_tf_overflow();
+        rejects_tail_duplicates_and_zero_doc_len();
+    }
+
+    /// 声明越界的 offset/length 必须拒绝而非回绕。
+    fn rejects_out_of_range_offsets() {
         assert!(decode_inverted(&[0xFF; 4], &[]).is_err());
-        // 声明 offset/length 指向显式 postings 区外,必须被拒绝而非回绕。
         let mut bytes = Vec::new();
         put_u32(&mut bytes, 1);
         put_u32(&mut bytes, 1);
@@ -364,14 +370,20 @@ mod tests {
             decode_inverted(&bytes, &[0]),
             Err(MnemeError::Corrupted { .. })
         ));
-        // 词频合并溢出必须报错。
+    }
+
+    /// 词频合并溢出必须报错。
+    fn rejects_tf_overflow() {
         let mut postings = Vec::new();
         varint::encode_u32(0, &mut postings);
         varint::encode_u32(u32::MAX, &mut postings);
         varint::encode_u32(0, &mut postings);
         varint::encode_u32(u32::MAX, &mut postings);
         assert!(decode_postings(&postings, 2, &[7]).is_err());
+    }
 
+    /// 区尾残留、词条重复与 `doc_len = 0` 必须拒绝。
+    fn rejects_tail_duplicates_and_zero_doc_len() {
         // 区尾残留:合法编码后多 1 字节必须拒绝。
         let mut index = InvertedIndex::default();
         index.insert_text(SlotId::new(0), NsId::new(1), "alpha", false);

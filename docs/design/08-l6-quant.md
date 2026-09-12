@@ -28,7 +28,7 @@
 > 微缩对照(4k×512);微缩规模下每查询的候选收集/位图等固定开销占比高,≥3×
 > 加速门槛需 1M×1536 heavy 档,与冷启动、fuzz 长跑同属 CI 收尾(14 §4/§5)。
 
-模块:`quant/{scalar_i8.rs, f16.rs, rescore.rs}`(已落地)、`memory::async_facade`(feature `async`)、`src/fuzzing.rs`(feature `fuzzing`)
+模块:`quant/{scalar_i8.rs, f16.rs, rescore.rs, support.rs}`(已落地)、`memory::async_facade`(feature `async`)、`src/fuzzing.rs`(feature `fuzzing`)
 
 ---
 

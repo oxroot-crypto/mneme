@@ -184,12 +184,12 @@ mneme/
 ├── src/
 │   ├── lib.rs          # 门面:Mneme / Namespace / Builder;pub use 公开类型
 │   ├── core/           # L0:types.rs error.rs metric.rs simd.rs varint.rs meta.rs heap.rs bitset.rs text.rs options/
-│   ├── memory/         # L1:engine.rs engine_ops.rs builder/ namespace/ analysis/ table/ snapshot.rs snapshot_scan.rs search_builder.rs expand.rs rerank.rs index.rs search.rs pred.rs pred_eval.rs record.rs write_helpers.rs mutate_helpers.rs dedup.rs relation.rs temporal.rs score.rs lifecycle.rs ops.rs config.rs
+│   ├── memory/         # L1:engine.rs engine_ops.rs builder/ namespace/ analysis/ table/ snapshot.rs snapshot_scan.rs search_builder.rs expand.rs rerank.rs index.rs search.rs pred.rs pred_eval.rs record.rs write_helpers.rs mutate_helpers.rs dedup.rs relation.rs temporal.rs score.rs lifecycle.rs ops.rs config.rs async_facade.rs(async)
 │   ├── persist/        # L2:mod.rs codec.rs hook.rs wal/ msec/ recover/ store/ vsec.rs manifest.rs edges.rs flush.rs source.rs storage.rs trash.rs
 │   ├── index/          # L3:hnsw.rs graph.rs filtered.rs rebuild.rs hidx.rs factory.rs
 │   ├── query/          # L4:parse.rs parse/literal.rs display.rs json.rs iso.rs plan.rs zmap.rs bm25.rs fusion.rs exec.rs
 │   ├── life/           # L5:compact.rs(选段/幸存版本)maintenance.rs(后台维护)
-│   ├── quant/          # L6(纯原语,依赖等级同 L0):scalar_i8.rs f16.rs(quant-f16) rescore.rs
+│   ├── quant/          # L6(纯原语,依赖等级同 L0):scalar_i8.rs f16.rs(quant-f16) rescore.rs support.rs
 │   ├── fuzzing.rs      # feature fuzzing:cargo-fuzz 专用解析入口(不参与运行时)
 │   ├── (规划) model/       # 记忆模型;当前实现见 memory/{relation,temporal}.rs、score.rs、namespace/life.rs (09)
 │   ├── (规划) score/       # 排序层;当前实现见 memory/{score,expand,rerank}.rs               (10)
