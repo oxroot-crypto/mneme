@@ -231,7 +231,7 @@ impl Store {
         // reason: 提交已生效;移动/清理失败只遗留孤儿文件,不影响正确性与可读性。
         if trash::move_to_trash(&self.root, &old_names).is_ok() {
             // reason: purge 失败同样只遗留 trash 垃圾,不影响数据集正确性。
-            let _ = trash::purge(&self.root);
+            let _ = trash::purge(&self.root).ok();
         }
     }
 }

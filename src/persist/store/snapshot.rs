@@ -50,10 +50,11 @@ impl CopySink<'_> {
     /// 复制一个必须存在的库内文件;缺失返回 [`MnemeError::Corrupted`]。
     fn copy_required(&mut self, rel: &str) -> Result<()> {
         // 被 MANIFEST 引用的段必须存在;缺失即备份不可信,绝不静默产出残档。
-        let content = storage::read_file(self.root, rel).map_err(|_| MnemeError::Corrupted {
-            segment: None,
-            reason: format!("备份:必存文件缺失或不可读:{rel}"),
-        })?;
+        let content =
+            storage::read_file(self.root, rel).map_err(|error| MnemeError::Corrupted {
+                segment: None,
+                reason: format!("备份:必存文件缺失或不可读:{rel}: {error}"),
+            })?;
         self.counts.files += 1;
         self.counts.bytes += content.len() as u64;
         storage::write_atomic(self.target, rel, &content)
@@ -290,7 +291,7 @@ impl Store {
         // reason: Checkpoint 为空间回收;旧帧均 ≤ watermark,恢复时跳过。段与
         // MANIFEST 已提交,重置失败不阻断 flush(句柄安全由 `WalWriter::reset`
         // 内部重建/停用保证,FC-PERSIST-INV-005)。
-        let _ = wal.reset();
+        let _ = wal.reset().ok();
     }
 
     /// 只发布 MANIFEST 快照(不重置 WAL;compaction 用,未落盘尾部仍在 WAL 中)。

@@ -215,7 +215,7 @@ impl Table {
         });
         // reason: 访问统计为尽力而为;WAL 失败时该批增量丢失,只影响遗忘速度
         // 估计,不影响记录可见性与检索正确性(FC-LIFE-POST-004)。
-        let _ = result;
+        let _ = result.ok();
     }
 
     /// 记录最近一次后台遗忘报告(I23 审计)。

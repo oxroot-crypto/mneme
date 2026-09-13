@@ -15,10 +15,11 @@ pub(crate) use support::ensure_format_supported;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     #[cfg(not(feature = "quant-f16"))]
     use crate::core::error::MnemeError;
     use crate::core::options::VectorFormat;
+
+    use super::*;
 
     /// FC-QUANT-ERR-001:feature 门控只拦 `F16`,`F32`/`I8Rescored` 恒可用。
     #[test]
