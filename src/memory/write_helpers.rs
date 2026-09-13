@@ -276,7 +276,7 @@ pub(crate) fn insert_one(
             });
         }
     };
-    let seqno = ws.alloc_seqno();
+    let seqno = ws.alloc_seqno()?;
     let slot_data = build_slot(SlotSpec {
         ns_id: ctx.ns_id,
         ns_path: ctx.ns_path,
@@ -305,7 +305,7 @@ fn apply_dedup(
             score: similarity,
         })),
         Dedup::Replace => {
-            let seqno = ws.alloc_seqno();
+            let seqno = ws.alloc_seqno()?;
             ws.tombstone(existing, ctx.now, seqno)?;
             Ok(None)
         }
@@ -343,7 +343,7 @@ fn merge_duplicate(
         return Ok(None);
     };
     validate_insert(config, &merged)?;
-    let seqno = ws.alloc_seqno();
+    let seqno = ws.alloc_seqno()?;
     let slot_data = build_slot(SlotSpec {
         ns_id: ctx.ns_id,
         ns_path: Arc::clone(&ctx.ns_path),
@@ -372,10 +372,10 @@ fn resolve_rowid(
     force_new_rowid: bool,
 ) -> Result<RowIdChoice> {
     if force_new_rowid {
-        return Ok(RowIdChoice::Use(ws.alloc_rowid()));
+        return Ok(RowIdChoice::Use(ws.alloc_rowid()?));
     }
     let Some(key) = &ctx.rec.key else {
-        return Ok(RowIdChoice::Use(ws.alloc_rowid()));
+        return Ok(RowIdChoice::Use(ws.alloc_rowid()?));
     };
     let existing = ws
         .key_index
@@ -394,6 +394,6 @@ fn resolve_rowid(
             }
         }
         (Some(existing), _) => Ok(RowIdChoice::Use(existing)),
-        (None, _) => Ok(RowIdChoice::Use(ws.alloc_rowid())),
+        (None, _) => Ok(RowIdChoice::Use(ws.alloc_rowid()?)),
     }
 }

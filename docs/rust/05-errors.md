@@ -70,7 +70,7 @@ let level: Option<u8> = None;
 level.map_or(0, |l| l as usize);      // None 时给默认 0
 ```
 
-见 [`src/index/filtered.rs:103`](../../src/index/filtered.rs) 与
+见 [`src/index/filtered.rs:109`](../../src/index/filtered.rs) 与
 [`src/index/hidx.rs:257-259`](../../src/index/hidx.rs)。`is_none_or` 是 Rust 1.82 稳定的
 新方法,名字直译就是"是 `None` 或者满足条件";在"默认放行、有值才检查"的语义下比
 `map_or(true, ...)` 更不容易读反。
@@ -101,7 +101,7 @@ let error = HnswIndex::load(...)
 assert!(matches!(error, MnemeError::Corrupted { .. }));
 ```
 
-见 [`src/index/hnsw.rs:690-709`](../../src/index/hnsw.rs)。
+见 [`src/index/hnsw.rs:786-800`](../../src/index/hnsw.rs)。
 
 mneme 的 `meta::get_path` 用 `?` 在 `Option` 上做链式短路:
 
@@ -152,10 +152,12 @@ filter.map_or_else(
 );
 ```
 
-见 [`src/query/iso.rs:94`](../../src/query/iso.rs)、
+见 [`src/query/iso.rs:103`](../../src/query/iso.rs)、
 [`src/query/zmap.rs:153-159`](../../src/query/zmap.rs)、
 [`src/query/json.rs:101-104`](../../src/query/json.rs)、
-[`src/query/exec.rs:385-388`](../../src/query/exec.rs) 与
+[`src/query/exec.rs:260`](../../src/query/exec.rs)、
+[`src/query/exec.rs:407-410`](../../src/query/exec.rs)、
+[`src/query/exec.rs:421`](../../src/query/exec.rs) 与
 [`src/query/plan.rs:53-56`](../../src/query/plan.rs)。逐条:
 
 - `then_some`:等价于 `if cond { Some(v) } else { None }`,但 `v` **立即求值**;
@@ -166,10 +168,10 @@ filter.map_or_else(
   `Option<Vec<T>>` → `Option<&[T]>` 同理。
 - `as_ref`:`Option<T>` → `Option<&T>`,只借一层;若 `T` 还能继续解引用(如 `String`),
   `as_deref` 会再走一步给出 `Option<&str>`。L4 物化 `Hit` 时用 `slot_data.text.as_ref().map(...)`
-  借出文本再转拥有值(见 [`src/query/exec.rs:385`](../../src/query/exec.rs))。
+  借出文本再转拥有值(见 [`src/query/exec.rs:407`](../../src/query/exec.rs))。
 - `cloned()`:`Option<&T>` → `Option<T>`(要求 `T: Clone`);`HashMap::get` 返回引用,
   L4 取来源边时用 `via_map.get(&candidate.rowid).cloned()` 复制出拥有值(见
-  [`src/query/exec.rs:388`](../../src/query/exec.rs))。
+  [`src/query/exec.rs:410`](../../src/query/exec.rs))。
 - `copied()`:`Option<&T>` → `Option<T>`(要求 `T: Copy`),是 `cloned()` 的零成本版本;
   `RowId`、`u32`、`f32` 这类 `Copy` 类型一律用它——L4 从访问统计表、分数表取值都是
   `get(...).copied()`(见 [`src/query/plan.rs:136`](../../src/query/plan.rs) 与
@@ -177,9 +179,9 @@ filter.map_or_else(
 - `or_else(f)`:只有是 `None` 时才调用闭包 `f`(惰性),返回另一个 `Option`;常用来把
   "第一种写法失败就试第二种"串起来。L4 兼容时区后缀的大小写就靠它:
   `.strip_prefix(&[b'Z']).or_else(|| ...to_ascii_lowercase...)`,见
-  [`src/query/iso.rs:58-63`](../../src/query/iso.rs)。`Result::or_else` 同理,只是换的是错误。
+  [`src/query/iso.rs:67-72`](../../src/query/iso.rs)。`Result::or_else` 同理,只是换的是错误。
 - `unwrap_or_default()`:`None` 时取 `T::default()`(要求 `T: Default`);L4 未显式设置融合策略时
-  取默认的 RRF(见 [`src/query/exec.rs:254`](../../src/query/exec.rs))。
+  取默认的 RRF(见 [`src/query/exec.rs:275`](../../src/query/exec.rs))。
 - `map_or_else(none_fn, some_fn)`:两个分支都惰性;L4 计划器用它"无过滤→全 1 位图,
   有过滤→下推求值"。默认值构造昂贵时,`map_or`(默认值立即求值)不合适。
 
@@ -211,7 +213,7 @@ mneme 给 `Result` 起了别名,固定错误类型:
 pub type Result<T> = std::result::Result<T, MnemeError>;
 ```
 
-见 [`src/core/error.rs:133`](../../src/core/error.rs)。于是全库函数签名统一写成 `-> Result<T>`,
+见 [`src/core/error.rs:141`](../../src/core/error.rs)。于是全库函数签名统一写成 `-> Result<T>`,
 不需要每次都写 `, MnemeError`。
 
 ### 2.1 `match` 处理
@@ -417,7 +419,7 @@ if let Some(&(_, best)) = candidates.first() {
 }
 ```
 
-见 [`src/index/hnsw.rs:374`](../../src/index/hnsw.rs)。`candidates.first()` 返回
+见 [`src/index/hnsw.rs:463`](../../src/index/hnsw.rs)。`candidates.first()` 返回
 `Option<&(Score, u32)>`(切片首元素的引用);模式最前面的 `&` 把引用"拆开",`(_, best)`
 再解出元组第二个字段,`_` 忽略分数。于是 `best` 是复制出来的 `u32`,不是引用。
 规则:模式要对**值的类型**匹配,加 `&` 可以"透过引用看进去"——和 [07 §3.1](07-iterators-closures.md)
@@ -449,7 +451,7 @@ pub const fn needs_norm(&self) -> bool {
 }
 ```
 
-见 [`src/core/metric.rs:108-110`](../../src/core/metric.rs)。`matches!` 判断值是否匹配某个模式,
+见 [`src/core/metric.rs:152-154`](../../src/core/metric.rs)。`matches!` 判断值是否匹配某个模式,
 比手写 `match { ... => true, _ => false }` 简洁。
 
 ### 4.4 测试里的 `matches!`
@@ -481,7 +483,7 @@ while let Some(current) = frontier.pop() {   // 堆非空就弹出一个继续�
 }
 ```
 
-见 [`src/index/hnsw.rs:260`](../../src/index/hnsw.rs)。`pop()` 返回 `Option<Cand>`:
+见 [`src/index/hnsw.rs:337`](../../src/index/hnsw.rs)。`pop()` 返回 `Option<Cand>`:
 `Some` 进入循环体,`None`(堆空)结束循环。它等价于:
 
 ```rust
@@ -509,7 +511,7 @@ let Ok(decoded) = decode(&bytes) else {
 // 从这里起,decoded 一定可用
 ```
 
-见 [`src/index/hidx.rs:780-782`](../../src/index/hidx.rs)。规则:
+见 [`src/index/hidx.rs:782-784`](../../src/index/hidx.rs)。规则:
 
 - `else` 块**必须发散(diverge)**:里面必须以 `return`/`break`/`continue`/`panic!` 结束,
   编译器才能保证"走到下面时模式一定匹配成功";
@@ -561,7 +563,7 @@ mneme 的 L0 契约明确:**公开 API 不 panic**(FC-CORE-INV-002,见
 if denominator < COSINE_EPSILON { 0.0 } else { simd::dot(a, b) / denominator }
 ```
 
-见 [`src/core/metric.rs:137-144`](../../src/core/metric.rs)。
+见 [`src/core/metric.rs:196-201`](../../src/core/metric.rs)。
 
 > **"拒绝静默失败"**:不能吞掉错误(如 `let _ = ...`),也不能把坏输入当正常数据处理。
 > 要么返回带上下文的错误,要么(仅在不可恢复时)panic。

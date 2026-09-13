@@ -175,7 +175,7 @@
 | zone map 剪枝 | $O(\lceil N/1024\rceil \times \text{predicates})$ | 17B/块/字段 | [04 §5.2](04-l2-persist.md) |
 | bloom 判定 | $O(k) = O(7)$ | $1.44\log_2(1/p)$ bit/元素 | [04 §5.3](04-l2-persist.md) |
 | MANIFEST 提交 | $O(\text{segments})$ 写新文件 | 保留 2 版 | [04 §6](04-l2-persist.md) |
-| 恢复(open) | $O(\text{段总字节} + \text{WAL 字节})$(逐段读入校验 + 回放) | $O(\text{段总字节} + \text{WAL 字节})$;恢复期仍整段载入,mmap 读路径优化已在 L3,惰性驻留待 L6 | [04 §7](04-l2-persist.md) |
+| 恢复(open) | $O(\text{段总字节} + \text{WAL 字节})$(逐段读入校验 + 回放) | $O(\text{段总字节} + \text{WAL 字节})$;恢复期仍整段载入,mmap 读路径优化已在 L3,惰性驻留待段句柄重构(未落地) | [04 §7](04-l2-persist.md) |
 | HNSW 构建 | $O(N \cdot d \cdot ef_c \cdot M_0)$ | ≈$(8M+20)$ B/节点 | [05 §4/§6.3](05-l3-hnsw.md) |
 | HNSW 查询 | 上界 $O(d \cdot ef \cdot M_0)$;实测 ≈ (2–5)·ef 次点积 | — | [05 §6.1](05-l3-hnsw.md) |
 | 层级分布 | $P(\ge l) = (1/M)^l$;层高 $O(\log_M N)$ | — | [05 §3.2](05-l3-hnsw.md) |
@@ -189,7 +189,7 @@
 | retain 扫描 | $O(N_{\text{cand}})$ | — | [07 §3.4](07-l5-life.md) |
 | compaction 单轮 | $O(S \cdot d \cdot ef_c \cdot M_0)$(建图主导) | 峰值 +$O(S)$ | [07 §4.5](07-l5-life.md) |
 | compaction 摊还 | 每字节重写平均 ≈ $\log_r(N/B)$ ≈ 7 次(上界 ≈ 9) | 段数 $O(\log_r N)$ | [07 §4.2](07-l5-life.md) |
-| i8 量化点积 | 带宽 ÷4;VNNI 再 ~4× 指令 | 粗排副本 $d$ B/行(f32 原向量另存) | [08 §2](08-l6-quant.md) |
+| i8 量化点积 | 读侧带宽 ÷4(u8 零扩展 + FMA,不用 `maddubs`/VNNI;见 [08 §2.3](08-l6-quant.md)) | 粗排副本 $d$ B/行(f32 原向量另存) | [08 §2](08-l6-quant.md) |
 | 单点写(insert) | $O(1)$ 内存 + WAL 追加;fsync 按策略 | $O(d)$ | [04 §3](04-l2-persist.md) |
 | 单点读(get key) | $O(\log n)$(key 索引二分)+ 一次记录读 | — | [04 §5.5](04-l2-persist.md) |
 | 单点读(get_by_rowid) | $O(\log n)$(版本链定位) | — | [04 §2.2](04-l2-persist.md) |
@@ -203,8 +203,8 @@
 
 > **复杂度即契约**:上表主体复杂度由 [spec/contracts.md §9](../spec/contracts.md)
 > 的 `FC-*-CPLX-*` 契约保证(时间/空间上界、口径标注与回归门禁见该节 §9.3);
-> 规划能力(量化/加密/部署)对应的 `FC-QUANT-*`/`FC-SEC-*`/`FC-DEPLOY-*` 及
-> `FC-GLOBAL-CPLX-001` 当前仍为 `Planned/待补`,实现后回填。
+> 规划能力(加密/部署)对应的 `FC-SEC-*`/`FC-DEPLOY-*` 及 `FC-GLOBAL-CPLX-001`
+> 当前仍为 `Planned/待补`,实现后回填;量化 `FC-QUANT-*` 已随 L6 落地为 `Passed`。
 > 本表是阅读视图,冲突时以契约矩阵为准。
 
 **性能承诺汇总(目标;冷启动与 1M 门槛见 [14 §4](14-testing.md) 的未兑现标注)**:

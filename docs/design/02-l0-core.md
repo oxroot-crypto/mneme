@@ -336,7 +336,7 @@ pub enum InsertMode { Upsert, RejectDuplicate }   // 同 key 行为,默认 Upser
 pub enum VectorFormat { F32, F16, I8Rescored }    // 量化格式,L6
 pub struct HnswParams { m, m0, ef_construction, ef_search }         // L3
 pub struct CompactionPolicy { tier_ratio, tier_count, dead_ratio, wal_bytes, wal_file_bytes, segment_rows, io_budget, history_horizon } // L5
-pub struct Tuning { parallel_block, field_dict_max, bloom_fpp, brute_force_max_rows, filter_post_threshold, filter_brute_threshold, stopwords } // 进阶
+pub struct Tuning { parallel_block, field_dict_max, bloom_fpp, brute_force_max_rows, filter_post_threshold, filter_brute_threshold, stopwords, rescore_oversample, quant_recall_floor } // 进阶;后两项 L6(见 08/16)
 pub struct Limits { key_bytes, text_bytes, meta_bytes, meta_depth, ns_depth, top_k_max, ef_max, wal_frame_max } // 16 §8
 pub struct Scoring { w_sim, w_recency, w_importance, w_access, w_confidence, half_life, c_norm, floor, time_axis, bias_routing }  // L4 排序打分,见 10
 pub enum TimeAxis { ValidTime, TransactionTime }  // 新鲜度时间轴,见 10

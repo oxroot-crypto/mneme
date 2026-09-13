@@ -56,7 +56,7 @@ impl MaintenanceHandle {
         if let Some(handle) = handle {
             // reason: 维护线程内部的 panic 由 `run` 隔离(线程异常终止不代表库损坏),
             // join 结果仅用于等待退出,无可执行的恢复动作。
-            let _ = handle.join();
+            let _ = handle.join().ok();
         }
     }
 
@@ -82,7 +82,7 @@ impl MaintenanceHandle {
         let (lock, cvar) = &*self.stop;
         let guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         // reason: 超时返回属正常路径;锁 poison 已在上一行恢复,无需再检查返回值。
-        let _ = cvar.wait_timeout(guard, timeout);
+        let _ = cvar.wait_timeout(guard, timeout).ok();
     }
 }
 
@@ -188,7 +188,7 @@ fn run_tick(context: &MaintenanceContext, timers: &mut Timers, compact_interval:
             .unwrap_or(policy.half_life / RETAIN_INTERVAL_DIVISOR);
         if elapsed(now_ms, timers.retain_ms) >= interval {
             // reason: 后台维护尽力而为;retain 失败由下一轮重试,不影响前台读写正确性。
-            let _ = run_retain(&table, &context.config, policy);
+            let _ = run_retain(&table, &context.config, policy).ok();
             timers.retain_ms = now_ms;
         }
     }
@@ -206,7 +206,7 @@ fn run_tick(context: &MaintenanceContext, timers: &mut Timers, compact_interval:
         };
         // reason: 后台 compaction 为尽力而为;失败由下一轮重试,已提交状态不变
         // (FC-LIFE-ERR-001),不影响前台读写的正确性。
-        let _ = mneme.compact();
+        let _ = mneme.compact().ok();
         timers.compact_ms = now_ms;
     }
     true

@@ -15,6 +15,14 @@ const STOPWORDS: &[&str] = &[
     "在", "和", "与", "或",
 ];
 
+/// CJK 统一表意文字区块的编码区间(扩展 A、基本区、兼容区、扩展 B 起)。
+const CJK_RANGES: [(u32, u32); 4] = [
+    (0x3400, 0x4DBF),
+    (0x4E00, 0x9FFF),
+    (0xF900, 0xFAFF),
+    (0x2_0000, 0x2_FA1F),
+];
+
 /// 判断字符是否属于 CJK 统一表意文字(基本区、扩展 A、兼容区与扩展 B 起)。
 ///
 /// # Arguments
@@ -23,10 +31,10 @@ const STOPWORDS: &[&str] = &[
 /// # Returns
 /// 属于 CJK 表意文字时返回 `true`;日文假名与韩文不在内(按整词处理)。
 fn is_cjk(c: char) -> bool {
-    matches!(
-        c as u32,
-        0x3400..=0x4DBF | 0x4E00..=0x9FFF | 0xF900..=0xFAFF | 0x2_0000..=0x2_FA1F
-    )
+    let codepoint = c as u32;
+    CJK_RANGES
+        .iter()
+        .any(|&(low, high)| (low..=high).contains(&codepoint))
 }
 
 /// 判断 token 是否命中内置停用词表。

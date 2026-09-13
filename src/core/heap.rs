@@ -216,16 +216,15 @@ impl<T: Ord> TopK<T> {
         self.heap.into_iter().map(|entry| entry.payload).collect()
     }
 
-    /// `a` 是否优于 `b`:先比分数方向,同分比载荷升序。
+    /// `a` 是否优于 `b`:先经 [`Metric::score_order`] 的全序比较(含 `NaN` 定序),
+    /// 完全相等时比载荷升序。
     fn is_better(metric: Metric, a: Candidate<'_, T>, b: Candidate<'_, T>) -> bool {
         #[cfg(test)]
         COMPARES.with(|count| count.set(count.get() + 1));
-        if metric.better(a.score, b.score) {
-            true
-        } else if metric.better(b.score, a.score) {
-            false
-        } else {
-            a.payload < b.payload
+        match metric.score_order(a.score, b.score) {
+            std::cmp::Ordering::Less => true,
+            std::cmp::Ordering::Greater => false,
+            std::cmp::Ordering::Equal => a.payload < b.payload,
         }
     }
 
@@ -309,6 +308,30 @@ mod tests {
             top.push(distance, id);
         }
         assert_eq!(top.into_sorted_vec(), vec![1, 2]);
+    }
+
+    /// FC-CORE-POST-004:`NaN` 分数与精排共用同一全序——`NaN` 恒排最后,
+    /// 不同 `top_k` 下代表元一致(不再出现 k=1/k=2 首名矛盾)。
+    #[test]
+    fn topk_orders_nan_consistently() {
+        let mut one = TopK::new(1, Metric::Dot);
+        one.push(1.0, 1_u32);
+        one.push(f32::NAN, 2_u32);
+        assert_eq!(one.into_sorted_vec(), vec![1], "NaN 不得挤掉有限候选");
+
+        let mut two = TopK::new(2, Metric::Dot);
+        two.push(f32::NAN, 2_u32);
+        two.push(1.0, 1_u32);
+        assert_eq!(two.into_sorted_vec(), vec![1, 2], "NaN 恒排最后");
+
+        let mut negative_nan = TopK::new(1, Metric::Dot);
+        negative_nan.push(-f32::NAN, 7_u32);
+        negative_nan.push(0.5, 8_u32);
+        assert_eq!(
+            negative_nan.into_sorted_vec(),
+            vec![8],
+            "-NaN 也不得排在有限分之前"
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::core::bitset::BitSet;
 use crate::core::error::{MnemeError, Result};
 use crate::core::meta::Meta;
-use crate::core::options::RelationKind;
+use crate::core::options::{RelationKind, VectorFormat};
 use crate::core::types::{Key, NsId, RowId, SeqNo, SlotId};
 use crate::memory::analysis::{BLOOM_INITIAL_CAPACITY, BloomSet, InvertedIndex, ZoneIndex};
 use crate::memory::index::{SegmentIndex, VectorIndex};
@@ -176,16 +176,32 @@ impl WriterState {
     }
 
     /// 分配下一个全局单调 `SeqNo`。
-    pub(crate) fn alloc_seqno(&mut self) -> SeqNo {
-        self.seqno = SeqNo::new(self.seqno.get() + 1);
-        self.seqno
+    ///
+    /// # Errors
+    /// `SeqNo` 空间耗尽时返回 [`MnemeError::IdExhausted`]
+    /// (FC-PERSIST-INV-020),绝不回绕复用。
+    pub(crate) fn alloc_seqno(&mut self) -> Result<SeqNo> {
+        let next = self
+            .seqno
+            .get()
+            .checked_add(1)
+            .ok_or(MnemeError::IdExhausted { kind: "seqno" })?;
+        self.seqno = SeqNo::new(next);
+        Ok(self.seqno)
     }
 
     /// 分配下一个稳定 `RowId`。
-    pub(crate) fn alloc_rowid(&mut self) -> RowId {
+    ///
+    /// # Errors
+    /// `RowId` 空间耗尽时返回 [`MnemeError::IdExhausted`]
+    /// (FC-PERSIST-INV-020),绝不回绕复用。
+    pub(crate) fn alloc_rowid(&mut self) -> Result<RowId> {
         let rowid = RowId::new(self.next_rowid);
-        self.next_rowid += 1;
-        rowid
+        self.next_rowid = self
+            .next_rowid
+            .checked_add(1)
+            .ok_or(MnemeError::IdExhausted { kind: "rowid" })?;
+        Ok(rowid)
     }
 
     /// 返回命名空间路径对应的 `NsId`(不存在则 `None`)。
@@ -223,12 +239,16 @@ impl WriterState {
                 reason: "命名空间路径含控制字符",
             });
         }
+        let next_ns_id = self
+            .next_ns_id
+            .checked_add(1)
+            .ok_or(MnemeError::IdExhausted { kind: "ns_id" })?;
         let id = NsId::new(self.next_ns_id);
-        self.next_ns_id += 1;
+        self.next_ns_id = next_ns_id;
         let path: Arc<str> = Arc::from(path);
         Arc::make_mut(&mut self.ns_registry).insert(id, path.clone());
         Arc::make_mut(&mut self.ns_by_path).insert(path.clone(), id);
-        let seqno = self.alloc_seqno();
+        let seqno = self.alloc_seqno()?;
         self.pending.push(WriteOp::NsRegister {
             ns_id: id.get(),
             path,
@@ -238,23 +258,30 @@ impl WriterState {
     }
 
     /// 注销命名空间(移除注册表与路径映射并记录 WAL 帧);`NsId` 水位不回退、永不复用。
-    pub(crate) fn unregister_ns(&mut self, ns_id: NsId) {
+    ///
+    /// # Errors
+    /// `SeqNo` 空间耗尽时返回 [`MnemeError::IdExhausted`]。
+    pub(crate) fn unregister_ns(&mut self, ns_id: NsId) -> Result<()> {
         if let Some(path) = Arc::make_mut(&mut self.ns_registry).remove(&ns_id) {
             Arc::make_mut(&mut self.ns_by_path).remove(&path);
         }
-        let seqno = self.alloc_seqno();
+        let seqno = self.alloc_seqno()?;
         self.pending.push(WriteOp::NsUnregister {
             ns_id: ns_id.get(),
             seqno,
         });
+        Ok(())
     }
 
     /// 建立/更新关系边并记录 WAL 操作。
-    pub(crate) fn relate_edge(&mut self, edge: Edge) {
+    ///
+    /// # Errors
+    /// `SeqNo` 空间耗尽时返回 [`MnemeError::IdExhausted`]。
+    pub(crate) fn relate_edge(&mut self, edge: Edge) -> Result<()> {
         crate::memory::relation::upsert_edge(Arc::make_mut(&mut self.out_edges), edge.clone());
         crate::memory::relation::upsert_edge(Arc::make_mut(&mut self.in_edges), edge.clone());
         Arc::make_mut(&mut self.edge_dirty).insert((edge.from, edge.to, edge.kind.0));
-        let seqno = self.alloc_seqno();
+        let seqno = self.alloc_seqno()?;
         self.pending.push(WriteOp::Relate {
             from: edge.from,
             to: edge.to,
@@ -263,10 +290,19 @@ impl WriterState {
             meta: edge.metadata,
             seqno,
         });
+        Ok(())
     }
 
     /// 删除关系边并记录 WAL 操作;未命中返回 `false` 且不消耗序号。
-    pub(crate) fn unrelate_edge(&mut self, from: RowId, to: RowId, kind: RelationKind) -> bool {
+    ///
+    /// # Errors
+    /// 命中边且 `SeqNo` 空间耗尽时返回 [`MnemeError::IdExhausted`]。
+    pub(crate) fn unrelate_edge(
+        &mut self,
+        from: RowId,
+        to: RowId,
+        kind: RelationKind,
+    ) -> Result<bool> {
         let removed = crate::memory::relation::remove_edge(
             Arc::make_mut(&mut self.out_edges),
             from,
@@ -276,7 +312,7 @@ impl WriterState {
         crate::memory::relation::remove_edge(Arc::make_mut(&mut self.in_edges), to, from, kind);
         if removed {
             Arc::make_mut(&mut self.edge_dirty).insert((from, to, kind.0));
-            let seqno = self.alloc_seqno();
+            let seqno = self.alloc_seqno()?;
             self.pending.push(WriteOp::Unrelate {
                 from,
                 to,
@@ -284,7 +320,7 @@ impl WriterState {
                 seqno,
             });
         }
-        removed
+        Ok(removed)
     }
 
     /// 把某 `RowId` 的当前最新版本标记为不可见(被遮蔽/删除)。
@@ -442,11 +478,14 @@ impl WriterState {
     ///
     /// `slot_indices` 为该段包含的全局槽位(升序);`index = None` 表示该段无
     /// `hidx`(或未配置索引工厂),其槽位由查询期暴力覆盖。
+    /// `quant`/`recall_est` 为该段实际生效的量化格式与建段抽样召回估计。
     pub(crate) fn install_segment(
         &mut self,
         segment_id: u32,
         slot_indices: &[usize],
         index: Option<Arc<dyn VectorIndex>>,
+        quant: VectorFormat,
+        recall_est: Option<f32>,
     ) {
         {
             let slot_segment = Arc::make_mut(&mut self.slot_segment);
@@ -464,7 +503,9 @@ impl WriterState {
                     SlotId::new(u32::try_from(idx).expect("槽位下标必可转入 u32(FC-MEM-INV-004)"))
                 })
                 .collect();
-            Arc::make_mut(&mut self.indexes).push(SegmentIndex::new(segment_id, index, slots));
+            Arc::make_mut(&mut self.indexes).push(SegmentIndex::new(
+                segment_id, index, slots, quant, recall_est,
+            ));
         }
     }
 
@@ -645,6 +686,28 @@ mod tests {
                 limit,
                 got,
             }) if limit == u32::MAX as usize && got == overflow
+        ));
+    }
+
+    /// FC-PERSIST-INV-020 / FC-PERSIST-ERR-012:`RowId`/`NsId`/`SeqNo`
+    /// 空间耗尽时返回 `IdExhausted`,绝不回绕复用。
+    #[test]
+    fn id_allocators_reject_exhaustion() {
+        let mut state = WriterState::new();
+        state.next_rowid = u64::MAX;
+        assert!(matches!(
+            state.alloc_rowid(),
+            Err(MnemeError::IdExhausted { kind: "rowid" })
+        ));
+        state.seqno = SeqNo::new(u64::MAX);
+        assert!(matches!(
+            state.alloc_seqno(),
+            Err(MnemeError::IdExhausted { kind: "seqno" })
+        ));
+        state.next_ns_id = u32::MAX;
+        assert!(matches!(
+            state.register_ns("耗尽"),
+            Err(MnemeError::IdExhausted { kind: "ns_id" })
         ));
     }
 }

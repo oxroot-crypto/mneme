@@ -34,7 +34,7 @@ pub(crate) fn update_rowid(
     // 版本数据经 `Arc` 与读者共享,更新必须克隆出新版本(COW)。
     let mut slot_data = (*base).clone();
     apply_patch(&mut slot_data, patch, now);
-    slot_data.seqno = ws.alloc_seqno();
+    slot_data.seqno = ws.alloc_seqno()?;
     slot_data.tx_ms = now;
     slot_data.deleted = false;
     ws.commit_version(rowid, slot_data)?;
@@ -112,7 +112,7 @@ pub(crate) fn touch_rowid(
     if let Some(boost) = boost {
         let mut slot_data = (*base).clone();
         slot_data.importance = (slot_data.importance + boost).clamp(0.0, 1.0);
-        slot_data.seqno = ws.alloc_seqno();
+        slot_data.seqno = ws.alloc_seqno()?;
         slot_data.tx_ms = now;
         ws.commit_version(rowid, slot_data)?;
     }
@@ -125,7 +125,7 @@ pub(crate) fn touch_rowid(
     // 访问增量随下次 flush 以 delta 区 `Access` 条目落盘(读路径零写放大)。
     ws.mark_access_dirty(rowid);
     // 访问统计单独落 WAL(重要性变更已随上面的版本 `Insert` 记录)。
-    let seqno = ws.alloc_seqno();
+    let seqno = ws.alloc_seqno()?;
     ws.pending.push(WriteOp::Access {
         rowid,
         seqno,
@@ -140,7 +140,7 @@ pub(crate) fn lower_confidence(ws: &mut WriterState, rowid: RowId, now: i64) -> 
     if let Some(base) = latest_live(ws, rowid) {
         let mut slot_data = (*base).clone();
         slot_data.confidence = (slot_data.confidence - CONFIDENCE_DECAY_STEP).clamp(0.0, 1.0);
-        slot_data.seqno = ws.alloc_seqno();
+        slot_data.seqno = ws.alloc_seqno()?;
         slot_data.tx_ms = now;
         ws.commit_version(rowid, slot_data)?;
     }

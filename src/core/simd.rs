@@ -96,6 +96,34 @@ pub fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
         .sum()
 }
 
+/// 计算 `u8` 码流与逐元素 f32 权重的点积(`Σ codesᵢ·weightsᵢ`)。
+///
+/// 供 L6 i8 量化粗排使用(设计 08 §2.3):码流每元素 1 字节,权重由查询向量与
+/// 段级逐维参数预计算。长度不等时按较短者计算(与 [`dot`] 同口径)。
+pub(crate) fn dot_u8_f32(codes: &[u8], weights: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            // SAFETY: 已确认 avx2 与 fma 均可用;长度前提由内核循环边界保证。
+            return unsafe { x86::dot_u8_avx2(codes, weights) };
+        }
+        dot_u8_f32_scalar(codes, weights)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    {
+        dot_u8_f32_scalar(codes, weights)
+    }
+}
+
+/// `u8 × f32` 点积的可移植标量参考实现(长度不等时按较短者)。
+pub(crate) fn dot_u8_f32_scalar(codes: &[u8], weights: &[f32]) -> f32 {
+    codes
+        .iter()
+        .zip(weights.iter())
+        .map(|(&code, &weight)| f32::from(code) * weight)
+        .sum()
+}
+
 #[cfg(target_arch = "x86_64")]
 fn dot_x86(a: &[f32], b: &[f32]) -> f32 {
     if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
@@ -110,9 +138,10 @@ fn dot_x86(a: &[f32], b: &[f32]) -> f32 {
 #[cfg(target_arch = "x86_64")]
 mod x86 {
     use std::arch::x86_64::{
-        __m128, _mm_add_ps, _mm_add_ss, _mm_cvtss_f32, _mm_loadu_ps, _mm_movehl_ps, _mm_mul_ps,
-        _mm_setzero_ps, _mm_shuffle_ps, _mm256_castps256_ps128, _mm256_extractf128_ps,
-        _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps,
+        __m128, __m128i, _mm_add_ps, _mm_add_ss, _mm_cvtss_f32, _mm_loadl_epi64, _mm_loadu_ps,
+        _mm_movehl_ps, _mm_mul_ps, _mm_setzero_ps, _mm_shuffle_ps, _mm256_castps256_ps128,
+        _mm256_cvtepi32_ps, _mm256_cvtepu8_epi32, _mm256_extractf128_ps, _mm256_fmadd_ps,
+        _mm256_loadu_ps, _mm256_setzero_ps,
     };
 
     /// AVX2 + FMA 点积内核。
@@ -172,6 +201,42 @@ mod x86 {
         };
         while i < n {
             sum += a[i] * b[i];
+            i += 1;
+        }
+        sum
+    }
+
+    /// `u8 × f32` 点积内核(AVX2):每次 8 个码位零扩展到 f32 后 FMA,
+    /// 读侧每元素 1 字节(设计 08 §2.3)。
+    ///
+    /// # Safety
+    ///
+    /// 调用者必须确认当前 CPU 支持 `avx2` 与 `fma`。
+    #[target_feature(enable = "avx2", enable = "fma")]
+    pub unsafe fn dot_u8_avx2(codes: &[u8], weights: &[f32]) -> f32 {
+        let n = codes.len().min(weights.len());
+        let mut i = 0usize;
+        // SAFETY: 循环条件 i + 8 <= n 保证 [i, i+8) 落在两个切片范围内;CPU 支持已由调用者确认。
+        let mut sum = unsafe {
+            let mut acc = _mm256_setzero_ps();
+            while i + 8 <= n {
+                let bytes = _mm_loadl_epi64(codes.as_ptr().add(i).cast::<__m128i>());
+                let widened = _mm256_cvtepu8_epi32(bytes);
+                let floats = _mm256_cvtepi32_ps(widened);
+                let weight = _mm256_loadu_ps(weights.as_ptr().add(i));
+                acc = _mm256_fmadd_ps(floats, weight, acc);
+                i += 8;
+            }
+            let lo = _mm256_castps256_ps128(acc);
+            let hi = _mm256_extractf128_ps(acc, 1);
+            let sum128 = _mm_add_ps(lo, hi);
+            let shuffled = _mm_movehl_ps(sum128, sum128);
+            let pairs = _mm_add_ps(sum128, shuffled);
+            let high = _mm_shuffle_ps(pairs, pairs, super::SHUFFLE_TAKE_HIGHEST);
+            _mm_cvtss_f32(_mm_add_ss(pairs, high))
+        };
+        while i < n {
+            sum += f32::from(codes[i]) * weights[i];
             i += 1;
         }
         sum
@@ -247,5 +312,30 @@ mod tests {
             assert_eq!(result, 2.0 * len as f32);
             assert_eq!(take_mul_adds(), len, "乘加次数必须恰为 min(len)");
         }
+    }
+
+    /// `dot_u8_f32`(L6 i8 粗排内核)与标量参考实现在所有尾块长度上一致。
+    #[test]
+    fn dot_u8_f32_matches_scalar_reference() {
+        for len in [0_usize, 1, 7, 8, 9, 31, 64, 257] {
+            let codes: Vec<u8> = (0..len).map(|index| (index * 37 % 256) as u8).collect();
+            let weights: Vec<f32> = (0..len).map(|index| index as f32 * 0.25 - 3.0).collect();
+            let expected = dot_u8_f32_scalar(&codes, &weights);
+            let got = dot_u8_f32(&codes, &weights);
+            assert!(
+                (got - expected).abs() <= expected.abs().max(1.0) * 1e-4,
+                "len={len}: {got} vs {expected}"
+            );
+        }
+    }
+
+    /// 码值取满 `[0, 255]` 全域时仍与标量一致。
+    #[test]
+    fn dot_u8_f32_handles_full_code_range() {
+        let codes: Vec<u8> = (0..=255_u8).collect();
+        let weights: Vec<f32> = (0..256).map(|index| 1.0 - index as f32 / 128.0).collect();
+        let expected = dot_u8_f32_scalar(&codes, &weights);
+        let got = dot_u8_f32(&codes, &weights);
+        assert!((got - expected).abs() <= expected.abs().max(1.0) * 1e-4);
     }
 }

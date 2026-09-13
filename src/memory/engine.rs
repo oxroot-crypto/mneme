@@ -200,7 +200,7 @@ impl Mneme {
                 rows += tombstone_namespace(ws, *ns_id, now)?;
             }
             for ns_id in &victims {
-                ws.unregister_ns(*ns_id);
+                ws.unregister_ns(*ns_id)?;
             }
             Ok(rows)
         })
@@ -353,7 +353,7 @@ fn tombstone_namespace(ws: &mut WriterState, ns_id: NsId, now: i64) -> Result<us
         .collect();
     let mut rows = 0;
     for rowid in rowids {
-        let seqno = ws.alloc_seqno();
+        let seqno = ws.alloc_seqno()?;
         if ws.tombstone(rowid, now, seqno)? {
             rows += 1;
         }

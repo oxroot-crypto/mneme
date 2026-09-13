@@ -1,0 +1,49 @@
+[package]
+name = "mneme-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mneme = { path = "..", features = ["fuzzing"] }
+
+[[bin]]
+name = "fuzz_vsec"
+path = "fuzz_targets/fuzz_vsec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_msec"
+path = "fuzz_targets/fuzz_msec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_hidx"
+path = "fuzz_targets/fuzz_hidx.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_wal_replay"
+path = "fuzz_targets/fuzz_wal_replay.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_dsl"
+path = "fuzz_targets/fuzz_dsl.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

@@ -182,4 +182,30 @@ mod tests {
             "got {with_access}"
         );
     }
+
+    /// `protect` 白名单豁免低分记录,未命中者按重要性下限回收。
+    #[test]
+    fn protect_expression_exempts_from_retention() {
+        use crate::memory::engine::Mneme;
+        use crate::memory::pred::Expr;
+        use crate::memory::record::Record;
+
+        let db = Mneme::in_memory(2).expect("in_memory");
+        let ns = db.namespace("t");
+        for (key, vector) in [("keep", vec![1.0, 0.0]), ("drop", vec![0.0, 1.0])] {
+            ns.insert(Record::new(vector).key(key).importance(0.01))
+                .expect("insert");
+        }
+        let policy = Retention::default().protect(Expr::field("key").eq("keep"));
+        let report = ns.retain(policy).expect("retain");
+        assert!(report.forgotten >= 1, "低分记录应被遗忘");
+        assert!(
+            ns.get("keep").expect("get").is_some(),
+            "protect 命中者豁免遗忘"
+        );
+        assert!(
+            ns.get("drop").expect("get").is_none(),
+            "未受保护的低分记录被遗忘"
+        );
+    }
 }

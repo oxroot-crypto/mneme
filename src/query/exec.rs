@@ -302,6 +302,7 @@ impl SearchBuilder<'_> {
             brute_force_max_rows: self.config.tuning.brute_force_max_rows as usize,
             filter_post_threshold: self.config.tuning.filter_post_threshold,
             filter_brute_threshold: self.config.tuning.filter_brute_threshold,
+            rescore_oversample: self.config.tuning.rescore_oversample,
             candidates: Some(ctx.candidates),
         })
     }

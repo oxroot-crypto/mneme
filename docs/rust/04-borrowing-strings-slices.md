@@ -219,7 +219,7 @@ if bytes.len() < 4 || !bytes[..4].iter().all(u8::is_ascii_digit) { return None; 
   凡是签名能对上就能直接传给迭代器方法(和 §2.3 的 `Vec::as_slice`、[10 §4.6](10-testing.md)
   的 `Cell::get` 是同一个原理)。
 
-见 [`src/query/iso.rs:31-56`](../../src/query/iso.rs) 与 [`src/query/iso.rs:59-63`](../../src/query/iso.rs)。
+见 [`src/query/iso.rs:39-72`](../../src/query/iso.rs)。
 
 ---
 
@@ -326,7 +326,7 @@ fn resolve_ns_id(&self, view: &ReaderView) -> Option<NsId> {
 }
 ```
 
-见 [`src/query/exec.rs:195-202`](../../src/query/exec.rs)。`ns_registry` 的值类型是 `Arc<str>`,
+见 [`src/query/exec.rs:216-223`](../../src/query/exec.rs)。`ns_registry` 的值类型是 `Arc<str>`,
 迭代给出 `path: &Arc<str>`,所以 `**path` 一路解到 `str`;`self.ns_path: Arc<str>`,`*self.ns_path`
 同样解到 `str`——两边比较的是字符内容。测试里 `**path == *"n"` 的 `*"n"` 也是把字面量 `&str`
 解一层得到 `str`(见 [`src/query/plan.rs:190`](../../src/query/plan.rs))。
@@ -422,16 +422,18 @@ pub(crate) struct QueryRef<'a> {
     pub(crate) vector: &'a [f32],
     /// 查询向量范数平方(度量需要时)。
     pub(crate) norm_sq: f32,
+    /// 量化粗排预计算(`None` = 精确 f32)。
+    pub(crate) quant: Option<&'a QuantQuery>,
 }
 ```
 
-见 [`src/index/hnsw.rs:27-34`](../../src/index/hnsw.rs)。含义:
+见 [`src/index/hnsw.rs:33-40`](../../src/index/hnsw.rs)。含义:
 
 - `QueryRef<'a>` 读作"借用寿命为 `'a` 的查询视图";`<'a>` 虽是类型参数,泛化的却是生命周期;
 - 它**不拥有**向量(字段类型是 `&'a [f32]`),所以实例不能活得比被借用的向量久——编译器保证;
 - 函数签名里用 `QueryRef<'_>`(省略具体名字)或 `QueryRef<'a>` 都行:
   `search_layer(&self, query: QueryRef<'_>, ...)`,见
-  [`src/index/hnsw.rs:243-249`](../../src/index/hnsw.rs);
+  [`src/index/hnsw.rs:320-326`](../../src/index/hnsw.rs);
 - 字段都是 `Copy`(引用与 `f32` 都 `Copy`),所以 `QueryRef` 自己也能 `derive(Copy)`,
   按值传递十分廉价——它像一个"带数据的借用凭证"。
 
@@ -517,6 +519,10 @@ pub(crate) struct Table {
     pub(crate) writer: Mutex<WriterState>,
     pub(crate) reader: RwLock<Arc<ReaderView>>,
     pub(crate) config: Arc<Config>,
+    pub(crate) persist: Option<Arc<dyn PersistHook>>,          // L2 持久钩子;None = 纯内存
+    pub(crate) access_buffer: Mutex<HashMap<RowId, u32>>,      // 读路径访问计数缓冲
+    pub(crate) retain_report: Mutex<Option<RetainReport>>,     // 后台遗忘报告(L5)
+    pub(crate) latency: Mutex<Histogram>,                      // 查询延迟直方图
 }
 ```
 
@@ -558,8 +564,8 @@ static NEXT_QUERY_ID: AtomicU64 = AtomicU64::new(1);
 let id = NEXT_QUERY_ID.fetch_add(1, Ordering::Relaxed);
 ```
 
-见 [`src/query/exec.rs:35`](../../src/query/exec.rs) 与
-[`src/query/exec.rs:291`](../../src/query/exec.rs)。要点:
+见 [`src/query/exec.rs:36`](../../src/query/exec.rs) 与
+[`src/query/exec.rs:313`](../../src/query/exec.rs)。要点:
 
 - `static` 是**整个程序唯一**的变量(比 `const` 多一个固定地址);普通 `static mut` 的读写
   是 `unsafe`,而 `AtomicU64` 提供安全的原子读写,`&self` 也能改内部值——这是它版本的
@@ -611,7 +617,7 @@ let Some(table) = context.table.upgrade() else {
 ```
 
 见 [`src/life/maintenance.rs:104-109`](../../src/life/maintenance.rs) 与
-[`src/life/maintenance.rs:170-178`](../../src/life/maintenance.rs)(字段与 `Weak` 工具见
+[`src/life/maintenance.rs:175-178`](../../src/life/maintenance.rs)(字段与 `Weak` 工具见
 [`src/life/maintenance.rs:9`](../../src/life/maintenance.rs) 的模块文档)。`Weak<T>` 不增加引用计数;
 `upgrade()` 在强引用归零后返回 `None`。库句柄反过来用 `Arc::strong_count` 判断
 "我是不是最后一个":`strong_count(&self.stop) <= 2`(见
@@ -670,7 +676,7 @@ let partials = std::thread::scope(|scope| {
 })?;
 ```
 
-见 [`src/memory/search.rs:326-354`](../../src/memory/search.rs)。要点:
+见 [`src/memory/search.rs:380-407`](../../src/memory/search.rs)。要点:
 
 - 闭包返回什么,`scope` 就返回什么;`scope` 保证**所有线程在返回前 join**,所以借用
   合法、不会泄漏线程。

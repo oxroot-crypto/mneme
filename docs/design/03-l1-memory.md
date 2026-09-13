@@ -423,10 +423,13 @@ pub(crate) trait VectorIndex: Send + Sync {
     fn search(&self, params: &IndexSearch<'_>) -> TopK<(RowId, SlotId)>;
 }
 pub(crate) trait IndexFactory: Send + Sync {
-    fn build(&self, nodes: &[IndexNode], params: HnswParams, metric: Metric) -> Arc<dyn VectorIndex>;
+    // slot_of 自 L5(多段增量段映射)、quant 自 L6(段量化副本,None = 纯 f32);
+    // 图结构仍由 f32 向量构建,副本只服务查询期粗排打分(见 08 §4)。
+    fn build(&self, nodes: &[IndexNode], slot_of: &[SlotId], params: HnswParams, metric: Metric,
+             quant: Option<QuantCopy>) -> Arc<dyn VectorIndex>;
     fn verify(&self, bytes: &[u8]) -> Result<()>;
-    fn load(&self, bytes: &[u8], nodes: &[IndexNode], slot_of: &[SlotId], metric: Metric)
-        -> Result<Arc<dyn VectorIndex>>;
+    fn load(&self, bytes: &[u8], nodes: &[IndexNode], slot_of: &[SlotId], metric: Metric,
+            quant: Option<QuantCopy>) -> Result<Arc<dyn VectorIndex>>;
 }
 ```
 

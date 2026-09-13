@@ -50,14 +50,29 @@ impl CopySink<'_> {
     /// 复制一个必须存在的库内文件;缺失返回 [`MnemeError::Corrupted`]。
     fn copy_required(&mut self, rel: &str) -> Result<()> {
         // 被 MANIFEST 引用的段必须存在;缺失即备份不可信,绝不静默产出残档。
-        let content = storage::read_file(self.root, rel).map_err(|_| MnemeError::Corrupted {
-            segment: None,
-            reason: format!("备份:必存文件缺失或不可读:{rel}"),
-        })?;
+        let content =
+            storage::read_file(self.root, rel).map_err(|error| MnemeError::Corrupted {
+                segment: None,
+                reason: format!("备份:必存文件缺失或不可读:{rel}: {error}"),
+            })?;
         self.counts.files += 1;
         self.counts.bytes += content.len() as u64;
         storage::write_atomic(self.target, rel, &content)
     }
+}
+
+/// 一次增量 flush 提交所需的输入(参数收敛,避免超长参数表)。
+struct CommitFlushInput {
+    /// 提交前的 MANIFEST。
+    previous: Manifest,
+    /// 本次物化的未落盘槽位。
+    slot_indices: Vec<usize>,
+    /// 跨段 delta 条目。
+    delta: Vec<crate::persist::msec::DeltaEntry>,
+    /// 是否全量重写关系表(首段)。
+    full_relations: bool,
+    /// 新段创建时刻(Unix 毫秒)。
+    now_ms: i64,
 }
 
 impl Store {
@@ -84,7 +99,33 @@ impl Store {
         {
             return Ok(());
         }
+        self.commit_flush(
+            ws,
+            config,
+            CommitFlushInput {
+                previous,
+                slot_indices,
+                delta,
+                full_relations,
+                now_ms,
+            },
+        )
+    }
 
+    /// 编码新段(若有)并提交 MANIFEST,随后安装索引、清脏并发布新快照。
+    fn commit_flush(
+        &self,
+        ws: &mut WriterState,
+        config: &Config,
+        input: CommitFlushInput,
+    ) -> Result<()> {
+        let CommitFlushInput {
+            previous,
+            slot_indices,
+            delta,
+            full_relations,
+            now_ms,
+        } = input;
         let segment_id = previous.next_segment_id;
         // 有新数据/delta 时写新段;仅注册表变化时只提交 MANIFEST。
         let encoded = self.encode_flush_segment(
@@ -105,12 +146,18 @@ impl Store {
             encoded: encoded.as_ref(),
             slot_indices: &slot_indices,
             now_ms,
-        });
+        })?;
         manifest_io::commit_manifest(&self.root, &new_manifest, self.hook.as_deref())?;
 
         // 段文件已原子提交:登记槽位归属与索引,清空 delta 标记;WAL 重置(Checkpoint)。
         if let Some(encoded) = encoded {
-            ws.install_segment(segment_id, &slot_indices, encoded.index);
+            ws.install_segment(
+                segment_id,
+                &slot_indices,
+                encoded.index,
+                encoded.quant,
+                encoded.recall_est,
+            );
         }
         ws.clear_flush_dirty();
         self.publish(&new_manifest);
@@ -203,21 +250,27 @@ impl Store {
     }
 
     /// 由当前写状态、刚物化的段(可缺省)与新增槽位构造下一个 MANIFEST 版本。
-    fn next_manifest(&self, input: &NextManifestInput<'_>) -> Manifest {
+    ///
+    /// # Errors
+    /// 段号或 MANIFEST 版本水位耗尽时返回 [`MnemeError::IdExhausted`]
+    /// (FC-PERSIST-ERR-012)。
+    fn next_manifest(&self, input: &NextManifestInput<'_>) -> Result<Manifest> {
         let mut segments = input.previous.segments.clone();
         let next_segment_id = match input.encoded {
             Some(encoded) => {
                 segments.push(segment_entry(input, encoded));
-                input.previous.next_segment_id + 1
+                crate::persist::manifest::next_segment_id(input.previous.next_segment_id)?
             }
             None => input.previous.next_segment_id,
         };
-        Manifest {
+        Ok(Manifest {
             dimension: self.dimension,
             metric: self.metric,
             stopwords: input.previous.stopwords,
             next_rel_kind: input.previous.next_rel_kind,
-            manifest_version: input.previous.manifest_version + 1,
+            manifest_version: crate::persist::manifest::next_manifest_version(
+                input.previous.manifest_version,
+            )?,
             watermark_seqno: input.ws.seqno.get(),
             next_rowid: input.ws.next_rowid,
             next_segment_id,
@@ -225,7 +278,7 @@ impl Store {
             namespaces: manifest_namespaces(input.ws),
             rel_kinds: input.previous.rel_kinds.clone(),
             segments,
-        }
+        })
     }
 
     /// 发布新 MANIFEST 快照并重置 WAL(Checkpoint)。
@@ -238,7 +291,7 @@ impl Store {
         // reason: Checkpoint 为空间回收;旧帧均 ≤ watermark,恢复时跳过。段与
         // MANIFEST 已提交,重置失败不阻断 flush(句柄安全由 `WalWriter::reset`
         // 内部重建/停用保证,FC-PERSIST-INV-005)。
-        let _ = wal.reset();
+        let _ = wal.reset().ok();
     }
 
     /// 只发布 MANIFEST 快照(不重置 WAL;compaction 用,未落盘尾部仍在 WAL 中)。

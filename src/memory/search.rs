@@ -9,6 +9,7 @@ use crate::core::bitset::BitSet;
 use crate::core::error::{MnemeError, Result};
 use crate::core::heap::TopK;
 use crate::core::metric::{Metric, Score};
+use crate::core::options::VectorFormat;
 use crate::core::simd;
 use crate::core::types::{NsId, RowId, SlotId};
 use crate::memory::index::IndexSearch;
@@ -19,11 +20,17 @@ use crate::memory::table::ReaderView;
 #[cfg(test)]
 thread_local! {
     static SCORE_CALLS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static COARSE_CANDIDATES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
 fn bump_score_calls() {
     SCORE_CALLS.with(|calls| calls.set(calls.get() + 1));
+}
+
+#[cfg(test)]
+fn record_coarse_candidates(k: usize) {
+    COARSE_CANDIDATES.with(|calls| calls.set(k));
 }
 
 /// 一条被打分的候选。
@@ -70,6 +77,8 @@ pub(crate) struct SearchParams<'a> {
     pub(crate) filter_post_threshold: f32,
     /// 过滤三档:放大后过滤 / 候选暴力分界。
     pub(crate) filter_brute_threshold: f32,
+    /// 两阶段粗排过采样倍率(粗排候选 = `top_k × 本值`;仅存在量化段时生效)。
+    pub(crate) rescore_oversample: usize,
     /// 预计算的候选槽位(过滤先行,与 BM25 通道共享);
     /// `None` = 本函数内自行收集。
     pub(crate) candidates: Option<&'a [u32]>,
@@ -134,12 +143,39 @@ pub(crate) fn search(params: &SearchParams<'_>) -> Result<Vec<Scored>> {
         .map(|segment| segment.covered.count_ones())
         .sum();
     if indexed > params.brute_force_max_rows {
-        let budget = AnnBudget { query_norm, k };
-        return ann_search(params, candidates, budget);
+        return search_indexed(params, candidates, query_norm);
     }
 
     let top = run_scan(params, candidates, query_norm, k)?;
     Ok(rescore(params, top, query_norm))
+}
+
+/// ANN 路径:存在量化段时粗排放宽到 `top_k × rescore_oversample`(默认 4 倍,即
+/// 设计中的「4k」),f32 精排按 f32 分重排再截回 `top_k`(I12 / FC-QUANT-INV-015);
+/// 无量化段时口径与 L3 完全一致。
+fn search_indexed(
+    params: &SearchParams<'_>,
+    candidates: &[u32],
+    query_norm: f32,
+) -> Result<Vec<Scored>> {
+    let quantized = params
+        .view
+        .indexes
+        .iter()
+        .any(|segment| segment.quant != VectorFormat::F32);
+    let coarse_k = if quantized {
+        crate::quant::rescore::coarse_candidates(params.top_k, params.rescore_oversample)
+            .min(candidates.len())
+    } else {
+        params.top_k.min(candidates.len())
+    };
+    let budget = AnnBudget {
+        query_norm,
+        k: coarse_k,
+    };
+    let mut scored = ann_search(params, candidates, budget)?;
+    scored.truncate(params.top_k);
+    Ok(scored)
 }
 
 /// 过滤先行:只求值元数据,得到候选槽位(不读向量)。
@@ -178,6 +214,8 @@ fn ann_search(
     budget: AnnBudget,
 ) -> Result<Vec<Scored>> {
     let AnnBudget { query_norm, k } = budget;
+    #[cfg(test)]
+    record_coarse_candidates(k);
     let mut top = TopK::new(k, params.metric);
     let mut covered = BitSet::default();
     for segment in params.view.indexes.iter() {
@@ -193,6 +231,7 @@ fn ann_search(
             filter: filter.as_ref(),
             post_threshold: params.filter_post_threshold,
             brute_threshold: params.filter_brute_threshold,
+            use_quant: segment.quant != VectorFormat::F32,
         });
         top.merge(partial);
         covered.union_with(&segment.covered);
@@ -282,9 +321,22 @@ fn plan_scan(params: &SearchParams<'_>) -> (usize, usize) {
     (chunk, threads)
 }
 
-/// 重新取分:TopK 只返回载荷,分数在候选集内 O(1) 重算。
+/// 两阶段精排排序键:先按 [`Metric::score_order`] 的全序(`NaN` 恒排最后),
+/// 再按 `RowId` 升序去平。与 [`TopK`] 选用同一全序,保证「入选集合」与
+/// 「最终排序」一致。
+fn compare_scored(metric: Metric, left: &Scored, right: &Scored) -> std::cmp::Ordering {
+    metric
+        .score_order(left.score, right.score)
+        .then_with(|| left.rowid.cmp(&right.rowid))
+}
+
+/// 重新取分:粗排 `TopK` 只提供候选,分数一律用 f32 原向量在候选集内重算并
+/// **按 f32 分重排**(两阶段第二阶段;I12 / FC-QUANT-INV-015)。
+///
+/// 排序口径与 [`TopK`] 一致:良者在前(`Metric::better` 方向),同分按 `RowId` 升序。
 fn rescore(params: &SearchParams<'_>, top: TopK<(RowId, SlotId)>, query_norm: f32) -> Vec<Scored> {
-    top.into_sorted_vec()
+    let mut scored: Vec<Scored> = top
+        .into_sorted_vec()
         .into_iter()
         .map(|(rowid, slot)| {
             let slot_data = &params.view.slots[slot.get() as usize];
@@ -296,7 +348,9 @@ fn rescore(params: &SearchParams<'_>, top: TopK<(RowId, SlotId)>, query_norm: f3
             );
             Scored { slot, rowid, score }
         })
-        .collect()
+        .collect();
+    scored.sort_by(|left, right| compare_scored(params.metric, left, right));
+    scored
 }
 
 fn scan_sequential(params: &ScanParams<'_>) -> TopK<(RowId, SlotId)> {
@@ -465,5 +519,69 @@ mod tests {
             calls, 64,
             "行数等于阈值(未严格超过)时必须走暴力;若索引存在即走图会在此变红"
         );
+    }
+
+    /// FC-QUANT-INV-015:两阶段粗排候选数 `= min(top_k × oversample, 候选总数)`,
+    /// 且仍返回 top_k;倍率为 8、top_k=4 时候选恰为 32,不得放大成全量扫描。
+    #[test]
+    fn coarse_candidates_respect_rescore_cap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = crate::memory::Builder::default()
+            .path(dir.path())
+            .dimension(4)
+            .quantization(crate::core::options::VectorFormat::I8Rescored)
+            .tuning(crate::core::options::Tuning {
+                brute_force_max_rows: 8,
+                rescore_oversample: 8,
+                quant_recall_floor: 0.0,
+                ..crate::core::options::Tuning::default()
+            })
+            .build()
+            .expect("build");
+        let ns = db.namespace("n");
+        let batch: Vec<crate::memory::Record> = (0..128)
+            .map(|row| crate::memory::Record::new(vec![row as f32, 1.0, (row % 7) as f32, 1.0]))
+            .collect();
+        ns.insert_batch(batch).expect("insert_batch");
+        db.flush().expect("flush");
+
+        COARSE_CANDIDATES.with(|calls| calls.set(0));
+        let hits = ns
+            .search()
+            .vector(&[1.0, 0.0, 0.0, 0.0])
+            .top_k(4)
+            .ef(16)
+            .execute()
+            .expect("search");
+        assert_eq!(hits.len(), 4);
+        let coarse = COARSE_CANDIDATES.with(std::cell::Cell::get);
+        assert_eq!(coarse, 32, "粗排候选应为 top_k × oversample = 32");
+    }
+
+    /// FC-QUANT-INV-015(重排口径):精排排序键按度量方向 + `RowId` 去平,
+    /// 与粗排插入次序无关;分数含 `NaN` 时仍给出确定性全序(不破坏 `sort_by`
+    /// 的严格弱序要求)。
+    #[test]
+    fn rescore_ordering_is_metric_aware_and_total() {
+        let scored = |rowid: u64, score: f32| Scored {
+            slot: SlotId::new(rowid as u32),
+            rowid: RowId::new(rowid),
+            score,
+        };
+        let mut dot = [
+            scored(1, 0.5),
+            scored(2, 2.0),
+            scored(3, 2.0),
+            scored(4, f32::NAN),
+        ];
+        dot.sort_by(|left, right| compare_scored(Metric::Dot, left, right));
+        assert_eq!(
+            dot.iter().map(|hit| hit.rowid.get()).collect::<Vec<_>>(),
+            vec![2, 3, 1, 4],
+            "Dot:高分在前,同分按 RowId 升序,NaN 排末"
+        );
+        let mut euclidean = [scored(1, 0.5), scored(2, 2.0)];
+        euclidean.sort_by(|left, right| compare_scored(Metric::Euclidean, left, right));
+        assert_eq!(euclidean[0].rowid.get(), 1, "Euclidean:低分(更近)在前");
     }
 }

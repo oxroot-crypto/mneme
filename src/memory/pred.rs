@@ -287,3 +287,26 @@ pub(crate) struct EvalCtx<'a> {
     /// 访问统计(缺失时 `last_access` 为 Unknown、`access_count` 为 0)。
     pub(crate) access: Option<AccessStat>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::engine::Mneme;
+    use crate::memory::record::Record;
+
+    #[test]
+    fn is_in_deduplicates_and_matches_listed_values() {
+        let db = Mneme::in_memory(2).expect("in_memory");
+        let ns = db.namespace("t");
+        for key in ["a", "b", "c"] {
+            ns.insert(Record::new(vec![1.0, 0.0]).key(key))
+                .expect("insert");
+        }
+        let expr = Expr::field("key").is_in(["a", "a", "c"].map(Val::from));
+        match &expr {
+            Expr::In(_, vals) => assert_eq!(vals.len(), 2, "重复候选值按首次出现去重"),
+            other => panic!("期望 In,得到 {other:?}"),
+        }
+        assert_eq!(ns.count(Some(expr)).expect("count"), 2);
+    }
+}

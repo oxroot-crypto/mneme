@@ -31,8 +31,9 @@ cargo test
 cargo doc --no-deps          # 公开项必须 100% 文档覆盖(#![deny(missing_docs)])
 ```
 
-> `cargo test --features async`(async 门面等价性)等 feature 相关命令待对应层
-> (含 `[features]` 定义)落地后加入本清单;feature 未定义时该命令会直接报错。
+> feature 相关测试命令(均已在 `Cargo.toml` 定义,可直接运行):
+> `cargo test --features async`(async 门面等价性)、
+> `cargo test --features quant-f16`(f16 量化副本)、`cargo test --all-features`(全量)。
 
 ## 提交信息
 

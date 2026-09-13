@@ -44,6 +44,10 @@ pub struct SegmentStat {
     pub index_nodes: u64,
     /// HNSW 图最高层级(无索引段为 0)。
     pub index_levels: u8,
+    /// 该段实际生效的量化格式(`F32` = 无副本或建段抽样已回退)。
+    pub quant: VectorFormat,
+    /// 建段抽样召回一致率估计(重开后为 `None`,仅原建段会话可见)。
+    pub recall_est: Option<f32>,
 }
 
 /// 单命名空间统计。
