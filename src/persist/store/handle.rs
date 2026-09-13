@@ -9,8 +9,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::error::{MnemeError, Result};
 use crate::core::metric::Metric;
-use crate::memory::index::IndexFactory;
-use crate::memory::index::VectorIndex;
+use crate::core::options::VectorFormat;
+use crate::memory::index::{IndexFactory, SegmentIndex};
 use crate::persist::hook::FsyncHook;
 use crate::persist::manifest::Manifest;
 use crate::persist::msec::{self, TOMBSTONE_DOC_OFFSET};
@@ -70,11 +70,10 @@ impl Store {
         segments
             .iter()
             .map(|segment| {
-                // 多段架构:按段号匹配该段真实载入的索引。
+                // 多段架构:按段号匹配该段真实载入的索引(含量化元信息)。
                 let loaded = indexes
                     .iter()
-                    .find(|loaded| loaded.segment_id == segment.segment_id)
-                    .map(|loaded| loaded.index.as_ref());
+                    .find(|loaded| loaded.segment_id == segment.segment_id);
                 segment_stat(&self.root, segment, loaded)
             })
             .collect()
@@ -156,7 +155,7 @@ impl Store {
 fn segment_stat(
     root: &Path,
     segment: &crate::persist::manifest::SegmentEntry,
-    index: Option<&dyn VectorIndex>,
+    loaded: Option<&SegmentIndex>,
 ) -> crate::memory::ops::SegmentStat {
     // reason: stats 为尽力而为;路径解析/元数据读取失败仅少计字节,不影响正确性。
     let file_bytes = |name: &str| {
@@ -169,6 +168,7 @@ fn segment_stat(
     if segment.hidx_crc != 0 {
         bytes += file_bytes(&hidx_name(segment.segment_id));
     }
+    let index = loaded.map(|entry| entry.index.as_ref());
     crate::memory::ops::SegmentStat {
         id: crate::core::types::SegmentId::new(segment.segment_id),
         rows: segment.row_count,
@@ -177,6 +177,8 @@ fn segment_stat(
         created: segment.created_ms,
         index_nodes: index.map_or(0, |idx| idx.node_count() as u64),
         index_levels: index.map_or(0, |idx| idx.max_level()),
+        quant: loaded.map_or(VectorFormat::F32, |entry| entry.quant),
+        recall_est: loaded.and_then(|entry| entry.recall_est),
     }
 }
 

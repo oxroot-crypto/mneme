@@ -16,6 +16,13 @@ categories = ["database"]
 default = ["mmap"]
 # 段文件 mmap 零拷贝读取(L3):引入 `memmap2`。
 mmap = ["dep:memmap2"]
+# f16 量化副本(L6):引入 `half`;关闭时只有 f32/i8,
+# `VectorFormat::F16` 于构造期返回 `Unsupported`(FC-QUANT-ERR-001)。
+quant-f16 = ["dep:half"]
+# async 门面(L6):引入 `tokio` 的阻塞线程池;核心库零 tokio(设计 08 §6)。
+async = ["dep:tokio"]
+# fuzz 专用解析入口(L6,设计 14 §5):只服务 `fuzz/` 构建,不改变运行时行为。
+fuzzing = []
 
 [dependencies]
 # 元数据与后续 DSL 序列化的基础;L0 阶段仅经 serde_json 使用,直接声明以对齐依赖白名单
@@ -27,6 +34,10 @@ thiserror = "2"
 crc32fast = "1"
 # L3 索引层的 mmap 零拷贝读(设计 04 §11);feature `mmap` 默认开启,关闭即回退 FileSource。
 memmap2 = { version = "0.9", optional = true }
+# L6 f16 量化副本的 IEEE 754 half 编解码(设计 01 §5 白名单);仅 feature `quant-f16` 编译。
+half = { version = "2", optional = true }
+# L6 async 门面的 `spawn_blocking`(设计 08 §6);只开 `rt`,不选 runtime、不引入 async I/O。
+tokio = { version = "1", optional = true, default-features = false, features = ["rt"] }
 
 [dev-dependencies]
 proptest = "1"
@@ -38,6 +49,10 @@ criterion = { version = "0.8", default-features = false }
 
 [[bench]]
 name = "hnsw"
+harness = false
+
+[[bench]]
+name = "quant"
 harness = false
 
 [profile.release]

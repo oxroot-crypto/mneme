@@ -261,7 +261,7 @@ impl WalWriter {
             if rel != active {
                 // reason: 旧轮转文件即使残留,恢复时也因 seqno ≤ watermark 被跳过,
                 // 删除失败不影响正确性。
-                let _ = storage::remove_if_exists(&storage::resolve(&self.root, &rel)?);
+                let _ = storage::remove_if_exists(&storage::resolve(&self.root, &rel)?).ok();
             }
         }
         Ok(())

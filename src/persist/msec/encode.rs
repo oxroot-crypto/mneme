@@ -8,9 +8,9 @@ use crate::persist::{FORMAT_VERSION, align_up, crc32, put_bytes_u32, put_i64, pu
 
 use super::{
     EntryData, FLAG_ACCESS, FLAG_CONFIDENCE, FLAG_IMPORTANCE, FLAG_KEY, FLAG_PROVENANCE, FLAG_TEXT,
-    FLAG_TTL, FLAG_VALID_TIME, HEADER_CRC_COVER, HEADER_LEN, KeyIndexRow, MAGIC, MsecInput,
-    NS_STAT_ROW_BYTES, NsStatRow, REGION_ALIGN, Region, Regions, SlotMeta, TOMBSTONE_DOC_OFFSET,
-    VERSION_ROW_BYTES, VersionRow,
+    FLAG_TTL, FLAG_VALID_TIME, HEADER_CRC_COVER, HEADER_CRC_OFFSET, HEADER_LEN, KeyIndexRow, MAGIC,
+    MsecInput, NS_STAT_ROW_BYTES, NsStatRow, REGION_ALIGN, Region, Regions, SlotMeta,
+    TOMBSTONE_DOC_OFFSET, VERSION_ROW_BYTES, VersionRow, region_offset,
 };
 
 /// 编码一个完整的 msec 文件。
@@ -21,11 +21,11 @@ pub(crate) fn encode(input: &MsecInput<'_>) -> Result<Vec<u8>> {
     let (doc_region, slot_offsets) = build_doc_region(input.slots)?;
     let version_table = build_version_table(input.slots, &slot_offsets);
     let key_rows = build_key_rows(input.slots, &slot_offsets);
-    let (data, regions) = assemble_regions(input, doc_region, &version_table, &key_rows);
+    let (body, regions) = assemble_regions(input, doc_region, &version_table, &key_rows);
     let header = encode_header(input.slots.len() as u64, regions);
     let mut out = header.to_vec();
-    out.extend_from_slice(&data);
-    out.extend_from_slice(&crc32(&data).to_le_bytes());
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&crc32(&body).to_le_bytes());
     Ok(out)
 }
 
@@ -94,18 +94,18 @@ fn assemble_regions(
     version_table: &[VersionRow],
     key_rows: &[KeyIndexRow],
 ) -> (Vec<u8>, Regions) {
-    let mut data = doc_region;
-    let field_dict = append_region(&mut data, input.field_dict);
-    let version = append_region(&mut data, &encode_version_table(version_table));
-    let key = append_region(&mut data, &encode_key_index(key_rows));
-    let inv = append_region(&mut data, input.inverted);
-    let ns_stats = append_region(&mut data, &encode_ns_stats(input.ns_stats));
-    let zmap = append_region(&mut data, input.zmap);
-    let bloom = append_region(&mut data, input.bloom);
-    let delta = append_region(&mut data, input.delta);
-    let rel = append_region(&mut data, input.relations);
+    let mut body = doc_region;
+    let field_dict = append_region(&mut body, input.field_dict);
+    let version = append_region(&mut body, &encode_version_table(version_table));
+    let key = append_region(&mut body, &encode_key_index(key_rows));
+    let inv = append_region(&mut body, input.inverted);
+    let ns_stats = append_region(&mut body, &encode_ns_stats(input.ns_stats));
+    let zmap = append_region(&mut body, input.zmap);
+    let bloom = append_region(&mut body, input.bloom);
+    let delta = append_region(&mut body, input.delta);
+    let rel = append_region(&mut body, input.relations);
     (
-        data,
+        body,
         Regions {
             field_dict,
             version,
@@ -120,12 +120,12 @@ fn assemble_regions(
     )
 }
 
-/// 追加一个数据区到 `data`(起点对齐 8 B),返回其**文件绝对**偏移/长度。
-fn append_region(data: &mut Vec<u8>, bytes: &[u8]) -> Region {
-    let aligned = align_up(data.len(), REGION_ALIGN);
-    data.resize(aligned, 0);
-    let offset = HEADER_LEN as u64 + data.len() as u64;
-    data.extend_from_slice(bytes);
+/// 追加一个数据区到 `body`(起点对齐 8 B),返回其**文件绝对**偏移/长度。
+fn append_region(body: &mut Vec<u8>, bytes: &[u8]) -> Region {
+    let aligned = align_up(body.len(), REGION_ALIGN);
+    body.resize(aligned, 0);
+    let offset = HEADER_LEN as u64 + body.len() as u64;
+    body.extend_from_slice(bytes);
     Region {
         offset,
         len: bytes.len() as u64,
@@ -145,17 +145,17 @@ fn encode_header(row_count: u64, regions: Regions) -> [u8; HEADER_LEN as usize] 
     };
     // 按设计顺序:field_dict(16)、version(32)、key(48)、inv(64)、ns_stats(80)、
     // zmap(96)、bloom(112)、delta(128)、rel(144)。
-    put_pair(16, regions.field_dict);
-    put_pair(32, regions.version);
-    put_pair(48, regions.key);
-    put_pair(64, regions.inv);
-    put_pair(80, regions.ns_stats);
-    put_pair(96, regions.zmap);
-    put_pair(112, regions.bloom);
-    put_pair(128, regions.delta);
-    put_pair(144, regions.rel);
+    put_pair(region_offset(0), regions.field_dict);
+    put_pair(region_offset(1), regions.version);
+    put_pair(region_offset(2), regions.key);
+    put_pair(region_offset(3), regions.inv);
+    put_pair(region_offset(4), regions.ns_stats);
+    put_pair(region_offset(5), regions.zmap);
+    put_pair(region_offset(6), regions.bloom);
+    put_pair(region_offset(7), regions.delta);
+    put_pair(region_offset(8), regions.rel);
     let crc = crc32(&out[0..HEADER_CRC_COVER]);
-    out[160..164].copy_from_slice(&crc.to_le_bytes());
+    out[HEADER_CRC_OFFSET..HEADER_CRC_OFFSET + 4].copy_from_slice(&crc.to_le_bytes());
     out
 }
 

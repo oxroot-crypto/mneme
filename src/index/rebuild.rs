@@ -7,7 +7,7 @@
 use crate::core::metric::Metric;
 use crate::core::options::HnswParams;
 use crate::core::types::SlotId;
-use crate::memory::index::IndexNode;
+use crate::memory::index::{IndexNode, QuantCopy};
 
 use super::hnsw::HnswIndex;
 
@@ -15,11 +15,13 @@ use super::hnsw::HnswIndex;
 ///
 /// 增量段只覆盖部分全局槽位,节点 id 与全局槽位不再恒等,必须显式映射
 /// (设计 07 §4;查询期 `alive`/过滤位图按全局槽位索引)。
+/// `quant` 只服务查询期粗排打分,图结构仍由 f32 向量构建(设计 08 §落地状态)。
 pub(crate) fn rebuild_with_slots(
     nodes: &[IndexNode],
     slot_of: &[SlotId],
     params: HnswParams,
     metric: Metric,
+    quant: Option<QuantCopy>,
 ) -> HnswIndex {
-    HnswIndex::build_with_slots(nodes, slot_of, params, metric)
+    HnswIndex::build_with_slots(nodes, slot_of, params, metric, quant)
 }

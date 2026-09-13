@@ -5,23 +5,27 @@
 >
 > **本套文档想解决什么**:让你能**独立读懂 `mneme` 的源码**。本套以 L0 原语层
 > `src/core/` 为教材,并把 L1 内存引擎 `src/memory/`、L2 持久层 `src/persist/`、
-> L3 索引层 `src/index/`、L4 检索层 `src/query/` 与 L5 生命周期层 `src/life/`
+> L3 索引层 `src/index/`、L4 检索层 `src/query/`、L5 生命周期层 `src/life/`
+> 与 L6 打磨层 `src/quant/` + async 门面(`src/memory/async_facade.rs`)
 > 新引入的 Rust 知识(`Arc` 共享所有权、写时复制,`Mutex`/`RwLock` 守卫、原子类型与
 > CAS,`std::thread` 后台线程、`Weak` 弱引用与 `Condvar`,`thread::scope` 借用式并行,
 > `Drop`/RAII,`move` 闭包写事务,`dyn` 策略与函数指针,构建者模式,手写 `Ord` 与
 > `BinaryHeap`,`TryFrom`/受检运算,字节切片操作,`std::io` 文件读写与 `ErrorKind`,
 > `memmap2` 的 `unsafe`,`let` 链与 `let...else`,递归枚举与 `Box`,带生命周期的
 > 解析器与切片借用,`PhantomData`,`HashMap` entry API,运算符重载,`Option` 组合子,
-> `fmt::Write`,`thread_local!` 测试探针,`proptest` 自定义策略)**回填到各章对应小节**
-> (见 §4 对照表);L1–L5 的业务语义与分文件阅读路线见
+> `fmt::Write`,`thread_local!` 测试探针,`proptest` 自定义策略,`half::f16` 半精度,
+> `async`/`.await`/`Future`,`tokio::task::spawn_blocking`,criterion 基准与 fuzz 骨架)
+> **回填到各章对应小节**
+> (见 §4 对照表);L1–L6 的业务语义与分文件阅读路线见
 > [设计 03 L1 内存引擎](../design/03-l1-memory.md)、
 > [设计 04 L2 持久层](../design/04-l2-persist.md)、
 > [设计 05 L3 HNSW](../design/05-l3-hnsw.md)、
-> [设计 06 L4 检索层](../design/06-l4-query.md) 与
-> [设计 07 L5 生命周期层](../design/07-l5-life.md)。
+> [设计 06 L4 检索层](../design/06-l4-query.md)、
+> [设计 07 L5 生命周期层](../design/07-l5-life.md) 与
+> [设计 08 L6 打磨层](../design/08-l6-quant.md)。
 > 所有语法点都锚定在 mneme 的真实代码上,不讲"为了教语法而教语法"的空例子。
 >
-> **预计阅读**:6–10 小时(边读边敲会更快掌握)。建议**开着源码对照阅读**。
+> **预计阅读**:7–11 小时(边读边敲会更快掌握)。建议**开着源码对照阅读**。
 
 ---
 
@@ -42,9 +46,9 @@ Rust 的通用教材很多(见 §5),但它们有两个问题:
 
 ## 2. 怎么读这套文档
 
-- **顺序读**:01 → 10。每章只依赖前面章节,不跳步。
+- **顺序读**:01 → 11。硬依赖不跳步(少量前瞻链接只是类比预告)。
 - **边读边跑**:每章末尾有「动手练习」,在 `examples/` 下新建一个文件敲一遍(或用临时 crate)。
-  **不要直接改 `src/core/`、`src/memory/`、`src/persist/`、`src/index/`、`src/query/` 与 `src/life/`**:库里的公开项受 `#![deny(missing_docs)]` 约束,乱加还会污染源码。
+  **不要直接改 `src/core/`、`src/memory/`、`src/persist/`、`src/index/`、`src/query/`、`src/life/` 与 `src/quant/`**:库里的公开项受 `#![deny(missing_docs)]` 约束,乱加还会污染源码。
   光看不敲,Rust 的所有权和借用是学不会的。
 - **对照源码**:遇到 `文件:行号` 就跳过去看完整上下文。
 - **不要背语法**:Rust 编译器报错信息极其友好,学会"看报错 → 改代码"比背规则更重要。
@@ -68,7 +72,8 @@ Rust 的通用教材很多(见 §5),但它们有两个问题:
 | [07](07-iterators-closures.md) | 迭代器与闭包 | 用链式调用替代手写循环 | `dot_scalar`、`TopK::into_sorted_vec`、`write_tx` 闭包、`BinaryHeap` 图搜索 |
 | [08](08-modules-docs.md) | 模块、可见性与文档 | 代码怎么分文件、怎么暴露 | `lib.rs`、`core/mod.rs`、`//!` 与 `///` |
 | [09](09-cfg-unsafe-simd.md) | 条件编译、unsafe 与 SIMD | 跨平台与手写向量指令 | `simd.rs` 的 `#[cfg(target_arch)]`、`unsafe` |
-| [10](10-testing.md) | 测试与属性测试 | `#[test]`、doctest、`proptest` | `tests/core_contracts.rs`、契约测试、proptest 自定义策略、复杂度探针 |
+| [10](10-testing.md) | 测试与属性测试 | `#[test]`、doctest、`proptest`、criterion 与 fuzz | `tests/core_contracts.rs`、契约测试、proptest 自定义策略、复杂度探针、`benches/quant.rs`、`fuzz/` |
+| [11](11-async-tokio.md) | 异步与 tokio 最小封装 | `async`/`.await`、future 与阻塞线程池 | `AsyncNamespace`、`spawn_blocking`、`no_run` doctest、取消语义 |
 
 > 章节编号是稳定标识,不严格等于阅读次序;但**首次学习请按编号顺序**。
 
@@ -131,7 +136,7 @@ L4(`src/query/`)新引入的 Rust 特性同样已**回填到对应章节**:
 | 固有 `Expr::from_str` 与 `#[allow(clippy::…)]` | [03 §2.1.2](03-structs-enums-impl.md) |
 | 字段初始化简写、`match` 守卫、元组变体 `(..)` 模式 | [03 §1.1](03-structs-enums-impl.md)、[03 §3.3](03-structs-enums-impl.md)、[05 §4.4](05-errors.md) |
 | `div_euclid`/`rem_euclid`/`div_ceil`/`unsigned_abs` | [02 §2.1.3](02-values-and-ownership.md) |
-| `char` 的 Unicode 判定与 `len_utf8`、`chars().next()` | [02 §2.3](02-values-and-ownership.md) |
+| `char` 的 Unicode 判定与 `len_utf8`、`chars().next()` | [02 §2.4](02-values-and-ownership.md) |
 | `f64::INFINITY`/`NEG_INFINITY`(融合中间量)、`f32::EPSILON`、`f64` 精确整数上限 | [02 §2.2](02-values-and-ownership.md) |
 | `[u8]::strip_prefix`、字节字面量 `b'0'`、`is_ascii_digit` | [04 §2.4](04-borrowing-strings-slices.md) |
 | 原始字符串 `r#"..."#`、`str` 模式 API(闭包/字符数组)、`trim_start`、`String::push`/`push_str` | [04 §3](04-borrowing-strings-slices.md)、[04 §3.4](04-borrowing-strings-slices.md) |
@@ -175,13 +180,32 @@ L2(`src/persist/`)与 L5(`src/life/`)新引入的 Rust 特性同样已**回填�
 | 跨线程共享的测试状态用原子(`FsyncHook` 实现的 `AtomicUsize` 计数器) | [10 §4.6](10-testing.md) |
 | 共享测试助手全貌(`tests/common/mod.rs`) | [10 §2](10-testing.md) |
 
+L6(`src/quant/`、`src/memory/async_facade.rs`、`benches/quant.rs` 与 `fuzz/`)新引入的 Rust 特性同样已**回填到对应章节**:
+
+| L6 新特性 | 落在哪一节 |
+|---|---|
+| `half::f16` 半精度类型与 `from_f32`/`to_bits`/`from_bits`/`to_f32` 位级 API | [02 §2.3](02-values-and-ownership.md) |
+| `usize::is_multiple_of`、`f32::round`/`powi` | [02 §2.1](02-values-and-ownership.md)、[02 §2.2](02-values-and-ownership.md) |
+| 枚举 + `match` 的量化格式分派(不为每种格式引入新 trait) | [03 §3.5](03-structs-enums-impl.md) |
+| `chunks`/`chunks_exact` 按块处理向量 | [07 §3](07-iterators-closures.md) |
+| `#[cfg(feature = "quant-f16")]` 条件模块声明、`#[cfg(test)]`/`#[cfg(not(...))]` 条件导入 | [08 §2](08-modules-docs.md) |
+| `cfg!(feature = "quant-f16")` 编译期特性门控(单点定义、不静默降级) | [09 §1.1](09-cfg-unsafe-simd.md) |
+| `#[cfg(test)]` 单函数级标注(测试专用编解码 API) | [10 §1.5](10-testing.md) |
+| feature 门控测试(`#[cfg(feature)]`/`#[cfg(not(feature))]` 成对) | [10 §1.5](10-testing.md) |
+| `async fn`/`.await`/`Future` 的惰性与 `tokio::task::spawn_blocking` 约束 | [11 §1](11-async-tokio.md)、[11 §2](11-async-tokio.md) |
+| `block_on`、`no_run` 异步 doctest 与条件重导出 `AsyncNamespace` | [11 §3](11-async-tokio.md)、[08 §1](08-modules-docs.md) |
+| future drop 的取消语义、owned 返回跨线程(`StoredRecord`) | [11 §4](11-async-tokio.md)、[11 §5](11-async-tokio.md) |
+| `criterion` 基准:`criterion_group!`/`BenchmarkId`/`bench_with_input`/`std::hint::black_box`/`harness = false` | [10 §6](10-testing.md) |
+| fuzz 骨架:`#![no_main]`/`fuzz_target!`/独立 workspace/`feature = "fuzzing"` | [10 §7](10-testing.md) |
+
 > L1 的业务语义(命名空间、写事务、去重、双时态等)、L2 的业务语义(段布局、WAL、
 > MANIFEST、崩溃恢复)、L3 的业务语义(HNSW 构建/查询、过滤三档、hidx 字节布局)、
-> L4 的业务语义(DSL 文法、BM25、RRF 融合、计划器)与 L5 的业务语义(compaction、
-> 遗忘、命名空间、快照备份)不属于语言教学,分别见
+> L4 的业务语义(DSL 文法、BM25、RRF 融合、计划器)、L5 的业务语义(compaction、
+> 遗忘、命名空间、快照备份)与 L6 的业务语义(量化误差界与 qvec 布局、两阶段候选预算、
+> 召回门槛与自动回退、async 门面语义)不属于语言教学,分别见
 > [设计 03 L1](../design/03-l1-memory.md)、[设计 04 L2](../design/04-l2-persist.md)、
-> [设计 05 L3](../design/05-l3-hnsw.md)、[设计 06 L4](../design/06-l4-query.md) 与
-> [设计 07 L5](../design/07-l5-life.md)。
+> [设计 05 L3](../design/05-l3-hnsw.md)、[设计 06 L4](../design/06-l4-query.md)、
+> [设计 07 L5](../design/07-l5-life.md) 与 [设计 08 L6](../design/08-l6-quant.md)。
 
 ---
 

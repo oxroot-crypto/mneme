@@ -9,7 +9,7 @@ use crate::core::error::Result;
 use crate::core::metric::Metric;
 use crate::core::options::HnswParams;
 use crate::core::types::SlotId;
-use crate::memory::index::{IndexFactory, IndexNode, VectorIndex};
+use crate::memory::index::{IndexFactory, IndexNode, QuantCopy, VectorIndex};
 
 use super::hnsw::HnswIndex;
 use super::{hidx, rebuild};
@@ -24,8 +24,11 @@ impl IndexFactory for HnswFactory {
         slot_of: &[SlotId],
         params: HnswParams,
         metric: Metric,
+        quant: Option<QuantCopy>,
     ) -> Arc<dyn VectorIndex> {
-        Arc::new(rebuild::rebuild_with_slots(nodes, slot_of, params, metric))
+        Arc::new(rebuild::rebuild_with_slots(
+            nodes, slot_of, params, metric, quant,
+        ))
     }
 
     fn verify(&self, bytes: &[u8]) -> Result<()> {
@@ -38,8 +41,11 @@ impl IndexFactory for HnswFactory {
         nodes: &[IndexNode],
         slot_of: &[SlotId],
         metric: Metric,
+        quant: Option<QuantCopy>,
     ) -> Result<Arc<dyn VectorIndex>> {
-        Ok(Arc::new(HnswIndex::load(bytes, nodes, slot_of, metric)?))
+        Ok(Arc::new(HnswIndex::load(
+            bytes, nodes, slot_of, metric, quant,
+        )?))
     }
 }
 

@@ -67,7 +67,7 @@ impl Namespace {
                 .collect();
             let count = victims.len();
             for rowid in victims {
-                let seqno = ws.alloc_seqno();
+                let seqno = ws.alloc_seqno()?;
                 ws.tombstone(rowid, now, seqno)?;
             }
             Ok(count)
@@ -117,7 +117,7 @@ impl Namespace {
             let (scanned, victims) = collect_retain_victims(ws, ns_id, now, &policy);
             report.scanned = scanned;
             for rowid in victims {
-                let seqno = ws.alloc_seqno();
+                let seqno = ws.alloc_seqno()?;
                 if ws.tombstone(rowid, now, seqno)? {
                     report.forgotten += 1;
                     report.sampled_ids.push(rowid);
@@ -312,8 +312,8 @@ impl ConsolidationCtx<'_> {
         }
         let source_ids: Vec<RowId> = members.iter().map(|slot_data| slot_data.rowid).collect();
         let summary = build_summary(policy, &members);
-        let summary_rowid = self.ws.alloc_rowid();
-        let seqno = self.ws.alloc_seqno();
+        let summary_rowid = self.ws.alloc_rowid()?;
+        let seqno = self.ws.alloc_seqno()?;
         let slot_data = build_slot(SlotSpec {
             ns_id: self.target_id,
             ns_path: Arc::clone(self.target_path),
@@ -323,10 +323,10 @@ impl ConsolidationCtx<'_> {
             rec: summary,
         });
         self.ws.commit_version(summary_rowid, slot_data)?;
-        self.link_sources(summary_rowid, &source_ids);
+        self.link_sources(summary_rowid, &source_ids)?;
         if !policy.keep_sources {
             for source in &source_ids {
-                let seqno = self.ws.alloc_seqno();
+                let seqno = self.ws.alloc_seqno()?;
                 self.ws.tombstone(*source, self.now, seqno)?;
             }
         }
@@ -337,7 +337,10 @@ impl ConsolidationCtx<'_> {
     }
 
     /// 以 `DERIVED_FROM` 边把摘要链接到各来源。
-    fn link_sources(&mut self, summary_rowid: RowId, source_ids: &[RowId]) {
+    ///
+    /// # Errors
+    /// `SeqNo` 空间耗尽时返回 [`MnemeError::IdExhausted`]。
+    fn link_sources(&mut self, summary_rowid: RowId, source_ids: &[RowId]) -> Result<()> {
         for source in source_ids {
             let edge = Edge {
                 from: summary_rowid,
@@ -346,7 +349,8 @@ impl ConsolidationCtx<'_> {
                 weight: 1.0,
                 metadata: Meta::Null,
             };
-            self.ws.relate_edge(edge);
+            self.ws.relate_edge(edge)?;
         }
+        Ok(())
     }
 }

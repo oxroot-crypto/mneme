@@ -23,8 +23,8 @@ Mneme 采用**渐进式分层设计**:自底向上共 7 层(L0–L6),每层只�
 
 ```mermaid
 flowchart TD
-    F["门面层 lib.rs<br/>Mneme / Namespace / Builder<br/>(async 门面为 L6 规划)"]
-    Q["L6 打磨层 quant/<br/>量化 + 重打分 · async 门面 · 基准<br/>(规划)"]
+    F["门面层 lib.rs<br/>Mneme / Namespace / Builder<br/>(feature async 提供 AsyncNamespace)"]
+    Q["L6 打磨层 quant/<br/>量化副本 + 两阶段重打分 · async 门面 · 基准"]
     L["L5 生命周期层 life/<br/>TTL · 遗忘曲线 · compaction<br/>命名空间 · 快照备份"]
     QL["L4 检索层 query/<br/>过滤 DSL · BM25 · RRF 融合 · 去重"]
     H["L3 索引层 index/<br/>自研 HNSW · 过滤感知搜索 · mmap"]
@@ -57,7 +57,7 @@ flowchart TD
 | L3 索引层 | 同一 API 下暴力→HNSW 无感升级 | [05-l3-hnsw.md](design/05-l3-hnsw.md) |
 | L4 检索层 | 过滤 + BM25 混合检索 + 去重 | [06-l4-query.md](design/06-l4-query.md) |
 | L5 生命周期 | "超长期"闭环:段数有界、安全遗忘 | [07-l5-life.md](design/07-l5-life.md) |
-| L6 打磨 | 量化提速、async 门面、性能达标 | [08-l6-quant.md](design/08-l6-quant.md) |
+| L6 打磨 | 量化提速(i8/f16 + 两阶段)、async 门面 | [08-l6-quant.md](design/08-l6-quant.md) |
 | 记忆模型 | 关系图、双时态 `as_of`(历史默认永久保留)、来源/可信度、沉淀 | [09-memory-model.md](design/09-memory-model.md) |
 | 排序层 | 相似度+新鲜度+重要度+访问+可信度+联想 | [10-scoring.md](design/10-scoring.md) |
 | 存储安全 | 可选静态加密、文本压缩 | [11-security-storage.md](design/11-security-storage.md) |
@@ -91,14 +91,14 @@ flowchart TD
 | [15-glossary.md](design/15-glossary.md) | 术语表(中英对照)、符号表、复杂度速查总表 | 所有人 |
 | [16-api-reference.md](design/16-api-reference.md) | 完整公开 API、配置总表、打开校验、错误/重试、线程安全、集成、备份恢复 runbook、数据限额 | 所有人 |
 | [spec/contracts.md](spec/contracts.md) | 形式化契约矩阵(FC-Matrix)与测试追溯 | 贡献者 |
-| [rust/README.md](rust/README.md) | **Rust 零基础教学**(10 章):以 mneme 源码为教材,覆盖读懂 L0 与 L1–L5 各层新引入的全部 Rust 语法(L1–L5 新特性回填至各章) | 无 Rust 基础者 |
+| [rust/README.md](rust/README.md) | **Rust 零基础教学**(11 章):以 mneme 源码为教材,覆盖读懂 L0–L6 各层新引入的全部 Rust 语法(L1–L6 新特性回填至各章) | 无 Rust 基础者 |
 
 ---
 
 ## 阅读路线
 
-**我完全没写过 Rust**(零基础,约 6–10 小时):
-先读 [Rust 零基础教学](rust/README.md) 的 10 章(以 `src/core/` 源码为教材、L1–L5 新特性回填至各章,边读边敲),
+**我完全没写过 Rust**(零基础,约 7–11 小时):
+先读 [Rust 零基础教学](rust/README.md) 的 11 章(以 `src/core/` 源码为教材、L1–L6 新特性回填至各章,边读边敲),
 再回到这里按"贡献者"路线阅读。教学文档与源码的映射总表见
 [rust/README.md §4](rust/README.md)。
 

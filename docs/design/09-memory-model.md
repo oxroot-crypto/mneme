@@ -259,7 +259,7 @@ DERIVED_FROM: S→m1, S→m2, S→m4
 ## 本章小结
 
 - 记忆 ≠ 向量:关系图、双时态、来源/可信度、沉淀是引擎级一等公民。
-- `relate` 以 `(from,to,kind)` 幂等;悬挂边不可见(I25);自定义关系类型有稳定注册表。
+- `relate` 以 `(from,to,kind)` 幂等;悬挂边不可见(I25);内置关系类型 `0..=3` 固定,自定义注册表为规划(尚未落地,见 §2.2)。
 - 双时态 = 事务时间 + 有效时间;`as_of` 时间旅行、`supersede` 信念修订(I26)。
 - 版本状态:`Active → Shadowed → Reclaimed`,默认永久保留。
 - `consolidate` 聚类→摘要→`DERIVED_FROM`,默认不删除来源。

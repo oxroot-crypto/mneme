@@ -2,11 +2,13 @@
 //!
 //! 本 crate 采用 L0–L6 渐进式分层;当前实现为 **L0 原语层**([`core`])、
 //! **L1 内存引擎**([`memory`])、**L2 持久层**(`persist`)、**L3 索引层**(`index`)、
-//! **L4 检索层**(`query`)与 **L5 生命周期层**(`life`)。L1 提供全内存的完整公开
+//! **L4 检索层**(`query`)、**L5 生命周期层**(`life`)与 **L6 打磨层**
+//! (`quant` + feature `async`/`quant-f16`)。L1 提供全内存的完整公开
 //! API(易失);L2 以 `Builder::path` 或 [`Mneme::open`] 打开本地目录库,提供 WAL、
 //! 段文件、MANIFEST 与崩溃恢复;L3 引入自研 HNSW;L4 补齐过滤 DSL、BM25 与 RRF
 //! 融合;L5 提供多段增量 flush、size-tiered compaction、WAL 轮转/Checkpoint、TTL
-//! 块级剪枝、后台维护、快照与备份。
+//! 块级剪枝、后台维护、快照与备份;L6 提供 i8/f16 量化副本、两阶段精排与
+//! `AsyncNamespace`(feature `async`)。
 //!
 //! # 模块
 //!
@@ -16,6 +18,7 @@
 //! * `index`(内部)—— L3 索引层:自研 HNSW、过滤三档、hidx 编解码与 mmap 段读取。
 //! * `query`(内部)—— L4 检索层:过滤 DSL、查询计划器、BM25、融合与执行管线。
 //! * `life`(内部)—— L5 生命周期层:compaction 计划、后台维护线程与自动遗忘。
+//! * `quant`(内部,纯原语)—— L6 量化:i8/f16 编解码、粗排点积与候选预算。
 //!
 //! # 示例
 //!
@@ -38,11 +41,14 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod core;
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing;
 pub mod memory;
 
 mod index;
 mod life;
 mod persist;
+mod quant;
 mod query;
 
 pub use crate::core::error::{MnemeError, Result};
@@ -58,13 +64,15 @@ pub use crate::core::options::{
 pub use crate::core::text::tokenize;
 pub use crate::core::types::{Key, NsId, RowId, SegmentId, SeqNo, SlotId};
 pub use crate::core::{simd, varint};
+#[cfg(feature = "async")]
+pub use crate::memory::AsyncNamespace;
 pub use crate::memory::{
     AccessStat, BackupReport, Builder, CheckReport, CmpOp, CompactionControl, CompactionState,
     ConsolidateReport, ConsolidationPolicy, Dedup, Edge, Expr, FieldBuilder, Fusion, Histogram,
     HistoryStat, Hit, InsertOutcome, Mneme, Namespace, NsStat, QuantStat, QueryCtx, Record,
     RecordRef, RelateOptions, RelationExpand, Reranker, ResultDedup, RetainReport, Retention,
     ScoreBreakdown, SearchBuilder, SegmentStat, SnapshotHandle, SnapshotNamespace, SnapshotStats,
-    Stats, StorageStat, Summarizer, UpdateOutcome, Val,
+    Stats, StorageStat, StoredRecord, Summarizer, UpdateOutcome, Val,
 };
 pub use crate::persist::hook::{FsyncHook, IoAction};
 

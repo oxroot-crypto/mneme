@@ -9,7 +9,7 @@ use crate::core::error::{MnemeError, Result};
 ///
 /// 项目尚未发布,不存在需要读取的旧开发格式;任何版本差异都直接拒绝
 /// (不保留旧版本读取分支),详见 `AGENTS.md`「项目状态与兼容纪律」。
-pub(crate) const FORMAT_VERSION: u16 = 0x0004;
+pub(crate) const FORMAT_VERSION: u16 = 0x0005;
 
 /// 校验文件格式版本必须与 `expected` 完全一致(I18)。
 ///
@@ -162,13 +162,14 @@ mod tests {
     #[test]
     fn version_gate_rejects_any_mismatch() {
         assert!(check_version("vsec", FORMAT_VERSION, FORMAT_VERSION).is_ok());
+        let previous = FORMAT_VERSION - 1;
         assert!(matches!(
-            check_version("vsec", FORMAT_VERSION - 1, FORMAT_VERSION),
+            check_version("vsec", previous, FORMAT_VERSION),
             Err(MnemeError::UnsupportedVersion {
                 file: "vsec",
-                found: 0x0003,
+                found,
                 max: FORMAT_VERSION,
-            })
+            }) if found == previous
         ));
         assert!(matches!(
             check_version("vsec", 0x0100, FORMAT_VERSION),

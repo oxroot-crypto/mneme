@@ -77,7 +77,7 @@ impl Namespace {
                 weight: options.weight.clamp(0.0, 1.0),
                 metadata: options.metadata,
             };
-            ws.relate_edge(edge);
+            ws.relate_edge(edge)?;
             Ok(())
         })
     }
@@ -116,7 +116,7 @@ impl Namespace {
             if ws.closed {
                 return Err(MnemeError::Closed);
             }
-            Ok(ws.unrelate_edge(from, to, kind))
+            ws.unrelate_edge(from, to, kind)
         })
     }
 
@@ -221,5 +221,45 @@ impl Namespace {
             }
         }
         Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::engine::Mneme;
+    use crate::memory::record::{InsertOutcome, Record};
+
+    fn inserted(outcome: InsertOutcome) -> RowId {
+        match outcome {
+            InsertOutcome::Inserted(id) | InsertOutcome::Merged(id) => id,
+            other => panic!("期望写入,得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn relate_with_options_clamps_weight_and_rejects_non_finite() {
+        let db = Mneme::in_memory(2).expect("in_memory");
+        let ns = db.namespace("t");
+        let a = inserted(
+            ns.insert(Record::new(vec![1.0, 0.0]).key("a"))
+                .expect("insert"),
+        );
+        let b = inserted(
+            ns.insert(Record::new(vec![0.0, 1.0]).key("b"))
+                .expect("insert"),
+        );
+        ns.relate_with_options(a, b, RelateOptions::new(RelationKind::SUPPORTS, 1.5))
+            .expect("relate");
+        let edges = ns
+            .neighbors(a, &[RelationKind::SUPPORTS])
+            .expect("neighbors");
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].weight, 1.0, "越界权重钳制到 [0,1]");
+
+        assert!(matches!(
+            ns.relate_with_options(a, b, RelateOptions::new(RelationKind::SUPPORTS, f32::NAN)),
+            Err(MnemeError::NonFinite)
+        ));
     }
 }
