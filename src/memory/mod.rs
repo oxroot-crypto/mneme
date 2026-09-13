@@ -35,6 +35,8 @@ mod builder;
 // `config`/`dedup`/`relation`/`search`/`table` 供 L2 `persist` 读取内存表结构
 // (flush/recover 需要),故以 `pub(crate)` 暴露给同 crate 的兄弟模块。
 pub(crate) mod analysis;
+#[cfg(feature = "async")]
+mod async_facade;
 pub(crate) mod config;
 pub(crate) mod dedup;
 mod engine;
@@ -59,6 +61,8 @@ pub(crate) mod table;
 pub(crate) mod temporal;
 mod write_helpers;
 
+#[cfg(feature = "async")]
+pub use async_facade::AsyncNamespace;
 pub use builder::Builder;
 pub use dedup::{Dedup, ResultDedup};
 pub use engine::Mneme;
@@ -69,7 +73,7 @@ pub use ops::{
     QuantStat, SegmentStat, SnapshotStats, Stats, StorageStat,
 };
 pub use pred::{CmpOp, Expr, FieldBuilder, Val};
-pub use record::{Hit, InsertOutcome, Record, RecordRef, UpdateOutcome};
+pub use record::{Hit, InsertOutcome, Record, RecordRef, StoredRecord, UpdateOutcome};
 pub use relation::{Edge, RelateOptions, RelationExpand};
 pub use rerank::{Fusion, QueryCtx, Reranker};
 pub use score::{ConsolidateReport, ConsolidationPolicy, ScoreBreakdown, Summarizer};

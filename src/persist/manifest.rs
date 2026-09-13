@@ -196,6 +196,26 @@ fn count_u32(value: usize, field: &'static str) -> Result<u32> {
     })
 }
 
+/// 分配下一个段号;`u32::MAX` 已无法再分配 → `IdExhausted`(FC-PERSIST-ERR-012)。
+///
+/// # Errors
+/// `current == u32::MAX` 时返回 [`MnemeError::IdExhausted`]。
+pub(crate) fn next_segment_id(current: u32) -> Result<u32> {
+    current
+        .checked_add(1)
+        .ok_or(MnemeError::IdExhausted { kind: "segment_id" })
+}
+
+/// 推进 MANIFEST 版本号;`u64::MAX` 已到表示上限 → `IdExhausted`。
+///
+/// # Errors
+/// `current == u64::MAX` 时返回 [`MnemeError::IdExhausted`]。
+pub(crate) fn next_manifest_version(current: u64) -> Result<u64> {
+    current.checked_add(1).ok_or(MnemeError::IdExhausted {
+        kind: "manifest_version",
+    })
+}
+
 /// 校验并解析 MANIFEST。
 ///
 /// # Errors
@@ -487,5 +507,23 @@ mod tests {
                 Err(MnemeError::UnsupportedVersion { .. })
             ));
         }
+    }
+
+    /// FC-PERSIST-ERR-012:段号/MANIFEST 版本水位 checked——正常 +1,
+    /// 到 `u32::MAX`/`u64::MAX` 时返回 `IdExhausted`,绝不回绕。
+    #[test]
+    fn manifest_counters_reject_exhaustion() {
+        assert_eq!(next_segment_id(41).expect("+1"), 42);
+        assert!(matches!(
+            next_segment_id(u32::MAX),
+            Err(MnemeError::IdExhausted { kind: "segment_id" })
+        ));
+        assert_eq!(next_manifest_version(7).expect("+1"), 8);
+        assert!(matches!(
+            next_manifest_version(u64::MAX),
+            Err(MnemeError::IdExhausted {
+                kind: "manifest_version"
+            })
+        ));
     }
 }

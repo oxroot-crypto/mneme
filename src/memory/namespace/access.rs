@@ -135,7 +135,7 @@ impl Namespace {
                         weight: 1.0,
                         metadata: Meta::Null,
                     };
-                    ws.relate_edge(edge);
+                    ws.relate_edge(edge)?;
                 }
             }
             // 生效成功后再登记幂等键:中途失败不占用键,调用方可重试(FC-SCORE-INV-027)。

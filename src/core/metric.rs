@@ -55,10 +55,28 @@ impl Metric {
     /// assert_eq!(Metric::Dot.score(&[1.0, 2.0], &[3.0, 4.0], 0.0, 0.0), 11.0);
     /// ```
     pub fn score(&self, a: &[f32], b: &[f32], a_norm: f32, b_norm: f32) -> Score {
+        self.score_from_dot(simd::dot(a, b), a_norm, b_norm)
+    }
+
+    /// 由**已算好的点积**按本度量口径折算分数。
+    ///
+    /// L6 量化粗排复用同一折算口径(仅点积为近似值),保证粗排分与精排分同向可比:
+    /// `Dot` 直通点积;`Cosine` 除以范数乘积(零向量返回 0);`Euclidean` 返回
+    /// `‖a‖² + ‖b‖² − 2·a·b`。
+    ///
+    /// # Arguments
+    ///
+    /// * `dot` - 两向量的点积(量化路径下为近似值)。
+    /// * `a_norm`、`b_norm` - 两向量的**范数平方**。
+    ///
+    /// # Returns
+    ///
+    /// 与 [`Metric::score`] 同口径的分数。
+    pub(crate) fn score_from_dot(&self, dot: f32, a_norm: f32, b_norm: f32) -> Score {
         match self {
-            Metric::Dot => simd::dot(a, b),
-            Metric::Cosine => cosine(a, b, a_norm, b_norm),
-            Metric::Euclidean => euclidean_sq(a, b, a_norm, b_norm),
+            Metric::Dot => dot,
+            Metric::Cosine => cosine_from_dot(dot, a_norm, b_norm),
+            Metric::Euclidean => a_norm + b_norm - 2.0 * dot,
         }
     }
 
@@ -88,6 +106,32 @@ impl Metric {
         match self {
             Metric::Cosine | Metric::Dot => x > y,
             Metric::Euclidean => x < y,
+        }
+    }
+
+    /// 分数的**全序**比较:`Metric::better` 方向;`NaN` 恒排最后(两个符号一视同仁),
+    /// 数值相等时用 `total_cmp` 区分 `±0`;完全相等返回 `Ordering::Equal`。
+    ///
+    /// 供 `TopK` 淘汰与两阶段精排共用,保证含 `NaN` 分数时「入选集合」与「最终排序」
+    /// 一致(FC-CORE-POST-002/004)。
+    ///
+    /// # Arguments
+    ///
+    /// * `a`、`b` - 待比较的两个分数。
+    ///
+    /// # Returns
+    ///
+    /// `a` 在最优序中位于 `b` 之前返回 `Less`;两者完全相等返回 `Equal`。
+    pub(crate) fn score_order(&self, a: Score, b: Score) -> std::cmp::Ordering {
+        if a.is_nan() || b.is_nan() {
+            return a.is_nan().cmp(&b.is_nan());
+        }
+        if self.better(a, b) {
+            std::cmp::Ordering::Less
+        } else if self.better(b, a) {
+            std::cmp::Ordering::Greater
+        } else {
+            a.total_cmp(&b)
         }
     }
 
@@ -135,11 +179,25 @@ impl Metric {
 /// assert!((s - 0.8).abs() < 1e-6);
 /// ```
 pub fn cosine(a: &[f32], b: &[f32], a_norm: f32, b_norm: f32) -> Score {
+    cosine_from_dot(simd::dot(a, b), a_norm, b_norm)
+}
+
+/// 由点积折算余弦相似度(量化粗排与精确路径共用)。
+///
+/// # Arguments
+///
+/// * `dot` - 两向量的点积(量化路径下为近似值)。
+/// * `a_norm`、`b_norm` - 两向量的范数平方。
+///
+/// # Returns
+///
+/// `dot / (‖a‖·‖b‖)`;分母低于 `COSINE_EPSILON` 时返回 `0`。
+pub(crate) fn cosine_from_dot(dot: f32, a_norm: f32, b_norm: f32) -> Score {
     let denominator = (a_norm * b_norm).sqrt();
     if denominator < COSINE_EPSILON {
         0.0
     } else {
-        simd::dot(a, b) / denominator
+        dot / denominator
     }
 }
 
@@ -216,6 +274,23 @@ mod tests {
         assert!(Metric::Dot.better(5.0, -5.0));
         assert!(Metric::Euclidean.better(0.1, 0.9));
         assert!(!Metric::Euclidean.better(0.9, 0.1));
+    }
+
+    /// FC-CORE-POST-002:`score_order` 为全序——`NaN`(正负号一视同仁)恒排
+    /// 最后、`±0` 由 `total_cmp` 区分、其余按度量方向。
+    #[test]
+    fn score_order_is_total_for_nan_and_signed_zero() {
+        use std::cmp::Ordering;
+        for metric in [Metric::Cosine, Metric::Dot, Metric::Euclidean] {
+            assert_eq!(metric.score_order(1.0, f32::NAN), Ordering::Less);
+            assert_eq!(metric.score_order(f32::NAN, 1.0), Ordering::Greater);
+            assert_eq!(metric.score_order(-f32::NAN, f32::NAN), Ordering::Equal);
+            assert_eq!(metric.score_order(0.0, -0.0), Ordering::Greater);
+            assert_eq!(metric.score_order(-0.0, 0.0), Ordering::Less);
+        }
+        assert_eq!(Metric::Dot.score_order(0.9, 0.1), Ordering::Less);
+        assert_eq!(Metric::Euclidean.score_order(0.1, 0.9), Ordering::Less);
+        assert_eq!(Metric::Cosine.score_order(0.5, 0.5), Ordering::Equal);
     }
 
     #[test]

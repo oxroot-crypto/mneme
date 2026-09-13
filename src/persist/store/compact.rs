@@ -110,7 +110,7 @@ impl Store {
             group: &group,
             created_ms: context.now_ms,
             encoded: &merged.encoded,
-        });
+        })?;
         manifest_io::commit_manifest(&self.root, &new_manifest, self.hook.as_deref())?;
         self.install_merge(ws, input, &merged, &new_manifest);
         self.cleanup_old_segments(&input.plan.segments);
@@ -215,6 +215,8 @@ impl Store {
             merged.segment_id,
             input.keep_slots,
             merged.encoded.index.clone(),
+            merged.encoded.quant,
+            merged.encoded.recall_est,
         );
         ws.clear_edge_dirty();
         self.publish_manifest(new_manifest);
@@ -229,7 +231,7 @@ impl Store {
         // reason: 提交已生效;移动/清理失败只遗留孤儿文件,不影响正确性与可读性。
         if trash::move_to_trash(&self.root, &old_names).is_ok() {
             // reason: purge 失败同样只遗留 trash 垃圾,不影响数据集正确性。
-            let _ = trash::purge(&self.root);
+            let _ = trash::purge(&self.root).ok();
         }
     }
 }
@@ -267,7 +269,11 @@ fn resolve_group(previous: &Manifest, plan: &CompactionPlan) -> Result<Vec<Segme
 }
 
 /// 构造"段组替换为新段"的 MANIFEST(watermark 不变,WAL 不重置)。
-fn next_manifest_after_merge(input: &MergeManifestInput<'_>) -> Manifest {
+///
+/// # Errors
+/// 段号或 MANIFEST 版本水位耗尽时返回 [`MnemeError::IdExhausted`]
+/// (FC-PERSIST-ERR-012)。
+fn next_manifest_after_merge(input: &MergeManifestInput<'_>) -> Result<Manifest> {
     let mut segments: Vec<SegmentEntry> = input
         .previous
         .segments
@@ -291,20 +297,22 @@ fn next_manifest_after_merge(input: &MergeManifestInput<'_>) -> Manifest {
         })
         .collect();
     namespaces.sort_by_key(|entry| entry.ns_id);
-    Manifest {
+    Ok(Manifest {
         dimension: input.previous.dimension,
         metric: input.previous.metric,
         stopwords: input.previous.stopwords,
         next_rel_kind: input.previous.next_rel_kind,
-        manifest_version: input.previous.manifest_version + 1,
+        manifest_version: crate::persist::manifest::next_manifest_version(
+            input.previous.manifest_version,
+        )?,
         watermark_seqno: input.previous.watermark_seqno,
         next_rowid: input.ws.next_rowid,
-        next_segment_id: input.segment_id + 1,
+        next_segment_id: crate::persist::manifest::next_segment_id(input.segment_id)?,
         next_ns_id: input.ws.next_ns_id,
         namespaces,
         rel_kinds: input.previous.rel_kinds.clone(),
         segments,
-    }
+    })
 }
 
 /// 新合并段的 MANIFEST 条目。

@@ -7,8 +7,9 @@ use crate::persist::{Cursor, FORMAT_VERSION, check_version, crc32};
 
 use super::entry::decode_entry;
 use super::{
-    EntryData, HEADER_CRC_COVER, HEADER_LEN, KeyIndexRow, MAGIC, NS_STAT_ROW_BYTES, NsStatRow,
-    Region, Regions, TOMBSTONE_DOC_OFFSET, VERSION_ROW_BYTES, VersionRow,
+    EntryData, HEADER_CRC_COVER, HEADER_CRC_OFFSET, HEADER_LEN, KeyIndexRow, MAGIC,
+    NS_STAT_ROW_BYTES, NsStatRow, Region, Regions, TOMBSTONE_DOC_OFFSET, VERSION_ROW_BYTES,
+    VersionRow, region_offset,
 };
 
 /// 头部解析结果:行数、9 个数据区与 payload CRC。
@@ -29,7 +30,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<MsecView<'_>> {
     validate_regions(&header.regions, data_start, data_end)?;
     Ok(MsecView {
         row_count: header.row_count,
-        data: &bytes[data_start..data_end],
+        body: &bytes[data_start..data_end],
         field_dict: slice_of(bytes, header.regions.field_dict),
         version_table: slice_of(bytes, header.regions.version),
         key_index: slice_of(bytes, header.regions.key),
@@ -68,7 +69,7 @@ fn parse_header(bytes: &[u8]) -> Result<HeaderLayout> {
             reason: "msec: 文件短于头部".to_string(),
         });
     }
-    let stored_crc = u32::from_le_bytes([bytes[160], bytes[161], bytes[162], bytes[163]]);
+    let stored_crc = read_u32_at(bytes, HEADER_CRC_OFFSET);
     if crc32(&bytes[0..HEADER_CRC_COVER]) != stored_crc {
         return Err(MnemeError::Corrupted {
             segment: None,
@@ -80,15 +81,15 @@ fn parse_header(bytes: &[u8]) -> Result<HeaderLayout> {
     Ok(HeaderLayout {
         row_count,
         regions: Regions {
-            field_dict: read_pair(bytes, 16),
-            version: read_pair(bytes, 32),
-            key: read_pair(bytes, 48),
-            inv: read_pair(bytes, 64),
-            ns_stats: read_pair(bytes, 80),
-            zmap: read_pair(bytes, 96),
-            bloom: read_pair(bytes, 112),
-            delta: read_pair(bytes, 128),
-            rel: read_pair(bytes, 144),
+            field_dict: read_pair(bytes, region_offset(0)),
+            version: read_pair(bytes, region_offset(1)),
+            key: read_pair(bytes, region_offset(2)),
+            inv: read_pair(bytes, region_offset(3)),
+            ns_stats: read_pair(bytes, region_offset(4)),
+            zmap: read_pair(bytes, region_offset(5)),
+            bloom: read_pair(bytes, region_offset(6)),
+            delta: read_pair(bytes, region_offset(7)),
+            rel: read_pair(bytes, region_offset(8)),
         },
         payload_crc: read_u32_at(bytes, bytes.len() - 4),
     })
@@ -153,7 +154,7 @@ fn slice_of(bytes: &[u8], region: Region) -> &[u8] {
 /// 元数据段只读视图。
 pub(crate) struct MsecView<'a> {
     row_count: u64,
-    data: &'a [u8],
+    body: &'a [u8],
     field_dict: &'a [u8],
     version_table: &'a [u8],
     key_index: &'a [u8],
@@ -295,26 +296,26 @@ impl MsecView<'_> {
             segment: None,
             reason: "msec: doc_offset 溢出".to_string(),
         })?;
-        if body_start > self.data.len() {
+        if body_start > self.body.len() {
             return Err(MnemeError::Corrupted {
                 segment: None,
                 reason: "msec: doc_offset 越界".to_string(),
             });
         }
-        let total_len = read_u32_at(self.data, start) as usize;
+        let total_len = read_u32_at(self.body, start) as usize;
         let body_end = body_start
             .checked_add(total_len)
             .ok_or_else(|| MnemeError::Corrupted {
                 segment: None,
                 reason: "msec: 记录体长度溢出".to_string(),
             })?;
-        if body_end > self.data.len() {
+        if body_end > self.body.len() {
             return Err(MnemeError::Corrupted {
                 segment: None,
                 reason: "msec: 记录体长度越界".to_string(),
             });
         }
-        Ok(Some(decode_entry(&self.data[body_start..body_end])?))
+        Ok(Some(decode_entry(&self.body[body_start..body_end])?))
     }
 
     /// 校验数据区 payload CRC;结果被缓存。
@@ -324,7 +325,7 @@ impl MsecView<'_> {
     pub(crate) fn verify_payload(&mut self) -> Result<()> {
         let ok = *self
             .payload_crc_ok
-            .get_or_insert_with(|| crc32(self.data) == self.payload_crc);
+            .get_or_insert_with(|| crc32(self.body) == self.payload_crc);
         if ok {
             Ok(())
         } else {

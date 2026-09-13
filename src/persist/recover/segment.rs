@@ -37,6 +37,9 @@ pub(super) fn load_segment_views<'a>(
         Err(error) if fail_fast || is_version_rejection(&error) => return Err(error),
         Err(_) => return Ok(None),
     };
+    // f16 段在未开 `quant-f16` 的构建上拒绝打开,绝不静默按 f32 服务
+    // (FC-QUANT-ERR-002);该判断先于 fail-fast 降级,数据仍完整可读也须显式报错。
+    crate::quant::ensure_format_supported(vsec_view.quant())?;
     let mut msec_view = match msec::parse(&segment.msec) {
         Ok(view) => view,
         Err(error) if fail_fast || is_version_rejection(&error) => return Err(error),
@@ -133,9 +136,7 @@ fn commit_recovered_slot(
     if seqno.get() > state.seqno.get() {
         state.seqno = seqno;
     }
-    if rowid.get() >= state.next_rowid {
-        state.next_rowid = rowid.get() + 1;
-    }
+    super::wal_replay::advance_rowid(state, rowid)?;
     if let Some((last_access_ms, access_count)) = access {
         Arc::make_mut(&mut state.access).insert(
             rowid,

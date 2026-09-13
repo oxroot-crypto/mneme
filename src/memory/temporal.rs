@@ -94,7 +94,7 @@ fn history_visibility(
 mod tests {
     use super::*;
     use crate::core::metric::Metric;
-    use crate::core::options::HnswParams;
+    use crate::core::options::{HnswParams, VectorFormat};
     use crate::index::hnsw::HnswIndex;
     use crate::memory::table::WriterState;
 
@@ -108,6 +108,8 @@ mod tests {
             0,
             built,
             Vec::new(),
+            VectorFormat::F32,
+            None,
         ));
         let view = ws.snapshot();
         assert!(!view.indexes.is_empty(), "构造的视图应携带索引");

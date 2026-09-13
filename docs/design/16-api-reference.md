@@ -16,10 +16,11 @@
 二者都通过内部 `Arc` 共享、可自由克隆并跨线程传递(见 §5)。
 
 > **实现状态**:本参考按冻结签名描述目标语义。L4 起 `text`(BM25)、`Fusion`、
-> `Expr::from_str`/`Display`/JSON 往返与 `filter!` 均已落地;正文逐项标注了规划 API
-> (L6/L11/L12)与未落地能力。**已接线但未落地**的配置项(如 `quantization`/`compression`)
-> 当前仅记录配置、不生效,并以 `stats()` 如实反映;其余未落地能力以结构化错误返回、
-> 绝不静默降级(FC-MEM-ERR-002),见 §4 错误表。
+> `Expr::from_str`/`Display`/JSON 往返与 `filter!` 均已落地;L6 起量化(含
+> `stats().quant` 实况)与 `feature = "async"` 门面已落地。正文逐项标注了规划 API
+> (L11/L12)与未落地能力。**已接线但未落地**的配置项(如 `compression`)当前仅记录配置、
+> 不生效,并以 `stats()` 如实反映;其余未落地能力以结构化错误返回、绝不静默降级
+> (FC-MEM-ERR-002),见 §4 错误表。
 
 ### 1.1 构建与打开
 
@@ -45,7 +46,7 @@ impl Builder {
     pub fn insert_mode(self, m: InsertMode) -> Self;        // 默认 Upsert
     pub fn dedup(self, d: Dedup) -> Self;                   // 默认 Off
     pub fn dedup_threshold(self, t: f32) -> Self;           // 默认 0.95;近似去重余弦阈值,`[0,1]` 内的有限值(越界建库即拒绝)
-    pub fn quantization(self, f: VectorFormat) -> Self;     // 默认 F32;L6 未落地,当前仅记录配置、不生效(stats().quant.active 恒 F32);见 08
+    pub fn quantization(self, f: VectorFormat) -> Self;     // 默认 F32;持久库才可配量化(纯内存库构造期 Unsupported);见 08
     pub fn hnsw(self, p: HnswParams) -> Self;               // 默认 M=16/M0=32/efc=200/ef=64
     pub fn compaction(self, p: CompactionPolicy) -> Self;   // 默认见 §2
     pub fn retention(self, r: Option<Retention>) -> Self;   // 后台自动遗忘;默认 None = 关闭(见 07 §3.4)
@@ -199,6 +200,25 @@ impl<'a> RecordRef<'a> {
     pub fn provenance(&self) -> Option<&Meta>;
     pub fn vector(&self) -> &[f32];      // 零拷贝
     pub fn to_record(&self) -> Record;   // 克隆为可写 Record(去重 Merge 回调等用)
+    pub fn to_stored(&self) -> StoredRecord; // 克隆为 owned 快照(跨线程点读 / async 门面用)
+}
+
+/// 点读的 owned 快照(跨线程点读与 async 门面用;同步读仍可用 `RecordRef`)。
+/// 另含 `RowId`;可安全跨线程移动。不含事务时间 `created_at`(需要它请用 `RecordRef`)。
+pub struct StoredRecord { /* private */ }
+impl StoredRecord {
+    pub fn rowid(&self) -> RowId;
+    pub fn key(&self) -> Option<&str>;
+    pub fn text(&self) -> Option<&str>;
+    pub fn vector(&self) -> &[f32];
+    pub fn metadata(&self) -> &Meta;
+    pub fn expires_at(&self) -> Option<i64>;
+    pub fn importance(&self) -> f32;
+    pub fn confidence(&self) -> f32;
+    pub fn valid_from(&self) -> i64;
+    pub fn valid_to(&self) -> Option<i64>;
+    pub fn provenance(&self) -> Option<&Meta>;
+    pub fn into_record(self) -> Record;  // 转回可写记录(不保留 RowId 与绝对过期时刻)
 }
 
 ```
@@ -399,7 +419,7 @@ pub struct Stats {
 }
 // `SegmentStat` 标注 #[non_exhaustive](字段随层扩展,下游不得穷尽构造/匹配);
 // `bytes` = 段内 vsec + 已落盘 hidx 字节数(不含 msec);`rows` 含墓碑与历史版本。
-pub struct SegmentStat { pub id: SegmentId, pub rows: u64, pub bytes: u64, pub dead_ratio: f32, pub created: i64, pub index_nodes: u64, pub index_levels: u8 }  // index_* 为 L3 HNSW 图统计(无索引段为 0;小段可能预建但查询恒暴力)
+pub struct SegmentStat { pub id: SegmentId, pub rows: u64, pub bytes: u64, pub dead_ratio: f32, pub created: i64, pub index_nodes: u64, pub index_levels: u8, pub quant: VectorFormat, pub recall_est: Option<f32> }  // index_* 为 L3 HNSW 图统计(无索引段为 0;小段可能预建但查询恒暴力);quant/recall_est 为 L6 量化状态(重开后 recall_est 为 None)
 pub struct NsStat      { pub doc_count: u64, pub total_doc_len: u64 }
 pub struct Histogram   { /* 固定 32 桶边界与计数,详见 07 §7 */ }
 pub struct StorageStat { pub encryption: bool, pub compression: Compression, pub migrated_segments: usize, pub total_segments: usize }
@@ -409,6 +429,11 @@ pub struct StorageStat { pub encryption: bool, pub compression: Compression, pub
 > 并标注 `#[non_exhaustive]`(统计字段随层扩展;外部可读但不得再以结构体字面量构造或穷尽匹配)。
 > 兼容口径:v0.1.0 未发布,下游无既有构造点;后续新增字段不再构成破坏性变更。正式 RFC
 > 流程(`CONTRIBUTING.md` §3)落地前,以本记录作为变更登记。
+>
+> **API 变更记录(L6,加法性)**:公开调参结构体 `Tuning` 新增 `rescore_oversample`(默认 4)
+> 与 `quant_recall_floor`(默认 0.98)两个字段(量化两阶段检索与建段回退,见 [08 §4](08-l6-quant.md));
+> `Tuning` 未标 `#[non_exhaustive]`,以结构体字面量构造的调用方需补 `..Tuning::default()`。
+> 兼容口径同上:v0.1.0 未发布,无既有构造点。
 
 ```rust
 /// 版本链/历史保留统计(见 [07 §4.2a](07-l5-life.md))。
@@ -418,9 +443,9 @@ pub struct HistoryStat {
     pub horizon: Option<Duration>,  // 当前生效的历史保留窗口,None = 永久
 }
 
-/// 量化运行状态:`configured` 为用户配置,`active` 为实际生效格式(可能因 I13 自动回退)。
-/// **L6 未落地**:量化副本与两阶段检索尚无实现,`active` 当前恒为 `F32`,绝不回显配置;
-/// `recall_est` 为抽样查询的粗/精排名一致率估计(见 [08 §4.3](08-l6-quant.md))。
+/// 量化运行状态:`configured` 为用户配置,`active` 为实际生效格式(无量化段或
+/// 建段抽样不达标回退时为 `F32`,绝不回显配置);`recall_est` 为建段抽样一致率估计
+/// (各段取最小;重开库后为 `None`,见 [08 §4.3](08-l6-quant.md))。
 pub struct QuantStat { pub configured: VectorFormat, pub active: VectorFormat, pub recall_est: Option<f32> }
 
 /// 后台合并状态(`stats()` 的 `compaction` 字段);运行中 `pause()` 转 `Paused`。
@@ -441,6 +466,53 @@ pub struct AccessStat { pub last_access_ms: i64, pub access_count: u32 }
 
 `SnapshotHandle` 在自身存活期间看到**完全一致的过去**:即使后台 compaction 推进,
 它引用的段文件因 `Arc` 引用而不会被物理删除([07 §6](07-l5-life.md)、不变量 I17)。
+
+### 1.6.1 async 门面(feature `async`)
+
+`Namespace::into_async()` 返回 `AsyncNamespace`:与同步命名空间共享同一底层句柄与
+写锁,所有方法都是 `spawn_blocking(同步方法)` 的机械包装(核心库零 tokio 依赖),
+语义与错误同同步 API(`FC-QUANT-INV-014`)。
+
+```rust
+impl Namespace {
+    pub fn into_async(self) -> AsyncNamespace;
+}
+
+impl AsyncNamespace {
+    pub async fn insert(&self, rec: Record) -> Result<InsertOutcome>;
+    pub async fn insert_batch(&self, recs: Vec<Record>) -> Result<Vec<InsertOutcome>>;
+    pub async fn delete(&self, key: &str) -> Result<bool>;
+    pub async fn delete_by_rowid(&self, id: RowId) -> Result<bool>;
+    pub async fn update(&self, key: &str, patch: UpdatePatch) -> Result<UpdateOutcome>;
+    pub async fn update_by_rowid(&self, id: RowId, patch: UpdatePatch) -> Result<UpdateOutcome>;
+    pub async fn supersede(&self, key: &str, rec: Record) -> Result<UpdateOutcome>;
+    pub async fn get(&self, key: &str) -> Result<Option<StoredRecord>>;
+    pub async fn get_by_rowid(&self, id: RowId) -> Result<Option<StoredRecord>>;
+    pub async fn get_many(&self, keys: &[&str]) -> Result<Vec<Option<StoredRecord>>>;
+    pub async fn get_many_by_rowid(&self, ids: &[RowId]) -> Result<Vec<Option<StoredRecord>>>;
+    pub async fn exists(&self, key: &str) -> Result<bool>;
+    pub async fn get_vector(&self, id: RowId) -> Result<Option<Vec<f32>>>;
+    pub async fn count(&self, filter: Option<Expr>) -> Result<u64>;
+    pub async fn touch(&self, key: &str, boost: Option<f32>) -> Result<bool>;
+    pub async fn touch_by_rowid(&self, id: RowId, boost: Option<f32>) -> Result<bool>;
+    pub async fn feedback(&self, id: RowId, feedback: Feedback, query_id: QueryId) -> Result<bool>;
+    pub async fn relate(&self, from: RowId, to: RowId, kind: RelationKind, weight: f32) -> Result<()>;
+    pub async fn relate_with_options(&self, from: RowId, to: RowId, options: RelateOptions) -> Result<()>;
+    pub async fn unrelate(&self, from: RowId, to: RowId, kind: RelationKind) -> Result<bool>;
+    pub async fn neighbors(&self, from: RowId, kinds: &[RelationKind]) -> Result<Vec<Edge>>;
+    pub async fn predecessors(&self, to: RowId, kinds: &[RelationKind]) -> Result<Vec<Edge>>;
+    pub async fn forget(&self, filter: Expr) -> Result<usize>;
+    pub async fn retain(&self, policy: Retention) -> Result<RetainReport>;
+    pub async fn consolidate(&self, policy: ConsolidationPolicy) -> Result<ConsolidateReport>;
+}
+```
+
+- **借用返回的方法不在门面内**:`iter`/`iter_with` 的迭代器借自读视图,无法跨线程
+  移动;点读改为返回 owned `StoredRecord`(含 `RowId`),语义等价。
+- **取消语义**:阻塞任务一经派发不可取消;drop future 只丢弃等待结果,后台操作仍
+  会完成(写入照常生效)。需要协作取消应在业务层自行以标志控制。
+- `search()` 构建器本身是轻量内存操作,`execute()` 为阻塞调用;异步场景请由宿主
+  自行 `spawn_blocking`。`Mneme` 级操作(flush/close/backup/snapshot)不走本门面。
 
 ### 1.7 关闭与 `Drop`
 
@@ -603,7 +675,7 @@ pub struct ConsolidateReport {
 | 同 key 行为 | `.insert_mode` | `Upsert` | `Upsert/RejectDuplicate` |
 | 去重策略 | `.dedup` | `Off` | `Off/Reject/Replace/KeepBoth/Merge`,[03 §6](03-l1-memory.md) |
 | 去重阈值 | `.dedup_threshold` | `0.95` | 近似去重阈值,**统一按余弦相似度口径**(非余弦度量下引擎内部先归一化);`[0,1]` 内的有限值,越界建库即拒绝;与 `ResultDedup::Near` 独立 |
-| 量化格式 | `.quantization` | `F32` | `F32/F16/I8Rescored`,[08](08-l6-quant.md);**L6 未落地**,当前仅记录配置、不生效(`active` 恒 `F32`) |
+| 量化格式 | `.quantization` | `F32` | `F32/F16/I8Rescored`,[08](08-l6-quant.md);持久库才可配,纯内存库构造期 `Unsupported`;`F16` 需 feature `quant-f16` |
 | HNSW 参数 | `.hnsw` | 见下 | `HnswParams` |
 | compaction | `.compaction` | 见下 | `CompactionPolicy` |
 | 历史保留窗口 | `.compaction(p)` 的 `p.history_horizon` | `None`(永久) | `Option<Duration>`;有限值可回收超期历史版本,见 [07 §4.2a](07-l5-life.md) |
@@ -654,6 +726,8 @@ pub struct Tuning {
     pub filter_post_threshold: f32,     // 默认 0.10  过滤三档:后过滤/放大后过滤分界(05 §8)
     pub filter_brute_threshold: f32,    // 默认 0.001 过滤三档:放大后过滤/候选暴力分界(05 §8)
     pub stopwords: bool,                // 默认 true  启用内置停用词表(06 §3.5;建库即锁定,既存库以 MANIFEST 为准)
+    pub rescore_oversample: usize,      // 默认 4     两阶段粗排候选 = top_k × 本值(08 §4.2;仅量化段生效)
+    pub quant_recall_floor: f32,        // 默认 0.98  建段抽样召回一致率门槛(0.0 关回退,>1 恒回退;08 §4.3)
 }
 ```
 
@@ -664,7 +738,7 @@ pub struct Tuning {
 | 会话级临时记忆 | `Record::ttl` 短 + `FsyncPolicy::Batched(20ms)` + 默认 `retention`;命名空间按会话分 |
 | 长期偏好/事实 | `importance` 显式设高 + `Retention::min_importance` 提高 + `Dedup::Replace` 或 `Merge` |
 | 只读/分析副本 | `.fsync(Never)` 仅限测试;生产只读副本仍用 `Batched`,备份目录 `open` 后勿写 |
-| 延迟敏感 | `.quantization(I8Rescored)`(**L6 目标;未落地前无效**) + `ef=64~128`;`.parallelism(0)` 交给运行时 |
+| 延迟敏感 | `.quantization(I8Rescored)` + `ef=64~128`;`.parallelism(0)` 交给运行时 |
 | 内存受限 | 默认 mmap + i8;定期 `backup_to` 后重建更小的段 |
 
 > 以上只是起点:所有旋钮都有默认值,先用默认跑通,再按 `stats()` 的延迟直方图与召回基准调参。
@@ -726,8 +800,9 @@ pub struct Tuning {
 | `NonFinite` | ❌ | 向量分量或 `importance`/`confidence`/边权/`boost` 含 `NaN`/`±Inf`,会污染排序与打分;修正输入 |
 | `Closed` | ❌ | 库已关闭;不要再使用该库的任何克隆句柄 |
 | `Config` | ❌ | 建库/查询配置非法(缺维度、无查询通道、MMR `lambda` 非有限值、`Fusion` 未同时启用双通道、`Weighted.alpha` 越界或非有限),策略参数含非有限值(`min_importance`/`access_weight`/`threshold`/`dedup_threshold`)或非法(如 `max_cluster = 0`) |
-| `Unsupported` | ❌ | 该能力延后到后续层,或对当前形态不适用(**纯内存库 `backup_to`**;只读模式写);按版本升级 |
+| `Unsupported` | ❌ | 该能力延后到后续层,或对当前形态不适用(**纯内存库 `backup_to`**;纯内存库配量化;未开 `quant-f16` 的 f16 段;只读模式写);按版本/feature 调整 |
 | `Inconsistent` | ❌ | 内部不变量被破坏(应为 bug);上报并附上下文 |
+| `IdExhausted` | ❌ | `RowId`/`NsId`/`SeqNo` 或段号/MANIFEST 版本的整型表示空间耗尽(恢复出近上限水位后再写入/提交);绝不回绕复用(FC-PERSIST-ERR-012) |
 | `UnsupportedVersion` | ❌ | 文件格式版本与当前定义不一致(未发布期无旧格式兼容);从备份恢复或重建 |
 | `Corrupted` | ❌ | 数据损坏:立即停止写入,跑 `db.check()`,按 §7 恢复 |
 
@@ -751,9 +826,9 @@ pub struct Tuning {
 | `Mneme` / `Namespace` | ✅ | ✅ | 内部 `Arc`;克隆廉价,可跨线程共享 |
 | `SnapshotHandle` | ✅ | ✅ | 只读视图,任意线程并发查询 |
 | `SnapshotNamespace` | ✅ | ✅ | 快照上的命名空间只读视图,持有快照 `Arc` |
-| `AsyncNamespace` | ✅ | ✅ | async 门面,共享同一底层句柄(feature `async`,**L6 规划,当前无此类型**) |
+| `AsyncNamespace` | ✅ | ✅ | async 门面,共享同一底层句柄(feature `async`;点读返回 owned `StoredRecord`) |
 | `SearchBuilder` | ✅ | ✅ | 短生命周期构建器,通常单线程用完即 `execute`(仅不承诺跨线程可变使用) |
-| `Record` / `Hit` / `InsertOutcome` / `UpdatePatch` / `QueryId` | ✅ | ✅ | 值类型 |
+| `Record` / `StoredRecord` / `Hit` / `InsertOutcome` / `UpdatePatch` / `QueryId` | ✅ | ✅ | 值类型 |
 | `RecordRef<'_>` | ✅ | ✅ | 以 `Arc` 持有记录数据的只读视图 |
 | `Reranker` / `Clock` / `Summarizer` / `KeyProvider` / `Observer` | ✅ | ✅ | 宿主实现需满足(`KeyProvider`/`Observer` 为 L11/L12 规划,当前无此类型) |
 | `Storage` | ✅ | ✅ | 平台存储后端(见 12 §3,`trait` 为 L12 规划) |
@@ -865,7 +940,7 @@ b.check()?;                  // 全绿 = 备份有效(写进 CI,见 14 §6)
 | `ef` | 4096 | 仅 L3+ |
 | WAL 单帧 payload | 16 MiB | 撕裂写检测与内存上界;**当前保留限额,尚未在写路径强制** |
 | 命名空间深度 | 32 级 | `a/b/c/...`,对应 `Limits.ns_depth` |
-| 自定义关系类型 | 65520 个 | u16 编号空间,内置占用 0..=15;超限 `TooLarge` |
+| 自定义关系类型 | 65520 个 | u16 编号空间,内置占用 0..=15;超限 `TooLarge`;**规划,当前 `custom` 未提供** |
 
 限额通过 `.limits(Limits { .. })` 调整;调大以内存/恢复时间为代价,请评估后再改。
 

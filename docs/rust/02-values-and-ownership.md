@@ -6,7 +6,8 @@
 > [`src/core/metric.rs`](../../src/core/metric.rs)、[`src/memory/table/state.rs`](../../src/memory/table/state.rs)、
 > [`src/index/hidx.rs`](../../src/index/hidx.rs)、[`src/index/filtered.rs`](../../src/index/filtered.rs)、
 > [`src/query/iso.rs`](../../src/query/iso.rs)、[`src/query/zmap.rs`](../../src/query/zmap.rs)、
-> [`src/query/fusion.rs`](../../src/query/fusion.rs)、[`src/query/parse.rs`](../../src/query/parse.rs)。
+> [`src/query/fusion.rs`](../../src/query/fusion.rs)、[`src/query/parse.rs`](../../src/query/parse.rs)、
+> [`src/quant/scalar_i8.rs`](../../src/quant/scalar_i8.rs)、[`src/quant/f16.rs`](../../src/quant/f16.rs)。
 
 这是全书**最关键**的一章。所有权是 Rust 区别于其他语言的核心,也是初学者最容易卡住的地方。
 读完本章你能理解 mneme 里为什么大量使用 `u32`/`u64`/`f32`、为什么 `newtype` 里直接包一个整数。
@@ -155,7 +156,7 @@ let expected_node_table = header
 - `checked_*`:算术**可能溢出**,返回 `Option`,适合"溢出即非法输入";
 - `saturating_*`:算术溢出时**取边界值**,适合"宁可夹紧不可回绕"——过滤档②的
   `ef` 放大就用了 `base.saturating_mul(AMPLIFIED_TIER_FACTOR)`,见
-  [`src/index/filtered.rs:148-154`](../../src/index/filtered.rs)。
+  [`src/index/filtered.rs:163`](../../src/index/filtered.rs)。
 
 #### 2.1.3 L4 用到的几个整数方法
 
@@ -181,9 +182,21 @@ value.unsigned_abs() <= MAX_EXACT_INT as u64;
 - 为什么用 `unsigned_abs`:对 `i64::MIN` 直接取负会溢出 panic,`unsigned_abs`
   返回 `u64`,先比上限再转 `f64`(见 §2.2 的 2^53)。
 
-见 [`src/query/iso.rs:183-184`](../../src/query/iso.rs)、
+见 [`src/query/iso.rs:192-193`](../../src/query/iso.rs)、
 [`src/query/zmap.rs:27-30`](../../src/query/zmap.rs) 与
 [`src/query/zmap.rs:179-182`](../../src/query/zmap.rs)。
+
+L6 的 f16 解码又用到 `usize::is_multiple_of`:
+
+```rust
+if !codes.len().is_multiple_of(BYTES_PER_ELEMENT) {
+    return Err(MnemeError::Corrupted { ... });   // 码流长度不是 2 的整数倍
+}
+```
+
+见 [`src/quant/f16.rs:27`](../../src/quant/f16.rs)。`n.is_multiple_of(m)` 判断 `n` 能否被 `m`
+整除,等价于 `n % m == 0`,但 `m == 0` 时不会 panic(仅当 `n == 0` 返回 `true`),
+意图也比"取模再判 0"更直白。
 
 ### 2.2 浮点
 
@@ -197,7 +210,7 @@ let s = 0.1_f32 + 0.2;
 assert!((s - 0.3).abs() < 1e-6);   // 惯用写法
 ```
 
-mneme 的测试里到处是 `(x - expected).abs() < 1e-6`,见 [`src/core/metric.rs:192`](../../src/core/metric.rs)。
+mneme 的测试里到处是 `(x - expected).abs() < 1e-6`,见 [`src/core/metric.rs:250-267`](../../src/core/metric.rs)。
 
 浮点还有几个 mneme 常用的"防 NaN / 防失控"工具:
 
@@ -215,7 +228,7 @@ f32::MIN_POSITIVE;         // 最小的正规格化浮点数,常用来替代 0 �
   就拒绝,绝不让 `NaN` 混进建图参数(见 [`src/index/hidx.rs:235`](../../src/index/hidx.rs))。
 - `clamp(min, max)` 同时完成上下限约束;过滤档①的 `ef` 放大系数写作
   `(1.0 / selectivity.max(f32::MIN_POSITIVE)).clamp(1.0, MAX_EF_AMPLIFICATION)`,
-  既不除以 0 也不超放大上限(见 [`src/index/filtered.rs:149-151`](../../src/index/filtered.rs))。
+  既不除以 0 也不超放大上限(见 [`src/index/filtered.rs:160`](../../src/index/filtered.rs))。
 - `MIN_POSITIVE` 是**下限哨兵**:把可能为 0 的分母抬到最小正数,结果虽大但有限,
   比 `0.0` 分母产生的 `inf`/`NaN` 更好处理。
 
@@ -251,7 +264,90 @@ alpha.is_finite();        // 三者都是 false;配合 [0,1] 区间判定拒绝�
 [`src/query/fusion.rs:202-221`](../../src/query/fusion.rs) 与
 [`src/query/zmap.rs:166-182`](../../src/query/zmap.rs)。
 
-### 2.3 布尔与字符
+L6 的量化编解码又用到两个浮点方法:
+
+```rust
+// ① round:四舍五入到最接近的整数(仍是 f32);i8 编码把连续值折到 [0, 255]
+let code = ((value - params.min(dim)) / delta).round();
+code.clamp(0.0, MAX_CODE) as u8;
+
+// ② powi:整数次幂;测试用它与契约里的相对精度 2^-11 一一对应
+let bound = original.abs() * 2.0_f32.powi(-11) + 1e-6;
+```
+
+见 [`src/quant/scalar_i8.rs:123`](../../src/quant/scalar_i8.rs) 与
+[`src/quant/f16.rs:75`](../../src/quant/f16.rs)。要点:
+
+- `round` 是"舍入到最近整数,`.5` 向远离 0 的方向",不是截断(`trunc`)也不是向下取整
+  (`floor`);`as u8` 只负责最后一步截位(见 §2.1.1 的截断规则)。
+- `powi` 的指数是 `i32`,负指数表示倒数;它比 `powf` 快且不引入对数误差,适合"2 的整数次幂"
+  这类常量。f16 测试里 `powi(-11)` 就是把文档里的 `2^-11` 直接写进代码,
+  免得读者对 `1.0 / 2048.0` 猜半天。
+
+### 2.3 半精度浮点 `half::f16`
+
+L6 的量化副本还有一个格式:**f16(半精度浮点)**。为什么不用 `f32` 直接存?因为向量的查询瓶颈
+在**内存带宽**:每个分量从 4 字节降到 2 字节,同一条带宽能多喂一倍的候选(见设计
+[08 L6 §1](../design/08-l6-quant.md))。i8 虽然更省(1 字节),但需要段级 `(v_min, v_max)`
+参数表、天然不对称;f16 自带 IEEE-754 的指数与符号,无参数表、误差无偏,是"不想维护刻度表"
+时的保守选择。
+
+Rust 标准库没有半精度类型,mneme 经 feature `quant-f16` 引入外部 crate `half`
+(见 [`Cargo.toml:37-38`](../../Cargo.toml)),用它的 `half::f16`:
+
+```rust
+use half::f16;
+
+/// 单分量字节数。
+pub(crate) const BYTES_PER_ELEMENT: usize = 2;
+
+/// 单行编码为小端 f16 码流。
+pub(crate) fn encode_row(vector: &[f32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vector.len() * BYTES_PER_ELEMENT);
+    for &value in vector {
+        out.extend_from_slice(&f16::from_f32(value).to_bits().to_le_bytes());
+    }
+    out
+}
+```
+
+见 [`src/quant/f16.rs:12-22`](../../src/quant/f16.rs)。四个 API 各管一段:
+
+| 方法 | 方向 | 说明 |
+|---|---|---|
+| `f16::from_f32(x)` | `f32 → f16` | 就近舍入;`x` 超出可表示范围(舍入中点约 `±65520`)时饱和为 `±∞` |
+| `f16::to_f32()` | `f16 → f32` | 无损宽化(`f16` 的每个值都能被 `f32` 精确表示) |
+| `to_bits()` | `f16 → u16` | 取 16 位 IEEE 位模式,便于落盘 |
+| `f16::from_bits(bits)` | `u16 → f16` | 从位模式还原,**不做浮点解释之外的处理** |
+
+解码路径正好反过来:每 2 字节读成一个小端 `u16`,再 `from_bits().to_f32()`:
+
+```rust
+codes
+    .chunks_exact(BYTES_PER_ELEMENT)
+    .map(|pair| f16::from_bits(u16::from_le_bytes([pair[0], pair[1]])).to_f32())
+    .collect()
+```
+
+见 [`src/quant/f16.rs:33-36`](../../src/quant/f16.rs)。行为上有三个必须记住的边界
+(都有测试钉住,见 [`src/quant/f16.rs:105-116`](../../src/quant/f16.rs)):
+
+- **相对精度约 `2^-11 ≈ 4.9e-4`**:f16 只有 10 位显式尾数,往返一次的最大相对误差就在这个量级;
+  这也决定了它只用于**粗排**(先用量化副本选出候选),精排恒回退 f32 原向量(I12);
+- **最大值 `±65504`**:`f16::from_f32` 是 IEEE 语义的"就近舍入",超出可表示范围的有限值
+  (舍入中点约 `±65520`)会**饱和为 `±∞`**,而不是回绕成小数;查询侧的点积因此可能得到
+  `inf`,但两阶段流程里粗排只负责排序;
+- **`NaN`/`±Inf` 保持**:特殊值原样透传;`-0.0`、最小 subnormal、`±65504` 这些极值可以
+  **逐位精确往返**。
+
+> `to_bits`/`from_bits` 是"位模式"与"浮点值"之间的转换:`to_bits()` 得到 `u16` 而不是
+> 某个"编码整数";反之 `from_bits` 是安全函数(不是 `unsafe`),因为它只重新解释 16 位,
+> 任何 16 位模式都是合法的 f16(可能正好是 `NaN`)。
+>
+> 对比 §2.1 的 `as`:`as` 只能在标量数值类型之间转换,而标准库根本没有 `f16` 这个类型,
+> 必须走 `half` crate 的显式 API——这也让"发生了舍入"在代码里一目了然。
+
+### 2.4 布尔与字符
 
 ```rust
 let is_enabled: bool = true;
@@ -282,7 +378,7 @@ c.len_utf8();          // 3:'好' 在 UTF-8 里占 3 个字节
 见 [`src/query/parse.rs:84-93`](../../src/query/parse.rs) 与
 [`src/query/parse.rs:298-315`](../../src/query/parse.rs)。
 
-### 2.4 数组与元组
+### 2.5 数组与元组
 
 **数组(array)**:长度固定、元素同类型。
 
@@ -405,6 +501,8 @@ pub struct Mneme {
     pub(crate) table: Arc<Table>,
     pub(crate) config: Arc<Config>,
     pub(crate) control: CompactionControl,
+    pub(crate) store: Option<Arc<Store>>,                 // L2 持久层协调句柄;纯内存库为 None
+    pub(crate) maintenance: Option<MaintenanceHandle>,    // L5 后台维护线程句柄
 }
 ```
 
@@ -444,7 +542,7 @@ pub(crate) fn hide_latest(&mut self, rowid: RowId) {
 > let shared: Arc<[f32]> = Arc::from(vector.into_boxed_slice());
 > ```
 >
-> 见 [`src/index/hnsw.rs:493-499`](../../src/index/hnsw.rs)。`into_boxed_slice()` 把
+> 见 [`src/index/hnsw.rs:583-587`](../../src/index/hnsw.rs)。`into_boxed_slice()` 把
 > `Vec<T>` 收缩成 `Box<[T]>`(丢掉多余容量,长度固定),`Arc::from` 再接管这块内存。
 > 此后每次克隆都只是引用计数 +1,索引与段数据因此可以零拷贝共享同一份向量——和
 > `Arc<str>` 是同一个套路,只是元素从 `u8` 换成了 `f32`。
@@ -487,6 +585,9 @@ pub struct SlotId(u32);
 - `let` 默认不可变,要改加 `mut`;常量用 `const` + 全大写下划线。
 - 整数按位宽/符号分很多种,Rust **不做隐式转换**;`as` 会静默截断,不允许丢数据时用
   `TryFrom`/`checked_*`/`saturating_*`;浮点比较用误差阈值,`is_finite`/`clamp` 防 NaN 与失控。
+- 浮点工具还有 `round`(就近舍入)与 `powi`(整数次幂);L6 的 f16 副本用 `half::f16` 的
+  `from_f32`/`to_f32`/`to_bits`/`from_bits`,相对精度约 `2^-11`、最大值 `±65504`、
+  溢出饱和为 `±∞`、`NaN`/`±Inf` 保持。
 - L4 用的整数方法:`div_euclid`/`rem_euclid`(负数 floor 除法)、`div_ceil`(向上取整)、
   `unsigned_abs`;`f64` 只精确到 2^53,整数转浮点比较前必须先检查范围。
 - `char` 不是 `u8`:用 `chars().next()` 拿字符、`len_utf8()` 换算字节数,别在 UTF-8 中间切刀。
@@ -504,6 +605,9 @@ pub struct SlotId(u32);
 3. 给 `examples/hello.rs` 加一个 `const MAX_ROWS: u32 = 1_000_000;` 并用 `println!` 打印。
 4. 对 `-1_i64` 分别计算 `/ 86_400_000`、`div_euclid(86_400_000)`、`rem_euclid(86_400_000)`,
    解释三者为什么不同。
+5. 读 [`src/quant/f16.rs:70-116`](../../src/quant/f16.rs) 的三个测试,再用 `half` crate 写一个
+   `f32 → f16 → f32` 往返,对 `0.1`、`-12.345`、`1.0e6` 打印结果,观察相对精度、溢出饱和与
+   特殊值行为。
 
 ## 下一章
 

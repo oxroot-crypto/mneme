@@ -88,7 +88,7 @@ impl<T: Ord> TopK<T> {
 `T: Ord` 读作"T 必须实现 `Ord` trait"。为什么需要?因为 `TopK` 在分数相同时要按载荷
 `a_payload < b_payload` 排序,`<` 来自 `Ord`。没有这个约束,编译器不知道 `T` 能否比较大小。
 
-见 [`src/core/heap.rs:51`](../../src/core/heap.rs) 与 [`src/core/heap.rs:201`](../../src/core/heap.rs)。
+见 [`src/core/heap.rs:51`](../../src/core/heap.rs) 与 [`src/core/heap.rs:221-230`](../../src/core/heap.rs)。
 
 等价写法(更复杂时用 `where`):
 
@@ -144,7 +144,7 @@ pub struct RecordRef<'a> {
 }
 ```
 
-见 [`src/memory/record.rs:179-182`](../../src/memory/record.rs)。`PhantomData<T>` 不占
+见 [`src/memory/record.rs:316-320`](../../src/memory/record.rs)。`PhantomData<T>` 不占
 空间,只在类型层面声明"逻辑上借用/拥有 `T`",从而参与借用检查与 auto trait
 (`Send`/`Sync`)推断;去掉它,编译器会报"生命周期参数 `'a` 未被使用"。
 
@@ -356,13 +356,13 @@ impl std::ops::BitAnd for Expr {
 }
 ```
 
-见 [`src/memory/pred.rs:243-257`](../../src/memory/pred.rs)。有了它,过滤条件就能像布尔式一样写:
+见 [`src/memory/pred.rs:267-273`](../../src/memory/pred.rs)。有了它,过滤条件就能像布尔式一样写:
 
 ```rust
 let expr = Expr::field("importance").gt(0.5_f32) & Expr::field("rank").lt(1028_i64);
 ```
 
-见 [`src/memory/pred.rs:243-257`](../../src/memory/pred.rs)。要点:
+见 [`src/memory/pred.rs:267-281`](../../src/memory/pred.rs)。要点:
 
 - `a & b` 只是 `a.bitand(b)` 的**语法糖**,`|` 同理;重载不改变优先级,也不能凭空造运算符。
 - **关联类型 vs 泛型参数**:`Output` 由 `Self` 唯一决定,所以用关联类型;如果要允许同一个类型

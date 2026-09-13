@@ -140,3 +140,48 @@ pub(crate) fn visit_frames(
     }
     Ok(offset)
 }
+
+impl FrameKind {
+    /// 帧类型编号。
+    pub(crate) const fn as_u8(self) -> u8 {
+        match self {
+            FrameKind::Insert => 1,
+            FrameKind::Delete => 2,
+            FrameKind::Touch => 3,
+            FrameKind::Checkpoint => 4,
+            FrameKind::BatchBegin => 5,
+            FrameKind::BatchCommit => 6,
+            FrameKind::DeleteRow => 7,
+            FrameKind::TouchRow => 8,
+            FrameKind::NsRegister => 9,
+            FrameKind::Update => 10,
+            FrameKind::UpdateRow => 11,
+            FrameKind::Relate => 12,
+            FrameKind::Unrelate => 13,
+            FrameKind::RelKindRegister => 14,
+            FrameKind::NsUnregister => 15,
+        }
+    }
+
+    /// 由编号解析;未知编号返回 `None`。
+    pub(crate) const fn from_u8(value: u8) -> Option<Self> {
+        Some(match value {
+            1 => FrameKind::Insert,
+            2 => FrameKind::Delete,
+            3 => FrameKind::Touch,
+            4 => FrameKind::Checkpoint,
+            5 => FrameKind::BatchBegin,
+            6 => FrameKind::BatchCommit,
+            7 => FrameKind::DeleteRow,
+            8 => FrameKind::TouchRow,
+            9 => FrameKind::NsRegister,
+            10 => FrameKind::Update,
+            11 => FrameKind::UpdateRow,
+            12 => FrameKind::Relate,
+            13 => FrameKind::Unrelate,
+            14 => FrameKind::RelKindRegister,
+            15 => FrameKind::NsUnregister,
+            _ => return None,
+        })
+    }
+}

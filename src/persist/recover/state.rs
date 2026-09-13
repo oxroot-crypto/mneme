@@ -366,6 +366,7 @@ fn build_remaps(
 mod tests {
     use super::*;
     use crate::core::error::MnemeError;
+    use crate::core::options::VectorFormat;
     use crate::persist::msec::VersionRow;
 
     /// 构造只带 relations 区的空 msec 段(无槽位)。
@@ -392,6 +393,9 @@ mod tests {
             vectors: &[],
             norms: &[],
             dead: &[],
+            quant: VectorFormat::F32,
+            quant_params: &[],
+            quant_codes: &[],
         })
         .expect("vsec");
         let empty_edges = crate::persist::edges::encode(&[], false, false).expect("edges");

@@ -91,6 +91,16 @@ impl Default for Builder {
     }
 }
 
+impl std::fmt::Debug for Builder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Builder")
+            .field("path", &self.path)
+            .field("dimension", &self.dimension)
+            .field("metric", &self.metric)
+            .finish_non_exhaustive()
+    }
+}
+
 impl Builder {
     /// 构建库句柄。
     ///
@@ -159,6 +169,7 @@ impl Builder {
         self.validate_hnsw()?;
         self.validate_tuning()?;
         self.validate_compaction()?;
+        self.validate_quantization()?;
         Ok(())
     }
 
@@ -230,7 +241,8 @@ impl Builder {
 
     /// 校验过滤三档阈值与 bloom/字段上限:有限且 `0 ≤ brute ≤ post ≤ 1`;
     /// `bloom_fpp ∈ (0,1)`(否则会生产 `k > 64`、自读不回的段);
-    /// `field_dict_max ≥ 1`(至少容纳 key 字符串字段)(FC-INDEX-PRE-001)。
+    /// `field_dict_max ≥ 1`(至少容纳 key 字符串字段)(FC-INDEX-PRE-001);
+    /// 两阶段候选上限 ≥ 1、召回门槛有限且 ≥ 0(FC-QUANT-PRE-001)。
     fn validate_tuning(&self) -> Result<()> {
         let post = self.tuning.filter_post_threshold;
         let brute = self.tuning.filter_brute_threshold;
@@ -248,6 +260,34 @@ impl Builder {
         if self.tuning.field_dict_max < 1 {
             return Err(MnemeError::Config {
                 reason: "field_dict_max 至少为 1(需容纳 key 字段)",
+            });
+        }
+        if self.tuning.rescore_oversample < 1 {
+            return Err(MnemeError::Config {
+                reason: "rescore_oversample 必须 ≥ 1",
+            });
+        }
+        let floor = self.tuning.quant_recall_floor;
+        if !floor.is_finite() || floor < 0.0 {
+            return Err(MnemeError::Config {
+                reason: "quant_recall_floor 必须是 ≥ 0 的有限值",
+            });
+        }
+        Ok(())
+    }
+
+    /// 校验量化配置:feature 门控与纯内存限制(FC-QUANT-ERR-001/002)。
+    ///
+    /// 量化副本随段同生同灭:纯内存库没有段,配置量化没有可服务的载体,
+    /// 构造期即报 `Unsupported`,绝不静默记配置回显 `active = F32`。
+    fn validate_quantization(&self) -> Result<()> {
+        if self.quantization == VectorFormat::F32 {
+            return Ok(());
+        }
+        crate::quant::ensure_format_supported(self.quantization)?;
+        if self.path.is_none() {
+            return Err(MnemeError::Unsupported {
+                feature: "量化副本(纯内存库无段)",
             });
         }
         Ok(())

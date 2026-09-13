@@ -25,6 +25,15 @@ mneme 的模块划分直接对应架构分层,读模块结构就能读出设计�
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod core;
+#[cfg(feature = "fuzzing")]
+pub mod fuzzing;
+pub mod memory;
+
+mod index;
+mod life;
+mod persist;
+mod quant;
+mod query;
 
 pub use crate::core::error::{MnemeError, Result};
 pub use crate::core::heap::TopK;
@@ -39,9 +48,16 @@ pub use crate::core::meta;
   - `#![deny(missing_docs)]`:任何公开项缺文档就**编译失败**;
   - `#![deny(unsafe_op_in_unsafe_fn)]`:在 `unsafe fn` 里做不安全操作必须再包一层 `unsafe` 块,
     强制显式(见 [09 章](09-cfg-unsafe-simd.md))。
-- `pub mod core;` 声明一个公开子模块。
+- `pub mod core;` 声明一个公开子模块;`mod index;`/`mod quant;` 等不带 `pub` 的是
+  crate 内部模块(`quant` 是 L6 纯原语模块,依赖等级同 L0,见 [AGENTS.md](../../AGENTS.md))。
+- `#[cfg(feature = "fuzzing")] pub mod fuzzing;` 说明**模块声明也能条件编译**:只有打开
+  `fuzzing` feature(即 `fuzz/` 构建)时,`src/fuzzing.rs` 才参与编译,普通运行时不暴露
+  (见 [10 §7](10-testing.md))。
 - `pub use ...` 是**重导出(re-export)**:把深层路径的项提升到 crate 根,
   让用户能写 `use mneme::Metric;` 而不是 `use mneme::core::metric::Metric;`。
+  重导出同样能带条件:L6 的 `AsyncNamespace` 写成
+  `#[cfg(feature = "async")] pub use crate::memory::AsyncNamespace;`
+  (见 [`src/lib.rs:67-68`](../../src/lib.rs))。
 - `pub use` 也能重导出**宏**:`core/meta.rs` 里的 `pub use serde_json::json;` 把第三方
   `json!` 宏转成本 crate 的 `mneme::json`。L4 的 doctest 因此写 `use mneme::{Expr, json};`,
   库用户不必直接依赖 serde_json(见 [`src/core/meta.rs:10`](../../src/core/meta.rs))。
@@ -59,7 +75,7 @@ mneme 的 `core` 模块用目录:
 
 ```text
 src/
-  lib.rs          # crate 根:pub mod core/memory;私有 mod index/life/persist/query
+  lib.rs          # crate 根:pub mod core/memory;私有 mod index/life/persist/quant/query
   core/           # L0 原语层(公开)
     mod.rs        # 声明子模块
     types.rs error.rs metric.rs simd.rs heap.rs varint.rs meta.rs bitset.rs text.rs
@@ -79,6 +95,9 @@ src/
     mod.rs parse/ display.rs json.rs iso.rs plan.rs zmap.rs bm25.rs fusion.rs exec.rs
   life/           # L5 生命周期层(crate 内部)
     mod.rs compact.rs maintenance.rs
+  quant/          # L6 量化原语(crate 内部;纯原语,依赖等级同 L0)
+    mod.rs f16.rs scalar_i8.rs rescore.rs support.rs
+  fuzzing.rs      # fuzz 专用解析入口(feature "fuzzing";仅 fuzz 构建)
 ```
 
 `src/core/mod.rs` 只做模块声明与文档:
@@ -114,6 +133,37 @@ pub mod varint;
 >
 > 见 [`src/persist/source.rs:89-92`](../../src/persist/source.rs)。关闭 feature 时该类型
 > 与相关方法都不参与编译,由 `FileSource` 兜底(见 [09 §4.2](09-cfg-unsafe-simd.md))。
+
+条件还能加在**模块声明**上。L6 的 `quant` 模块把 f16 子模块整个挂上 feature 门:
+
+```rust
+pub(crate) mod rescore;
+pub(crate) mod scalar_i8;
+mod support;
+
+#[cfg(feature = "quant-f16")]
+pub(crate) mod f16;
+```
+
+见 [`src/quant/mod.rs:7-12`](../../src/quant/mod.rs)。关闭 `quant-f16` 时 `f16.rs` 根本不参与
+编译,`persist`/`index` 里对它的调用各自带门控(见 [09 §1.1](09-cfg-unsafe-simd.md) 的
+`cfg!` 单点门控)。`use` 也能带条件,测试模块里常用**互补条件**成对引入:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[cfg(not(feature = "quant-f16"))]
+    use crate::core::error::MnemeError;
+    use crate::core::options::VectorFormat;
+    ...
+}
+```
+
+见 [`src/quant/mod.rs:16-21`](../../src/quant/mod.rs)。`#[cfg(not(feature = "quant-f16"))] use ...`
+只在关闭 feature 时引入 `MnemeError`,这样两种构建下都不会出现"未使用 import"告警;
+单测文件里也有 `#[cfg(test)] use ...`,只给测试代码引入辅助类型
+(见 [`src/quant/f16.rs:9-10`](../../src/quant/f16.rs))。
 
 ---
 
@@ -346,6 +396,8 @@ Rust 的文档注释会被 `cargo doc` 渲染成 HTML,也是 doctest 的来源�
 
 - `src/lib.rs` 是 crate 根,声明模块、重导出公共 API、写 crate 级属性。
 - 模块用 `mod` 声明,可拆成文件/目录;`mod.rs` 只做组织与 `pub use`。
+- `mod`/`use`/`pub use` 都能用 `#[cfg(...)]` 条件化(L6 的 `f16` 子模块、`fuzzing` 入口与
+  `AsyncNamespace` 重导出),测试里常用互补条件成对声明,避免"未使用 import"告警。
 - 默认私有;`pub` / `pub(crate)` / `pub(super)` 逐级放开;重导出同样能带可见性(`pub(crate) use`)。
 - trait 方法要先 `use` 对应 trait 才能调用,如 `std::fmt::Write` 的 `write_char`/`write_str`。
 - `pub use` 重导出让用户只依赖稳定路径,文件结构可自由重构。

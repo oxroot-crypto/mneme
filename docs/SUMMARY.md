@@ -48,3 +48,4 @@
 - [08 模块、可见性与文档](rust/08-modules-docs.md)
 - [09 条件编译、unsafe 与 SIMD](rust/09-cfg-unsafe-simd.md)
 - [10 测试与属性测试](rust/10-testing.md)
+- [11 异步与 tokio 最小封装](rust/11-async-tokio.md)

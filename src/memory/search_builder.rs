@@ -251,3 +251,86 @@ impl std::fmt::Debug for SearchBuilder<'_> {
             .finish_non_exhaustive()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::core::options::Feedback;
+    use crate::core::types::RowId;
+    use crate::memory::engine::Mneme;
+    use crate::memory::record::{Hit, Record};
+    use crate::memory::rerank::QueryCtx;
+
+    #[test]
+    fn query_id_is_carried_into_hits_and_feedback_idempotency() {
+        let db = Mneme::in_memory(2).expect("in_memory");
+        let ns = db.namespace("t");
+        ns.insert(Record::new(vec![1.0, 0.0]).key("a"))
+            .expect("insert");
+        let hits = ns
+            .search()
+            .vector(&[1.0, 0.0])
+            .top_k(1)
+            .query_id(QueryId(42))
+            .execute()
+            .expect("search");
+        assert_eq!(
+            hits[0].query_id,
+            QueryId(42),
+            "构建器指定的幂等标识原样回传"
+        );
+        assert!(
+            ns.feedback(hits[0].rowid, Feedback::Used, QueryId(42))
+                .expect("feedback")
+        );
+        assert!(
+            !ns.feedback(hits[0].rowid, Feedback::Used, QueryId(42))
+                .expect("feedback"),
+            "同一 (rowid, query_id) 只记一次"
+        );
+    }
+
+    struct ReversingReranker {
+        calls: AtomicUsize,
+    }
+
+    impl Reranker for ReversingReranker {
+        fn rerank(&self, _ctx: &QueryCtx<'_>, mut hits: Vec<Hit>) -> Vec<Hit> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            hits.reverse();
+            hits
+        }
+    }
+
+    #[test]
+    fn rerank_hook_is_applied_once_without_changing_hit_set() {
+        let db = Mneme::in_memory(2).expect("in_memory");
+        let ns = db.namespace("t");
+        for key in ["a", "b", "c"] {
+            ns.insert(Record::new(vec![1.0, 0.0]).key(key))
+                .expect("insert");
+        }
+        let reranker = Arc::new(ReversingReranker {
+            calls: AtomicUsize::new(0),
+        });
+        let hits = ns
+            .search()
+            .vector(&[1.0, 0.0])
+            .top_k(3)
+            .rerank(reranker.clone())
+            .execute()
+            .expect("search");
+        assert_eq!(reranker.calls.load(Ordering::Relaxed), 1, "钩子调用一次");
+        assert_eq!(hits.len(), 3, "命中集合不变");
+        let mut rowids: Vec<RowId> = hits.iter().map(|hit| hit.rowid).collect();
+        rowids.sort();
+        rowids.dedup();
+        assert_eq!(rowids.len(), 3, "三个不同命中");
+        assert!(
+            hits.windows(2).all(|pair| pair[0].rowid > pair[1].rowid),
+            "钩子反转了同分命中的顺序"
+        );
+    }
+}

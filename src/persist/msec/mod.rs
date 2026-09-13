@@ -44,6 +44,17 @@ pub(crate) const MAGIC: [u8; 4] = *b"MSC1";
 pub(crate) const HEADER_LEN: u16 = 192;
 /// 头部 CRC 覆盖的字节数(CRC 字段之前)。
 const HEADER_CRC_COVER: usize = 160;
+/// 头部 9 组区域 `offset/len` 对的起始偏移(每组 16 B,字段顺序见设计 04 §2.2)。
+const HEADER_REGION_BASE: usize = 16;
+/// 头部区域 `offset/len` 对的步长。
+const HEADER_REGION_STRIDE: usize = 16;
+/// 头部 CRC 字段的偏移(4 B,紧随覆盖区)。
+const HEADER_CRC_OFFSET: usize = HEADER_CRC_COVER;
+
+/// 第 `index` 组区域 `offset/len` 对的头部偏移。
+const fn region_offset(index: usize) -> usize {
+    HEADER_REGION_BASE + index * HEADER_REGION_STRIDE
+}
 /// 墓碑版本在 `version_table` 中的 `doc_offset` 哨兵(无记录体)。
 pub(crate) const TOMBSTONE_DOC_OFFSET: u64 = u64::MAX;
 /// `version_table` 单行定长字节数。

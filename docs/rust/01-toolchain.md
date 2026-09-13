@@ -108,6 +108,12 @@ categories = ["database"]
 default = ["mmap"]
 # 打开本 feature 时才引入可选依赖 memmap2。
 mmap = ["dep:memmap2"]
+# L6 f16 量化副本:引入 `half`;关闭时 `VectorFormat::F16` 于构造期返回 `Unsupported`。
+quant-f16 = ["dep:half"]
+# L6 async 门面:引入 `tokio` 的阻塞线程池;核心库零 tokio。
+async = ["dep:tokio"]
+# fuzz 专用解析入口:只服务 `fuzz/` 构建,不改变运行时行为。
+fuzzing = []
 ```
 
 - `default = ["mmap"]` 表示不额外指定时也启用 `mmap`;`cargo build --no-default-features`
@@ -131,14 +137,22 @@ thiserror = "2"
 crc32fast = "1"
 # L3 索引层的 mmap 零拷贝读;可选,由 feature `mmap` 控制。
 memmap2 = { version = "0.9", optional = true }
+# L6 f16 量化副本的 IEEE 754 half 编解码;可选,由 feature `quant-f16` 控制。
+half = { version = "2", optional = true }
+# L6 async 门面的 `spawn_blocking`;可选,由 feature `async` 控制;只开 `rt`。
+tokio = { version = "1", optional = true, default-features = false, features = ["rt"] }
 
 [dev-dependencies]
 proptest = "1"
 tempfile = "3"
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false }
 
 [[bench]]
 name = "hnsw"
+harness = false
+
+[[bench]]
+name = "quant"
 harness = false
 ```
 
@@ -151,12 +165,13 @@ harness = false
 - 版本写法 `"1"` 是 **caret 语义**:等价于 `"^1"`,表示"任何 `1.x.y`",但**不允许 `2.0.0`**。
   mneme 规范禁止 `"*"` 这种无界版本;`"0.9"` 同理表示 `>=0.9.0, <0.10.0`。
 - `optional = true` 的依赖必须被某个 feature 用 `dep:` 引入,否则永远不会参与编译。
-- `criterion` 用了 `default-features = false`:关掉它自带的绘图等默认功能,只保留
-  `cargo_bench_support`(让 `cargo bench` 认识它)。下方 `[[bench]]` 声明基准目标
-  `benches/hnsw.rs`,并关掉 libtest 的默认 `harness`——基准由 criterion 自己驱动。
+- `criterion` 用了 `default-features = false`:关掉它自带的绘图等默认功能;
+  `black_box` 自 0.6 起改由 `std::hint` 提供,bench 不再从 criterion 引入。下方
+  两个 `[[bench]]` 声明基准目标 `benches/hnsw.rs` 与 `benches/quant.rs`,并关掉
+  libtest 的默认 `harness`——基准由 criterion 自己驱动。
 - 新增依赖前必须论证(见 [CONTRIBUTING.md](../../CONTRIBUTING.md)):体积、编译时间、
   维护活跃度、能否零依赖自研。mneme 的复杂算法(HNSW、BM25、量化)全部自研,
-  依赖白名单上限 4 个(不含 feature 引入的 `memmap2`)。
+  依赖白名单上限 4 个(不含 feature 引入的 `memmap2`、`half`、`tokio`)。
 - `thiserror` 是**过程宏(proc-macro)** crate,用来给错误枚举自动生成样板代码,见 [05 章](05-errors.md)。
 
 ### 4.3 edition 与 MSRV:两个"版本"
@@ -280,7 +295,7 @@ cargo run --example hello
 >
 > 同族的 `format!` 不打印,而是直接产出一个 `String`。格式参数还能带**宽度与补零**:
 > `{month:02}` 按两位输出、不足补 0,`{milli:03}` 补到三位——L4 的 ISO 8601
-> 格式化就用它拼出定宽时间戳(见 [`src/query/iso.rs:182-193`](../../src/query/iso.rs))。
+> 格式化就用它拼出定宽时间戳(见 [`src/query/iso.rs:191-201`](../../src/query/iso.rs))。
 
 ---
 

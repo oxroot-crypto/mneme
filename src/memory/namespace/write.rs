@@ -156,7 +156,7 @@ impl Namespace {
             let Some(rowid) = ws.key_index.get(&(ns_id, Key::new(key))).copied() else {
                 return Ok(false);
             };
-            let seqno = ws.alloc_seqno();
+            let seqno = ws.alloc_seqno()?;
             ws.tombstone(rowid, config.clock.now_unix_ms(), seqno)
         })
     }
@@ -177,7 +177,7 @@ impl Namespace {
             if ws.closed {
                 return Err(MnemeError::Closed);
             }
-            let seqno = ws.alloc_seqno();
+            let seqno = ws.alloc_seqno()?;
             ws.tombstone(id, config.clock.now_unix_ms(), seqno)
         })
     }
@@ -311,7 +311,7 @@ impl Namespace {
             validate_insert(&config, &rec)?;
             let now = config.clock.now_unix_ms();
             let new_valid_from = rec.valid_from.unwrap_or(now);
-            let seqno = ws.alloc_seqno();
+            let seqno = ws.alloc_seqno()?;
             let slot_data = build_slot(SlotSpec {
                 ns_id,
                 ns_path,
@@ -347,4 +347,48 @@ fn reconcile_supersede_key(mut rec: Record, key: &str) -> Result<Record> {
         Some(_) => {}
     }
     Ok(rec)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::engine::Mneme;
+
+    fn inserted(outcome: InsertOutcome) -> RowId {
+        match outcome {
+            InsertOutcome::Inserted(id) | InsertOutcome::Merged(id) => id,
+            other => panic!("期望写入,得到 {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_by_rowid_updates_visible_and_reports_missing() {
+        let db = Mneme::in_memory(2).expect("in_memory");
+        let ns = db.namespace("t");
+        let id = inserted(
+            ns.insert(Record::new(vec![1.0, 0.0]).key("a"))
+                .expect("insert"),
+        );
+        let patch = UpdatePatch {
+            importance: Some(0.75),
+            ..UpdatePatch::default()
+        };
+        assert_eq!(
+            ns.update_by_rowid(id, patch).expect("update"),
+            UpdateOutcome::Updated(id)
+        );
+        let record = ns.get_by_rowid(id).expect("get").expect("可见");
+        assert_eq!(record.importance(), 0.75);
+
+        let tombstoned = inserted(
+            ns.insert(Record::new(vec![0.0, 1.0]).key("b"))
+                .expect("insert"),
+        );
+        assert!(ns.delete_by_rowid(tombstoned).expect("delete"));
+        assert_eq!(
+            ns.update_by_rowid(tombstoned, UpdatePatch::default())
+                .expect("update"),
+            UpdateOutcome::NotFound
+        );
+    }
 }
