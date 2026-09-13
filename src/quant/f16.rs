@@ -102,7 +102,7 @@ mod tests {
         }
     }
 
-    /// 特殊值透传与溢出饱和:`NaN`/`±Inf` 保持,超出 `±65504` 的有限值
+    /// 特殊值透传与溢出饱和:`NaN`/`±Inf` 保持,超出舍入中点约 `±65520` 的有限值
     /// 饱和为无穷(与 `half::f16::from_f32` 的 IEEE 语义一致)。
     #[test]
     fn special_values_are_preserved_and_overflow_saturates() {
