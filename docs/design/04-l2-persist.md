@@ -20,7 +20,7 @@ agent_memory/
 ├── MANIFEST.000041      # 旧版本 MANIFEST(write-once,保留最近 2 个)
 ├── MANIFEST.000042      # 当前版本 MANIFEST
 ├── wal/
-│   └── wal_000001.log   # 预写日志(L2 只有这一个;多文件轮转是 L5,见 §3.2)
+│   └── wal_000001.log   # 预写日志(单文件为 L2 形态;L5 起按字节上限多文件轮转,见 §3.2)
 ├── segments/
 │   ├── seg_000007.vsec  # 向量段(vectors + norm + 删除位图)
 │   ├── seg_000007.msec  # 元数据段(记录体 + 版本链表 + key 索引 + zone map + bloom + 倒排 + ns 统计)
@@ -876,7 +876,7 @@ L2 提供 `FileSource`(std,`seek+read`);`MmapSource`(feature `mmap`,memmap2)按�
 白名单([01 §5](01-overview.md))**自 L3 起已实现**:段读取经 `source::read_whole` 统一走
 `MmapSource`(默认开)或 `FileSource`(feature 关闭)。索引层与恢复层只依赖此 trait——
 mmap 是**优化**而非功能依赖,按 feature `mmap` 二选一(关闭后编译为 `FileSource`,读吞吐降、正确性不变)。
-L3 恢复阶段仍需自有字节以重建内存表,真正的"零拷贝驻留"随 L6 的段句柄重构落地。
+L3 恢复阶段仍需自有字节以重建内存表,真正的"零拷贝驻留"待段句柄重构(**尚未落地**,属后续收尾,见 [14 §4](14-testing.md))。
 
 ---
 

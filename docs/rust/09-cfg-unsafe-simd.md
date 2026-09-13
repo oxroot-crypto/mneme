@@ -3,7 +3,8 @@
 > **本章目标**:理解 `#[cfg(...)]` 条件编译、`unsafe` 的含义与边界,以及 mneme 如何用 SIMD
 > 内联指令加速点积。
 > **前置**:[04 章](04-borrowing-strings-slices.md)(切片与引用)、[08 章](08-modules-docs.md)。
-> **对应源码**:[`src/core/simd.rs`](../../src/core/simd.rs)。
+> **对应源码**:[`src/core/simd.rs`](../../src/core/simd.rs)、[`src/quant/support.rs`](../../src/quant/support.rs)、
+> [`src/quant/mod.rs`](../../src/quant/mod.rs)。
 
 这一章涉及 Rust 里唯一"绕过编译器保护"的部分。**mneme 把 `unsafe` 压缩到全库仅两处**
 (L0 `src/core/simd.rs` 的 arch 内联与 L2 `src/persist/source.rs` 的 `MmapSource`),
@@ -42,8 +43,8 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 > **语句/块表达式**上。上面 `dot` 就是后者:三个互斥的块各自带 `#[cfg]`,编译后只留下一个。
 > 注意块本身仍要写成 `{ ... }`,属性写在块前面。注意:上例为教学而把
 `simd.rs` 不同位置的片段拼在一起——`dot` 内部三段 `#[cfg]` 分发(含
-`not(any(...))` 兜底)才是 50–65 行的连续原文;`fn dot_x86` 在 100 行附近,
-`mod neon` 在 182 行附近。
+`not(any(...))` 兜底)才是 50–65 行的连续原文;`fn dot_x86` 在 128 行附近,
+`mod neon` 在 247 行附近。
 
 常用条件:
 
@@ -68,6 +69,24 @@ if cfg!(target_arch = "x86_64") { ... }
 
 区别:`#[cfg]` 在**编译期把代码整段删掉**;`cfg!` 在编译期展开成常量 `true`/`false`,**两个分支都仍会被编译和类型检查**,只是死分支会被优化掉。所以需要"两个分支都得能编译"时用 `cfg!`,需要"平台相关代码根本不参与编译"时用 `#[cfg]`。
 
+L6 的量化格式门控只用一次 `cfg!`:
+
+```rust
+pub(crate) fn ensure_format_supported(format: VectorFormat) -> Result<()> {
+    if format == VectorFormat::F16 && !cfg!(feature = "quant-f16") {
+        return Err(MnemeError::Unsupported {
+            feature: "quant-f16",
+        });
+    }
+    Ok(())
+}
+```
+
+见 [`src/quant/support.rs:14-20`](../../src/quant/support.rs)。这里刻意**不用** `#[cfg]` 写两份函数:
+`F16` 的错误返回需要无条件参与类型检查(分支无论开不开 feature 都得能编译),关闭 feature 时
+`cfg!` 折叠成 `false`、死分支由优化器删掉;若用 `#[cfg]`,就得维护两份几乎相同的签名与文档,
+还容易漂移——"两个分支都得能编译"正是 `cfg!` 的适用场景。
+
 ### 1.2 mneme 的运行时分发
 
 `dot` 先做编译期架构选择,再在 x86_64 上做**运行时 CPU 特性检测**:
@@ -80,7 +99,7 @@ if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
 }
 ```
 
-见 [`src/core/simd.rs:100-108`](../../src/core/simd.rs)。
+见 [`src/core/simd.rs:128-136`](../../src/core/simd.rs)。
 
 - `is_x86_feature_detected!` 是标准库宏,在**运行时**查询 CPU 是否支持某指令集。
 - 这样同一个二进制能跑在支持 AVX2 的新 CPU(快)和不支持的旧 CPU(回退 SSE2)上。
@@ -111,7 +130,7 @@ pub unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
 }
 ```
 
-见 [`src/core/simd.rs:124-128`](../../src/core/simd.rs)。
+见 [`src/core/simd.rs:152-158`](../../src/core/simd.rs)。
 
 - `unsafe fn` 表示"调用此函数需要满足某些前提"。
 - `unsafe { ... }` 块表示"这里我做了不安全操作,并为此负责"。
@@ -127,7 +146,7 @@ mneme 规范要求**每个 `unsafe` 块必须有 `// SAFETY:` 注释**,逐条说
 let mut sum = unsafe { ... };
 ```
 
-见 [`src/core/simd.rs:127-128`](../../src/core/simd.rs)。
+见 [`src/core/simd.rs:156-157`](../../src/core/simd.rs)。
 
 调用处也要证明:
 
@@ -136,7 +155,7 @@ let mut sum = unsafe { ... };
 unsafe { x86::dot_avx2(a, b) }
 ```
 
-见 [`src/core/simd.rs:102-103`](../../src/core/simd.rs)。
+见 [`src/core/simd.rs:130-131`](../../src/core/simd.rs)。
 
 > 没有 `// SAFETY:` 的 `unsafe` 一律视为违规。这不是形式主义:它把"为什么这段代码是安全的"
 > 写进代码,让后来者能审计。
@@ -150,7 +169,7 @@ unsafe { x86::dot_avx2(a, b) }
 pub unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 { ... }
 ```
 
-见 [`src/core/simd.rs:123-124`](../../src/core/simd.rs)。
+见 [`src/core/simd.rs:152-153`](../../src/core/simd.rs)。
 
 - 它让编译器为这个函数生成使用 AVX2/FMA 指令的代码。
 - 因为目标 CPU 不一定支持,函数被标记为 `unsafe`,调用者必须先检测(§1.2)。
@@ -165,7 +184,7 @@ SIMD 内联函数需要指针:
 let va = _mm256_loadu_ps(a.as_ptr().add(i));
 ```
 
-见 [`src/core/simd.rs:131`](../../src/core/simd.rs)。
+见 [`src/core/simd.rs:160`](../../src/core/simd.rs)。
 
 - `a.as_ptr()` 得到 `*const f32` 裸指针。
 - `.add(i)` 指针算术,向后移动 `i` 个元素(不是字节)。

@@ -204,7 +204,7 @@ impl<'a> RecordRef<'a> {
 }
 
 /// 点读的 owned 快照(跨线程点读与 async 门面用;同步读仍可用 `RecordRef`)。
-/// 字段与 `RecordRef` 同口径,另含 `RowId`;可安全跨线程移动。
+/// 另含 `RowId`;可安全跨线程移动。不含事务时间 `created_at`(需要它请用 `RecordRef`)。
 pub struct StoredRecord { /* private */ }
 impl StoredRecord {
     pub fn rowid(&self) -> RowId;
@@ -940,7 +940,7 @@ b.check()?;                  // 全绿 = 备份有效(写进 CI,见 14 §6)
 | `ef` | 4096 | 仅 L3+ |
 | WAL 单帧 payload | 16 MiB | 撕裂写检测与内存上界;**当前保留限额,尚未在写路径强制** |
 | 命名空间深度 | 32 级 | `a/b/c/...`,对应 `Limits.ns_depth` |
-| 自定义关系类型 | 65520 个 | u16 编号空间,内置占用 0..=15;超限 `TooLarge` |
+| 自定义关系类型 | 65520 个 | u16 编号空间,内置占用 0..=15;超限 `TooLarge`;**规划,当前 `custom` 未提供** |
 
 限额通过 `.limits(Limits { .. })` 调整;调大以内存/恢复时间为代价,请评估后再改。
 

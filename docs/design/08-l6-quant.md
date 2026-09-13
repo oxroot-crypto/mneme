@@ -20,7 +20,7 @@
 >    scale 无法直接喂给整数点积指令;`core::simd::dot_u8_f32` 每行只读 `d` 字节
 >    (带宽 ÷4),AVX2 可用时走 `_mm256_cvtepu8_epi32` + FMA,否则回退标量;
 > 3. **每维参数表紧随 norm 区之后写入 qvec 区**(vsec 头仍是定长 64 B),而非
->    扩长头部;`VsecView::quant_params`/`quant_row` 提供零拷贝视图。
+>    扩长头部;`VsecView::quant_row` 提供零拷贝切片,`quant_params` 按需解码参数表。
 >
 > 量化副本属**持久段特性**:纯内存库配置量化在构造期返回 `Unsupported`
 > (`FC-QUANT-ERR-002`);`src/quant/` 为纯原语模块(无 I/O/锁/全局态,依赖等级同
@@ -191,7 +191,7 @@ IEEE 754 half:1 位符号 + 5 位指数 + 10 位尾数。相对精度 $2^{-11} \
 
 ---
 
-## 6. async 门面(lib.rs)
+## 6. async 门面(memory::async_facade.rs)
 
 ```rust
 // 同步与异步方法不能同名挂在同一类型上(Rust 方法名唯一),故异步门面是
@@ -205,11 +205,21 @@ impl Namespace {
 }
 
 #[cfg(feature = "async")]
+async fn run_blocking<T, F>(task: F) -> T
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    tokio::task::spawn_blocking(task)
+        .await
+        .expect("async 门面:阻塞任务异常终止") // 核心不 panic,见 L0 契约;属文档化例外
+}
+
+#[cfg(feature = "async")]
 impl AsyncNamespace {
     pub async fn insert(&self, rec: Record) -> Result<InsertOutcome> {
-        let this = self.inner.clone();              // Arc 克隆,无生命周期问题
-        tokio::task::spawn_blocking(move || this.insert(rec))
-            .await.expect("blocking task panicked") // 核心不 panic,见 L0 契约
+        let inner = self.inner.clone();             // Arc 克隆,无生命周期问题
+        run_blocking(move || inner.insert(rec)).await
     }
 }
 ```

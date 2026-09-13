@@ -5,7 +5,8 @@
 > **对应源码**:[`src/core/simd.rs`](../../src/core/simd.rs)、[`src/core/heap.rs`](../../src/core/heap.rs)、
 > [`src/core/varint.rs`](../../src/core/varint.rs)、[`src/memory/namespace/access.rs`](../../src/memory/namespace/access.rs)、
 > [`src/index/hnsw.rs`](../../src/index/hnsw.rs)、[`src/index/filtered.rs`](../../src/index/filtered.rs)、
-> [`src/query/bm25.rs`](../../src/query/bm25.rs)、[`src/query/fusion.rs`](../../src/query/fusion.rs)。
+> [`src/query/bm25.rs`](../../src/query/bm25.rs)、[`src/query/fusion.rs`](../../src/query/fusion.rs)、
+> [`src/quant/scalar_i8.rs`](../../src/quant/scalar_i8.rs)、[`src/quant/f16.rs`](../../src/quant/f16.rs)。
 
 Rust 的迭代器是**惰性(lazy)**的:你写一串转换,只有到"消费"时(如 `sum`、`collect`、`for`)
 才真正执行。它既表达力强,又能被编译器优化到和手写循环一样快。
@@ -87,6 +88,7 @@ pub fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
 | `rev()` | 反向迭代(`DoubleEndedIterator` 才有) |
 | `copied()` | 把 `&T` 变成 `T`(`T: Copy`),省去 `|x| *x` |
 | `flat_map(f)` | 每个元素展开成多个 |
+| `chunks(n)` / `chunks_exact(n)` | 把切片切成固定大小的块(产出 `&[T]`);`chunks_exact` 丢弃不足一块的尾块 |
 | `peekable()` | 可以偷看下一个元素 |
 | `find_map(f)` | `map` + `find` 合一:闭包返回 `Option`,第一个 `Some` 即为结果 |
 
@@ -112,8 +114,31 @@ view.ns_registry.iter().find_map(|(id, path)| {
 })
 ```
 
-见 [`src/query/exec.rs:195-202`](../../src/query/exec.rs)。闭包返回 `Option`,所以既能"过滤掉
+见 [`src/query/exec.rs:216-223`](../../src/query/exec.rs)。闭包返回 `Option`,所以既能"过滤掉
 不关心的项",又能顺手做转换;`**path` 的双重解引用见 [04 §3.3](04-borrowing-strings-slices.md)。
+
+`chunks_exact(n)` 是"按块处理连续数据"的入口,L6 的量化编解码到处在用它:i8 参数表以交错
+`(v_min, v_max)` 存储,解码时每两块取一对维参数——
+
+```rust
+for (index, pair) in table.chunks_exact(2).enumerate() {
+    let (min, max) = (pair[0], pair[1]);
+    if !min.is_finite() || !max.is_finite() || min > max {
+        return Err(corrupt(&format!("i8 参数表第 {index} 维非法")));
+    }
+    mins.push(min);
+    maxs.push(max);
+}
+```
+
+见 [`src/quant/scalar_i8.rs:45-52`](../../src/quant/scalar_i8.rs)。`chunks_exact(2)` 保证每块
+恰好两个元素,所以 `pair[0]`/`pair[1]` 索引安全;f16 码流同理,每 2 字节解出一个小端 `u16`
+再还原成 `f16`(见 [`src/quant/f16.rs:33-36`](../../src/quant/f16.rs))。
+
+> `chunks(n)` 与 `chunks_exact(n)` 的区别在**尾块**:`chunks` 会产出最后一个不足 `n` 的短块,
+> `chunks_exact` 直接丢弃。所以 `chunks_exact` 常与 `len().is_multiple_of(n)` 的入口校验搭配
+> (见 [02 §2.1](02-values-and-ownership.md));`windows(n)`(§3.4)则是**滑动**窗口,
+> 相邻块互相重叠。
 
 另外两个不属于迭代器、但总在链尾露脸的 `Vec` 方法:
 
@@ -121,7 +146,7 @@ view.ns_registry.iter().find_map(|(id, path)| {
   收集到的其余项合并成一个列表再 `into_boxed_slice`,见
   [`src/query/parse.rs:191-194`](../../src/query/parse.rs);
 - `Vec::truncate(n)`:只保留前 `n` 个元素(多出的直接丢掉)。L4 执行管线在融合排序后按 `top_k`
-  截断,见 [`src/query/exec.rs:369`](../../src/query/exec.rs)。
+  截断,见 [`src/query/exec.rs:391`](../../src/query/exec.rs)。
 
 ### 3.1 `enumerate` 的例子
 
@@ -197,7 +222,7 @@ let max = oriented.iter().copied().fold(f64::NEG_INFINITY, f64::max);
 
 - **`binary_search`**:在**已排序**切片上二分定位,返回 `Ok(下标)` 或 `Err(插入点)`;
   L5 的 compaction 用它把"按槽位排序的幸存列表"定位到目标槽位(见
-  [`src/memory/engine_ops.rs:397`](../../src/memory/engine_ops.rs))。
+  [`src/memory/engine_ops.rs:431`](../../src/memory/engine_ops.rs))。
 
 - **`filter_map`**:`filter` + `map` 合一,闭包返回 `Option`,`None` 直接丢弃:
 
@@ -209,7 +234,7 @@ let max = oriented.iter().copied().fold(f64::NEG_INFINITY, f64::max);
       .collect()
   ```
 
-  见 [`src/memory/table/state.rs:495-499`](../../src/memory/table/state.rs)。和 `find_map`
+  见 [`src/memory/table/state.rs:536-540`](../../src/memory/table/state.rs)。和 `find_map`
   (§3)的区别是:它消费**整个**迭代器,而不是拿到第一个 `Some` 就停。
 
 - **`windows(n)`**:滑动窗口,每次产出连续的 `n` 个元素的切片;CJK bigram 分词靠它:
@@ -221,12 +246,12 @@ let max = oriented.iter().copied().fold(f64::NEG_INFINITY, f64::max);
   }
   ```
 
-  见 [`src/core/text.rs:47`](../../src/core/text.rs)。窗口是只读切片,不复制数据;
+  见 [`src/core/text.rs:55`](../../src/core/text.rs)。窗口是只读切片,不复制数据;
   `n = 0` 会 panic,`n > len` 时产出空迭代器(循环体一次也不执行)。
 
 - **`peekable()`**(表里已列):包成"可偷看下一个而不消费"的 `Peekable`,适合解析器
   判断"还有没有下一个"。CJK 分词按连续字符成段时也先用它,再 `while let` 逐个消费
-  (见 [`src/core/text.rs:57`](../../src/core/text.rs))。
+  (见 [`src/core/text.rs:66`](../../src/core/text.rs))。
 
 ---
 
@@ -264,7 +289,7 @@ self.heap.sort_by(|a, b| {
 });
 ```
 
-见 [`src/core/heap.rs:203-211`](../../src/core/heap.rs)。
+见 [`src/core/heap.rs:207-218`](../../src/core/heap.rs)。
 
 - 闭包参数 `a`、`b` 是 `&Entry<T>`(因为 `sort_by` 传引用)。
 - 返回值是 `std::cmp::Ordering`,三选一:`Less`(a 在前)、`Greater`(b 在前)、`Equal`。
@@ -275,7 +300,7 @@ self.heap.sort_by(|a, b| {
 > `a.score.partial_cmp(&b.score).unwrap()` 的原因:`f32` 的 `partial_cmp` 遇到 `NaN` 返回 `None`,
 > `unwrap()` 会 panic。mneme 绕开浮点比较,改用 `Metric::better` + `Ord` 载荷保证全序:
 > 对任意 `a`、`b`,`is_better(a, b)` 与 `is_better(b, a)` 至多一个为真,相等时再用
-> `a_payload < b_payload` 兜底。见 [`src/core/heap.rs:216-226`](../../src/core/heap.rs)。
+> `a_payload < b_payload` 兜底。见 [`src/core/heap.rs:221-230`](../../src/core/heap.rs)。
 
 ### 4.2 闭包捕获与借用规则
 
@@ -401,7 +426,7 @@ while let Some(current) = frontier.pop() {
 }
 ```
 
-见 [`src/index/hnsw.rs:243-266`](../../src/index/hnsw.rs)。两个堆的分工:
+见 [`src/index/hnsw.rs:320-365`](../../src/index/hnsw.rs)。两个堆的分工:
 
 - `frontier`(最大堆):按"越近键越大",每次弹**最有希望**的候选继续扩展——best-first;
 - `results`(最小堆 + `Reverse`):固定大小 `ef`,只淘汰**最差**。`Reverse` 让"堆顶 =
@@ -425,7 +450,7 @@ if !visited.insert(neighbor) {
 }
 ```
 
-见 [`src/index/hnsw.rs:250-271`](../../src/index/hnsw.rs)。对照 `Vec<u32>` 的 `contains`
+见 [`src/index/hnsw.rs:328-346`](../../src/index/hnsw.rs)。对照 `Vec<u32>` 的 `contains`
 是 $O(n)$ 线性扫描;需要反复问"在不在集合里"时,`HashSet` 的期望 $O(1)$ 是数量级差别
 (代价是哈希与额外内存)。要放进 `HashSet` 的类型必须实现 `Hash + Eq`(见
 [03 §4](03-structs-enums-impl.md))。
@@ -441,9 +466,11 @@ L4 的融合要把两个通道的分数按 `RowId` 累加:同一个文档可能�
 
 ```rust
 let mut fused: HashMap<RowId, (SlotId, f32)> = HashMap::new();
-for (rank, hit) in channel.iter().enumerate() {
-    let add = 1.0 / (k as f32 + (rank + 1) as f32);
-    fused.entry(hit.rowid).or_insert((hit.slot, 0.0)).1 += add;
+for channel in [&vector, &text] {
+    for (rank, hit) in channel.iter().enumerate() {
+        let add = 1.0 / (k as f32 + (rank + 1) as f32);
+        fused.entry(hit.rowid).or_insert((hit.slot, 0.0)).1 += add;
+    }
 }
 ```
 
@@ -518,6 +545,8 @@ mneme 的测试里也常见 `for (score, id) in [...]` 直接遍历数组,见
 - 迭代器适配器(`map`/`filter`/`zip`/`enumerate`/`rev`/`copied`/`find_map`)+ 消费器
   (`sum`/`collect`/`fold`/`max_by_key`)链式组合,惰性零开销;`Vec::extend`/`Vec::truncate`
   常用来收尾。
+- 切片用 `chunks`/`chunks_exact` 按固定大小分块、`windows` 做滑动窗口;L6 量化编解码靠
+  `chunks_exact` 把码流(每 2 字节一个 f16 分量)拆开。
 - `fold(init, f)` 是带累加器的归约;`f64::min`/`f32::min` 这类方法只要签名对得上,就能当函数指针传给 `fold`。
 - `HashMap::entry(key).or_insert(..)` 一次查找完成"查 / 插 / 改";`keys()` 遍历键;
   `map[&key]` 键不存在会 panic,拿不准时用 `get(..).copied()`;`sort` + `dedup` 是有序去重。

@@ -121,7 +121,7 @@ fn main() -> mneme::Result<()> {
 | [12 部署形态](docs/design/12-deployment.md) | 多进程只读、WASM 适配、可观测 |
 | [13 记忆模式手册](docs/design/13-cookbook.md) | Agent 记忆配方(可直接照抄) |
 | [spec/contracts.md](docs/spec/contracts.md) | 形式化契约矩阵(FC-Matrix) |
-| [rust/README.md](docs/rust/README.md) | **Rust 零基础教学**(10 章):以 mneme 源码为教材,面向没有 Rust 基础的开发者 |
+| [rust/README.md](docs/rust/README.md) | **Rust 零基础教学**(11 章):以 mneme 源码为教材,面向没有 Rust 基础的开发者 |
 
 ## 构建文档站点
 

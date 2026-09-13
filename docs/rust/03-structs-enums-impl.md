@@ -7,7 +7,7 @@
 > [`src/core/error.rs`](../../src/core/error.rs)、[`src/core/options/`](../../src/core/options)、
 > [`src/memory/builder.rs`](../../src/memory/builder.rs)、[`src/memory/pred.rs`](../../src/memory/pred.rs)、
 > [`src/index/hnsw.rs`](../../src/index/hnsw.rs)、[`src/index/hidx.rs`](../../src/index/hidx.rs)、
-> [`src/query/parse.rs`](../../src/query/parse.rs)。
+> [`src/query/parse.rs`](../../src/query/parse.rs)、[`src/persist/flush.rs`](../../src/persist/flush.rs)。
 
 Rust 没有"类(class)",而是把数据和行为分开:
 
@@ -68,7 +68,7 @@ let fast = GraphParams { m: 4, ..GRAPH_PARAMS };
 ```
 
 见 [`src/index/hidx.rs:401-407`](../../src/index/hidx.rs) 与
-[`src/index/hidx.rs:519-526`](../../src/index/hidx.rs)。要点:
+[`src/index/hidx.rs:523-525`](../../src/index/hidx.rs)。要点:
 
 - `..` 后面的表达式必须与目标类型相同,可以是变量、常量,也可以是 `T::default()`;
 - 更新语法按字段依次构造,`..` 表达式里**未被显式覆盖的字段会被移动**进新值;
@@ -213,7 +213,7 @@ pub fn into_sorted_vec(mut self) -> Vec<T> {
 
 `mut self` 不是一种新的接收者,而是"`self`(值接收) + 一个可变的局部绑定"。调用后原 `TopK`
 被**移动**进函数,不能再使用——这正是 `into_*` 命名的语义。见
-[`src/core/heap.rs:201-213`](../../src/core/heap.rs)。
+[`src/core/heap.rs:205-214`](../../src/core/heap.rs)。
 
 #### 2.2.3 链式方法:`mut self -> Self` 与构建者模式
 
@@ -353,6 +353,46 @@ pub enum Expr {
 > `Box` 在 prelude 里,无需 `use`;`Box::new(x)` 把 `x` 移到堆上,所有者离开作用域时
 > 连同堆内存一起自动释放(所有权规则,见 [02 §3](02-values-and-ownership.md))。
 
+### 3.5 不是所有分派都要 trait:枚举 + `match` 的量化格式分派
+
+L6 的 `VectorFormat` 只有三个变体,决定"向量在段文件里怎么存":
+
+```rust
+pub enum VectorFormat {
+    F32,        // 仅 f32 原向量
+    F16,        // 额外维护 f16 量化副本(feature `quant-f16`)
+    I8Rescored, // i8 副本 + 两阶段重打分
+}
+```
+
+见 [`src/core/options/index.rs:87-97`](../../src/core/options/index.rs)(上例省略了 `derive` 与各变体
+的文档)。使用时就是一个 `match`,分派到各格式自己的编解码函数(`plan_quant` 节选):
+
+```rust
+match format {
+    VectorFormat::F32 => Ok(None),
+    VectorFormat::I8Rescored => {
+        let params = crate::quant::scalar_i8::build_params(vectors, dimension)?;
+        ...
+    }
+    VectorFormat::F16 => {
+        #[cfg(feature = "quant-f16")]
+        { ... crate::quant::f16::encode_row(vector) ... }
+        #[cfg(not(feature = "quant-f16"))]
+        { Err(MnemeError::Unsupported { feature: "quant-f16" }) }
+    }
+}
+```
+
+见 [`src/persist/flush.rs:205-242`](../../src/persist/flush.rs)。要点:
+
+- **穷尽性是免费的分派约束**:新增格式时,每个漏掉的 `match` 都会在编译期报
+  `non-exhaustive patterns`(见 §3.3),不用维护"实现了 trait 却忘了登记"的注册表;
+- **各格式的差异是"数据"而非"接口"**:i8 要段级 `(v_min, v_max)` 参数表、f16 无参数、
+  f32 没有副本;引入 `trait QuantCodec` 只是把 `match` 藏进 `dyn` 虚表,换不来扩展性——
+  要允许下游扩展或两维度正交组合时才值得引入 trait(见 [06 §4](06-generics-traits.md)),
+  取舍与 §4.2 手写比较 trait 相同:**先看类型系统已能表达什么,再决定要不要抽象**。
+
 ---
 
 ## 4. `#[derive(...)]`:自动生成样板
@@ -401,9 +441,9 @@ pub struct Scoring {                         // 字段含 f32
   所以载荷**不能是 `f32`**(`RowId`、`u32` 可以)。
 - 需要给 `f32` 排序时,用 `f32::total_cmp`(它定义了一个把 `NaN` 也纳入的全序),而不是
   `partial_cmp().unwrap()`(遇 `NaN` 会 panic)。mneme 的 `TopK` 排序不依赖载荷是浮点,而是由
-  `Metric::better` 决定方向,同分再比 `Ord` 载荷。见 [`src/core/heap.rs:201-213`](../../src/core/heap.rs)。
+  `Metric::better` 决定方向,同分再比 `Ord` 载荷。见 [`src/core/heap.rs:221-230`](../../src/core/heap.rs)。
 
-`derive` 也能用在枚举上,见 [`src/core/options/index.rs:66-76`](../../src/core/options/index.rs)
+`derive` 也能用在枚举上,见 [`src/core/options/index.rs:87-97`](../../src/core/options/index.rs)
 的 `VectorFormat`。
 
 ### 4.2 手写比较 trait:字段含 `f32` 又要排序时(L3 的 `Cand`)
@@ -446,7 +486,7 @@ impl Ord for Cand {
 }
 ```
 
-见 [`src/index/hnsw.rs:61-86`](../../src/index/hnsw.rs)。逐条解释:
+见 [`src/index/hnsw.rs:68-95`](../../src/index/hnsw.rs)。逐条解释:
 
 - **`f32::total_cmp` 提供全序**:`partial_cmp` 遇 `NaN` 返回 `None`,而 `Ord::cmp` 必须
   **永远**给出 `Less`/`Equal`/`Greater` 之一。`total_cmp` 按 IEEE-754 位模式定义了一个
@@ -499,7 +539,7 @@ pub enum VectorFormat {
 }
 ```
 
-`#[default]` 指定哪个变体是默认值。见 [`src/core/options/index.rs:67-71`](../../src/core/options/index.rs)。
+`#[default]` 指定哪个变体是默认值。见 [`src/core/options/index.rs:88-96`](../../src/core/options/index.rs)。
 
 ### 5.3 惯用法
 
@@ -563,7 +603,7 @@ pub struct UpdatePatch {
 }
 ```
 
-见 [`src/core/options/write.rs:45-63`](../../src/core/options/write.rs)。
+见 [`src/core/options/write.rs:49-66`](../../src/core/options/write.rs)。
 
 - `Option<T>` 本身就是一个枚举(`Some(T)` / `None`),见 [05 章](05-errors.md)。
 - `Option<Option<T>>` 看似绕,但精确表达了三种语义:**不改 / 清空 / 设为某值**。
@@ -578,6 +618,8 @@ pub struct UpdatePatch {
   (`模式 if 条件`),但穷尽性只看主模式,带守卫的分支之后仍要兜底。
 - 递归 `enum`(如 `Expr`)用 `Box<Expr>`/`Box<[Expr]>` 打断无限大小;固有方法不要求 trait
   在作用域,`#[allow(clippy::…)]` 必须就近写明理由。
+- 枚举 + `match` 本身就是一种分派:量化格式 `VectorFormat` 按变体直接调用各自的编解码函数,
+  不必为每个格式引入 trait;`match` 的穷尽性会在编译期兜住新增变体。
 - `impl` 里:关联函数不带 `self`,方法带 `self`/`&self`/`&mut self`;还能定义关联常量。
 - `#[derive(...)]` 自动生成 `Debug`/`Clone`/`Copy`/比较/`Default` 等;`Default` 也可手写或给枚举变体加 `#[default]`;
   构造时可用结构体更新语法 `..base` 只覆盖部分字段。
