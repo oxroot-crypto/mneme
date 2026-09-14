@@ -154,12 +154,12 @@ Table
 WriterState
 ├── slots:      Arc<Vec<Arc<SlotData>>>  ← 下标 = SlotId(物理版本),只增不减
 ├── dead:       Arc<BitSet>              ← 当前不可见版本位图(按 SlotId;被遮蔽/删除;as_of 仍可读)
-├── key_index:  Arc<HashMap<(NsId, Key), RowId>>  ← key → 稳定 RowId
-├── text_index: Arc<HashMap<(NsId, u64), RowId>>  ← 文本 FNV-1a 哈希 → RowId(精确去重)
-├── versions:   Arc<HashMap<RowId, Vec<SlotId>>>  ← 版本链(按 seqno 升序,含墓碑版本;L2 持久化)
-├── latest:     Arc<HashMap<RowId, SlotId>>       ← 每个 RowId 当前可见版本
-├── out_edges / in_edges: Arc<HashMap<RowId, Vec<Edge>>>  ← 关系邻接表(双向)
-├── access:     Arc<HashMap<RowId, AccessStat>>   ← touch 累积区(L5 落盘)
+├── key_index:  ShardedMap<(NsId, Key), RowId>    ← key → 稳定 RowId;分片共享
+├── text_index: ShardedMap<(NsId, u64), RowId>    ← 文本 FNV-1a 哈希 → RowId(精确去重)
+├── versions:   ShardedMap<RowId, Arc<Vec<SlotId>>> ← 版本链(按 seqno 升序,含墓碑版本;L2 持久化)
+├── latest:     ShardedMap<RowId, SlotId>         ← 每个 RowId 当前可见版本
+├── out_edges / in_edges: ShardedMap<RowId, Vec<Edge>>  ← 关系邻接表(双向)
+├── access:     ShardedMap<RowId, AccessStat>     ← touch 累积区(L5 落盘)
 ├── seqno:      SeqNo                    ← 下一个可分配序号
 ├── next_rowid / next_ns_id: u64 / u32   ← 标识水位
 ├── ns_registry / ns_by_path: Arc<HashMap<…>>     ← 命名空间路径 ↔ NsId 双向注册表
@@ -183,6 +183,13 @@ ReaderView = WriterState 的不可变快照(仅克隆 Arc 句柄):slots / dead /
 - **关系边**:`out_edges`/`in_edges` 双向邻接表,以 `(from, to, kind)` 为唯一键;flush 时并入新段
   relations 区([04 §2.2b](04-l2-persist.md)),compaction 时物化([09 §2](09-memory-model.md))。
 
+- **写放大控制(分块/分片 COW)**:`slot_segment` 是固定块(1024)的 `ChunkedVec`
+  (FC-CORE-POST-009;查询不读、写只 COW 末块);`latest`/`versions`/`key_index`/
+  `text_index`/`access`/`out_edges`/`in_edges` 是固定 256 分片的 `ShardedMap`
+  (FC-CORE-POST-010);内存倒排按命名空间分桶、桶内再按词条与槽位块分片。写事务只对
+  命中的块/分片做写时复制,快照克隆仅复制句柄;`ReaderView` 的不可变语义与逐值结果
+  不变。`slots` 保持连续 `Arc<Vec>`:顺序扫描热路径上分块会引入每元素额外一层间接
+  (同规模基准对照实测回归,50k 冒烟 P50 2.94→3.39ms),其写放大由批量提交摊还。
 - `slots` 的下标即 `SlotId`,**永不回收**——`Vec` 只增不减,
   墓碑槽位保留占位(每槽 = `Arc<SlotData>` 句柄 + 记录体,约百字节级),
   随墓碑比例线性增长,由 compaction 物理回收;

@@ -9,8 +9,8 @@ use std::time::Duration;
 use crate::core::error::{MnemeError, Result};
 use crate::core::metric::Metric;
 use crate::core::options::{
-    Clock, CompactionPolicy, Compression, Dimension, FsyncPolicy, HnswParams, InsertMode, Limits,
-    MonotonicClock, RelationIndex, SystemClock, Tuning, VectorFormat,
+    BuildPrecision, Clock, CompactionPolicy, Compression, Dimension, FsyncPolicy, HnswParams,
+    InsertMode, Limits, MonotonicClock, RelationIndex, SystemClock, Tuning, VectorFormat,
 };
 use crate::memory::config::Config;
 use crate::memory::dedup::Dedup;
@@ -44,13 +44,19 @@ pub struct Builder {
     dedup_threshold: f32,
     quantization: VectorFormat,
     hnsw: HnswParams,
+    build_precision: BuildPrecision,
     compaction: CompactionPolicy,
     retention: Option<Retention>,
     retain_interval: Option<Duration>,
     access_flush_interval: Duration,
     compression: Compression,
+    encryption: Option<crate::crypto::Encryption>,
+    observer: Option<Arc<dyn crate::core::observe::Observer>>,
+    read_only_probe_interval: std::time::Duration,
+    storage: Option<Arc<dyn crate::persist::storage::Storage>>,
     relation_index: RelationIndex,
     parallelism: usize,
+    maintenance: bool,
     tuning: Tuning,
     limits: Limits,
     clock: Arc<dyn Clock>,
@@ -73,13 +79,19 @@ impl Default for Builder {
             dedup_threshold: DEFAULT_DEDUP_THRESHOLD,
             quantization: VectorFormat::default(),
             hnsw: HnswParams::default(),
+            build_precision: BuildPrecision::default(),
             compaction: CompactionPolicy::default(),
             retention: None,
             retain_interval: None,
             access_flush_interval: Duration::from_secs(DEFAULT_ACCESS_FLUSH_SECS),
             compression: Compression::default(),
+            encryption: None,
+            observer: None,
+            read_only_probe_interval: std::time::Duration::from_secs(1),
+            storage: None,
             relation_index: RelationIndex::default(),
             parallelism: 0,
+            maintenance: true,
             tuning: Tuning::default(),
             limits: Limits::default(),
             clock: Arc::new(SystemClock),
@@ -136,6 +148,9 @@ impl Builder {
         if let Some(state) = &recovered {
             self.tuning.stopwords = state.stopwords_enabled;
         }
+        let read_only_probe_interval = self.read_only_probe_interval;
+        // 后台维护开关需在 `into_config` 消费 `self` 之前取出(`FC-LIFE-POST-010`)。
+        let maintenance = self.maintenance;
         let config = Arc::new(self.into_config(dimension, metric));
         let hook = store.as_ref();
         let table = build_table(hook, recovered, &config);
@@ -146,13 +161,28 @@ impl Builder {
             store,
             maintenance: None,
         };
-        // 后台维护:持久库(访问攒批/自动 compaction)或显式开启自动遗忘的纯内存库。
-        if !db.config.read_only && (db.store.is_some() || db.config.retention.is_some()) {
+        // 后台维护:持久库(访问攒批/自动 compaction)或显式开启自动遗忘的纯内存库;
+        // `maintenance(false)` 时整体不启动(手动 `maintenance_tick`/`compact` 照常)。
+        if maintenance
+            && !db.config.read_only
+            && (db.store.is_some() || db.config.retention.is_some())
+        {
             db.maintenance = Some(crate::life::maintenance::spawn(
                 &db.table,
                 &db.config,
                 &db.control,
                 db.store.as_ref(),
+            ));
+        }
+        // 只读共享:周期探测 `current` 并原子换视图(设计 12 §2.1;0 = 关闭)。
+        if db.config.read_only
+            && !read_only_probe_interval.is_zero()
+            && let Some(store) = db.store.as_ref()
+        {
+            db.maintenance = Some(crate::life::maintenance::spawn_read_only_probe(
+                &db.table,
+                store,
+                read_only_probe_interval,
             ));
         }
         Ok(db)
@@ -170,6 +200,8 @@ impl Builder {
         self.validate_tuning()?;
         self.validate_compaction()?;
         self.validate_quantization()?;
+        self.validate_compression()?;
+        crate::crypto::ensure_supported(self.encryption.as_ref())?;
         Ok(())
     }
 
@@ -273,6 +305,38 @@ impl Builder {
                 reason: "quant_recall_floor 必须是 ≥ 0 的有限值",
             });
         }
+        // 建图/建段工程调参:0 会让批行数/切块/线程数失去意义(除零或空批),
+        // 一律拒绝(FC-INDEX-PRE-001)。
+        if self.tuning.hnsw_compare_cap < 1 {
+            return Err(MnemeError::Config {
+                reason: "hnsw_compare_cap 必须 ≥ 1",
+            });
+        }
+        if self.tuning.hnsw_batch_rows < 1 {
+            return Err(MnemeError::Config {
+                reason: "hnsw_batch_rows 必须 ≥ 1",
+            });
+        }
+        if self.tuning.hnsw_serial_rows < 1 {
+            return Err(MnemeError::Config {
+                reason: "hnsw_serial_rows 必须 ≥ 1",
+            });
+        }
+        if self.tuning.hnsw_threads_max < 1 {
+            return Err(MnemeError::Config {
+                reason: "hnsw_threads_max 必须 ≥ 1",
+            });
+        }
+        if self.tuning.flush_chunk_rows < 1 {
+            return Err(MnemeError::Config {
+                reason: "flush_chunk_rows 必须 ≥ 1",
+            });
+        }
+        if self.tuning.flush_threads < 1 {
+            return Err(MnemeError::Config {
+                reason: "flush_threads 必须 ≥ 1",
+            });
+        }
         Ok(())
     }
 
@@ -291,6 +355,12 @@ impl Builder {
             });
         }
         Ok(())
+    }
+
+    /// 校验压缩策略与 feature 门控:`Lz4` 需 feature `compress`,`Zstd` 需
+    /// `compress-zstd`,未开启即 `Unsupported`,绝不静默按 `None` 运行。
+    fn validate_compression(&self) -> Result<()> {
+        crate::compress::codec_for(self.compression).map(|_codec| ())
     }
 
     /// 打开持久后端;纯内存库返回 `None` 后端与初始写状态。
@@ -314,6 +384,10 @@ impl Builder {
                         index_factory: Some(crate::index::default_factory()),
                         wal_file_bytes: self.compaction.wal_file_bytes,
                         tuning: self.tuning.clone(),
+                        compression: self.compression,
+                        encryption: self.encryption.clone(),
+                        storage: self.storage.clone(),
+                        observer: self.observer.clone(),
                     },
                 )?;
                 Ok((Some(store), Some(state), Dimension::new(dimension)?, metric))
@@ -337,12 +411,14 @@ impl Builder {
             dedup_threshold: self.dedup_threshold,
             quantization: self.quantization,
             hnsw: self.hnsw,
+            build_precision: self.build_precision,
             index_factory: Some(crate::index::default_factory()),
             compaction: self.compaction,
             retention: self.retention,
             retain_interval: self.retain_interval,
             access_flush_interval: self.access_flush_interval,
             compression: self.compression,
+            observer: self.observer,
             relation_index: self.relation_index,
             parallelism: self.parallelism,
             tuning: self.tuning,

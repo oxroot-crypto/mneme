@@ -11,7 +11,7 @@ use crate::core::error::{MnemeError, Result};
 use crate::memory::config::Config;
 use crate::memory::table::WriterState;
 use crate::persist::flush::{self, SegmentBuildInput};
-use crate::persist::manifest::{Manifest, NsEntry, SegmentEntry};
+use crate::persist::manifest::{Manifest, NsEntry, RelKindEntry, SegmentEntry};
 use crate::persist::storage::{
     self, CURRENT_FILE, SEGMENTS_DIR, WAL_DIR, hidx_name, manifest_name, msec_name, vsec_name,
 };
@@ -59,6 +59,74 @@ impl CopySink<'_> {
         self.counts.bytes += content.len() as u64;
         storage::write_atomic(self.target, rel, &content)
     }
+}
+
+/// 大 flush 切块行数:环境变量 `MNEME_FLUSH_CHUNK_ROWS` 优先,否则取
+/// `Tuning.flush_chunk_rows`(默认 65_536;非法/0 值回退配置值)。
+///
+/// 小于该规模保持「一次 flush = 一段」语义;大规模建库按此切块,块数 =
+/// ⌈行数/本值⌉(每块一个段),并行度只限制**同时**构建的块数。
+pub(super) fn flush_chunk_rows(tuning: &crate::core::options::Tuning) -> usize {
+    std::env::var("MNEME_FLUSH_CHUNK_ROWS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|rows| *rows > 0)
+        .unwrap_or(tuning.flush_chunk_rows.max(1))
+}
+
+/// 并行构建的内存预算(字节):单个构建块的编码缓冲约占
+/// `块行数 × (维度 × 4 + 256) × 2`(vsec f32 区 + msec/hidx/量化副本与临时
+/// 缓冲)。超过预算时降低同时构建的块数,避免大维度多核并行触发换页(swap)。
+const FLUSH_BUILD_MEMORY_BUDGET: u64 = 6 * 1024 * 1024 * 1024;
+
+/// 块级并行构建度:环境变量 `MNEME_FLUSH_THREADS` 优先,否则取
+/// `Tuning.flush_threads`(默认 1 = 块级串行,由块内批并行承担加速;
+/// 实测 4 核机上嵌套并行因带宽争抢反而更慢)。
+pub(super) fn flush_parallelism(tuning: &crate::core::options::Tuning) -> usize {
+    if let Ok(value) = std::env::var("MNEME_FLUSH_THREADS") {
+        // reason: 调参入口;非法值按串行处理,只影响性能不影响正确性。
+        return value.parse::<usize>().unwrap_or(1).max(1);
+    }
+    tuning.flush_threads.max(1)
+}
+
+/// 并行构建的块数:受并行度、块数与内存预算三者约束。
+///
+/// `dimension`/`chunk_rows` 用于估算单块编码缓冲;预算不足时宁可少并行,
+/// 也不让多个大块同时驻留把机器拖进 swap(内存带宽已使并行收益递减)。
+fn flush_build_threads(
+    dimension: usize,
+    chunk_rows: usize,
+    parallelism: usize,
+    chunk_count: usize,
+) -> usize {
+    let per_block = (chunk_rows as u64)
+        .saturating_mul((dimension as u64).saturating_mul(4).saturating_add(256))
+        .saturating_mul(2)
+        .max(1);
+    let by_memory = (FLUSH_BUILD_MEMORY_BUDGET / per_block).max(1) as usize;
+    parallelism.min(chunk_count).min(by_memory).max(1)
+}
+
+/// 把本次物化槽位按 [`flush_chunk_rows`] 切分为构建块。
+///
+/// 每块至多配置的块行数;块数由行数决定,并行度只限制**同时**构建的块数
+/// (见 `encode_flush_segments`),不放大单块规模。空槽位(纯 delta 段)同样返回
+/// 一个空块:块与段一一对应,供 MANIFEST/安装使用。
+fn split_slot_chunks<'a>(
+    slots: &'a [usize],
+    tuning: &crate::core::options::Tuning,
+) -> Vec<&'a [usize]> {
+    split_slot_chunks_with(slots, flush_chunk_rows(tuning))
+}
+
+/// 按给定块行数切分(便于单测覆盖多块边界;生产经 [`split_slot_chunks`])。
+fn split_slot_chunks_with(slots: &[usize], chunk_rows: usize) -> Vec<&[usize]> {
+    if slots.is_empty() {
+        return vec![&[]];
+    }
+    // reason: 调用方保证 `chunk_rows > 0`(环境变量非法值已在 `flush_chunk_rows` 回退)。
+    slots.chunks(chunk_rows.max(1)).collect()
 }
 
 /// 一次增量 flush 提交所需的输入(参数收敛,避免超长参数表)。
@@ -112,80 +180,194 @@ impl Store {
         )
     }
 
-    /// 编码新段(若有)并提交 MANIFEST,随后安装索引、清脏并发布新快照。
+    /// 编码新段(大 flush 按 [`FLUSH_CHUNK_ROWS`] 切块并行构建)并提交 MANIFEST,
+    /// 随后安装索引、清脏并发布新快照。
     fn commit_flush(
         &self,
         ws: &mut WriterState,
         config: &Config,
         input: CommitFlushInput,
     ) -> Result<()> {
-        let CommitFlushInput {
-            previous,
-            slot_indices,
-            delta,
-            full_relations,
-            now_ms,
-        } = input;
-        let segment_id = previous.next_segment_id;
+        let base_segment_id = input.previous.next_segment_id;
+        let chunks = split_slot_chunks(&input.slot_indices, &config.tuning);
         // 有新数据/delta 时写新段;仅注册表变化时只提交 MANIFEST。
-        let encoded = self.encode_flush_segment(
-            ws,
-            config,
-            &FlushSegmentInput {
-                segment_id,
-                slot_indices: &slot_indices,
-                delta: &delta,
-                full_relations,
-                now_ms,
-            },
-        )?;
+        let encoded = self.encode_flush_segments(ws, config, &input, &chunks)?;
 
         let new_manifest = self.next_manifest(&NextManifestInput {
-            previous: &previous,
+            previous: &input.previous,
             ws,
-            encoded: encoded.as_ref(),
-            slot_indices: &slot_indices,
-            now_ms,
+            encoded: &encoded,
+            chunks: &chunks,
+            now_ms: input.now_ms,
         })?;
-        manifest_io::commit_manifest(&self.root, &new_manifest, self.hook.as_deref())?;
+        manifest_io::commit_manifest(
+            self.storage.as_ref(),
+            &new_manifest,
+            self.hook.as_deref(),
+            self.encryption.as_ref(),
+        )?;
 
         // 段文件已原子提交:登记槽位归属与索引,清空 delta 标记;WAL 重置(Checkpoint)。
-        if let Some(encoded) = encoded {
-            ws.install_segment(
-                segment_id,
-                &slot_indices,
-                encoded.index,
-                encoded.quant,
-                encoded.recall_est,
-            );
-        }
-        ws.clear_flush_dirty();
-        self.publish(&new_manifest);
+        self.install_committed(ws, base_segment_id, &chunks, &encoded, &new_manifest);
         Ok(())
     }
 
-    /// 有新增槽位/delta 时编码并写出新段;否则 `None`(仅注册表变化)。
-    fn encode_flush_segment(
+    /// 段文件提交后的安装与发布:登记槽位/索引、清脏、发布快照并发 flush 事件。
+    fn install_committed(
+        &self,
+        ws: &mut WriterState,
+        base_segment_id: u32,
+        chunks: &[&[usize]],
+        encoded: &[flush::EncodedSegment],
+        new_manifest: &Manifest,
+    ) {
+        // 本次物化的槽位计入「已落盘」计数(WAL 阈值检查据此判断未落盘行数)。
+        ws.note_materialized(chunks.iter().map(|chunk| chunk.len()).sum());
+        // 段号从 `base_segment_id` 起连续分配,与 MANIFEST 条目一一对应。
+        for (offset, (chunk, segment)) in chunks.iter().zip(encoded).enumerate() {
+            let Some(segment_id) = u32::try_from(offset)
+                .ok()
+                .and_then(|offset| base_segment_id.checked_add(offset))
+            else {
+                // reason: 段号水位已在 `next_manifest` 经 `next_segment_id` 检查;
+                // 此处不可达,保留防御分支避免 release 回绕。
+                continue;
+            };
+            ws.install_segment(
+                segment_id,
+                chunk,
+                segment.index.clone(),
+                segment.quant,
+                segment.recall_est,
+            );
+        }
+        ws.clear_flush_dirty();
+        self.publish(new_manifest);
+        // 事件可观测:一次段 flush 提交(新增段数 + 当前 WAL 字节)。
+        crate::core::observe::emit(
+            self.observer.as_ref(),
+            crate::core::observe::Event::Flush {
+                segments: encoded.len(),
+                wal_bytes: self.wal_bytes(),
+            },
+        );
+    }
+
+    /// 有新增槽位/delta 时编码并写出新段(大 flush 切块并行构建);否则空 `Vec`。
+    ///
+    /// 跨段 `delta` 与全量关系表只随首段写入(其余段为空),恢复语义不变。
+    fn encode_flush_segments(
         &self,
         ws: &WriterState,
         config: &Config,
-        input: &FlushSegmentInput<'_>,
-    ) -> Result<Option<flush::EncodedSegment>> {
-        if input.slot_indices.is_empty() && input.delta.is_empty() {
-            return Ok(None);
+        input: &CommitFlushInput,
+        chunks: &[&[usize]],
+    ) -> Result<Vec<flush::EncodedSegment>> {
+        if input.slot_indices.is_empty() {
+            if input.delta.is_empty() {
+                return Ok(Vec::new());
+            }
+            // 纯 delta 段(无槽位):单段即可,无需并行。
+            let encoded = flush::build_segment(
+                ws,
+                config,
+                input.now_ms,
+                &SegmentBuildInput {
+                    slots: &[],
+                    delta: &input.delta,
+                    full_relations: input.full_relations,
+                    parallelism: 1,
+                },
+            )?;
+            self.write_segment_files(input.previous.next_segment_id, &encoded)?;
+            return Ok(vec![encoded]);
         }
-        let encoded = flush::build_segment(
-            ws,
-            config,
-            input.now_ms,
-            &SegmentBuildInput {
-                slots: input.slot_indices,
-                delta: input.delta,
-                full_relations: input.full_relations,
-            },
-        )?;
-        self.write_segment_files(input.segment_id, &encoded)?;
-        Ok(Some(encoded))
+        // 单块时用库配置的批内并行;多块时块间已并行,内层传 1 避免嵌套过度订阅
+        // (4 块 × 4 线程会争抢 4 核,反而拖慢)。
+        let build =
+            |chunk: &[usize], first: bool, parallelism: usize| -> Result<flush::EncodedSegment> {
+                flush::build_segment(
+                    ws,
+                    config,
+                    input.now_ms,
+                    &SegmentBuildInput {
+                        slots: chunk,
+                        delta: if first { &input.delta } else { &[] },
+                        full_relations: first && input.full_relations,
+                        parallelism,
+                    },
+                )
+            };
+        let encoded: Vec<flush::EncodedSegment> = if chunks.len() <= 1 {
+            vec![build(
+                chunks.first().copied().unwrap_or(&[]),
+                true,
+                config.parallelism,
+            )?]
+        } else {
+            // 段间独立,有界并行构建各块(worker 轮转分派),结果按块序回收;
+            // 每块在独立线程构建图与编码(设计 04 §8 增量段)。并发块数由内存
+            // 预算收紧,避免大维度多块同时驻留触发换页。
+            //
+            // 默认块级串行(`Tuning.flush_threads == 1`):块级并行与块内 HNSW 批
+            // 并行争抢内存带宽,实测嵌套(4 块 × 4 线程)反而更慢;串行块级 + 块内
+            // 批并行是 4 核机上的最快组合。块级并行可经 `Tuning.flush_threads`/
+            // `MNEME_FLUSH_THREADS` 显式开启(大内存/多核 runner),此时内层传 1
+            // 避免过度订阅。
+            let threads = flush_build_threads(
+                config.dimension.get() as usize,
+                flush_chunk_rows(&config.tuning),
+                flush_parallelism(&config.tuning),
+                chunks.len(),
+            );
+            let inner = if threads > 1 { 1 } else { config.parallelism };
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..threads)
+                    .map(|worker| {
+                        scope.spawn(move || -> Result<Vec<(usize, flush::EncodedSegment)>> {
+                            let mut produced = Vec::new();
+                            let mut index = worker;
+                            while index < chunks.len() {
+                                produced.push((index, build(chunks[index], index == 0, inner)?));
+                                index += threads;
+                            }
+                            Ok(produced)
+                        })
+                    })
+                    .collect();
+                let mut results: Vec<Option<flush::EncodedSegment>> =
+                    (0..chunks.len()).map(|_| None).collect();
+                for handle in handles {
+                    // reason: 构建线程 panic 时收敛为结构化错误,不把 panic 抛给调用方。
+                    let produced = handle.join().map_err(|_| MnemeError::Inconsistent {
+                        reason: "flush 段构建线程 panic",
+                    })??;
+                    for (index, segment) in produced {
+                        results[index] = Some(segment);
+                    }
+                }
+                results
+                    .into_iter()
+                    .map(|segment| {
+                        segment.ok_or(MnemeError::Inconsistent {
+                            reason: "flush 段构建缺失块",
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()
+            })?
+        };
+        // 段文件串行写出(write-once;段号与 MANIFEST 条目顺序一致)。
+        for (offset, segment) in encoded.iter().enumerate() {
+            let offset = u32::try_from(offset)
+                .map_err(|_| MnemeError::IdExhausted { kind: "segment_id" })?;
+            let segment_id = input
+                .previous
+                .next_segment_id
+                .checked_add(offset)
+                .ok_or(MnemeError::IdExhausted { kind: "segment_id" })?;
+            self.write_segment_files(segment_id, segment)?;
+        }
+        Ok(encoded)
     }
 
     /// 写入一个新段的 vsec/msec(以及可选 hidx)文件。
@@ -195,10 +377,10 @@ impl Store {
             format!("{SEGMENTS_DIR}/{}", msec_name(segment_id)),
             format!("{SEGMENTS_DIR}/{}", hidx_name(segment_id)),
         ];
-        self.write_file(&names[0], &encoded.vsec)?;
-        self.write_file(&names[1], &encoded.msec)?;
+        self.write_file(&names[0], b"vsec", u64::from(segment_id), &encoded.vsec)?;
+        self.write_file(&names[1], b"msec", u64::from(segment_id), &encoded.msec)?;
         if let Some(hidx) = &encoded.hidx {
-            self.write_file(&names[2], hidx)?;
+            self.write_file(&names[2], b"hidx", u64::from(segment_id), hidx)?;
         }
         Ok(())
     }
@@ -234,7 +416,7 @@ impl Store {
         copy_segment_files(&mut sink, &manifest)?;
         sink.copy_required(&manifest_name(version))?;
         // WAL 文件集可缺省(只读实例/刚 Checkpoint 后);逐文件复制。
-        for rel in super::wal_writer::wal_files(&self.root)? {
+        for rel in super::wal_writer::wal_files(self.storage.as_ref())? {
             copy_optional(&self.root, target, &rel, &mut sink.counts)?;
         }
         let CopyCounts { files, bytes } = sink.counts;
@@ -256,18 +438,24 @@ impl Store {
     /// (FC-PERSIST-ERR-012)。
     fn next_manifest(&self, input: &NextManifestInput<'_>) -> Result<Manifest> {
         let mut segments = input.previous.segments.clone();
-        let next_segment_id = match input.encoded {
-            Some(encoded) => {
-                segments.push(segment_entry(input, encoded));
-                crate::persist::manifest::next_segment_id(input.previous.next_segment_id)?
-            }
-            None => input.previous.next_segment_id,
-        };
+        let mut next_segment_id = input.previous.next_segment_id;
+        for (chunk, encoded) in input.chunks.iter().zip(input.encoded) {
+            segments.push(segment_entry(
+                &SegmentEntryInput {
+                    segment_id: next_segment_id,
+                    ws: input.ws,
+                    slot_indices: chunk,
+                    now_ms: input.now_ms,
+                },
+                encoded,
+            ));
+            next_segment_id = crate::persist::manifest::next_segment_id(next_segment_id)?;
+        }
         Ok(Manifest {
             dimension: self.dimension,
             metric: self.metric,
             stopwords: input.previous.stopwords,
-            next_rel_kind: input.previous.next_rel_kind,
+            next_rel_kind: input.ws.next_rel_kind,
             manifest_version: crate::persist::manifest::next_manifest_version(
                 input.previous.manifest_version,
             )?,
@@ -276,7 +464,7 @@ impl Store {
             next_segment_id,
             next_ns_id: input.ws.next_ns_id,
             namespaces: manifest_namespaces(input.ws),
-            rel_kinds: input.previous.rel_kinds.clone(),
+            rel_kinds: manifest_rel_kinds(input.ws),
             segments,
         })
     }
@@ -305,39 +493,37 @@ impl Store {
     }
 }
 
-/// [`Store::encode_flush_segment`] 的输入(参数收敛)。
-struct FlushSegmentInput<'a> {
-    /// 新段编号。
-    segment_id: u32,
-    /// 本次物化的未落盘槽位。
-    slot_indices: &'a [usize],
-    /// 跨段 delta 条目。
-    delta: &'a [crate::persist::msec::DeltaEntry],
-    /// 是否全量重写关系表(首段)。
-    full_relations: bool,
-    /// 新段创建时刻(Unix 毫秒)。
-    now_ms: i64,
-}
-
 /// [`Store::next_manifest`] 的输入(参数收敛)。
 struct NextManifestInput<'a> {
     /// 提交前的 MANIFEST。
     previous: &'a Manifest,
     /// 写状态(水位/注册表)。
     ws: &'a WriterState,
-    /// 本批物化的新段(仅注册表变化时为 `None`)。
-    encoded: Option<&'a flush::EncodedSegment>,
-    /// 新段包含的槽位。
-    slot_indices: &'a [usize],
+    /// 本批物化的新段(仅注册表变化时为空;与 `chunks` 一一对应)。
+    encoded: &'a [flush::EncodedSegment],
+    /// 各新段包含的槽位(与 `encoded` 一一对应)。
+    chunks: &'a [&'a [usize]],
     /// 新段创建时刻(Unix 毫秒)。
     now_ms: i64,
 }
 
+/// 单段 MANIFEST 条目的输入(参数收敛)。
+struct SegmentEntryInput<'a> {
+    /// 本段编号。
+    segment_id: u32,
+    /// 写状态(水位)。
+    ws: &'a WriterState,
+    /// 本段包含的全局槽位。
+    slot_indices: &'a [usize],
+    /// 段创建时刻(Unix 毫秒)。
+    now_ms: i64,
+}
+
 /// 新段的 MANIFEST 条目。
-fn segment_entry(input: &NextManifestInput<'_>, encoded: &flush::EncodedSegment) -> SegmentEntry {
+fn segment_entry(input: &SegmentEntryInput<'_>, encoded: &flush::EncodedSegment) -> SegmentEntry {
     let (min_seqno, max_seqno) = seqno_range(input.ws, input.slot_indices);
     SegmentEntry {
-        segment_id: input.previous.next_segment_id,
+        segment_id: input.segment_id,
         format_version: FORMAT_VERSION,
         row_count: input.slot_indices.len() as u64,
         min_seqno,
@@ -363,6 +549,20 @@ fn manifest_namespaces(ws: &WriterState) -> Vec<NsEntry> {
         .collect();
     namespaces.sort_by_key(|entry| entry.ns_id);
     namespaces
+}
+
+/// 由写状态的关系类型注册表构造 MANIFEST 条目(按编号升序,确定性编码)。
+fn manifest_rel_kinds(ws: &WriterState) -> Vec<RelKindEntry> {
+    let mut entries: Vec<RelKindEntry> = ws
+        .rel_kind_names
+        .iter()
+        .map(|(&kind, name)| RelKindEntry {
+            kind,
+            name: Arc::clone(name),
+        })
+        .collect();
+    entries.sort_by_key(|entry| entry.kind);
+    entries
 }
 
 /// 备份已复制文件数与字节数。
@@ -429,6 +629,66 @@ fn namespace_registry_changed(previous: &Manifest, ws: &WriterState) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 切块覆盖全部槽位且保序、不重叠;空槽位(纯 delta 段)仍产生一个空块;
+    /// 块行数尊重 `Tuning.flush_chunk_rows` 配置。
+    #[test]
+    fn split_slot_chunks_covers_all_slots_in_order() {
+        let tuning = crate::core::options::Tuning::default();
+        let slots: Vec<usize> = (0..10_000).collect();
+        let chunks = split_slot_chunks(&slots, &tuning);
+        assert!(!chunks.is_empty());
+        let flat: Vec<usize> = chunks
+            .iter()
+            .flat_map(|chunk| chunk.iter().copied())
+            .collect();
+        assert_eq!(flat, slots, "切块必须按序覆盖全部槽位且不重叠/不遗漏");
+
+        let empty = split_slot_chunks(&[], &tuning);
+        assert_eq!(empty.len(), 1, "空槽位需要一个空块与纯 delta 段一一对应");
+        assert!(empty[0].is_empty());
+
+        let small_chunks = {
+            let custom = crate::core::options::Tuning {
+                flush_chunk_rows: 1_024,
+                ..tuning
+            };
+            split_slot_chunks(&slots, &custom)
+        };
+        assert_eq!(small_chunks.len(), 10, "块行数配置应生效");
+    }
+
+    /// 并行块数受内存预算约束:1536 维 65,536 行块单块约 0.82GB,6GB 预算下
+    /// 至多 7 块并行;小维度(预算充足)不被额外收紧。
+    #[test]
+    fn flush_build_threads_bounded_by_memory_budget() {
+        // 1536 维 × 65,536 行:约 0.82GB/块 → 6GB / 0.82GB = 7。
+        assert_eq!(flush_build_threads(1536, 65_536, 8, 16), 7);
+        // 16 核也不超过预算允许的并发。
+        assert_eq!(flush_build_threads(1536, 65_536, 16, 16), 7);
+        // 小维度:预算充足时只受并行度与块数约束。
+        assert_eq!(flush_build_threads(128, 65_536, 8, 16), 8);
+        assert_eq!(flush_build_threads(128, 65_536, 8, 3), 3);
+        // 退化输入:至少 1 块。
+        assert_eq!(flush_build_threads(0, 0, 0, 0), 1);
+    }
+
+    /// FC-PERSIST-STA-004:块数由行数决定、**每块不超过 `chunk_rows`**;并行度只限
+    /// 同时构建的块数,不得放大单块规模(修复「并行度越大块越大」的行为)。
+    #[test]
+    fn split_slot_chunks_limits_block_rows() {
+        let slots: Vec<usize> = (0..10_000).collect();
+        let chunks = split_slot_chunks_with(&slots, 1_024);
+        assert_eq!(chunks.len(), 10, "10_000 行按 1_024 行应切 10 块");
+        assert!(
+            chunks.iter().all(|chunk| chunk.len() <= 1_024),
+            "每块不得超过块行数上限"
+        );
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.len()).sum::<usize>(),
+            10_000
+        );
+    }
 
     /// FC-LIFE-POST-008:硬链接失败(目标已存在/跨盘)时回退逐文件复制,
     /// `hardlinked` 如实置 `false`,产物内容正确。

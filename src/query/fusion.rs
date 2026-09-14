@@ -43,14 +43,15 @@ pub(crate) fn fuse(
 
 /// RRF:分数 = Σ `1 / (k + rank)`,名次从 1 起。
 fn rrf(vector: Vec<Scored>, text: Vec<Scored>, k: u32, top_k: usize) -> Vec<Scored> {
-    let mut fused: HashMap<RowId, (SlotId, f32)> = HashMap::new();
+    let mut fused: HashMap<RowId, (SlotId, f32)> =
+        HashMap::with_capacity(vector.len() + text.len());
     for channel in [&vector, &text] {
         for (rank, hit) in channel.iter().enumerate() {
             let add = 1.0 / (k as f32 + (rank + 1) as f32);
             fused.entry(hit.rowid).or_insert((hit.slot, 0.0)).1 += add;
         }
     }
-    rank_top(fused, top_k)
+    rank_top(&fused, top_k)
 }
 
 /// 加权融合:两通道各自在**本次结果集内**归一化后按 `alpha` 加权。
@@ -60,14 +61,15 @@ fn weighted(
     alpha: f32,
     params: FusionParams,
 ) -> Vec<Scored> {
-    let mut fused: HashMap<RowId, (SlotId, f32)> = HashMap::new();
+    let mut fused: HashMap<RowId, (SlotId, f32)> =
+        HashMap::with_capacity(vector.len() + text.len());
     for (rowid, (slot, value)) in normalize(&vector, params.vector_is_distance) {
         fused.entry(rowid).or_insert((slot, 0.0)).1 += alpha * value;
     }
     for (rowid, (slot, value)) in normalize(&text, false) {
         fused.entry(rowid).or_insert((slot, 0.0)).1 += (1.0 - alpha) * value;
     }
-    rank_top(fused, params.top_k)
+    rank_top(&fused, params.top_k)
 }
 
 /// 结果集内 min-max 归一化;`flip` 时先取负把"越小越优"翻成"越大越优"。
@@ -79,38 +81,34 @@ fn normalize(hits: &[Scored], flip: bool) -> HashMap<RowId, (SlotId, f32)> {
     if hits.is_empty() {
         return HashMap::new();
     }
-    let oriented: Vec<f64> = hits
-        .iter()
-        .map(|hit| f64::from(if flip { -hit.score } else { hit.score }))
-        .collect();
-    let min = oriented.iter().copied().fold(f64::INFINITY, f64::min);
-    let max = oriented.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let oriented = |hit: &Scored| f64::from(if flip { -hit.score } else { hit.score });
+    let mut min = f64::INFINITY;
+    let mut max = f64::NEG_INFINITY;
+    for hit in hits {
+        let value = oriented(hit);
+        min = min.min(value);
+        max = max.max(value);
+    }
     let span = max - min;
-    hits.iter()
-        .zip(oriented)
-        .map(|(hit, value)| {
-            // 仅真正的零极差(单点)取 1;极小极差仍按公式缩放,保住分数差异。
-            let normalized = if span == 0.0 {
-                1.0
-            } else {
-                (value - min) / span
-            };
-            let normalized = if normalized.is_finite() {
-                normalized as f32
-            } else {
-                0.0
-            };
-            (hit.rowid, (hit.slot, normalized))
-        })
-        .collect()
+    let mut normalized = HashMap::with_capacity(hits.len());
+    for hit in hits {
+        let value = oriented(hit);
+        // 仅真正的零极差(单点)取 1;极小极差仍按公式缩放,保住分数差异。
+        let value = if span == 0.0 {
+            1.0
+        } else {
+            (value - min) / span
+        };
+        let value = if value.is_finite() { value as f32 } else { 0.0 };
+        normalized.insert(hit.rowid, (hit.slot, value));
+    }
+    normalized
 }
 
 /// 由 `RowId → (SlotId, 分数)` 取 top-k(同分 `RowId` 升序)。
-fn rank_top(fused: HashMap<RowId, (SlotId, f32)>, top_k: usize) -> Vec<Scored> {
+fn rank_top(fused: &HashMap<RowId, (SlotId, f32)>, top_k: usize) -> Vec<Scored> {
     let mut top = TopK::new(top_k, Metric::Dot);
-    let mut scores: HashMap<(RowId, SlotId), f32> = HashMap::with_capacity(fused.len());
-    for (rowid, (slot, score)) in fused {
-        scores.insert((rowid, slot), score);
+    for (&rowid, &(slot, score)) in fused {
         top.push(score, (rowid, slot));
     }
     top.into_sorted_vec()
@@ -118,7 +116,8 @@ fn rank_top(fused: HashMap<RowId, (SlotId, f32)>, top_k: usize) -> Vec<Scored> {
         .map(|(rowid, slot)| Scored {
             slot,
             rowid,
-            score: scores.get(&(rowid, slot)).copied().unwrap_or(0.0),
+            // `rowid` 来自本表键,查询必然命中;`map_or` 仅为无 panic 的全函数形态。
+            score: fused.get(&rowid).map_or(0.0, |(_, score)| *score),
         })
         .collect()
 }

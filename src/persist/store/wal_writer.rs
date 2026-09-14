@@ -1,22 +1,19 @@
 //! WAL 写入器与 WAL 文件集(`store/wal_writer.rs`)。
 //!
-//! 持有当前活动 WAL 文件句柄,按 [`FsyncPolicy`] 决定落盘时机;单文件达
-//! `wal_file_bytes` 后在下一次事务提交时轮转到下一个文件(**单批不跨文件**,
-//! 设计 04 §3.2)。只读实例不持有可写句柄(`file = None`);任何写方法返回
-//! `Unsupported`,且打开时绝不创建或改写 WAL 文件(设计 12 §2 只读共享)。
+//! 持有当前活动 WAL **相对路径**,经 [`Storage`] 后端追加/同步/轮转;按
+//! [`FsyncPolicy`] 决定落盘时机,单文件达 `wal_file_bytes` 后在下一次事务提交时
+//! 轮转到下一个文件(**单批不跨文件**,设计 04 §3.2)。只读实例不写入
+//! (`writable = false`);任何写方法返回 `Unsupported`,且打开时绝不创建或改写
+//! WAL 文件(设计 12 §2 只读共享)。
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::core::error::{MnemeError, Result};
 use crate::core::metric::Metric;
 use crate::core::options::FsyncPolicy;
 use crate::persist::hook::{FsyncHook, IoAction};
-use crate::persist::storage::{self, WAL_DIR};
+use crate::persist::storage::{Storage, WAL_DIR};
 use crate::persist::wal;
-
-/// 首文件相对路径(常量;轮转文件按序号递增)。
-pub(super) const WAL_FILE: &str = "wal/wal_000001.log";
 
 /// 活动 WAL 文件相对路径(按文件序号,`000001` 起)。
 pub(super) fn wal_name(index: u32) -> String {
@@ -27,28 +24,27 @@ pub(super) fn wal_name(index: u32) -> String {
 ///
 /// # Errors
 /// 目录列举失败时返回 [`MnemeError::Io`]。
-pub(super) fn wal_files(root: &Path) -> Result<Vec<String>> {
-    let mut names: Vec<(u32, String)> = storage::list_dir(root, WAL_DIR)?
+pub(super) fn wal_files(storage: &dyn Storage) -> Result<Vec<String>> {
+    let mut names: Vec<String> = storage
+        .list_dir(WAL_DIR)?
         .into_iter()
-        .filter_map(|name| {
-            let index = wal_index_of(&name)?;
-            Some((index, format!("{WAL_DIR}/{name}")))
-        })
+        .filter(|name| name.starts_with("wal_") && name.ends_with(".log"))
+        .map(|name| format!("{WAL_DIR}/{name}"))
         .collect();
-    names.sort_by_key(|(index, _)| *index);
-    Ok(names.into_iter().map(|(_, rel)| rel).collect())
+    names.sort();
+    Ok(names)
 }
 
-/// 从 `wal_<6 位序号>.log` 文件名解析序号;不匹配返回 `None`。
-fn wal_index_of(name: &str) -> Option<u32> {
+/// 从 WAL 文件名解析文件序号(严格 `wal_NNNNNN.log`;不匹配返回 `None`)。
+pub(super) fn wal_index_of(name: &str) -> Option<u32> {
     let digits = name.strip_prefix("wal_")?.strip_suffix(".log")?;
     if digits.len() != 6 || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
         return None;
     }
-    digits.parse::<u32>().ok()
+    digits.parse().ok()
 }
 
-/// 打开 WAL 写入器所需的身份与策略参数。
+/// WAL 打开参数(维度/度量来自 MANIFEST,建库即锁定)。
 pub(super) struct WalConfig {
     /// 建库维度(写入 WAL 文件头)。
     pub(super) dimension: u32,
@@ -62,18 +58,30 @@ pub(super) struct WalConfig {
     pub(super) hook: Option<Arc<dyn FsyncHook>>,
     /// 只读打开(仅只读句柄、不创建/改写)。
     pub(super) read_only: bool,
+    /// 静态加密配置(`None` = 明文帧)。
+    pub(super) encryption: Option<crate::crypto::Encryption>,
 }
 
-/// WAL 写入器(单活动文件;轮转后序号递增)。
+/// WAL 写入器(单活动文件;轮转后序号递增;字节操作全部经 [`Storage`])。
 pub(super) struct WalWriter {
-    root: PathBuf,
-    file: Option<std::fs::File>,
+    storage: Arc<dyn Storage>,
     active_index: u32,
+    /// 活动文件相对路径(轮转/重建时同步更新,免每次追加都重新格式化)。
+    active_rel: String,
+    /// 活动文件当前字节数(本写入器是唯一写者;追加/回滚/重建处同步维护)。
+    written: u64,
+    /// 已轮转旧文件的字节数合计(轮转时累加、Checkpoint 删除旧文件后清零)。
+    ///
+    /// 供 `Store::wal_bytes` 免列目录 + stat 直接取总量(统计为尽力而为)。
+    sealed_bytes: u64,
     max_file_bytes: u64,
     policy: FsyncPolicy,
     dimension: u32,
     metric: Metric,
     hook: Option<Arc<dyn FsyncHook>>,
+    encryption: Option<crate::crypto::Encryption>,
+    /// 只读实例(无写权限)。
+    writable: bool,
     /// 重置失败且重建失败后停用:后续写入报 `Io`,绝不向状态可疑的文件追加
     /// (否则重启截断会丢已确认帧)。
     poisoned: bool,
@@ -88,49 +96,109 @@ impl WalWriter {
     ///
     /// # Errors
     /// I/O 失败返回 [`MnemeError::Io`];身份不符返回 [`MnemeError::Corrupted`]。
-    pub(super) fn open_or_create(root: &Path, config: WalConfig) -> Result<Self> {
-        let files = wal_files(root)?;
+    pub(super) fn open_or_create(storage: Arc<dyn Storage>, config: WalConfig) -> Result<Self> {
+        let files = wal_files(storage.as_ref())?;
         if config.read_only {
-            return open_read_only(root, &files, config);
+            // 只读实例不写入;总字节按当前文件集一次性统计(无活动句柄)。
+            let total: u64 = files
+                .iter()
+                .filter_map(|rel| storage.stat(rel).ok())
+                .map(|meta| meta.len)
+                .sum();
+            return Ok(Self::from_parts(
+                storage,
+                files
+                    .last()
+                    .and_then(|rel| wal_index_of(rel.rsplit('/').next().unwrap_or(rel)))
+                    .unwrap_or(0),
+                config,
+                false,
+                total,
+                0,
+            ));
         }
-        open_writable(root, &files, config)
+        storage.ensure_dir(WAL_DIR)?;
+        let Some(rel) = files.last() else {
+            return create_truncating(storage, 1, config);
+        };
+        let index = wal_index_of(rel.rsplit('/').next().unwrap_or(rel)).unwrap_or(1);
+        let bytes = storage.read_file(rel)?;
+        let header = if bytes.len() >= wal::FILE_HEADER_LEN {
+            wal::parse_file_header(&bytes).ok()
+        } else {
+            None
+        };
+        match header {
+            Some(header)
+                if header.dimension != config.dimension || header.metric != config.metric =>
+            {
+                Err(MnemeError::Corrupted {
+                    segment: None,
+                    reason: "WAL 头维度/度量与 MANIFEST 不符".to_string(),
+                })
+            }
+            Some(_) => {
+                let written = storage.stat(rel)?.len;
+                let sealed: u64 = files
+                    .iter()
+                    .filter(|other| other.as_str() != rel.as_str())
+                    .filter_map(|other| storage.stat(other).ok())
+                    .map(|meta| meta.len)
+                    .sum();
+                Ok(Self::from_parts(
+                    storage, index, config, true, written, sealed,
+                ))
+            }
+            // 短头/损坏头(Checkpoint 中途崩溃):原地重建,后续帧本就不完整。
+            None => create_truncating(storage, index, config),
+        }
     }
 
-    /// 由文件句柄与配置组装写入器。
+    /// 由后端与配置组装写入器;`written` 为活动文件当前字节数,
+    /// `sealed` 为已轮转旧文件字节合计。
     fn from_parts(
-        root: PathBuf,
-        file: Option<std::fs::File>,
+        storage: Arc<dyn Storage>,
         active_index: u32,
         config: WalConfig,
+        writable: bool,
+        written: u64,
+        sealed: u64,
     ) -> Self {
         Self {
-            root,
-            file,
+            storage,
             active_index,
+            active_rel: wal_name(active_index),
+            written,
+            sealed_bytes: sealed,
             max_file_bytes: config.max_file_bytes,
             policy: config.policy,
             dimension: config.dimension,
             metric: config.metric,
             hook: config.hook,
+            encryption: config.encryption,
+            writable,
             poisoned: false,
         }
     }
 
     /// 当前活动文件相对路径。
-    pub(super) fn active_rel(&self) -> String {
-        wal_name(self.active_index)
+    pub(super) fn active_rel(&self) -> &str {
+        &self.active_rel
     }
 
-    /// 打开可写句柄;只读实例返回 `Unsupported`,已停用句柄返回 `Io`。
-    fn writable(&mut self) -> Result<&mut std::fs::File> {
+    /// 写前置检查:只读 → `Unsupported`;已停用 → `Io`。
+    fn ensure_writable(&self) -> Result<()> {
         if self.poisoned {
             return Err(MnemeError::Io(std::io::Error::other(
                 "WAL 重置失败,句柄已停用",
             )));
         }
-        self.file.as_mut().ok_or(MnemeError::Unsupported {
-            feature: "只读模式写入",
-        })
+        if !self.writable {
+            return Err(MnemeError::Unsupported {
+                feature: "只读模式写入",
+            });
+        }
+        Ok(())
     }
 
     /// 追加一帧(不 fsync;由 [`WalWriter::sync`] 在事务末统一落盘)。
@@ -143,20 +211,20 @@ impl WalWriter {
         kind: wal::FrameKind,
         payload: &[u8],
     ) -> Result<()> {
-        use std::io::Write as _;
-        let frame = wal::encode_frame(seqno, kind, payload);
-        let active = self.active_rel();
-        let hook = self.hook.clone();
-        let file = self.writable()?;
-        let offset = file.metadata()?.len();
-        if let Some(hook) = &hook {
+        self.ensure_writable()?;
+        let sealed = match self.encryption.as_ref() {
+            Some(encryption) => Some(crate::crypto::seal(encryption, b"wal", seqno, payload)?),
+            None => None,
+        };
+        let frame = wal::encode_frame(seqno, kind, sealed.as_deref().unwrap_or(payload));
+        if let Some(hook) = &self.hook {
             hook.before(IoAction::Write {
-                file: &active,
-                offset,
+                file: &self.active_rel,
+                offset: self.written,
                 len: frame.len(),
             })?;
         }
-        file.write_all(&frame)?;
+        self.written = self.storage.append(&self.active_rel, &frame)?;
         Ok(())
     }
 
@@ -166,33 +234,28 @@ impl WalWriter {
     /// # Errors
     /// 只读实例返回 [`MnemeError::Unsupported`];同步 I/O 失败返回 [`MnemeError::Io`]。
     pub(super) fn sync(&mut self) -> Result<()> {
-        if matches!(self.policy, FsyncPolicy::Always | FsyncPolicy::Batched(_)) {
-            let active = self.active_rel();
-            let hook = self.hook.clone();
-            let file = self.writable()?;
-            if let Some(hook) = &hook {
-                hook.before(IoAction::Fsync { file: &active })?;
+        if self.writable && matches!(self.policy, FsyncPolicy::Always | FsyncPolicy::Batched(_)) {
+            if let Some(hook) = &self.hook {
+                hook.before(IoAction::Fsync {
+                    file: &self.active_rel,
+                })?;
             }
-            file.sync_all()?;
+            self.storage.sync(&self.active_rel)?;
         }
         self.rotate_if_needed()
     }
 
     /// 活动文件达到轮转阈值时,在下个事务开始前切换到新文件。
     fn rotate_if_needed(&mut self) -> Result<()> {
-        if self.max_file_bytes == 0 || self.file.is_none() {
+        if self.max_file_bytes == 0 || !self.writable {
             return Ok(());
         }
-        let Some(file) = &self.file else {
-            return Ok(());
-        };
-        if file.metadata()?.len() < self.max_file_bytes {
+        if self.written < self.max_file_bytes {
             return Ok(());
         }
         let next = self.active_index.saturating_add(1);
-        let path = storage::resolve(&self.root, &wal_name(next))?;
-        create_truncating(
-            &path,
+        let writer = create_truncating(
+            Arc::clone(&self.storage),
             next,
             WalConfig {
                 dimension: self.dimension,
@@ -201,40 +264,45 @@ impl WalWriter {
                 max_file_bytes: self.max_file_bytes,
                 hook: self.hook.clone(),
                 read_only: false,
+                encryption: None,
             },
-        )
-        .map(|writer| {
-            self.file = writer.file;
-            self.active_index = next;
-        })
+        )?;
+        // 轮转:旧活动文件计入已封印字节,新写入器从文件头开始。
+        let sealed = self.sealed_bytes.saturating_add(self.written);
+        *self = writer;
+        self.sealed_bytes = sealed;
+        Ok(())
+    }
+
+    /// 当前 WAL 文件集总字节数(活动 + 已轮转;统计为尽力而为)。
+    pub(super) fn total_bytes(&self) -> u64 {
+        self.sealed_bytes.saturating_add(self.written)
     }
 
     /// 当前活动 WAL 文件字节长度(用于写事务失败时回滚截断点)。
     ///
+    /// 缓存值由写入器在追加/回滚/重建处同步维护;本写入器是活动文件的唯一写者。
+    ///
     /// # Errors
-    /// 元数据读取失败时返回 [`MnemeError::Io`]。
+    /// 保留 `Result` 形态与读写失败调用点兼容;当前实现不产生错误。
     pub(super) fn len(&self) -> Result<u64> {
-        match &self.file {
-            Some(file) => Ok(file.metadata()?.len()),
-            None => Ok(0),
-        }
+        Ok(self.written)
     }
 
-    /// 回滚到 `len`:截断活动文件并 seek 到末尾,丢弃本次事务的半写/未确认帧。
+    /// 回滚到 `len`:截断活动文件,丢弃本次事务的半写/未确认帧。
     ///
     /// # Errors
     /// 只读实例返回 [`MnemeError::Unsupported`];I/O 失败返回 [`MnemeError::Io`]。
     pub(super) fn rollback_to(&mut self, len: u64) -> Result<()> {
-        let active = self.active_rel();
-        let hook = self.hook.clone();
-        let file = self.writable()?;
-        file.set_len(len)?;
-        use std::io::{Seek, SeekFrom};
-        file.seek(SeekFrom::Start(len))?;
-        if let Some(hook) = &hook {
-            hook.before(IoAction::Fsync { file: &active })?;
+        self.ensure_writable()?;
+        self.storage.truncate(&self.active_rel, len)?;
+        self.written = len;
+        if let Some(hook) = &self.hook {
+            hook.before(IoAction::Fsync {
+                file: &self.active_rel,
+            })?;
         }
-        file.sync_all()?;
+        self.storage.sync(&self.active_rel)?;
         Ok(())
     }
 
@@ -243,149 +311,86 @@ impl WalWriter {
     /// 调用方保证所有 `seqno ≤ manifest.watermark` 的帧已被段/delta 覆盖;
     /// 旧文件即使残留,恢复时也会因 `seqno ≤ watermark` 被跳过。
     ///
-    /// 实现按"先写头、后截断"顺序,任何时刻文件头都完整;任一步失败时尝试原地
-    /// 重建,重建仍失败才停用句柄——绝不向可疑文件继续追加(否则重启截断会丢
-    /// 已确认帧,FC-PERSIST-INV-005)。
+    /// 实现按"先原子换头、后截断"顺序,任何时刻文件头都完整;任一步失败时尝试原地
+    /// 重建,重建仍失败才停用句柄——绝不向可疑文件追加(否则重启截断会丢已确认帧,
+    /// FC-PERSIST-INV-005)。
     ///
     /// # Errors
     /// 只读实例返回 [`MnemeError::Unsupported`];I/O 失败返回 [`MnemeError::Io`]。
     pub(super) fn reset(&mut self) -> Result<()> {
         if let Err(error) = self.rewrite_header_and_truncate() {
-            if self.recreate().is_err() {
+            // 重建兜底:同样经过 hook(注入失败必须让 writer 停用,绝不向可疑文件追加)。
+            let header = wal::encode_file_header(self.dimension, self.metric);
+            let rebuild = (|| -> Result<()> {
+                if let Some(hook) = &self.hook {
+                    hook.before(IoAction::Write {
+                        file: &self.active_rel,
+                        offset: 0,
+                        len: header.len(),
+                    })?;
+                }
+                self.storage.write_atomic(&self.active_rel, &header)?;
+                if let Some(hook) = &self.hook {
+                    hook.before(IoAction::Fsync {
+                        file: &self.active_rel,
+                    })?;
+                }
+                self.storage.sync(&self.active_rel)?;
+                Ok(())
+            })();
+            if rebuild.is_ok() {
+                self.written = header.len() as u64;
+            } else {
                 self.poisoned = true;
             }
             return Err(error);
         }
         let active = self.active_rel();
-        for rel in wal_files(&self.root)? {
+        for rel in wal_files(self.storage.as_ref())? {
             if rel != active {
                 // reason: 旧轮转文件即使残留,恢复时也因 seqno ≤ watermark 被跳过,
                 // 删除失败不影响正确性。
-                let _ = storage::remove_if_exists(&storage::resolve(&self.root, &rel)?).ok();
+                let _ = self.storage.remove_if_exists(&rel).ok();
             }
         }
+        // Checkpoint 成功:旧轮转文件的字节不再计入 WAL 总量。
+        self.sealed_bytes = 0;
         Ok(())
     }
 
-    /// 重置的第一步:覆盖文件头并把文件截到头部长度。
+    /// 重置的第一步:原子换头(写头 + fsync)并把活动文件截到头部长度。
     fn rewrite_header_and_truncate(&mut self) -> Result<()> {
-        use std::io::{Seek, SeekFrom, Write as _};
-        let active = self.active_rel();
+        self.ensure_writable()?;
         let header = wal::encode_file_header(self.dimension, self.metric);
-        let hook = self.hook.clone();
-        let file = self.writable()?;
-        if let Some(hook) = &hook {
+        if let Some(hook) = &self.hook {
             hook.before(IoAction::Write {
-                file: &active,
+                file: &self.active_rel,
                 offset: 0,
                 len: header.len(),
             })?;
         }
-        file.seek(SeekFrom::Start(0))?;
-        file.write_all(&header)?;
-        file.set_len(wal::FILE_HEADER_LEN as u64)?;
-        file.seek(SeekFrom::Start(wal::FILE_HEADER_LEN as u64))?;
-        if let Some(hook) = &hook {
-            hook.before(IoAction::Fsync { file: &active })?;
+        self.storage.write_atomic(&self.active_rel, &header)?;
+        self.storage
+            .truncate(&self.active_rel, wal::FILE_HEADER_LEN as u64)?;
+        self.written = wal::FILE_HEADER_LEN as u64;
+        if let Some(hook) = &self.hook {
+            hook.before(IoAction::Fsync {
+                file: &self.active_rel,
+            })?;
         }
-        file.sync_all()?;
-        Ok(())
-    }
-
-    /// 重置失败后的兜底:截断重建当前活动文件(写新头 + fsync)。
-    fn recreate(&mut self) -> Result<()> {
-        let path = storage::resolve(&self.root, &self.active_rel())?;
-        let writer = create_truncating(
-            &path,
-            self.active_index,
-            WalConfig {
-                dimension: self.dimension,
-                metric: self.metric,
-                policy: self.policy,
-                max_file_bytes: self.max_file_bytes,
-                hook: self.hook.clone(),
-                read_only: false,
-            },
-        )?;
-        self.file = writer.file;
+        self.storage.sync(&self.active_rel)?;
         Ok(())
     }
 }
 
-/// 只读打开:仅只读句柄、不创建文件;WAL 不存在时 `file = None`。
-fn open_read_only(root: &Path, files: &[String], config: WalConfig) -> Result<WalWriter> {
-    let file = match files.last() {
-        Some(rel) => Some(
-            std::fs::OpenOptions::new()
-                .read(true)
-                .open(storage::resolve(root, rel)?)?,
-        ),
-        None => None,
-    };
-    let active_index = files
-        .last()
-        .and_then(|rel| wal_index_of(rel.rsplit('/').next().unwrap_or(rel)))
-        .unwrap_or(0);
-    Ok(WalWriter::from_parts(
-        root.to_path_buf(),
-        file,
-        active_index,
-        config,
-    ))
-}
-
-/// 可写打开:确保目录、校验/重建文件头并定位活动文件。
-fn open_writable(root: &Path, files: &[String], config: WalConfig) -> Result<WalWriter> {
-    storage::ensure_dir(&root.join(WAL_DIR))?;
-    let Some(rel) = files.last() else {
-        return create_truncating(&storage::resolve(root, WAL_FILE)?, 1, config);
-    };
-    let path = storage::resolve(root, rel)?;
-    let index = wal_index_of(rel.rsplit('/').next().unwrap_or(rel)).unwrap_or(1);
-    let bytes = storage::read_file(root, rel)?;
-    let header = if bytes.len() >= wal::FILE_HEADER_LEN {
-        wal::parse_file_header(&bytes).ok()
-    } else {
-        None
-    };
-    match header {
-        Some(header) if header.dimension != config.dimension || header.metric != config.metric => {
-            Err(MnemeError::Corrupted {
-                segment: None,
-                reason: "WAL 头维度/度量与 MANIFEST 不符".to_string(),
-            })
-        }
-        Some(_) => {
-            // 以 `write`(而非 `append`)打开:Windows 下 append-only 句柄缺少
-            // FILE_WRITE_DATA,`set_len`(Checkpoint 重置)会被拒绝。
-            let mut file = std::fs::OpenOptions::new().write(true).open(&path)?;
-            use std::io::{Seek, SeekFrom};
-            file.seek(SeekFrom::End(0))?;
-            Ok(WalWriter::from_parts(
-                root.to_path_buf(),
-                Some(file),
-                index,
-                config,
-            ))
-        }
-        // 短头/损坏头(Checkpoint 中途崩溃):原地重建,后续帧本就不完整。
-        None => create_truncating(&path, index, config),
-    }
-}
-
-/// 以截断方式新建/重建 WAL:写文件头并 fsync。
-///
-/// 名为「truncating」是因为实现用 `File::create` **覆盖**既有文件;调用场景
-/// (首次创建、短头重建、重置兜底)都需要覆盖语义。
-fn create_truncating(path: &Path, index: u32, config: WalConfig) -> Result<WalWriter> {
+/// 以截断方式新建/重建 WAL:原子写文件头。
+fn create_truncating(
+    storage: Arc<dyn Storage>,
+    index: u32,
+    config: WalConfig,
+) -> Result<WalWriter> {
     let header = wal::encode_file_header(config.dimension, config.metric);
     let rel = wal_name(index);
-    let root = path
-        .parent()
-        .and_then(Path::parent)
-        .map_or_else(|| PathBuf::from("."), Path::to_path_buf);
-    let mut file = std::fs::File::create(path)?;
-    use std::io::Write as _;
     if let Some(hook) = &config.hook {
         hook.before(IoAction::Write {
             file: &rel,
@@ -393,9 +398,17 @@ fn create_truncating(path: &Path, index: u32, config: WalConfig) -> Result<WalWr
             len: header.len(),
         })?;
     }
-    file.write_all(&header)?;
-    file.sync_all()?;
-    Ok(WalWriter::from_parts(root, Some(file), index, config))
+    // 覆盖语义:write_atomic 先写临时文件再 rename,永远不会读到半截头。
+    storage.write_atomic(&rel, &header)?;
+    storage.sync(&rel)?;
+    Ok(WalWriter::from_parts(
+        storage,
+        index,
+        config,
+        true,
+        wal::FILE_HEADER_LEN as u64,
+        0,
+    ))
 }
 
 #[cfg(test)]
@@ -439,7 +452,12 @@ mod tests {
             max_file_bytes: 0,
             hook,
             read_only: false,
+            encryption: None,
         }
+    }
+
+    fn fs(dir: &std::path::Path) -> Arc<dyn Storage> {
+        Arc::new(crate::persist::storage::FsStorage::new(dir))
     }
 
     /// FC-PERSIST-INV-005:重置失败且重建失败时停用句柄,绝不向状态可疑的文件追加。
@@ -450,7 +468,7 @@ mod tests {
             seen: std::sync::atomic::AtomicUsize::new(0),
         });
         let mut writer =
-            WalWriter::open_or_create(dir.path(), config(Some(hook))).expect("create wal");
+            WalWriter::open_or_create(fs(dir.path()), config(Some(hook))).expect("create wal");
         assert!(writer.reset().is_err(), "注入的头写入失败必须上报");
         let result = writer.append(1, wal::FrameKind::DeleteRow, &[]);
         assert!(
@@ -463,7 +481,8 @@ mod tests {
     #[test]
     fn reset_keeps_complete_header() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut writer = WalWriter::open_or_create(dir.path(), config(None)).expect("create wal");
+        let mut writer =
+            WalWriter::open_or_create(fs(dir.path()), config(None)).expect("create wal");
         writer
             .append(1, wal::FrameKind::DeleteRow, &[])
             .expect("append");
@@ -473,5 +492,26 @@ mod tests {
         let header = wal::parse_file_header(&bytes).expect("reset 后头必须完整可解析");
         assert_eq!(header.dimension, 4);
         assert_eq!(header.metric, Metric::Cosine);
+    }
+
+    /// 内存后端可完整走 WAL 追加/同步/重置(无 mmap 依赖;设计 12 §3.1)。
+    #[test]
+    fn mem_storage_supports_wal_lifecycle() {
+        let storage: Arc<dyn Storage> = Arc::new(crate::persist::storage::MemStorage::new());
+        let mut writer =
+            WalWriter::open_or_create(Arc::clone(&storage), config(None)).expect("create wal");
+        writer
+            .append(7, wal::FrameKind::DeleteRow, b"payload")
+            .expect("append");
+        writer.sync().expect("sync");
+        let bytes = storage
+            .read_file("wal/wal_000001.log")
+            .expect("read mem wal");
+        assert!(bytes.len() > wal::FILE_HEADER_LEN);
+        writer.reset().expect("reset");
+        let bytes = storage
+            .read_file("wal/wal_000001.log")
+            .expect("read mem wal");
+        assert_eq!(bytes.len(), wal::FILE_HEADER_LEN);
     }
 }

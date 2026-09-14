@@ -13,9 +13,12 @@
 > `feature = "async"` 门面均已接线,`FC-QUANT-*` 全部转 `Passed`。
 > 与本章原文的三处实现取舍(以契约为准):
 >
-> 1. **图仍由 f32 构建,量化副本只服务查询期打分**——装配式 HNSW 的图结构在
->    flush 期一次性构建,查询期 `score_query` 读 qvec 副本算粗排分;这样 f32 图
->    天然作为建段召回抽样的对照基线,且构建期成本不变(带宽收益在查询期兑现);
+> 1. **存储量化副本只服务查询期打分;建图另按 `BuildPrecision` 档位**——装配式 HNSW
+>    的图结构在 flush 期一次性构建,查询期 `score_query` 读 qvec 副本算粗排分;这样
+>    f32 图天然作为建段召回抽样的对照基线。建图距离默认走 `Hybrid` 档(段内临时 i8
+>    码流近似遍历 + 选邻前 f32 精排重排,见 05 §4.4),`F32` 档为全精确原行为;两者
+>    与段是否落盘 qvec 副本相互独立(临时码流不写文件、`Tuning.quant_recall_floor`
+>    的抽样回退只作用于存储副本);
 > 2. **i8 粗排内核用「u8 码位零扩展 + FMA」而不是 `maddubs`/VNNI**——每维独立
 >    scale 无法直接喂给整数点积指令;`core::simd::dot_u8_f32` 每行只读 `d` 字节
 >    (带宽 ÷4),AVX2 可用时走 `_mm256_cvtepu8_epi32` + FMA,否则回退标量;
@@ -26,7 +29,7 @@
 > (`FC-QUANT-ERR-002`);`src/quant/` 为纯原语模块(无 I/O/锁/全局态,依赖等级同
 > L0),供 L2 段编码与 L3 索引打分直接复用。`benches/quant.rs` 给出 f32/i8 的
 > 微缩对照(4k×512);微缩规模下每查询的候选收集/位图等固定开销占比高,≥3×
-> 加速门槛需 1M×1536 heavy 档,与冷启动、fuzz 长跑同属 CI 收尾(14 §4/§5)。
+> 加速门槛需 1M×1536 heavy 档,已接线 CI heavy 档、待 runner 首跑验证(14 §4/§5)。
 
 模块:`quant/{scalar_i8.rs, f16.rs, rescore.rs, support.rs}`(已落地)、`memory::async_facade`(feature `async`)、`src/fuzzing.rs`(feature `fuzzing`)
 
@@ -164,8 +167,8 @@ IEEE 754 half:1 位符号 + 5 位指数 + 10 位尾数。相对精度 $2^{-11} \
   低于 `Tuning.quant_recall_floor`(默认 0.98)即**该段不写 qvec、回退 f32**,
   且 `stats().quant` 的 `configured`/`active`/`recall_est` 如实反映(I13,
   验收见 [14 §3.2](14-testing.md));`quant_recall_floor = 0.0` 关闭回退,
-  `> 1` 恒回退(测试用)。离线 1 万查询基准与 1M×1536 门槛仍属 CI 收尾
-  ([14 §4](14-testing.md));
+  `> 1` 恒回退(测试用)。离线 1 万查询基准未接线,1M×1536 门槛已接线 CI heavy 档
+  (待 runner 首跑验证,见 [14 §4](14-testing.md));
 - 运行期监控:`stats().quant.recall_est` 暴露建段抽样一致率(各段取最小值;
   重开库后无建段采样上下文,为 `None`,回归见
   `tests/l6_contracts.rs::i8_qvec_roundtrip_after_reopen` 与 [16 §1.6](16-api-reference.md))。
@@ -246,8 +249,8 @@ impl AsyncNamespace {
 
 | 事项 | 标准 | 详见 |
 |---|---|---|
-| criterion 基准集 | 已落地:建库吞吐(`benches/hnsw.rs`)与量化微缩对照(`benches/quant.rs`);QPS-ef 曲线 / 过滤三档 / 混合 / compaction 停顿 / 冷启动待 CI | [14 §4](14-testing.md) |
-| cargo-fuzz | 五目标骨架已搭起(`fuzz/`);1h/24h 长跑待 CI | [14 §5](14-testing.md) |
+| criterion 基准集 | 已落地:建库吞吐(`benches/hnsw.rs`)与量化微缩对照(`benches/quant.rs`);QPS-ef 曲线 / 过滤三档 / 混合 / compaction 停顿 / 冷启动已接线 CI heavy 档(待 runner 首跑),基线回归待入库 | [14 §4](14-testing.md) |
+| cargo-fuzz | 五目标骨架已搭起(`fuzz/`);1h/24h 长跑已接线 fuzz 夜跑档(待 runner 首跑;发布前累计 24h) | [14 §5](14-testing.md) |
 | MSRV | `rust-version = 1.93`(edition 2024) | Cargo.toml |
 | 文档 | pub API 100% 文档覆盖;`#![deny(missing_docs)]` | — |
 | 发布 | `cargo publish --dry-run` + 变更日志(发布前执行) | — |

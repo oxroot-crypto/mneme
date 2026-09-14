@@ -66,7 +66,50 @@ pub struct Tuning {
     /// 该段自动回退为 f32 并如实反映在 `stats().quant`(I13)。取值须为有限且 ≥ 0;
     /// `0.0` 表示关闭自动回退,`> 1` 表示恒回退(测试/强制关闭用)。
     pub quant_recall_floor: f32,
+    /// HNSW 建图启发式选邻的「新方向」比较上限,默认 4。
+    ///
+    /// 候选按距离升序,只与最近选中的至多该数量比较:调小更快、调大更准
+    /// (1536 维实测 8→4 与无上限召回相同、构建快约 1.4×)。必须 ≥ 1。
+    pub hnsw_compare_cap: usize,
+    /// HNSW 批内并行建图的批行数,默认 8。
+    ///
+    /// 批大小只依赖节点数、与线程数无关(同输入同图);调大并行任务更多、
+    /// 批内互不可见更强。必须 ≥ 1。
+    pub hnsw_batch_rows: usize,
+    /// HNSW 建图小图串行阈值,默认 64。
+    ///
+    /// 节点数 ≤ 该值时不分批(无并行收益且避免冷启动批破坏连通性)。必须 ≥ 1。
+    pub hnsw_serial_rows: usize,
+    /// HNSW 建图批内并行度硬上限,默认 8。
+    ///
+    /// 实际线程数 = `min(Builder::parallelism(0=可用核数), 本值, 批行数)`。
+    /// 必须 ≥ 1。
+    pub hnsw_threads_max: usize,
+    /// 大 flush 切块行数,默认 65_536。
+    ///
+    /// 块数 = ⌈行数/本值⌉;每块一个段。环境变量 `MNEME_FLUSH_CHUNK_ROWS`
+    /// 优先于本值(测试/调参)。必须 ≥ 1。
+    pub flush_chunk_rows: usize,
+    /// flush 块级并行度,默认 1(块级串行)。
+    ///
+    /// 块级并行与块内批并行嵌套会争抢内存带宽(4 核实测反而更慢),故默认串行、
+    /// 把并行度交给块内批并行。环境变量 `MNEME_FLUSH_THREADS` 优先于本值。
+    /// 必须 ≥ 1。
+    pub flush_threads: usize,
 }
+
+/// HNSW 建图选邻比较上限缺省值(设计 05 §4.3;1536 维实测 4 与无上限同召回)。
+pub(crate) const DEFAULT_HNSW_COMPARE_CAP: usize = 4;
+/// HNSW 批内建图批行数缺省值(`FC-INDEX-POST-012`)。
+pub(crate) const DEFAULT_HNSW_BATCH_ROWS: usize = 8;
+/// HNSW 建图小图串行阈值缺省值。
+pub(crate) const DEFAULT_HNSW_SERIAL_ROWS: usize = 64;
+/// HNSW 建图批内并行度硬上限缺省值。
+pub(crate) const DEFAULT_HNSW_THREADS_MAX: usize = 8;
+/// 大 flush 切块行数缺省值。
+pub(crate) const DEFAULT_FLUSH_CHUNK_ROWS: usize = 65_536;
+/// flush 块级并行度缺省值(1 = 块级串行,并行交给块内批并行)。
+pub(crate) const DEFAULT_FLUSH_THREADS: usize = 1;
 
 impl Default for Tuning {
     fn default() -> Self {
@@ -80,6 +123,69 @@ impl Default for Tuning {
             stopwords: true,
             rescore_oversample: DEFAULT_RESCORE_OVERSAMPLE,
             quant_recall_floor: DEFAULT_QUANT_RECALL_FLOOR,
+            hnsw_compare_cap: DEFAULT_HNSW_COMPARE_CAP,
+            hnsw_batch_rows: DEFAULT_HNSW_BATCH_ROWS,
+            hnsw_serial_rows: DEFAULT_HNSW_SERIAL_ROWS,
+            hnsw_threads_max: DEFAULT_HNSW_THREADS_MAX,
+            flush_chunk_rows: DEFAULT_FLUSH_CHUNK_ROWS,
+            flush_threads: DEFAULT_FLUSH_THREADS,
+        }
+    }
+}
+
+/// HNSW 建图距离精度档位(设计 05 §4.4;`FC-INDEX-POST-010/011`)。
+///
+/// 只影响 HNSW 构建期的距离计算,不改变存储格式与查询语义;flush/compaction
+/// 按当前配置生效(与 [`VectorFormat`] 同口径)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BuildPrecision {
+    /// 全 f32 精确建图(原行为;逐位可复现)。
+    F32,
+    /// 默认:建图遍历用段内临时 i8 码流近似距离(读带宽 ÷4),
+    /// 邻居选择/修剪前按 f32 原向量对候选精排;临时码流不落盘。
+    #[default]
+    Hybrid,
+}
+
+/// HNSW 建图工程参数(由 [`Tuning`] 派生;批内并行、选邻比较上限等)。
+///
+/// 与算法参数 [`HnswParams`] 分开:这些只影响构建过程的并行与近似策略,
+/// 不改变磁盘格式与查询语义(`FC-INDEX-POST-012`)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct HnswBuildParams {
+    /// 批内并行线程数(`0` = 按可用核数)。
+    pub(crate) parallelism: usize,
+    /// 批内并行度硬上限。
+    pub(crate) threads_max: usize,
+    /// 批行数。
+    pub(crate) batch_rows: usize,
+    /// 小图串行阈值。
+    pub(crate) serial_rows: usize,
+    /// 选邻「新方向」比较上限。
+    pub(crate) compare_cap: usize,
+}
+
+impl HnswBuildParams {
+    /// 由进阶调参与实际并行度派生。
+    pub(crate) fn from_tuning(tuning: &Tuning, parallelism: usize) -> Self {
+        Self {
+            parallelism,
+            threads_max: tuning.hnsw_threads_max,
+            batch_rows: tuning.hnsw_batch_rows,
+            serial_rows: tuning.hnsw_serial_rows,
+            compare_cap: tuning.hnsw_compare_cap,
+        }
+    }
+}
+
+impl Default for HnswBuildParams {
+    fn default() -> Self {
+        Self {
+            parallelism: 0,
+            threads_max: DEFAULT_HNSW_THREADS_MAX,
+            batch_rows: DEFAULT_HNSW_BATCH_ROWS,
+            serial_rows: DEFAULT_HNSW_SERIAL_ROWS,
+            compare_cap: DEFAULT_HNSW_COMPARE_CAP,
         }
     }
 }
@@ -108,6 +214,33 @@ mod tests {
             (16, 32, 200, 64)
         );
         assert_eq!(VectorFormat::default(), VectorFormat::F32);
+    }
+
+    /// FC-INDEX-PRE-001 / FC-INDEX-POST-012:建图/建段工程调参默认值与设计一致
+    /// (选邻比较上限 4、批 8、小图阈值 64、建图线程上限 8、块行数 65_536、
+    /// 块级串行 1)。
+    #[test]
+    fn build_tuning_defaults_match_design() {
+        let tuning = Tuning::default();
+        assert_eq!(tuning.hnsw_compare_cap, DEFAULT_HNSW_COMPARE_CAP);
+        assert_eq!(tuning.hnsw_batch_rows, DEFAULT_HNSW_BATCH_ROWS);
+        assert_eq!(tuning.hnsw_serial_rows, DEFAULT_HNSW_SERIAL_ROWS);
+        assert_eq!(tuning.hnsw_threads_max, DEFAULT_HNSW_THREADS_MAX);
+        assert_eq!(tuning.flush_chunk_rows, DEFAULT_FLUSH_CHUNK_ROWS);
+        assert_eq!(tuning.flush_threads, DEFAULT_FLUSH_THREADS);
+        assert_eq!(tuning.hnsw_compare_cap, 4, "1536 维实测默认值");
+        assert_eq!(tuning.flush_threads, 1, "块级默认串行");
+        let build = HnswBuildParams::from_tuning(&tuning, 0);
+        assert_eq!(
+            (
+                build.parallelism,
+                build.threads_max,
+                build.batch_rows,
+                build.serial_rows,
+                build.compare_cap
+            ),
+            (0, 8, 8, 64, 4)
+        );
     }
 
     /// FC-QUANT-PRE-001 / FC-QUANT-INV-015:量化调参默认值与设计一致

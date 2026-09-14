@@ -6,19 +6,23 @@ use crate::core::error::{MnemeError, Result};
 use crate::core::meta::Meta;
 use crate::core::options::RelationKind;
 use crate::core::types::{NsId, RowId, SeqNo};
+use crate::memory::lazy::{ByteSource, VectorStorage};
 use crate::memory::relation::{self, Edge};
 use crate::memory::table::{AccessStat, SlotData, WriterState};
 use crate::persist::msec::{self, EntryData, VersionRow};
 use crate::persist::vsec;
 
 use super::SegmentBytes;
+use super::state::ParsedSegment;
 
-/// `slot_from_entry` 的输入(记录体 + 向量 + 事务时间 + 墓碑标志)。
+/// `slot_from_entry` 的输入(记录体 + 向量存储 + 事务时间 + 墓碑标志)。
 pub(super) struct SlotFromEntry<'a> {
     /// 记录体。
     pub(super) entry: &'a EntryData,
-    /// 对应向量。
-    pub(super) vector: Vec<f32>,
+    /// 对应向量(自有或段内惰性)。
+    pub(super) vector: Arc<VectorStorage>,
+    /// 向量范数平方(vsec 范数列回读;无范数列时由解码回退算出)。
+    pub(super) norm_sq: f32,
     /// 事务时间(Unix 毫秒)。
     pub(super) tx_ms: i64,
     /// 是否为墓碑。
@@ -31,7 +35,7 @@ pub(super) fn load_segment_views<'a>(
     verify_payload: bool,
     fail_fast: bool,
 ) -> Result<Option<(vsec::VsecView<'a>, msec::MsecView<'a>)>> {
-    let mut vsec_view = match vsec::parse(&segment.vsec) {
+    let mut vsec_view = match vsec::parse(segment.vsec_bytes()?) {
         Ok(view) => view,
         // 版本不一致一律拒绝打开(I18),绝不因 fail-fast 关闭而降级为跳过。
         Err(error) if fail_fast || is_version_rejection(&error) => return Err(error),
@@ -40,7 +44,7 @@ pub(super) fn load_segment_views<'a>(
     // f16 段在未开 `quant-f16` 的构建上拒绝打开,绝不静默按 f32 服务
     // (FC-QUANT-ERR-002);该判断先于 fail-fast 降级,数据仍完整可读也须显式报错。
     crate::quant::ensure_format_supported(vsec_view.quant())?;
-    let mut msec_view = match msec::parse(&segment.msec) {
+    let mut msec_view = match msec::parse(segment.msec_bytes()?) {
         Ok(view) => view,
         Err(error) if fail_fast || is_version_rejection(&error) => return Err(error),
         Err(_) => return Ok(None),
@@ -67,34 +71,101 @@ fn is_version_rejection(error: &MnemeError) -> bool {
     matches!(error, MnemeError::UnsupportedVersion { .. })
 }
 
+/// 并行解码阈值:版本数低于此值时直接顺序处理,避免线程开销。
+const PARALLEL_DECODE_MIN: usize = 4096;
+
 /// 按全局有序的版本链重建槽位。
+///
+/// 解码阶段(记录体解析 + 向量句柄构造)无副作用、可并行;提交阶段按全局序
+/// 单线程执行(版本链 / key 索引 / 水位推进)。大批量时打开耗时的主体落在
+/// 解码阶段,多核可线性摊薄(FC-PERSIST-INV-021 的冷启动优化)。
 pub(super) fn apply_versions(
     state: &mut WriterState,
     versions: &[(VersionRow, usize)],
-    parsed: &[(vsec::VsecView<'_>, msec::MsecView<'_>)],
+    parsed: &[ParsedSegment<'_>],
 ) -> Result<()> {
-    for (row, index) in versions {
-        let (vsec_view, msec_view) = &parsed[*index];
-        apply_version(state, vsec_view, msec_view, row)?;
+    let decoded = decode_versions(state, versions, parsed)?;
+    let total = decoded.len();
+    Arc::make_mut(&mut state.slots).reserve(total);
+    state.slot_segment.reserve(total);
+    state.versions.reserve(total);
+    state.latest.reserve(total);
+    // 解码结果保持 `(rowid, seqno)` 全局序:同一 `rowid` 的版本连续出现,
+    // 据此判断是否存在旧版本可遮蔽(跳过大部分 `hide_latest` 查找)。
+    let mut previous_rowid: Option<RowId> = None;
+    for (slot_data, access) in decoded {
+        let rowid = slot_data.rowid;
+        commit_recovered_slot(state, slot_data, access, previous_rowid == Some(rowid))?;
+        previous_rowid = Some(rowid);
     }
     Ok(())
 }
 
-/// 应用单个版本行到写状态。
-fn apply_version(
-    state: &mut WriterState,
-    vsec_view: &vsec::VsecView<'_>,
-    msec_view: &msec::MsecView<'_>,
+/// 单个版本行的解码产物(纯数据,可跨线程移动)。
+type DecodedVersion = (SlotData, Option<(i64, u32)>);
+
+/// 解码全部版本行;大批量走 scoped threads,结果保持输入次序。
+fn decode_versions(
+    state: &WriterState,
+    versions: &[(VersionRow, usize)],
+    parsed: &[ParsedSegment<'_>],
+) -> Result<Vec<DecodedVersion>> {
+    let workers = if cfg!(feature = "wasm") {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .min(versions.len())
+    };
+    if versions.len() < PARALLEL_DECODE_MIN || workers == 1 {
+        let mut out = Vec::with_capacity(versions.len());
+        for (row, index) in versions {
+            out.push(decode_version(state, &parsed[*index], row)?);
+        }
+        return Ok(out);
+    }
+    let chunk = versions.len().div_ceil(workers);
+    let pieces: Vec<Result<Vec<DecodedVersion>>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = versions
+            .chunks(chunk)
+            .map(|chunk_versions| {
+                scope.spawn(move || {
+                    let mut out = Vec::with_capacity(chunk_versions.len());
+                    for (row, index) in chunk_versions {
+                        out.push(decode_version(state, &parsed[*index], row)?);
+                    }
+                    Ok(out)
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                // reason: 解码是纯函数,线程 panic 只可能来自实现 bug;显式转内部
+                // 不一致错误而非二次 panic(绝不静默丢版本)。
+                handle.join().unwrap_or(Err(MnemeError::Inconsistent {
+                    reason: "恢复解码线程 panic",
+                }))
+            })
+            .collect()
+    });
+    let mut out = Vec::with_capacity(versions.len());
+    for piece in pieces {
+        out.extend(piece?);
+    }
+    Ok(out)
+}
+
+/// 解码单个版本行(无副作用;可在任意线程执行)。
+fn decode_version(
+    state: &WriterState,
+    segment: &ParsedSegment<'_>,
     row: &VersionRow,
-) -> Result<()> {
+) -> Result<DecodedVersion> {
     let slot_id = row.slot_id as usize;
-    let vector = vsec_view
-        .vector(slot_id)
-        .ok_or_else(|| MnemeError::Corrupted {
-            segment: None,
-            reason: "recover: vsec 缺少版本槽位向量".to_string(),
-        })?;
-    let (slot_data, access) = match msec_view.read_entry(row.doc_offset)? {
+    let (vector, norm_sq) =
+        vector_storage(&segment.vsec_view, Arc::clone(&segment.vsec_file), slot_id)?;
+    let (slot_data, access) = match segment.msec_view.read_entry(row.doc_offset)? {
         Some(entry) => {
             let access = entry.access;
             (
@@ -103,6 +174,7 @@ fn apply_version(
                     SlotFromEntry {
                         entry: &entry,
                         vector,
+                        norm_sq,
                         tx_ms: row.tx_ms,
                         deleted: false,
                     },
@@ -116,11 +188,44 @@ fn apply_version(
                 SeqNo::new(row.seqno),
                 row.tx_ms,
                 vector,
+                norm_sq,
             ),
             None,
         ),
     };
-    commit_recovered_slot(state, slot_data, access)
+    Ok((slot_data, access))
+}
+
+/// 构造版本向量的存储形态:优先惰性句柄(范数列回读,不解码向量);
+/// 无范数列时回退逐行解码并计算范数(旧布局防御,语义一致)。
+fn vector_storage(
+    vsec_view: &vsec::VsecView<'_>,
+    vsec_file: Arc<crate::persist::source::ByteFile>,
+    slot_id: usize,
+) -> Result<(Arc<VectorStorage>, f32)> {
+    let dimension = vsec_view.dimension() as usize;
+    let offset = vsec_view.vector_offset(slot_id);
+    if let (Some(offset), Some(norm_sq)) = (offset, vsec_view.norm_sq(slot_id))
+        && let Some(storage) = VectorStorage::lazy(
+            Arc::clone(&vsec_file) as Arc<dyn ByteSource>,
+            offset,
+            dimension,
+        )
+    {
+        return Ok((storage, norm_sq));
+    }
+    // 回退:逐行解码(无范数列或句柄区间异常),仍不得静默丢弃版本。
+    let vector = vsec_view
+        .vector(slot_id)
+        .ok_or_else(|| MnemeError::Corrupted {
+            segment: None,
+            reason: "recover: vsec 缺少版本槽位向量".to_string(),
+        })?;
+    let norm_sq = crate::memory::search::norm_sq(&vector);
+    Ok((
+        VectorStorage::owned(Arc::from(vector.into_boxed_slice())),
+        norm_sq,
+    ))
 }
 
 /// 提交恢复出的槽位并推进水位/访问统计。
@@ -128,17 +233,24 @@ fn commit_recovered_slot(
     state: &mut WriterState,
     slot_data: SlotData,
     access: Option<(i64, u32)>,
+    previous_exists: bool,
 ) -> Result<()> {
     let rowid = slot_data.rowid;
     let seqno = slot_data.seqno;
-    // `commit_version` 会遮蔽同一 RowId 的上一版本(含墓碑),保证可见性正确。
-    state.commit_version(rowid, slot_data)?;
+    // 恢复专用提交:只建版本链(`commit_version` 会遮蔽同一 RowId 的上一版本)。
+    state.commit_recovered(rowid, slot_data, previous_exists)?;
     if seqno.get() > state.seqno.get() {
         state.seqno = seqno;
     }
     super::wal_replay::advance_rowid(state, rowid)?;
-    if let Some((last_access_ms, access_count)) = access {
-        Arc::make_mut(&mut state.access).insert(
+    // 版本行的 `access` 列是写入时刻的累计快照:**同一 `rowid` 的后续版本必须覆盖**
+    // (后一个版本的零快照要让更旧版本的值失效,跳过插入会让陈旧值残留并在 delta 上
+    // 重复累加,FC-PERSIST-POST-010)。首个版本(无旧值可覆盖)为全零时可跳过——零值
+    // 与缺失等价(`unwrap_or_default`),省去打开期每行一次分片插入。
+    if let Some((last_access_ms, access_count)) = access
+        && (previous_exists || last_access_ms != 0 || access_count != 0)
+    {
+        state.access.insert(
             rowid,
             AccessStat {
                 last_access_ms,
@@ -164,8 +276,8 @@ pub(super) fn apply_relations(
 ) -> Result<()> {
     let edges = crate::persist::edges::parse(msec_view.relations_bytes())?;
     if edges.full {
-        state.out_edges = Arc::new(std::collections::HashMap::new());
-        state.in_edges = Arc::new(std::collections::HashMap::new());
+        state.out_edges = crate::core::sharded::ShardedMap::new();
+        state.in_edges = crate::core::sharded::ShardedMap::new();
     }
     let build = |edge: &crate::persist::edges::EdgeData| Edge {
         from: RowId::new(edge.from),
@@ -175,11 +287,11 @@ pub(super) fn apply_relations(
         metadata: edge.meta.clone(),
     };
     for edge in &edges.forward {
-        relation::upsert_edge(Arc::make_mut(&mut state.out_edges), build(edge));
-        relation::upsert_edge(Arc::make_mut(&mut state.in_edges), build(edge));
+        relation::upsert_edge_sharded(&mut state.out_edges, build(edge));
+        relation::upsert_edge_sharded(&mut state.in_edges, build(edge));
     }
     for edge in &edges.reverse {
-        relation::upsert_edge(Arc::make_mut(&mut state.in_edges), build(edge));
+        relation::upsert_edge_sharded(&mut state.in_edges, build(edge));
     }
     Ok(())
 }
@@ -209,9 +321,7 @@ fn apply_delta_entry(state: &mut WriterState, entry: msec::DeltaEntry) {
             if superseded_by_latest_version(state, rowid, seqno) {
                 return;
             }
-            let stat = Arc::make_mut(&mut state.access)
-                .entry(RowId::new(rowid))
-                .or_default();
+            let stat = state.access.get_or_insert_default(RowId::new(rowid));
             stat.access_count = stat.access_count.saturating_add(access_delta);
             // 时钟回拨下回放序可能倒退;保留更晚的访问时刻。
             stat.last_access_ms = stat.last_access_ms.max(last_access_ms);
@@ -231,8 +341,8 @@ fn apply_delta_entry(state: &mut WriterState, entry: msec::DeltaEntry) {
                 weight,
                 metadata: meta,
             };
-            relation::upsert_edge(Arc::make_mut(&mut state.out_edges), edge.clone());
-            relation::upsert_edge(Arc::make_mut(&mut state.in_edges), edge);
+            relation::upsert_edge_sharded(&mut state.out_edges, edge.clone());
+            relation::upsert_edge_sharded(&mut state.in_edges, edge);
         }
         msec::DeltaEntry::Unrelate { from, to, kind, .. } => {
             apply_unrelate_delta(state, from, to, kind);
@@ -242,14 +352,14 @@ fn apply_delta_entry(state: &mut WriterState, entry: msec::DeltaEntry) {
 
 /// 应用 `Unrelate` delta:移除出边与入边。
 fn apply_unrelate_delta(state: &mut WriterState, from: u64, to: u64, kind: u16) {
-    relation::remove_edge(
-        Arc::make_mut(&mut state.out_edges),
+    relation::remove_edge_sharded(
+        &mut state.out_edges,
         RowId::new(from),
         RowId::new(to),
         RelationKind(kind),
     );
-    relation::remove_edge(
-        Arc::make_mut(&mut state.in_edges),
+    relation::remove_edge_sharded(
+        &mut state.in_edges,
         RowId::new(to),
         RowId::new(from),
         RelationKind(kind),
@@ -268,11 +378,12 @@ fn superseded_by_latest_version(state: &WriterState, rowid: u64, delta_seqno: u6
         .is_some_and(|slot| state.slots[slot.get() as usize].seqno.get() > delta_seqno)
 }
 
-/// 由记录体 + 向量构造一个活槽位。
+/// 由记录体 + 向量存储构造一个活槽位。
 pub(super) fn slot_from_entry(state: &WriterState, input: SlotFromEntry<'_>) -> SlotData {
     let SlotFromEntry {
         entry,
         vector,
+        norm_sq,
         tx_ms,
         deleted,
     } = input;
@@ -281,8 +392,6 @@ pub(super) fn slot_from_entry(state: &WriterState, input: SlotFromEntry<'_>) -> 
         .get(&entry.ns_id)
         .cloned()
         .unwrap_or_else(|| Arc::from(""));
-    let vector: Arc<[f32]> = Arc::from(vector.into_boxed_slice());
-    let norm_sq = crate::memory::search::norm_sq(&vector);
     let text: Option<Arc<str>> = entry.text.clone();
     let text_hash = text
         .as_ref()
@@ -314,9 +423,13 @@ pub(super) fn slot_from_entry(state: &WriterState, input: SlotFromEntry<'_>) -> 
 }
 
 /// 构造墓碑槽位(无记录体;仅保留可见性所需的标识与向量占位)。
-fn tombstone_slot(rowid: RowId, seqno: SeqNo, tx_ms: i64, vector: Vec<f32>) -> SlotData {
-    let vector: Arc<[f32]> = Arc::from(vector.into_boxed_slice());
-    let norm_sq = crate::memory::search::norm_sq(&vector);
+fn tombstone_slot(
+    rowid: RowId,
+    seqno: SeqNo,
+    tx_ms: i64,
+    vector: Arc<VectorStorage>,
+    norm_sq: f32,
+) -> SlotData {
     SlotData {
         rowid,
         ns_id: NsId::new(0),

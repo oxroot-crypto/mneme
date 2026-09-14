@@ -5,7 +5,7 @@ use std::sync::Arc;
 use crate::core::error::{MnemeError, Result};
 use crate::core::meta::{self, Meta};
 use crate::persist::msec::{self, EntryData};
-use crate::persist::{Cursor, put_bytes_u32, put_i64, put_u32, put_u64};
+use crate::persist::{Cursor, put_bytes_u32, put_i64, put_u16, put_u32, put_u64};
 
 /// `Relate` 负载的标量字段(权重与元数据)。
 #[derive(Debug, Clone, Copy)]
@@ -27,8 +27,15 @@ pub(crate) struct RelateSpec<'a> {
 ///
 /// # Errors
 /// 记录体或向量长度超限时返回 [`MnemeError::TooLarge`]。
-pub(crate) fn encode_insert(entry: &EntryData, vector: &[f32], tx_ms: i64) -> Result<Vec<u8>> {
-    let mut out = msec::encode_entry(entry)?;
+pub(crate) fn encode_insert(
+    entry: &EntryData,
+    vector: &[f32],
+    tx_ms: i64,
+    compression: crate::core::options::Compression,
+) -> Result<Vec<u8>> {
+    // 单缓冲:记录体直接写进输出尾部,免「记录体 Vec 再拷入负载」。
+    let mut out = Vec::new();
+    msec::encode_entry_into(&mut out, entry, compression)?;
     put_i64(&mut out, tx_ms);
     let dim = u32::try_from(vector.len()).map_err(|_| MnemeError::TooLarge {
         field: "wal insert vector",
@@ -265,4 +272,32 @@ pub(crate) fn encode_ns_unregister(ns_id: u32) -> Vec<u8> {
 /// 长度不足时返回 [`MnemeError::Corrupted`]。
 pub(crate) fn decode_ns_unregister(payload: &[u8]) -> Result<u32> {
     Cursor::new(payload, "wal ns_unregister").u32()
+}
+
+/// 编码 `RelKindRegister` 负载 `[u16 kind][name 字节(余下全部)]`。
+pub(crate) fn encode_rel_kind_register(kind: u16, name: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 + name.len());
+    put_u16(&mut out, kind);
+    out.extend_from_slice(name.as_bytes());
+    out
+}
+
+/// 解码 `RelKindRegister` 负载;空名或非 UTF-8 返回结构化错误。
+///
+/// # Errors
+/// 长度不足、空名或非 UTF-8 时返回 [`MnemeError::Corrupted`]。
+pub(crate) fn decode_rel_kind_register(payload: &[u8]) -> Result<(u16, Arc<str>)> {
+    let mut cursor = Cursor::new(payload, "wal rel_kind_register");
+    let kind = cursor.u16()?;
+    let name = std::str::from_utf8(cursor.rest()).map_err(|error| MnemeError::Corrupted {
+        segment: None,
+        reason: format!("wal: rel_kind 名称非 UTF-8:{error}"),
+    })?;
+    if name.is_empty() {
+        return Err(MnemeError::Corrupted {
+            segment: None,
+            reason: "wal: rel_kind 名称为空".to_string(),
+        });
+    }
+    Ok((kind, Arc::from(name)))
 }

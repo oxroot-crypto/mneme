@@ -13,8 +13,11 @@
 //! * FC-PERSIST-POST-008(四区落盘与重开一致性)
 //! * FC-PERSIST-POST-009(分词口径建库即锁定)
 //! * FC-PERSIST-CPLX-004/005(zone map / bloom 评估)
-//! * FC-MEM-ERR-002(Fusion 单通道拒绝)
+//! * FC-MEM-ERR-002(Fusion 单通道拒绝)、FC-SCORE-POST-003(候选放大召回门槛)
 //! * FC-INDEX-PRE-001(bloom_fpp 定义域校验)
+//!
+//! 不变量锚定:I5(混合检索等价性)、I6(过滤先行)、I7(DSL 任意输入不 panic)、
+//! I21(BM25 统计跨段全局 + NS 隔离)
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -807,7 +810,7 @@ proptest! {
         }
     }
 
-    /// FC-INDEX-INV-005/006(候选集内 ANN ≡ 过滤后参考暴力)
+    /// FC-INDEX-INV-005/006(I5/I6:候选集内 ANN ≡ 过滤后参考暴力;过滤先行)
     #[test]
     fn vector_channel_matches_bruteforce(
         records in prop::collection::vec(
@@ -851,28 +854,75 @@ proptest! {
     }
 }
 
-/// FC-MEM-ERR-002:未落地的 `Scoring::bias_routing` 设置即返回 `Unsupported`,
-/// 绝不静默忽略(未接线的语义不得参与运行)。
+/// FC-SCORE-POST-003:开启非相似度因子后向量通道按 `ef' = max(ef, 4·top_k)` 放大,
+/// 综合排序相对全量暴力参照 Recall@10 ≥ 0.98;默认 `Scoring` 不放大。
 #[test]
-fn bias_routing_unsupported_is_explicit() {
-    let ns = mem(2).namespace("n");
-    ns.insert(Record::new(vec![1.0, 0.0]).key("a")).expect("a");
-    let error = ns
-        .search()
-        .vector(&[1.0, 0.0])
-        .score(mneme::Scoring {
-            bias_routing: true,
-            ..mneme::Scoring::default()
-        })
-        .execute()
-        .expect_err("bias_routing 必须显式拒绝");
+fn scoring_amplification_preserves_recall() {
+    use mneme::{Builder, Metric, Scoring};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let db = Builder::default()
+            .dimension(8)
+            .metric(Metric::Dot)
+            .path(dir.path())
+            .build()
+            .expect("build");
+        let ns = db.namespace("n");
+        for row in 0..256_u32 {
+            let vector: Vec<f32> = (0..8)
+                .map(|col| ((row * 17 + col * 29) % 97) as f32 / 97.0)
+                .collect();
+            ns.insert(
+                Record::new(vector)
+                    .key(format!("k{row}"))
+                    .importance(((row * 37) % 100) as f32 / 100.0),
+            )
+            .expect("insert");
+        }
+        db.flush().expect("flush");
+        db.close().expect("close");
+    }
+
+    let scoring = Scoring {
+        w_importance: 1.0,
+        ..Scoring::default()
+    };
+    let query: Vec<f32> = (0..8).map(|col| (col + 1) as f32 / 8.0).collect();
+    let run = |brute_force_max_rows: u32, ef: usize| {
+        let db = Builder::default()
+            .path(dir.path())
+            .tuning(Tuning {
+                brute_force_max_rows,
+                ..Tuning::default()
+            })
+            .build()
+            .expect("open");
+        let ns = db.namespace("n");
+        let hits = ns
+            .search()
+            .vector(&query)
+            .top_k(10)
+            .ef(ef)
+            .score(scoring.clone())
+            .execute()
+            .expect("search");
+        db.close().expect("close");
+        hits
+    };
+
+    // 参照:候选全量暴力 + 综合打分(= 无召回损失的上界)。
+    let reference: Vec<_> = run(u32::MAX, 16).iter().map(|hit| hit.rowid).collect();
+    // 产品路径:ANN 放大(ef' = max(16, 40)),召回相对参照损失 ≤ 2%。
+    let amplified: Vec<_> = run(1, 16).iter().map(|hit| hit.rowid).collect();
+    assert_eq!(reference.len(), 10);
+    let common = amplified
+        .iter()
+        .filter(|rowid| reference.contains(rowid))
+        .count();
+    let recall = common as f32 / reference.len() as f32;
     assert!(
-        matches!(
-            error,
-            mneme::MnemeError::Unsupported {
-                feature: "Scoring::bias_routing"
-            }
-        ),
-        "必须是 Unsupported 且指出特性名,实际 {error:?}"
+        recall >= 0.98,
+        "放大后综合排序 Recall@10 = {recall}(参照 {reference:?},实际 {amplified:?})"
     );
 }

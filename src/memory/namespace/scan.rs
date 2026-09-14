@@ -44,11 +44,12 @@ impl Namespace {
             return Ok(0);
         };
         let mut count = 0;
+        let uses_access = filter.as_ref().is_some_and(pred::Expr::uses_access);
         for (idx, slot) in view.slots.iter().enumerate() {
             if view.dead.get(idx) || slot.ns_id != ns_id || !slot.is_live(now) {
                 continue;
             }
-            if !passes_filter(&filter, slot, &view, &slot.rowid) {
+            if !passes_filter(&filter, slot, &view, &slot.rowid, uses_access) {
                 continue;
             }
             count += 1;
@@ -111,6 +112,7 @@ impl Namespace {
         }
         let now = self.config.clock.now_unix_ms();
         let mut collected = Vec::new();
+        let uses_access = filter.as_ref().is_some_and(pred::Expr::uses_access);
         if let Some(ns_id) = ns_id_of(&view, &self.ns_path) {
             for (rowid, slot) in view.latest.iter() {
                 let slot_data = &view.slots[slot.get() as usize];
@@ -122,7 +124,7 @@ impl Namespace {
                 {
                     continue;
                 }
-                if !passes_filter(&filter, slot_data, &view, rowid) {
+                if !passes_filter(&filter, slot_data, &view, rowid, uses_access) {
                     continue;
                 }
                 collected.push(Arc::clone(slot_data));
@@ -137,28 +139,27 @@ impl Namespace {
 
 /// 解析命名空间路径对应的 `NsId`。
 fn ns_id_of(view: &ReaderView, ns_path: &str) -> Option<NsId> {
-    view.ns_registry.iter().find_map(|(id, path)| {
-        if path.as_ref() == ns_path {
-            Some(*id)
-        } else {
-            None
-        }
-    })
+    view.ns_by_path.get(ns_path).copied()
 }
 
 /// 判断记录是否通过可选过滤表达式(三值语义,缺失字段不命中)。
+///
+/// `uses_access` 由调用方在循环外预判定:表达式未引用访问统计时不查访问表。
 fn passes_filter(
     filter: &Option<Expr>,
     slot_data: &SlotData,
     view: &ReaderView,
     rowid: &RowId,
+    uses_access: bool,
 ) -> bool {
     match filter {
         Some(expr) => pred::matches(
             expr,
             &EvalCtx {
                 slot: slot_data,
-                access: view.access.get(rowid).copied(),
+                access: uses_access
+                    .then(|| view.access.get(rowid).copied())
+                    .flatten(),
             },
         ),
         None => true,

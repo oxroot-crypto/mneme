@@ -14,6 +14,26 @@ pub(crate) struct BitSet {
 }
 
 impl BitSet {
+    /// 按 `bits` 位预留字容量(避免逐位置位时的多次扩容)。
+    pub(crate) fn with_capacity_bits(bits: usize) -> Self {
+        Self {
+            words: Vec::with_capacity(bits.div_ceil(BITS_PER_WORD)),
+        }
+    }
+
+    /// 置位 `[0, count)` 的全部比特,并清除其余位(批量全 1 位图)。
+    pub(crate) fn set_all(&mut self, count: usize) {
+        let words = count.div_ceil(BITS_PER_WORD);
+        self.words.clear();
+        self.words.resize(words, u64::MAX);
+        let tail_bits = count % BITS_PER_WORD;
+        if tail_bits != 0
+            && let Some(last) = self.words.last_mut()
+        {
+            *last = (1_u64 << tail_bits) - 1;
+        }
+    }
+
     /// 置位第 `idx` 位,必要时扩容。
     pub(crate) fn set(&mut self, idx: usize) {
         let word = idx / BITS_PER_WORD;

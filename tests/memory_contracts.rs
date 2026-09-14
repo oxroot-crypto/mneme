@@ -5,6 +5,7 @@
 //! * FC-MEM-PRE-001/002/003、FC-MEM-POST-001..007/009、FC-MEM-INV-001/002
 //! * FC-GLOBAL-PRE-001..005、FC-MEM-CPLX-004(delete 复杂度哨兵)
 //! * 跨族条目:FC-INDEX-POST-004、FC-MODEL-INV-022/024、FC-LIFE-INV-009
+//! * 不变量锚定:I9(过期/墓碑零返回)、I15(批量原子)、I22(RowId 稳定)、I24(更新原子可见)
 //!
 //! 检索/过滤/打分、记忆模型、遗忘与库生命周期的专项测试分见
 //! `query_contracts.rs`、`model_contracts.rs`、`life_contracts.rs`。复杂度/公式类
@@ -349,28 +350,26 @@ fn failed_writes_do_not_register_namespace() {
         .build()
         .expect("build");
     // 单条 insert 预校验失败 → 不登记。
-    assert!(
-        db.namespace("single")
-            .insert(Record::new(vec![1.0]))
-            .is_err()
-    );
+    assert!(matches!(
+        db.namespace("single").insert(Record::new(vec![1.0])),
+        Err(mneme::MnemeError::DimensionMismatch { .. })
+    ));
     assert!(db.list_namespaces().expect("list").is_empty());
     // 批量预校验失败 → 不登记。
-    assert!(
+    assert!(matches!(
         db.namespace("batch")
-            .insert_batch(vec![Record::new(vec![1.0])])
-            .is_err()
-    );
+            .insert_batch(vec![Record::new(vec![1.0])]),
+        Err(mneme::MnemeError::DimensionMismatch { .. })
+    ));
     assert!(db.list_namespaces().expect("list").is_empty());
     // 批量预校验后中途失败(Merge 产物超限)→ 回滚全部副作用,含命名空间登记。
-    assert!(
-        db.namespace("mid")
-            .insert_batch(vec![
-                Record::new(vec![1.0, 0.0]).text("aaaa"),
-                Record::new(vec![1.0, 0.0]).text("aaaa"),
-            ])
-            .is_err()
-    );
+    assert!(matches!(
+        db.namespace("mid").insert_batch(vec![
+            Record::new(vec![1.0, 0.0]).text("aaaa"),
+            Record::new(vec![1.0, 0.0]).text("aaaa"),
+        ]),
+        Err(mneme::MnemeError::TooLarge { field: "text", .. })
+    ));
     assert!(
         db.list_namespaces().expect("list").is_empty(),
         "失败批不得残留命名空间登记"

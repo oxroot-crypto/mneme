@@ -8,8 +8,9 @@
 > 只读共享与 WASM 是**采用门槛级**能力:许多 Agent 框架会
 > 以多进程运行,边缘/浏览器则是嵌入式库的天然战场。单写者语义保持不变。
 
-模块:`deploy/{readonly.rs}`、`obs/observer.rs`;`Storage` trait 计划落在 `persist/storage.rs`
-(L12 抽取,见 §3.1);L2 目前只有该文件的 `std::fs` 自由函数
+模块:`persist/storage.rs`(`Storage`/`FsStorage`/`MemStorage` 与文件锁,已落地)、
+`core/observe.rs`(`Observer`/`Event`/`WriteOp`,已落地);只读共享与周期探测落在 L1/L2
+引擎路径。
 
 ---
 
@@ -37,8 +38,9 @@ let db = Mneme::builder().path("./agent_memory").read_only(true).build()?;
 - 只读实例**不改动文件系统**:打开时**不建目录、不清 `trash/`、不移动损坏段、不截断 WAL**,
   只读取既有数据;在内存中重放未落段的 WAL(遇撕裂帧只忽略、不截断,
   [04 §7](04-l2-persist.md));损坏段只从视图剔除,不移动文件(库目录不存在 → `Config`);
-- 只读实例的可见性:打开时读一次 `current` → MANIFEST。**周期性探测 `current` 版本号并原子
-  切换视图是 L12 目标**;L2 的只读实例打开后不随写者推进刷新(§2.1 描述的是目标语义);
+- 只读实例的可见性:打开时读一次 `current` → MANIFEST;注册探测周期
+  (`Builder::read_only_probe_interval`,默认 1s)后后台线程周期探测 `current`
+  并原子切换视图(`Table::publish`),也可显式调用 `Mneme::reload()`;
 - **不变量 I29**:任意时刻只读实例看到的都是某个**已提交 MANIFEST 版本的完整视图**
   (段集一致,不会看到半提交状态);新版本的可见延迟 ≤ 探测周期(默认 1s,L12)。
 
@@ -70,31 +72,45 @@ let db = Mneme::builder().path("./agent_memory").read_only(true).build()?;
 ### 3.1 现状
 
 [04 §11](04-l2-persist.md) 已把段读取抽象为 `SegmentSource`(mmap / `FileSource`)。
-WASM 没有 mmap,但有内存文件系统/IndexedDB;需要把**写路径**也抽象出来。
-为此,`Storage` trait 计划定义在 `persist/storage.rs`(与 `SegmentSource` 同层,
-避免上层反向依赖),`deploy/` 只提供 WASM 适配实现。
-> **落地状态**:L2 目前以 `persist/storage.rs` 的 `std::fs` 自由函数实现文件操作
-> (原子写/锁/目录遍历),`Storage` trait 与 `Builder::storage` 待 **L12** 引入首个
-> 非 `FsStorage` 后端(WASM/OPFS)时抽取,以避免在仅有一个后端时过早抽象。
-> 故 16 §1.1 的 `Builder::storage` 亦标记为 L12 落地。
+WASM 没有 mmap,但有内存文件系统/IndexedDB;为此需要把**写路径**也抽象出来。
+`Storage` trait 已定义在 `persist/storage.rs`(与 `SegmentSource` 同层,
+避免上层反向依赖);WASM 适配由 `MemStorage`/宿主后端提供。
+> **落地状态(已落地)**:`Storage` trait 与 `FsStorage`/`MemStorage` 已抽取到
+> `persist/storage.rs`,`Builder::storage` 可注入任意后端;段/WAL/MANIFEST/trash/
+> 恢复/校验全链路经后端读写(WAL 写入器已去 `File` 句柄化),`MemStorage` 通过
+> 完整生命周期测试(`FC-DEPLOY-POST-001`)。WASM 目标由 feature `wasm` 关闭 mmap
+> 与后台线程、配合 `MemStorage`/宿主后端;目标构建验证留 CI(`wasm-check` job)。
 
 ```rust
 /// 存储后端的文件元数据(不依赖 `std::fs`,WASM 后端同样可实现)。
-pub struct FileMeta { pub len: u64, pub modified_ms: i64 }
+pub struct FileMeta { pub len: u64 }
 
-pub trait Storage: Send + Sync {
-    fn read_at(&self, off: u64, buf: &mut [u8]) -> Result<()>;
-    fn write_at(&self, off: u64, buf: &[u8]) -> Result<()>;
-    fn append(&self, buf: &[u8]) -> Result<()>;      // WAL 顺序追加
-    fn sync(&self) -> Result<()>;
+pub trait Storage: Send + Sync + std::fmt::Debug {
+    fn read_file(&self, rel: &str) -> Result<Vec<u8>>;
+    fn read_file_opt(&self, rel: &str) -> Result<Option<Vec<u8>>>;
+    fn read_prefix(&self, rel: &str, max: usize) -> Result<Vec<u8>>;  // 段打开 4 字节信封探测;默认整读后截断,文件后端应覆写
+    fn write_atomic(&self, rel: &str, bytes: &[u8]) -> Result<()>;  // 临时文件 + fsync + rename,绝不原地覆盖
+    fn write_new(&self, rel: &str, bytes: &[u8]) -> Result<()>;     // 只创建不覆盖(已存在则失败)
+    fn append(&self, rel: &str, bytes: &[u8]) -> Result<u64>;       // 追加并返回新长度(WAL 顺序写)
+    fn truncate(&self, rel: &str, len: u64) -> Result<()>;
+    fn sync(&self, rel: &str) -> Result<()>;
+    fn list_dir(&self, rel: &str) -> Result<Vec<String>>;
+    fn ensure_dir(&self, rel: &str) -> Result<()>;
+    fn remove_if_exists(&self, rel: &str) -> Result<()>;
     fn rename(&self, from: &str, to: &str) -> Result<()>;
-    fn remove(&self, path: &str) -> Result<()>;
-    fn list(&self, dir: &str) -> Result<Vec<String>>;
-    fn stat(&self, path: &str) -> Result<FileMeta>;
-    fn create_new(&self, path: &str) -> Result<()>;  // 原子创建,已存在则失败(元数据原子写用)
-    fn exists(&self, path: &str) -> Result<bool>;
+    fn exists(&self, rel: &str) -> Result<bool>;
+    fn stat(&self, rel: &str) -> Result<FileMeta>;
+    // ---- 默认实现(实现者通常无需覆写)----
+    fn open_bytes(&self, rel: &str) -> Result<RawBytes>;            // 默认整文件读入;mmap 后端可覆写
+    fn root_exists(&self) -> Result<bool>;
+    fn try_lock(&self) -> Result<Box<dyn std::any::Any + Send + Sync>>;  // 独占锁;`Drop` 即释放
 }
 ```
+
+> `RawBytes` 是 `open_bytes` 的只读字节视图:`Mmap`(feature `mmap` 下的内核映射)
+> 或 `Owned`(整文件自有缓冲);`Storage::open_bytes` 的默认实现返回 `Owned`,
+> 实现者不必关心 mmap。返回 `Mmap` 的后端必须保证视图存活期内文件不被原地
+> 改写/截断;库内仅对 write-once 段文件调用 `open_bytes`。
 
 - 桌面/服务器用 `FsStorage`(std);WASM 用 `MemStorage`(纯内存)或宿主提供的
   `OpfsStorage`(Origin Private File System,经宿主实现);后端经 `Builder::storage(Arc<dyn Storage>)`
@@ -124,8 +140,9 @@ WASM 通过 `Storage` 抽象接入;本章固化 `Storage`/`SegmentSource` 抽象
 [16 §10](16-api-reference.md) 目前只有 `stats()` 轮询。产品化需要**事件级**可观测,
 但又要守住"默认不引 `log`/`tracing` 依赖"。
 
-> **落地状态**:`Observer`/`Event`/`Builder::observer` 尚未在 `src/` 实现,计划随
-> **L12** 落地;当前版本没有该 API。
+> **落地状态(已落地)**:`Observer`/`Event`/`WriteOp`/`ErrorKind` 定义于
+> `src/core/observe.rs`,`Builder::observer` 注册;查询/写入/flush/compaction/错误
+> 均发事件,回调 panic 经 `catch_unwind` 隔离(FC-DEPLOY-INV-030)。
 
 ```rust
 pub trait Observer: Send + Sync {

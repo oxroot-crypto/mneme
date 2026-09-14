@@ -51,7 +51,8 @@ fn apply_patch(slot_data: &mut SlotData, patch: &UpdatePatch, now: i64) {
 
 /// 应用补丁的向量字段:整体替换并重算范数平方(维度/有限值已由校验保证)。
 fn apply_vector_patch(slot_data: &mut SlotData, vector: &[f32]) {
-    slot_data.vector = Arc::from(vector.to_vec().into_boxed_slice());
+    slot_data.vector =
+        crate::memory::lazy::VectorStorage::owned(Arc::from(vector.to_vec().into_boxed_slice()));
     slot_data.norm_sq = search::norm_sq(&slot_data.vector);
 }
 
@@ -118,7 +119,7 @@ pub(crate) fn touch_rowid(
     }
     // 提交成功后再记访问,避免提交失败时计数被提前累加。
     {
-        let stat = Arc::make_mut(&mut ws.access).entry(rowid).or_default();
+        let stat = ws.access.get_or_insert_default(rowid);
         stat.access_count = stat.access_count.saturating_add(1);
         stat.last_access_ms = now;
     }

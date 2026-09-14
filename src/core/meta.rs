@@ -194,6 +194,10 @@ pub(crate) fn to_bytes(value: &Meta) -> Vec<u8> {
 ///
 /// 字节不是合法 JSON 时返回 [`MnemeError::Corrupted`]。
 pub(crate) fn from_bytes(bytes: &[u8]) -> Result<Meta> {
+    // 常见路径:无元数据(`null`)直接返回,免 serde_json 解析(打开期每行一次)。
+    if bytes == b"null" {
+        return Ok(Meta::Null);
+    }
     serde_json::from_slice(bytes).map_err(|error| MnemeError::Corrupted {
         segment: None,
         reason: format!("元数据 JSON 解码失败:{error}"),

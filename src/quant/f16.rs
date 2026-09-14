@@ -12,13 +12,19 @@ use crate::core::error::{MnemeError, Result};
 /// 单分量字节数。
 pub(crate) const BYTES_PER_ELEMENT: usize = 2;
 
-/// 单行编码为小端 f16 码流。
+/// 单行编码为小端 f16 码流(测试对照用;生产批量编码走 [`encode_row_into`])。
+#[cfg(test)]
 pub(crate) fn encode_row(vector: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(vector.len() * BYTES_PER_ELEMENT);
+    encode_row_into(&mut out, vector);
+    out
+}
+
+/// 追加单行编码到 `out`(段级批量编码用,免每行一次 `Vec` 分配)。
+pub(crate) fn encode_row_into(out: &mut Vec<u8>, vector: &[f32]) {
     for &value in vector {
         out.extend_from_slice(&f16::from_f32(value).to_bits().to_le_bytes());
     }
-    out
 }
 
 /// 单行解码;码流长度为奇数 → `Corrupted`(测试与误差界验证用)。

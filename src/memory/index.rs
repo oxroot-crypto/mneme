@@ -12,6 +12,7 @@ use crate::core::heap::TopK;
 use crate::core::metric::{Metric, Score};
 use crate::core::options::{HnswParams, VectorFormat};
 use crate::core::types::{RowId, SlotId};
+use crate::memory::lazy::{LazyRows, VectorStorage};
 
 /// HNSW 每层邻居数硬上限。
 ///
@@ -19,29 +20,29 @@ use crate::core::types::{RowId, SlotId};
 /// 同时防止恶意文件声明巨量度数导致内存膨胀。
 pub(crate) const MAX_INDEX_DEGREE: u16 = 4096;
 
-/// 建图节点的只读输入:稳定 `RowId`、向量 `Arc` 句柄与预计算范数平方。
+/// 建图节点的只读输入:稳定 `RowId`、向量句柄与预计算范数平方。
 #[derive(Debug, Clone)]
 pub(crate) struct IndexNode {
     /// 稳定逻辑标识。
     pub(crate) rowid: RowId,
-    /// 向量数据(零拷贝共享)。
-    pub(crate) vector: Arc<[f32]>,
+    /// 向量数据(自有或段内惰性,`Arc` 共享缓存)。
+    pub(crate) vector: Arc<VectorStorage>,
     /// 范数平方(余弦/欧氏复用)。
     pub(crate) norm_sq: f32,
 }
 
 /// 单个段的量化副本(i8/f16);f32 段为 `None`。
 ///
-/// 副本与段同生同灭:flush/compaction 按当前配置生成,`open` 从 vsec qvec 区载入;
-/// f32 原向量始终保留供精排(I12)。`rows` 与建图节点顺序一一对应。
+/// 副本与段同生同灭:flush/compaction 按当前配置生成,`open` 从 vsec qvec 区
+/// 以惰性行区载入;f32 原向量始终保留供精排(I12)。行顺序与建图节点一一对应。
 #[derive(Debug, Clone)]
 pub(crate) struct QuantCopy {
     /// 副本格式(`I8Rescored` 或 `F16`)。
     pub(crate) format: VectorFormat,
     /// i8 逐维 `(v_min, v_max)` 交错表;f16 为空。
     pub(crate) params: Vec<f32>,
-    /// 每节点码流(节点顺序与 [`IndexNode`] 一致)。
-    pub(crate) rows: Vec<Arc<[u8]>>,
+    /// 每节点码流(节点顺序与 [`IndexNode`] 一致;段内惰性行区)。
+    pub(crate) rows: LazyRows,
 }
 
 impl QuantCopy {
@@ -55,12 +56,12 @@ impl QuantCopy {
         }
     }
 
-    /// 维度(i8 由参数表推得;f16 由首行码流推得;空副本为 0)。
+    /// 维度(i8 由参数表推得;f16 由行距推得;空副本为 0)。
     pub(crate) fn dimension(&self) -> usize {
         match self.format {
             VectorFormat::F32 => 0,
             VectorFormat::I8Rescored => self.params.len() / 2,
-            VectorFormat::F16 => self.rows.first().map_or(0, |row| row.len() / 2),
+            VectorFormat::F16 => self.rows.stride() / 2,
         }
     }
 }
@@ -94,6 +95,12 @@ impl QuantQuery {
     }
 }
 
+/// 遍历期节点偏置(只改 HNSW 前沿出堆顺序,不改最终打分;FC-SCORE-POST-007)。
+pub(crate) trait NodeBias: Send + Sync {
+    /// 返回全局槽位的偏置值(0 = 无偏置);槽位不可见/不存在返回 0。
+    fn bias(&self, slot: SlotId) -> f32;
+}
+
 /// 一次索引搜索的全部输入。
 ///
 /// `alive` / `filter` 按**全局 `SlotId`** 索引;索引内部经 `slot_of` 映射到图节点。
@@ -117,6 +124,8 @@ pub(crate) struct IndexSearch<'a> {
     pub(crate) brute_threshold: f32,
     /// 是否使用段的量化副本做粗排(`false` = 精确 f32;召回抽样对照用)。
     pub(crate) use_quant: bool,
+    /// 重要性偏置(只改遍历顺序;`None` = 关闭,`Scoring::bias_routing`)。
+    pub(crate) bias: Option<&'a dyn NodeBias>,
 }
 
 /// 单个段的向量索引与其覆盖的全局槽位(多段架构,设计 07 §4)。
@@ -190,20 +199,32 @@ pub(crate) trait VectorIndex: Send + Sync {
     fn search(&self, params: &IndexSearch<'_>) -> TopK<(RowId, SlotId)>;
 }
 
+/// 索引构建请求(参数收敛;字段语义见各字段文档)。
+pub(crate) struct IndexBuildRequest<'a> {
+    /// 建图节点(节点 id = 下标)。
+    pub(crate) nodes: &'a [IndexNode],
+    /// 节点 id → 全局槽位映射(与 `nodes` 等长;增量段用)。
+    pub(crate) slot_of: &'a [SlotId],
+    /// HNSW 图参数。
+    pub(crate) params: HnswParams,
+    /// 距离度量(建库即锁定)。
+    pub(crate) metric: Metric,
+    /// 段量化副本(`None` = 纯 f32),只服务查询期粗排打分。
+    pub(crate) quant: Option<QuantCopy>,
+    /// 建图距离精度档位(设计 05 §4.4、`FC-INDEX-POST-010`)。
+    pub(crate) build_precision: crate::core::options::BuildPrecision,
+    /// 建图工程参数(并行度/批行数/选邻比较上限,由 `Tuning` 派生;`FC-INDEX-POST-012`)。
+    pub(crate) build: crate::core::options::HnswBuildParams,
+}
+
 /// 索引工厂:构建与载入(组合根注入)。
 pub(crate) trait IndexFactory: Send + Sync {
-    /// 由节点构建索引;`slot_of[node]` 为节点对应的全局槽位(多段增量段用)。
+    /// 由构建请求构建索引。
     ///
-    /// `quant` 为段的量化副本(`None` = 纯 f32);图结构仍由 f32 向量构建,
-    /// 副本只服务查询期粗排打分(设计 08 §4,落地取舍见 08 §落地状态)。
-    fn build(
-        &self,
-        nodes: &[IndexNode],
-        slot_of: &[SlotId],
-        params: HnswParams,
-        metric: Metric,
-        quant: Option<QuantCopy>,
-    ) -> Arc<dyn VectorIndex>;
+    /// # Errors
+    /// 建图输入不满足档位前置(如向量维度不一致/非有限值导致段内量化失败)时
+    /// 返回结构化错误,绝不静默降级为其它档位。
+    fn build(&self, request: IndexBuildRequest<'_>) -> Result<Arc<dyn VectorIndex>>;
 
     /// 校验 hidx 字节。
     ///
@@ -211,9 +232,10 @@ pub(crate) trait IndexFactory: Send + Sync {
     /// 解析/CRC/版本失败时返回结构化错误。
     fn verify(&self, bytes: &[u8]) -> Result<()>;
 
-    /// 由 hidx 字节载入索引。
+    /// 由 hidx 句柄载入索引。
     ///
     /// # Arguments
+    /// * `span` - hidx 文件视图(只读头部与 `node_table`,邻接按需解码)。
     /// * `nodes` - 段内节点顺序的输入(与 hidx 节点 id 对齐)。
     /// * `slot_of` - 段内节点 id → 全局槽位(恢复重排映射)。
     /// * `metric` - 库距离度量(建库即锁定,不存于 hidx)。
@@ -225,7 +247,7 @@ pub(crate) trait IndexFactory: Send + Sync {
     /// 魔数/版本/CRC/布局不符时返回结构化错误。
     fn load(
         &self,
-        bytes: &[u8],
+        span: &crate::memory::lazy::ByteSpan,
         nodes: &[IndexNode],
         slot_of: &[SlotId],
         metric: Metric,

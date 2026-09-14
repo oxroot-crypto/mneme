@@ -7,14 +7,18 @@
 //! 2. 各契约测试文件中的每个 `#[test]` 必须在契约矩阵「对应测试」列中被引用
 //!    (无孤立测试;只看表格行,防止正文随意提及放水);
 //! 3. 状态列为 `Passed` 的契约条目必须登记至少一个真实测试路径(禁止
-//!    「已通过却无测试证明」的自由文本);
+//!    「已通过却无测试证明」的自由文本),且状态词必须落在 §0 白名单内
+//!    (防止 `Pased` 之类拼写错误静默跳过校验);
 //! 4. 各契约测试文件 doc 注释声明的 `FC-*` 编号(展开 `/002` 复用与 `001..003`
-//!    区间简写)必须与契约矩阵中引用该文件的条目**双向相等**(无多报、无少报)。
+//!    区间简写)必须与契约矩阵中引用该文件的条目**双向相等**(无多报、无少报);
+//! 5. `tests/` 下**所有**含 `#[test]` 的 `.rs` 文件必须登记进 `CONTRACT_TEST_FILES`
+//!    (辅助模块若无测试自然豁免;门禁自身豁免),防新文件逃逸出追溯。
 //!
 //! 说明:源码内的单元测试(操作计数 / 公式)可被契约引用,但不强制每个单元测试
 //! 都登记 FC 编号——它们是实现细节测试,契约门禁只对集成契约测试文件做孤立与
 //! 声明一致性检查。L1 契约测试按 FC 模块族拆分(memory/query/model/life),门禁
-//! 统一纳入。
+//! 统一纳入。测试函数识别兼容 `#[test]` 独占一行与 `#[test] fn name()` 单行两种
+//! 写法,并要求名字在源文件中真实以函数定义形式出现(压制 raw string 误报)。
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -40,6 +44,14 @@ const L4_TESTS: &str = include_str!("l4_contracts.rs");
 const L5_TESTS: &str = include_str!("l5_contracts.rs");
 /// L6 契约验收测试(量化副本/两阶段检索/自动回退/async 门面)。
 const L6_TESTS: &str = include_str!("l6_contracts.rs");
+/// L1–L6 冷启动门槛(heavy 档;FC-PERSIST-POST-013)。
+const COLD_START_TESTS: &str = include_str!("cold_start.rs");
+/// 建库吞吐/查询延迟门槛(heavy 档,规模 env 可配;FC-GLOBAL-CPLX-001)。
+const HEAVY_GATE_TESTS: &str = include_str!("heavy_gate.rs");
+/// L11 安全存储契约验收(加密/轮换/压缩;FC-SEC-*)。
+const SECURITY_TESTS: &str = include_str!("security_contracts.rs");
+/// L12 部署形态契约验收(存储后端/只读共享/可观测;FC-DEPLOY-*)。
+const DEPLOY_TESTS: &str = include_str!("deploy_contracts.rs");
 /// 承载操作计数单测的源码文件。
 const SRC_SEARCH: &str = include_str!("../src/memory/search.rs");
 const SRC_TABLE: &str = include_str!("../src/memory/table/state.rs");
@@ -71,6 +83,14 @@ const SRC_CORE_HEAP: &str = include_str!("../src/core/heap.rs");
 const SRC_CORE_METRIC: &str = include_str!("../src/core/metric.rs");
 /// L2 恢复重排映射源码(槽位一致性单测被 ERR 契约引用)。
 const SRC_RECOVER_STATE: &str = include_str!("../src/persist/recover/state.rs");
+/// L1 惰性字节源/向量源码(解码缓存与区间校验单测被 INV 契约引用)。
+const SRC_MEMORY_LAZY: &str = include_str!("../src/memory/lazy.rs");
+/// L12 可观测源码(事件派发/panic 隔离单测被 DEPLOY 契约引用)。
+const SRC_OBSERVE: &str = include_str!("../src/core/observe.rs");
+/// L11 静态加密源码(信封往返/篡改/轮换单测被 SEC 契约引用)。
+const SRC_CRYPTO: &str = include_str!("../src/crypto/mod.rs");
+/// L11 压缩源码(LZ4 往返/畸形拒绝单测被 SEC 契约引用)。
+const SRC_COMPRESS: &str = include_str!("../src/compress/mod.rs");
 /// L2 打开路径源码(载入期重排越界二次校验单测被 ERR 契约引用)。
 const SRC_STORE_OPEN: &str = include_str!("../src/persist/store/open.rs");
 /// L4 计划器源码(块级剪枝等价性单测被契约引用)。
@@ -119,9 +139,16 @@ const SRC_STORE_SNAPSHOT: &str = include_str!("../src/persist/store/snapshot.rs"
 const SRC_QUANT_MOD: &str = include_str!("../src/quant/mod.rs");
 /// L6 i8 量化源码(误差界单测被 POST 契约引用)。
 const SRC_QUANT_I8: &str = include_str!("../src/quant/scalar_i8.rs");
+/// L1 排序源码(MMR 缓存化操作计数单测被 CPLX 契约引用)。
+const SRC_MEMORY_SCORE: &str = include_str!("../src/memory/score.rs");
+/// L0 分块向量源码(与 Vec 全等/块级 COW 单测被 POST 契约引用)。
+const SRC_CORE_CHUNKED: &str = include_str!("../src/core/chunked.rs");
+/// L0 分片哈希表源码(与 HashMap 全等/分片级 COW 单测被 POST 契约引用)。
+const SRC_CORE_SHARDED: &str = include_str!("../src/core/sharded.rs");
 
 /// 契约测试文件(孤立检查与覆盖声明检查的范围)。
-const CONTRACT_TEST_FILES: [(&str, &str); 10] = [
+/// `tests/` 下每个含 `#[test]` 的 `.rs` 文件都必须在此登记(门禁自身除外)。
+const CONTRACT_TEST_FILES: [(&str, &str); 14] = [
     ("tests/core_contracts.rs", CORE_TESTS),
     ("tests/memory_contracts.rs", MEMORY_TESTS),
     ("tests/query_contracts.rs", QUERY_TESTS),
@@ -132,10 +159,14 @@ const CONTRACT_TEST_FILES: [(&str, &str); 10] = [
     ("tests/l4_contracts.rs", L4_TESTS),
     ("tests/l5_contracts.rs", L5_TESTS),
     ("tests/l6_contracts.rs", L6_TESTS),
+    ("tests/security_contracts.rs", SECURITY_TESTS),
+    ("tests/deploy_contracts.rs", DEPLOY_TESTS),
+    ("tests/cold_start.rs", COLD_START_TESTS),
+    ("tests/heavy_gate.rs", HEAVY_GATE_TESTS),
 ];
 
 /// 契约引用的测试可能落在的全部文件(路径必须与 `contracts.md` 中书写一致)。
-const SOURCES: [(&str, &str); 54] = [
+const SOURCES: [(&str, &str); 65] = [
     ("tests/core_contracts.rs", CORE_TESTS),
     ("tests/memory_contracts.rs", MEMORY_TESTS),
     ("tests/query_contracts.rs", QUERY_TESTS),
@@ -146,6 +177,13 @@ const SOURCES: [(&str, &str); 54] = [
     ("tests/l4_contracts.rs", L4_TESTS),
     ("tests/l5_contracts.rs", L5_TESTS),
     ("tests/l6_contracts.rs", L6_TESTS),
+    ("tests/cold_start.rs", COLD_START_TESTS),
+    ("tests/heavy_gate.rs", HEAVY_GATE_TESTS),
+    ("tests/security_contracts.rs", SECURITY_TESTS),
+    ("tests/deploy_contracts.rs", DEPLOY_TESTS),
+    ("src/core/observe.rs", SRC_OBSERVE),
+    ("src/crypto/mod.rs", SRC_CRYPTO),
+    ("src/compress/mod.rs", SRC_COMPRESS),
     ("src/memory/search.rs", SRC_SEARCH),
     ("src/memory/table/state.rs", SRC_TABLE),
     ("src/memory/lifecycle.rs", SRC_LIFECYCLE),
@@ -165,6 +203,7 @@ const SOURCES: [(&str, &str); 54] = [
     ("src/core/heap.rs", SRC_CORE_HEAP),
     ("src/core/metric.rs", SRC_CORE_METRIC),
     ("src/persist/recover/state.rs", SRC_RECOVER_STATE),
+    ("src/memory/lazy.rs", SRC_MEMORY_LAZY),
     ("src/persist/store/open.rs", SRC_STORE_OPEN),
     ("src/query/plan.rs", SRC_QUERY_PLAN),
     ("src/query/parse.rs", SRC_QUERY_PARSE),
@@ -190,26 +229,41 @@ const SOURCES: [(&str, &str); 54] = [
     ("src/persist/store/snapshot.rs", SRC_STORE_SNAPSHOT),
     ("src/quant/mod.rs", SRC_QUANT_MOD),
     ("src/quant/scalar_i8.rs", SRC_QUANT_I8),
+    ("src/memory/score.rs", SRC_MEMORY_SCORE),
+    ("src/core/chunked.rs", SRC_CORE_CHUNKED),
+    ("src/core/sharded.rs", SRC_CORE_SHARDED),
 ];
 
 /// 契约编号的类型段(五维 + CPLX,见 `contracts.md` §0)。
 const FC_KINDS: [&str; 6] = ["PRE", "POST", "INV", "STA", "ERR", "CPLX"];
 
 /// 提取源码中所有 `#[test]` 之后的函数名。
+///
+/// 兼容多种写法:`#[test]` 独占一行、`#[test] fn name()` 单行、
+/// `#[cfg_attr(test, test)]`(test 构建下是真测试)以及属性与 `fn` 之间夹注释。
+/// 只接受行首属性(注释/字符串片段中的同名文本不匹配);解析出的名字还必须在
+/// 源文件中真实以函数定义形式出现(`fn <name>(...`),压制 raw string 内伪代码的误报。
 fn test_fns(source: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut pending = false;
     for line in source.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with("#[test]") {
-            pending = true;
-            continue;
-        }
         if !pending {
+            let Some(rest) = test_attr_rest(line.trim()) else {
+                continue;
+            };
+            let rest = strip_leading_comments(rest);
+            if let Some(name) = fn_name(rest) {
+                names.push(name);
+                continue;
+            }
+            if rest.is_empty() || rest.starts_with("//") || rest.starts_with("#[") {
+                pending = true;
+            }
             continue;
         }
-        // 跳过 `#[test]` 与声明之间可能出现的注释/其它属性行,
+        // 跳过测试属性与声明之间可能出现的注释/其它属性行,
         // 防止 `// fn foo` 之类注释被误当成测试名(也会让真孤立测试逃逸)。
+        let trimmed = strip_leading_comments(line.trim());
         if trimmed.is_empty() || trimmed.starts_with("//") || trimmed.starts_with("#[") {
             continue;
         }
@@ -218,14 +272,97 @@ fn test_fns(source: &str) -> Vec<String> {
         }
         pending = false;
     }
+    // 二次校验:名字必须在本文件存在真实函数定义(而非仅字符串/注释片段)。
+    names.retain(|name| defines_fn(source, name));
     names
 }
 
-/// 从形如 `fn foo(...)` 的行提取 `foo`;支持 `pub` / `async` / `pub(crate)` 等前缀。
+/// 若整行以测试属性开头(`#[test]` 或 `#[cfg_attr(..., test)]`),
+/// 返回属性之后的文本;其余行返回 `None`。
+fn test_attr_rest(line: &str) -> Option<&str> {
+    if let Some(rest) = line.strip_prefix("#[test]") {
+        return Some(rest);
+    }
+    let rest = line.strip_prefix("#[cfg_attr(")?;
+    let end = rest.find(")]")?;
+    let is_test = rest[..end]
+        .split(',')
+        .any(|argument| argument.trim() == "test");
+    is_test.then(|| &rest[end + 2..])
+}
+
+/// 剥离行首空白与块注释前缀(`/* ... */`),容忍属性与 `fn` 之间夹注释。
+fn strip_leading_comments(mut text: &str) -> &str {
+    loop {
+        let trimmed = text.trim_start();
+        let Some(rest) = trimmed.strip_prefix("/*") else {
+            return trimmed;
+        };
+        let Some(end) = rest.find("*/") else {
+            return trimmed;
+        };
+        text = &rest[end + 2..];
+    }
+}
+
+/// 从一行声明提取函数名:跳过 `pub`/`async` 等前缀,只认**首个** `fn`
+/// (避免行内后续 `fn ` 文本——如字符串字面量——被取错)。
 fn fn_name(line: &str) -> Option<String> {
-    let rest = line.rsplit_once("fn ")?.1;
-    let end = rest.find(['(', '<', ' ']).unwrap_or(rest.len());
-    Some(rest[..end].to_string())
+    const PREFIXES: [&str; 7] = [
+        "pub(crate) ",
+        "pub(super) ",
+        "pub ",
+        "async ",
+        "const ",
+        "unsafe ",
+        "extern \"C\" ",
+    ];
+    let mut rest = line.trim_start();
+    loop {
+        let mut advanced = false;
+        for prefix in PREFIXES {
+            if let Some(stripped) = rest.strip_prefix(prefix) {
+                rest = stripped.trim_start();
+                advanced = true;
+            }
+        }
+        if !advanced {
+            break;
+        }
+    }
+    let rest = rest.strip_prefix("fn ")?.trim_start();
+    let end = rest
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+        .unwrap_or(rest.len());
+    (end > 0).then(|| rest[..end].to_string())
+}
+
+/// 源文件中是否存在 `fn <name>` 的函数定义行(排除注释行;支持属性与 `fn`
+/// 同行的 `#[test] fn name()` 写法)。
+fn defines_fn(source: &str, name: &str) -> bool {
+    source.lines().any(|line| {
+        let trimmed = strip_leading_comments(line.trim());
+        if trimmed.starts_with("//") {
+            return false;
+        }
+        let unwrapped = strip_leading_attributes(trimmed);
+        let unwrapped = strip_leading_comments(unwrapped);
+        fn_name(unwrapped).as_deref() == Some(name)
+    })
+}
+
+/// 去掉行首的 `#[...]` 属性(可连续多个),返回剩余部分供函数定义识别。
+fn strip_leading_attributes(mut line: &str) -> &str {
+    loop {
+        let trimmed = line.trim_start();
+        let Some(rest) = trimmed.strip_prefix("#[") else {
+            return trimmed;
+        };
+        let Some(end) = rest.find(']') else {
+            return trimmed;
+        };
+        line = &rest[end + 1..];
+    }
 }
 
 /// 读取十进制数字串,返回(值, 消费字节数)。
@@ -457,6 +594,22 @@ fn passed_contracts_register_real_tests() {
     );
 }
 
+/// 契约状态列只允许 §0 图例白名单词:`Pased` 之类拼写错误必须显式报错,
+/// 绝不静默跳过该条目的 `Passed` 证明校验。
+#[test]
+fn contract_status_words_are_known() {
+    const STATUS_WORDS: [&str; 4] = ["Planned", "Passed", "Failed", "Waived"];
+    let unknown: Vec<String> = contract_rows()
+        .into_iter()
+        .filter(|(_, _, status)| !STATUS_WORDS.contains(&status.as_str()))
+        .map(|(id, _, status)| format!("{id}: {status:?}"))
+        .collect();
+    assert!(
+        unknown.is_empty(),
+        "契约状态列出现未知状态词(§0 白名单之外): {unknown:?}"
+    );
+}
+
 /// `contracts.md` 中「对应测试」列引用了某测试文件的条目编号集合。
 fn coverage_by_file() -> BTreeMap<&'static str, Vec<String>> {
     let mut map: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
@@ -488,28 +641,103 @@ fn declared_fcs_match_contract_coverage() {
     }
 }
 
-/// `tests/` 下每个 `*_contracts.rs` 都必须登记进门禁清单,防新文件逃逸出追溯。
+/// `tests/` 下每个含 `#[test]` 的 `.rs` 文件都必须登记进 `CONTRACT_TEST_FILES`,
+/// 防新测试文件逃逸出孤立与声明一致性检查;辅助模块(`tests/common/`)无测试自然
+/// 豁免,门禁自身(`contract_traceability.rs`)豁免。
 #[test]
-fn every_contract_test_file_is_registered() {
+fn every_test_file_is_registered() {
     let registered: HashSet<String> = CONTRACT_TEST_FILES
         .iter()
         .map(|(path, _)| path.strip_prefix("tests/").unwrap_or(*path).to_string())
         .collect();
-    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/tests");
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests");
     let mut unregistered = Vec::new();
-    for entry in std::fs::read_dir(dir).expect("读取 tests 目录") {
-        let name = entry
-            .expect("目录项")
-            .file_name()
-            .to_string_lossy()
-            .to_string();
-        if name.ends_with("_contracts.rs") && !registered.contains(&name) {
-            unregistered.push(name);
-        }
-    }
+    collect_unregistered(&root, &root, &registered, &mut unregistered);
     unregistered.sort();
     assert!(
         unregistered.is_empty(),
-        "tests/ 下存在未登记进 CONTRACT_TEST_FILES 的契约测试文件: {unregistered:?}"
+        "tests/ 下存在含 #[test] 但未登记进 CONTRACT_TEST_FILES 的测试文件: {unregistered:?}"
     );
+}
+
+/// 递归扫描 `tests/` 下所有 `.rs`,把含真实测试但未登记的文件加入 `out`。
+fn collect_unregistered(
+    root: &std::path::Path,
+    dir: &std::path::Path,
+    registered: &HashSet<String>,
+    out: &mut Vec<String>,
+) {
+    for entry in std::fs::read_dir(dir).expect("读取 tests 目录") {
+        let path = entry.expect("目录项").path();
+        if path.is_dir() {
+            collect_unregistered(root, &path, registered, out);
+            continue;
+        }
+        if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
+            continue;
+        }
+        let relative = path
+            .strip_prefix(root)
+            .expect("相对路径")
+            .to_string_lossy()
+            .replace('\\', "/");
+        if relative == "contract_traceability.rs" {
+            continue;
+        }
+        let source = std::fs::read_to_string(&path).expect("读取测试源码");
+        if !test_fns(&source).is_empty() && !registered.contains(&relative) {
+            out.push(relative);
+        }
+    }
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::{fn_name, test_fns};
+
+    /// 单行 `#[test] fn name()` 与独占一行两种写法都能发现。
+    #[test]
+    fn finds_single_line_and_multiline_tests() {
+        let source =
+            "#[test] fn one() {}\n#[test]\nfn two() {}\n#[test]\n#[ignore]\nfn three() {}\n";
+        assert_eq!(
+            test_fns(source),
+            vec!["one".to_string(), "two".to_string(), "three".to_string()]
+        );
+    }
+
+    /// `#[test]` 与 `fn` 同名文本仅出现在注释/行内字符串时不误报。
+    #[test]
+    fn ignores_comments_and_inline_strings() {
+        let source = "// #[test]\n// fn fake() {}\nlet _ = \"fn fake2() {}\";\n";
+        assert!(test_fns(source).is_empty());
+    }
+
+    /// `fn_name` 取行内首个 `fn`,支持可见性 / `async` 前缀。
+    #[test]
+    fn fn_name_takes_first_fn_with_prefixes() {
+        assert_eq!(
+            fn_name("pub async fn target() { let _ = \"fn fake\"; }").as_deref(),
+            Some("target")
+        );
+        assert_eq!(fn_name("let not_a_fn = 1;"), None);
+    }
+
+    /// `#[cfg_attr(test, test)]` 与夹块注释的写法也能发现;非测试 `cfg_attr` 不误报。
+    #[test]
+    fn finds_cfg_attr_tests_and_comments_between_attr_and_fn() {
+        let source = "#[cfg_attr(test, test)]\nfn cfg_attr_test() {}\n\
+                      #[test] /* 说明 */ fn block_comment_test() {}\n\
+                      #[test]\n/* 跨行注释 */\nfn multiline_comment_test() {}\n";
+        assert_eq!(
+            test_fns(source),
+            vec![
+                "cfg_attr_test".to_string(),
+                "block_comment_test".to_string(),
+                "multiline_comment_test".to_string()
+            ]
+        );
+        let derive_only = "#[cfg_attr(feature = \"x\", derive(Debug))]\nfn not_a_test() {}\n";
+        assert!(test_fns(derive_only).is_empty());
+    }
 }

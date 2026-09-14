@@ -47,6 +47,7 @@ impl Namespace {
                 return Ok(0);
             };
             let now = config.clock.now_unix_ms();
+            let uses_access = filter.uses_access();
             let victims: Vec<RowId> = ws
                 .slots
                 .iter()
@@ -59,7 +60,9 @@ impl Namespace {
                             &filter,
                             &EvalCtx {
                                 slot,
-                                access: ws.access.get(&slot.rowid).copied(),
+                                access: uses_access
+                                    .then(|| ws.access.get(&slot.rowid).copied())
+                                    .flatten(),
                             },
                         )
                 })
@@ -172,7 +175,7 @@ impl Namespace {
             let candidates = collect_consolidation_candidates(ws, ns_id, now, &policy);
             let vectors: Vec<&[f32]> = candidates
                 .iter()
-                .map(|slot_data| slot_data.vector.as_ref())
+                .map(|slot_data| &slot_data.vector[..])
                 .collect();
             let clusters = score::cluster_by_similarity(&vectors, policy.threshold);
             let target_path = consolidation_target(&ns_path, &policy);
@@ -222,18 +225,13 @@ fn collect_retain_victims(
             continue;
         }
         scanned += 1;
+        let access = ws.access.get(&slot.rowid).copied();
         if let Some(protect) = &policy.protect
-            && pred::matches(
-                protect,
-                &EvalCtx {
-                    slot,
-                    access: ws.access.get(&slot.rowid).copied(),
-                },
-            )
+            && pred::matches(protect, &EvalCtx { slot, access })
         {
             continue;
         }
-        let access = ws.access.get(&slot.rowid).copied().unwrap_or_default();
+        let access = access.unwrap_or_default();
         let age = now - slot.valid_from.max(access.last_access_ms);
         let score = retention_score(slot.importance, age, access.access_count, policy);
         if score < policy.min_importance {
@@ -250,6 +248,7 @@ fn collect_consolidation_candidates(
     now: i64,
     policy: &ConsolidationPolicy,
 ) -> Vec<Arc<SlotData>> {
+    let uses_access = policy.filter.as_ref().is_some_and(pred::Expr::uses_access);
     ws.slots
         .iter()
         .enumerate()
@@ -262,7 +261,9 @@ fn collect_consolidation_candidates(
                         expr,
                         &EvalCtx {
                             slot,
-                            access: ws.access.get(&slot.rowid).copied(),
+                            access: uses_access
+                                .then(|| ws.access.get(&slot.rowid).copied())
+                                .flatten(),
                         },
                     )
                 })

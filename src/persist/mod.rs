@@ -34,7 +34,7 @@ pub(crate) mod recover;
 // `read_whole` 统一经此读取段字节;`FileSource`/`MmapSource` 随 feature `mmap`
 // 二选一(各后端个未用分支在模块内定点豁免)。
 pub(crate) mod source;
-pub(crate) mod storage;
+pub mod storage;
 pub(crate) mod store;
 pub(crate) mod trash;
 pub(crate) mod vsec;

@@ -140,7 +140,13 @@ mod tests {
         bytes.extend_from_slice(&encode_frame(
             1,
             FrameKind::Insert,
-            &encode_insert(&entry(), &[1.0, 2.0], 42).expect("insert"),
+            &encode_insert(
+                &entry(),
+                &[1.0, 2.0],
+                42,
+                crate::core::options::Compression::None,
+            )
+            .expect("insert"),
         ));
         bytes.extend_from_slice(&encode_frame(2, FrameKind::Delete, &encode_delete(1, "k")));
         bytes.extend_from_slice(&encode_frame(

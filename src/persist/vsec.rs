@@ -189,36 +189,35 @@ pub(crate) fn encode(input: &VsecInput<'_>) -> Result<Vec<u8>> {
     };
     let quant_bytes = quant_len(&header)?;
     let header = encode_header(&header)?;
-    let data = encode_data(input, row_stride(input.dimension), quant_bytes);
-
-    let mut out = header.to_vec();
-    out.extend_from_slice(&data);
-    out.extend_from_slice(&crc32(&data).to_le_bytes());
+    let stride = row_stride(input.dimension);
+    let data_len = count * stride + count * 4 + quant_bytes + bitmap_bytes(count as u64);
+    // 单缓冲:头与数据一次预留、按偏移写入,免「数据区物化后再整段拷入输出」。
+    let mut out = Vec::with_capacity(header.len() + data_len + 4);
+    out.extend_from_slice(&header);
+    encode_data_into(&mut out, input, stride);
+    let crc = crc32(&out[header.len()..]);
+    out.extend_from_slice(&crc.to_le_bytes());
     Ok(out)
 }
 
-/// 编码数据区(向量区 + norm 区 + qvec 区 + 删除位图),不含头与尾 CRC。
-fn encode_data(input: &VsecInput<'_>, stride: usize, quant_bytes: usize) -> Vec<u8> {
-    let count = input.vectors.len();
-    let mut data =
-        Vec::with_capacity(count * stride + count * 4 + quant_bytes + bitmap_bytes(count as u64));
+/// 追加编码数据区(向量区 + norm 区 + qvec 区 + 删除位图),不含头与尾 CRC。
+fn encode_data_into(out: &mut Vec<u8>, input: &VsecInput<'_>, stride: usize) {
     for vector in input.vectors {
         for value in *vector {
-            data.extend_from_slice(&value.to_le_bytes());
+            out.extend_from_slice(&value.to_le_bytes());
         }
-        data.resize(data.len() + (stride - vector.len() * 4), 0);
+        out.resize(out.len() + (stride - vector.len() * 4), 0);
     }
     for norm in input.norms {
-        data.extend_from_slice(&norm.to_le_bytes());
+        out.extend_from_slice(&norm.to_le_bytes());
     }
     for param in input.quant_params {
-        data.extend_from_slice(&param.to_le_bytes());
+        out.extend_from_slice(&param.to_le_bytes());
     }
     for row in input.quant_codes {
-        data.extend_from_slice(row);
+        out.extend_from_slice(row);
     }
-    data.extend_from_slice(&encode_bitmap(input.dead));
-    data
+    out.extend_from_slice(&encode_bitmap(input.dead));
 }
 
 /// 校验 qvec 输入与格式/行数匹配(FC-QUANT-ERR-001/003 的编码侧防线)。
@@ -538,6 +537,40 @@ impl VsecView<'_> {
         self.header.row_count
     }
 
+    /// 维度(建库锁定,1..=65536)。
+    pub(crate) const fn dimension(&self) -> u32 {
+        self.header.dimension
+    }
+
+    /// 第 `row` 行向量在文件内的绝对字节偏移(供惰性句柄按需解码;
+    /// 行区定长 `stride`,越界返回 `None`)。
+    pub(crate) fn vector_offset(&self, row: usize) -> Option<usize> {
+        if row >= self.header.row_count as usize {
+            return None;
+        }
+        Some(HEADER_LEN as usize + row * self.stride)
+    }
+
+    /// 第 `row` 行的范数平方(`norm_col` 区;无范数列或越界返回 `None`)。
+    ///
+    /// 范数列存储的是编码时的 `norm_sq`(与 [`VsecView::vector`] 逐位对应),
+    /// 读路径可直接取用而无需解码整行向量(FC-PERSIST-INV-021)。
+    pub(crate) fn norm_sq(&self, row: usize) -> Option<f32> {
+        if !self.header.norm_col || row >= self.header.row_count as usize {
+            return None;
+        }
+        let rows = self.header.row_count as usize;
+        let offset = rows * self.stride + row * size_of::<f32>();
+        let bytes = self.data.get(offset..offset + size_of::<f32>())?;
+        Some(f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    /// 量化码区在文件内的 `(绝对偏移, 单行字节数)`;无副本(`F32`)返回 `None`。
+    pub(crate) fn quant_region(&self) -> Option<(usize, usize)> {
+        (self.code_stride > 0)
+            .then_some((HEADER_LEN as usize + self.codes_offset, self.code_stride))
+    }
+
     /// i8 逐维 `(v_min, v_max)` 交错表;非 i8 返回空表。
     pub(crate) fn quant_params(&self) -> Vec<f32> {
         let (start, len) = self.params_range;
@@ -548,6 +581,8 @@ impl VsecView<'_> {
     }
 
     /// 第 `row` 行的量化码流;无副本或行越界返回 `None`。
+    // reason: 生产路径改走 `LazyRows` 惰性行区;逐行切片接口供测试与诊断。
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn quant_row(&self, row: usize) -> Option<&[u8]> {
         if self.code_stride == 0 || row >= self.header.row_count as usize {
             return None;

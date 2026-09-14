@@ -244,6 +244,16 @@ impl Key {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// 返回内部 `Arc<str>` 的共享句柄(仅克隆引用计数,不复制字符串内容)。
+    pub(crate) fn shared(&self) -> Arc<str> {
+        Arc::clone(&self.0)
+    }
+
+    /// 由已共享的 `Arc<str>` 构造(免再次分配;恢复解码复用已解析的 Arc)。
+    pub(crate) fn from_arc(value: Arc<str>) -> Self {
+        Self(value)
+    }
 }
 
 impl From<&str> for Key {

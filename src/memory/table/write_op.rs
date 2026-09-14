@@ -12,6 +12,31 @@ use crate::core::types::{RowId, SeqNo};
 
 use super::state::{SlotData, WriterState};
 
+/// 由内部写操作映射观测层的逻辑写操作(metadata 帧不产生 Write 事件)。
+pub(crate) fn observed_op(ops: &[WriteOp]) -> Option<crate::core::observe::WriteOp> {
+    use crate::core::observe::WriteOp as Observed;
+    let inserts = ops
+        .iter()
+        .filter(|op| matches!(op, WriteOp::Insert { .. }))
+        .count();
+    if inserts > 1 {
+        return Some(Observed::InsertBatch);
+    }
+    for op in ops {
+        match op {
+            WriteOp::Insert { .. } => return Some(Observed::Insert),
+            WriteOp::DeleteRow { .. } => return Some(Observed::Delete),
+            WriteOp::Access { .. } => return Some(Observed::Touch),
+            WriteOp::Relate { .. } => return Some(Observed::Relate),
+            WriteOp::Unrelate { .. } => return Some(Observed::Unrelate),
+            WriteOp::NsRegister { .. }
+            | WriteOp::NsUnregister { .. }
+            | WriteOp::RelKindRegister { .. } => {}
+        }
+    }
+    None
+}
+
 /// 一个待持久化到 WAL 的写操作(L2 由 [`PersistHook`] 消费)。
 #[derive(Debug, Clone)]
 pub(crate) enum WriteOp {
@@ -28,6 +53,15 @@ pub(crate) enum WriteOp {
     NsUnregister {
         /// 被注销的命名空间编号。
         ns_id: u32,
+        /// 版本序号(metadata 帧也参与水位判定)。
+        seqno: SeqNo,
+    },
+    /// 注册一个自定义关系类型名称(编号单调分配、永不复用)。
+    RelKindRegister {
+        /// 分配的稳定编号(≥ [`RelationKind::FIRST_CUSTOM`](crate::RelationKind::FIRST_CUSTOM))。
+        kind: u16,
+        /// 类型名(UTF-8,库内唯一)。
+        name: Arc<str>,
         /// 版本序号(metadata 帧也参与水位判定)。
         seqno: SeqNo,
     },

@@ -3,8 +3,6 @@
 //! 关系边以 `(from, to, kind)` 为唯一键,重复 `relate` 为 upsert;任一端被删除
 //! 则边视为悬挂、不可见(不变量 I25)。语义见设计 09 §2。
 
-use std::collections::HashMap;
-
 use crate::core::meta::Meta;
 use crate::core::options::RelationKind;
 use crate::core::types::RowId;
@@ -105,9 +103,8 @@ impl Default for RelationExpand {
     }
 }
 
-/// 以 `(from, to, kind)` 为键 upsert 一条边到邻接表。
-pub(crate) fn upsert_edge(map: &mut HashMap<RowId, Vec<Edge>>, edge: Edge) {
-    let bucket = map.entry(edge.from).or_default();
+/// 以 `(to, kind)` 为键 upsert 一条边到单个节点的邻接表。
+pub(crate) fn upsert_edge(bucket: &mut Vec<Edge>, edge: Edge) {
     if let Some(existing) = bucket
         .iter_mut()
         .find(|candidate| candidate.to == edge.to && candidate.kind == edge.kind)
@@ -118,9 +115,24 @@ pub(crate) fn upsert_edge(map: &mut HashMap<RowId, Vec<Edge>>, edge: Edge) {
     }
 }
 
-/// 从邻接表移除 `(from, to, kind)`,返回是否命中。
-pub(crate) fn remove_edge(
-    map: &mut HashMap<RowId, Vec<Edge>>,
+/// 从单个节点的邻接表移除 `(to, kind)`,返回是否命中(空表由调用方按需清理)。
+pub(crate) fn remove_edge(bucket: &mut Vec<Edge>, to: RowId, kind: RelationKind) -> bool {
+    let before = bucket.len();
+    bucket.retain(|edge| !(edge.to == to && edge.kind == kind));
+    bucket.len() != before
+}
+
+/// 在分片邻接表中 upsert 边(自动建立 `from` 的桶)。
+pub(crate) fn upsert_edge_sharded(
+    map: &mut crate::core::sharded::ShardedMap<RowId, Vec<Edge>>,
+    edge: Edge,
+) {
+    upsert_edge(map.get_or_insert_default(edge.from), edge);
+}
+
+/// 从分片邻接表移除 `(from, to, kind)`;空桶随删,返回是否命中。
+pub(crate) fn remove_edge_sharded(
+    map: &mut crate::core::sharded::ShardedMap<RowId, Vec<Edge>>,
     from: RowId,
     to: RowId,
     kind: RelationKind,
@@ -128,9 +140,7 @@ pub(crate) fn remove_edge(
     let Some(bucket) = map.get_mut(&from) else {
         return false;
     };
-    let before = bucket.len();
-    bucket.retain(|edge| !(edge.to == to && edge.kind == kind));
-    let removed = bucket.len() != before;
+    let removed = remove_edge(bucket, to, kind);
     if bucket.is_empty() {
         map.remove(&from);
     }

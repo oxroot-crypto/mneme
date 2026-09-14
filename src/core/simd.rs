@@ -6,13 +6,24 @@
 //!
 //! # 运行时分发
 //!
-//! * x86_64:检测 `avx2` + `fma` → AVX2 内核;否则回退 SSE2(基线可用)。
+//! * x86_64:长度 ≥ `AVX512_MIN_LEN`(256)且检测到 `avx512f` → AVX-512F 内核
+//!   (16 f32/次);否则检测 `avx2` + `fma` → AVX2 内核;再否则回退 SSE2(基线可用)。
 //! * aarch64:使用 NEON 内核(NEON 为基线)。
 //! * 其它架构:标量参考实现。
+//!
+//! 分发保留逐调用特性检测(检测缓存为廉价原子读);实测将其改为一次性缓存函数
+//! 指针反而使 1536 维构建/查询回退(间接调用阻止内联),故不缓存。
 
 /// `_mm_shuffle_ps` 立即数:取每对 32 位元素中的高元素(即 `imm[1:0] = 0b01`)。
 #[cfg(target_arch = "x86_64")]
 const SHUFFLE_TAKE_HIGHEST: i32 = 0x1;
+
+/// 启用 AVX-512F 内核的最小向量长度。
+///
+/// 短向量下 512 位内核的收益不足以抵消宽指令的频率影响(实测 64 维基准变慢),
+/// 故仅长向量(如 1536 维嵌入)走 AVX-512,短向量保持 AVX2。
+#[cfg(target_arch = "x86_64")]
+const AVX512_MIN_LEN: usize = 256;
 
 #[cfg(test)]
 thread_local! {
@@ -103,6 +114,10 @@ pub fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
 pub(crate) fn dot_u8_f32(codes: &[u8], weights: &[f32]) -> f32 {
     #[cfg(target_arch = "x86_64")]
     {
+        if codes.len().min(weights.len()) >= AVX512_MIN_LEN && is_x86_feature_detected!("avx512f") {
+            // SAFETY: 已确认 avx512f 可用;长度前提由内核循环边界保证。
+            return unsafe { x86::dot_u8_avx512(codes, weights) };
+        }
         if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
             // SAFETY: 已确认 avx2 与 fma 均可用;长度前提由内核循环边界保证。
             return unsafe { x86::dot_u8_avx2(codes, weights) };
@@ -126,7 +141,10 @@ pub(crate) fn dot_u8_f32_scalar(codes: &[u8], weights: &[f32]) -> f32 {
 
 #[cfg(target_arch = "x86_64")]
 fn dot_x86(a: &[f32], b: &[f32]) -> f32 {
-    if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+    if a.len().min(b.len()) >= AVX512_MIN_LEN && is_x86_feature_detected!("avx512f") {
+        // SAFETY: 已确认 avx512f 可用;长度前提由内核循环边界保证。
+        unsafe { x86::dot_avx512(a, b) }
+    } else if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
         // SAFETY: 已确认 avx2 与 fma 均可用;长度前提由 dot 的 debug 断言与 n 收敛保证。
         unsafe { x86::dot_avx2(a, b) }
     } else {
@@ -139,10 +157,68 @@ fn dot_x86(a: &[f32], b: &[f32]) -> f32 {
 mod x86 {
     use std::arch::x86_64::{
         __m128, __m128i, _mm_add_ps, _mm_add_ss, _mm_cvtss_f32, _mm_loadl_epi64, _mm_loadu_ps,
-        _mm_movehl_ps, _mm_mul_ps, _mm_setzero_ps, _mm_shuffle_ps, _mm256_castps256_ps128,
-        _mm256_cvtepi32_ps, _mm256_cvtepu8_epi32, _mm256_extractf128_ps, _mm256_fmadd_ps,
-        _mm256_loadu_ps, _mm256_setzero_ps,
+        _mm_loadu_si128, _mm_movehl_ps, _mm_mul_ps, _mm_setzero_ps, _mm_shuffle_ps,
+        _mm256_castps256_ps128, _mm256_cvtepi32_ps, _mm256_cvtepu8_epi32, _mm256_extractf128_ps,
+        _mm256_fmadd_ps, _mm256_loadu_ps, _mm256_setzero_ps, _mm512_cvtepi32_ps,
+        _mm512_cvtepu8_epi32, _mm512_fmadd_ps, _mm512_loadu_ps, _mm512_reduce_add_ps,
+        _mm512_setzero_ps,
     };
+
+    /// AVX-512F 点积内核:每次 16 个 f32 通道。
+    ///
+    /// # Safety
+    ///
+    /// 调用者必须确认当前 CPU 支持 `avx512f`。
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn dot_avx512(a: &[f32], b: &[f32]) -> f32 {
+        let n = a.len().min(b.len());
+        let mut i = 0usize;
+        // SAFETY: 循环条件 i + 16 <= n 保证 [i, i+16) 落在两个切片范围内;CPU 支持已由调用者确认。
+        let mut sum = unsafe {
+            let mut acc = _mm512_setzero_ps();
+            while i + 16 <= n {
+                let va = _mm512_loadu_ps(a.as_ptr().add(i));
+                let vb = _mm512_loadu_ps(b.as_ptr().add(i));
+                acc = _mm512_fmadd_ps(va, vb, acc);
+                i += 16;
+            }
+            _mm512_reduce_add_ps(acc)
+        };
+        while i < n {
+            sum += a[i] * b[i];
+            i += 1;
+        }
+        sum
+    }
+
+    /// AVX-512F `u8 × f32` 点积内核:每次 16 个码位零扩展到 f32 后 FMA。
+    ///
+    /// # Safety
+    ///
+    /// 调用者必须确认当前 CPU 支持 `avx512f`。
+    #[target_feature(enable = "avx512f")]
+    pub unsafe fn dot_u8_avx512(codes: &[u8], weights: &[f32]) -> f32 {
+        let n = codes.len().min(weights.len());
+        let mut i = 0usize;
+        // SAFETY: 循环条件 i + 16 <= n 保证 [i, i+16) 落在两个切片范围内;CPU 支持已由调用者确认。
+        let mut sum = unsafe {
+            let mut acc = _mm512_setzero_ps();
+            while i + 16 <= n {
+                let bytes = _mm_loadu_si128(codes.as_ptr().add(i).cast::<__m128i>());
+                let widened = _mm512_cvtepu8_epi32(bytes);
+                let floats = _mm512_cvtepi32_ps(widened);
+                let weight = _mm512_loadu_ps(weights.as_ptr().add(i));
+                acc = _mm512_fmadd_ps(floats, weight, acc);
+                i += 16;
+            }
+            _mm512_reduce_add_ps(acc)
+        };
+        while i < n {
+            sum += f32::from(codes[i]) * weights[i];
+            i += 1;
+        }
+        sum
+    }
 
     /// AVX2 + FMA 点积内核。
     ///

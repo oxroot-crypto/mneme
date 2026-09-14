@@ -278,8 +278,8 @@ db.close()?;
 - 备份目标必须不存在或为空([16 §7](16-api-reference.md));
 - PITR:按目标时间点定期 `backup_to`,每份备份独立可开;单份备份**不能**把 `current`
   指回旧 MANIFEST(实时库的 MANIFEST 保留 2 版可供回滚,见 [16 §7.2](16-api-reference.md));
-- 观测:`.observer(Arc::new(MyMetrics))` 接事件流为 **L12 规划 API**(`Observer` 尚未
-  落地,见 [12 §4](12-deployment.md))。
+- 观测:`.observer(Arc::new(MyMetrics))` 接事件流(`Observer` 已落地;回调 panic 被
+  `catch_unwind` 隔离,见 [12 §4](12-deployment.md))。
 
 ---
 
@@ -290,10 +290,13 @@ db.close()?;
 let ro = Mneme::builder().path("./agent_memory").read_only(true).build()?;
 ```
 
-- 只读实例打开后**不随写者推进刷新**(周期性探测与原子切换视图是 L12 目标,
-  见 [12 §2.1](12-deployment.md)),无需锁;
-- 加密(feature `encrypt`):`Builder::encryption(Some(Encryption { provider: Arc::new(KmsKeyProvider), cipher: Cipher::Aes256Gcm }))` 为 **L11 规划 API**,当前未落地([11 §2](11-security-storage.md));
-- 压缩:`Builder::compression(Compression::Lz4)` 配置已可设置,压缩实现待 **L11**([11 §3](11-security-storage.md))。
+- 只读实例默认每 1s 探测一次新 MANIFEST 并原子切换视图(`Builder::read_only_probe_interval`
+  可调,`Duration::ZERO` = 关闭),也可显式 `Mneme::reload()`;打开不创建/不争抢写锁,
+  不随写者推进也能拿到新视图(见 [12 §2.1](12-deployment.md));
+- 加密(feature `encrypt`):`Builder::encryption(Some(Encryption { provider: Arc::new(KmsKeyProvider), cipher: Cipher::Aes256Gcm }))`,
+  密钥轮换用 `Mneme::rotate_encryption_key()`(需 provider 实现 `rotate`;见 [11 §2](11-security-storage.md));
+- 压缩:`Builder::compression(Compression::Lz4)` 作用于记录体 `text`/`meta`/`provenance`,
+  压缩无收益自动回退原文(feature `compress`/`compress-zstd`,见 [11 §3](11-security-storage.md))。
 
 ## 本章小结
 

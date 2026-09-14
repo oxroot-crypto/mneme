@@ -14,15 +14,22 @@
 //! * [`varint`] —— 变长整数编解码。
 //! * [`meta`] —— 元数据(JSON)隔离区。
 //! * `bitset` —— 可增长位图(不可见版本标记 / 索引层候选位图)。
+//! * `chunked` —— 分块共享向量(写状态追加型容器的块级 COW)。
+//! * `sharded` —— 分片共享哈希表(写状态行号索引的分片级 COW)。
+//! * `hash` —— FNV-1a 64 位哈希器(分片表快速哈希)。
 //! * [`text`] —— 文本分词(空白切词 + CJK bigram,BM25 与倒排共用)。
 //! * [`options`] —— 全局配置与选项类型。
 
 pub(crate) mod bitset;
+pub(crate) mod chunked;
 pub mod error;
+pub(crate) mod hash;
 pub mod heap;
 pub mod meta;
 pub mod metric;
+pub mod observe;
 pub mod options;
+pub(crate) mod sharded;
 pub mod simd;
 pub mod text;
 pub mod types;

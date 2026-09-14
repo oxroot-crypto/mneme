@@ -20,6 +20,7 @@
 //! * `expand` —— 关系联想扩展与结果级去重。
 //! * `table` —— 内存表、写状态与不可变读视图。
 //! * `index` —— 向量索引抽象(暴力 → HNSW 的替换缝;HNSW 实现见 crate::index)。
+//! * `lazy` —— 段句柄惰性字节源与惰性向量/码流载体(设计 04 §8/§11,FC-PERSIST-INV-021)。
 //! * `pred` / `pred_eval` —— 过滤 AST 与三值求值。
 //! * `dedup` —— 写入期两级去重。
 //! * `record` —— 记录与写入/更新结果值类型。
@@ -43,6 +44,7 @@ mod engine;
 mod engine_ops;
 pub(crate) mod expand;
 pub(crate) mod index;
+pub(crate) mod lazy;
 mod lifecycle;
 mod mutate_helpers;
 mod namespace;

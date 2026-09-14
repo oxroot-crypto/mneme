@@ -71,6 +71,8 @@ impl Table {
         persist: Option<Arc<dyn PersistHook>>,
     ) -> Self {
         state.ns_depth_max = config.limits.ns_depth;
+        // 恢复路径已回填段归属,重算已物化行数(避免 WAL 阈值误判触发空 flush)。
+        state.recount_materialized();
         let view = Arc::new(state.snapshot());
         Self {
             writer: Mutex::new(state),
@@ -119,12 +121,26 @@ impl Table {
     /// 任何失败的写操作对读者零可见、不留半写(FC-MEM-POST-002 泛化),并让
     /// 失败写入不残留命名空间登记等副作用。
     pub(crate) fn write_tx<T>(&self, f: impl FnOnce(&mut WriterState) -> Result<T>) -> Result<T> {
+        let started = std::time::Instant::now();
         let mut ws = self.write();
         let snapshot = ws.clone();
         match f(&mut ws) {
             Ok(value) => {
                 // WAL 先于可见性写入:持久失败则整体回滚,绝不发布半持久状态。
                 let ops = std::mem::take(&mut ws.pending);
+                // 内存库无持久层:在此发 Write 事件(持久库由 L2 在编码后发,含真实字节)。
+                if self.persist.is_none()
+                    && let Some(op) = crate::memory::table::write_op::observed_op(&ops)
+                {
+                    crate::core::observe::emit(
+                        self.config.observer.as_ref(),
+                        crate::core::observe::Event::Write {
+                            op,
+                            took: started.elapsed(),
+                            bytes: 0,
+                        },
+                    );
+                }
                 if let Some(persist) = &self.persist {
                     if let Err(error) = persist.log(&ops) {
                         // WAL 未落盘:整批回滚,写入对读者零可见(FC-MEM-POST-002)。
@@ -141,6 +157,13 @@ impl Table {
             }
             Err(error) => {
                 *ws = snapshot;
+                crate::core::observe::emit(
+                    self.config.observer.as_ref(),
+                    crate::core::observe::Event::Error {
+                        kind: crate::core::observe::ErrorKind::of(&error),
+                        context: "table::write_tx",
+                    },
+                );
                 Err(error)
             }
         }
@@ -197,7 +220,7 @@ impl Table {
                     continue;
                 }
                 {
-                    let stat = Arc::make_mut(&mut ws.access).entry(*rowid).or_default();
+                    let stat = ws.access.get_or_insert_default(*rowid);
                     stat.access_count = stat.access_count.saturating_add(*delta);
                     stat.last_access_ms = now_ms;
                 }

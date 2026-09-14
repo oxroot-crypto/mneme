@@ -8,8 +8,8 @@ use std::time::Duration;
 
 use crate::core::metric::Metric;
 use crate::core::options::{
-    Clock, CompactionPolicy, Compression, Dimension, HnswParams, InsertMode, Limits, RelationIndex,
-    Tuning, VectorFormat,
+    BuildPrecision, Clock, CompactionPolicy, Compression, Dimension, HnswParams, InsertMode,
+    Limits, RelationIndex, Tuning, VectorFormat,
 };
 use crate::memory::dedup::Dedup;
 use crate::memory::index::IndexFactory;
@@ -25,6 +25,8 @@ pub(crate) struct Config {
     pub(crate) dedup_threshold: f32,
     pub(crate) quantization: VectorFormat,
     pub(crate) hnsw: HnswParams,
+    /// HNSW 建图距离精度档位(设计 05 §4.4;`FC-INDEX-POST-010/011`)。
+    pub(crate) build_precision: BuildPrecision,
     /// 向量索引工厂(L3);`None` = 纯暴力(L1 语义)。
     pub(crate) index_factory: Option<Arc<dyn IndexFactory>>,
     pub(crate) compaction: CompactionPolicy,
@@ -32,6 +34,8 @@ pub(crate) struct Config {
     pub(crate) retain_interval: Option<Duration>,
     pub(crate) access_flush_interval: Duration,
     pub(crate) compression: Compression,
+    /// 事件可观测钩子(默认 `None`,零成本;设计 12 §4)。
+    pub(crate) observer: Option<Arc<dyn crate::core::observe::Observer>>,
     pub(crate) relation_index: RelationIndex,
     pub(crate) parallelism: usize,
     pub(crate) tuning: Tuning,

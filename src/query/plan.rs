@@ -64,9 +64,10 @@ pub(crate) fn compile(view: &ReaderView, ns_id: NsId, filter: Option<&Expr>, now
         ttl_unexpired: &ttl_unexpired,
         mask: &mask,
         filter,
+        uses_access: filter.is_some_and(pred::Expr::uses_access),
     };
     let mut candidates = Vec::new();
-    let mut bits = BitSet::default();
+    let mut bits = BitSet::with_capacity_bits(view.slots.len());
     let mut alive = 0_usize;
     for (index, slot) in view.slots.iter().enumerate() {
         if !row_visible(&ctx, index, slot) {
@@ -107,6 +108,8 @@ struct RowFilter<'a> {
     mask: &'a BitSet,
     /// 过滤表达式;`None` = 仅可见性。
     filter: Option<&'a Expr>,
+    /// 过滤表达式是否引用访问统计(决定行级求值是否查访问表)。
+    uses_access: bool,
 }
 
 /// 行级可见性(未回收 / 命名空间匹配 / 未墓碑与逻辑过期;TTL 块证明时跳过逐行比较)。
@@ -133,7 +136,10 @@ fn row_matches(ctx: &RowFilter<'_>, index: usize, slot: &SlotData) -> bool {
         expr,
         &EvalCtx {
             slot,
-            access: ctx.view.access.get(&slot.rowid).copied(),
+            access: ctx
+                .uses_access
+                .then(|| ctx.view.access.get(&slot.rowid).copied())
+                .flatten(),
         },
     )
 }
@@ -145,9 +151,11 @@ fn row_matches(ctx: &RowFilter<'_>, index: usize, slot: &SlotData) -> bool {
 /// 退回逐行判定,绝不误判整块过期。
 fn ttl_unexpired_blocks(view: &ReaderView, now_ms: i64) -> BitSet {
     let blocks = zmap::block_count(view);
-    let mut unexpired = BitSet::default();
+    // 字段统计一次定位:循环内直接下标访问,免逐块按字段名哈希。
+    let expires = view.zones.field_blocks("expires_at");
+    let mut unexpired = BitSet::with_capacity_bits(blocks);
     for block in 0..blocks {
-        let proven = match view.zones.block_stat("expires_at", block) {
+        let proven = match expires.and_then(|stats| stats.get(block)) {
             None => true,
             Some(stat) => !stat.has_value || stat.min > now_ms as f64,
         };

@@ -1,14 +1,14 @@
 //! msec 段与记录体编码(`msec/encode.rs`)。
 
-use std::sync::Arc;
-
 use crate::core::error::{MnemeError, Result};
 use crate::core::meta;
+use crate::core::options::Compression;
 use crate::persist::{FORMAT_VERSION, align_up, crc32, put_bytes_u32, put_i64, put_u32, put_u64};
 
 use super::{
     EntryData, FLAG_ACCESS, FLAG_CONFIDENCE, FLAG_IMPORTANCE, FLAG_KEY, FLAG_PROVENANCE, FLAG_TEXT,
-    FLAG_TTL, FLAG_VALID_TIME, HEADER_CRC_COVER, HEADER_CRC_OFFSET, HEADER_LEN, KeyIndexRow, MAGIC,
+    FLAG_TTL, FLAG_VALID_TIME, FLAG2_META_COMPRESSED, FLAG2_PROVENANCE_COMPRESSED,
+    FLAG2_TEXT_COMPRESSED, HEADER_CRC_COVER, HEADER_CRC_OFFSET, HEADER_LEN, KeyIndexRow, MAGIC,
     MsecInput, NS_STAT_ROW_BYTES, NsStatRow, REGION_ALIGN, Region, Regions, SlotMeta,
     TOMBSTONE_DOC_OFFSET, VERSION_ROW_BYTES, VersionRow, region_offset,
 };
@@ -18,33 +18,40 @@ use super::{
 /// # Errors
 /// 槽位记录体长度超限或编码失败时返回结构化错误。
 pub(crate) fn encode(input: &MsecInput<'_>) -> Result<Vec<u8>> {
-    let (doc_region, slot_offsets) = build_doc_region(input.slots)?;
+    // 单缓冲:先占 192 字节头位,doc 区与各索引区依次追加;末了回填头与尾 CRC,
+    // 免「数据区物化后再整段拷入输出」的第二遍拷贝。
+    let mut out = vec![0_u8; HEADER_LEN as usize];
+    let slot_offsets = append_doc_region(&mut out, input.slots, input.compression)?;
     let version_table = build_version_table(input.slots, &slot_offsets);
     let key_rows = build_key_rows(input.slots, &slot_offsets);
-    let (body, regions) = assemble_regions(input, doc_region, &version_table, &key_rows);
+    let regions = assemble_regions(&mut out, input, &version_table, &key_rows);
     let header = encode_header(input.slots.len() as u64, regions);
-    let mut out = header.to_vec();
-    out.extend_from_slice(&body);
-    out.extend_from_slice(&crc32(&body).to_le_bytes());
+    out[..HEADER_LEN as usize].copy_from_slice(&header);
+    let crc = crc32(&out[HEADER_LEN as usize..]);
+    out.extend_from_slice(&crc.to_le_bytes());
     Ok(out)
 }
 
-/// 顺序写入非墓碑记录体,单遍记录每个槽位的偏移(避免 O(n²) 重编码)。
-fn build_doc_region(slots: &[SlotMeta]) -> Result<(Vec<u8>, Vec<u64>)> {
-    let mut doc_region = Vec::new();
+/// 顺序追加非墓碑记录体,单遍记录每个槽位**相对数据区起点**的偏移。
+fn append_doc_region(
+    out: &mut Vec<u8>,
+    slots: &[SlotMeta],
+    compression: Compression,
+) -> Result<Vec<u64>> {
+    let base = u64::from(HEADER_LEN);
     let mut offsets = Vec::with_capacity(slots.len());
     for slot in slots {
         let offset = match &slot.body {
             Some(body) => {
-                let offset = doc_region.len() as u64;
-                doc_region.extend_from_slice(&encode_entry(body)?);
+                let offset = out.len() as u64 - base;
+                encode_entry_into(out, body, compression)?;
                 offset
             }
             None => TOMBSTONE_DOC_OFFSET,
         };
         offsets.push(offset);
     }
-    Ok((doc_region, offsets))
+    Ok(offsets)
 }
 
 /// 构造版本链表(按 `(rowid, seqno)` 排序)。
@@ -73,7 +80,7 @@ fn build_key_rows(slots: &[SlotMeta], offsets: &[u64]) -> Vec<KeyIndexRow> {
         let Some(key) = &body.key else { continue };
         rows.push(KeyIndexRow {
             ns_id: body.ns_id.get(),
-            key: Arc::from(key.as_str()),
+            key: key.shared(),
             rowid: body.rowid.get(),
             slot_id: index as u32,
             seqno: body.seqno.get(),
@@ -84,47 +91,45 @@ fn build_key_rows(slots: &[SlotMeta], offsets: &[u64]) -> Vec<KeyIndexRow> {
     rows
 }
 
-/// 组装数据区并记录各区偏移。
+/// 依次追加数据区并记录各区偏移(`body` 前 192 字节为文件头占位)。
 ///
 /// `doc_region` 置于数据区首位,故 `version_table.doc_offset`(相对 doc_region 起点)
 /// 即相对数据区起点。
 fn assemble_regions(
+    body: &mut Vec<u8>,
     input: &MsecInput<'_>,
-    doc_region: Vec<u8>,
     version_table: &[VersionRow],
     key_rows: &[KeyIndexRow],
-) -> (Vec<u8>, Regions) {
-    let mut body = doc_region;
-    let field_dict = append_region(&mut body, input.field_dict);
-    let version = append_region(&mut body, &encode_version_table(version_table));
-    let key = append_region(&mut body, &encode_key_index(key_rows));
-    let inv = append_region(&mut body, input.inverted);
-    let ns_stats = append_region(&mut body, &encode_ns_stats(input.ns_stats));
-    let zmap = append_region(&mut body, input.zmap);
-    let bloom = append_region(&mut body, input.bloom);
-    let delta = append_region(&mut body, input.delta);
-    let rel = append_region(&mut body, input.relations);
-    (
-        body,
-        Regions {
-            field_dict,
-            version,
-            key,
-            inv,
-            ns_stats,
-            zmap,
-            bloom,
-            delta,
-            rel,
-        },
-    )
+) -> Regions {
+    let field_dict = append_region(body, input.field_dict);
+    let version = append_region(body, &encode_version_table(version_table));
+    let key = append_region(body, &encode_key_index(key_rows));
+    let inv = append_region(body, input.inverted);
+    let ns_stats = append_region(body, &encode_ns_stats(input.ns_stats));
+    let zmap = append_region(body, input.zmap);
+    let bloom = append_region(body, input.bloom);
+    let delta = append_region(body, input.delta);
+    let rel = append_region(body, input.relations);
+    Regions {
+        field_dict,
+        version,
+        key,
+        inv,
+        ns_stats,
+        zmap,
+        bloom,
+        delta,
+        rel,
+    }
 }
 
 /// 追加一个数据区到 `body`(起点对齐 8 B),返回其**文件绝对**偏移/长度。
+///
+/// `body` 已含 192 字节头占位,故 `body.len()` 即下一个区的绝对偏移。
 fn append_region(body: &mut Vec<u8>, bytes: &[u8]) -> Region {
     let aligned = align_up(body.len(), REGION_ALIGN);
     body.resize(aligned, 0);
-    let offset = HEADER_LEN as u64 + body.len() as u64;
+    let offset = body.len() as u64;
     body.extend_from_slice(bytes);
     Region {
         offset,
@@ -163,23 +168,42 @@ fn encode_header(row_count: u64, regions: Regions) -> [u8; HEADER_LEN as usize] 
 ///
 /// # Errors
 /// 记录体长度超出 `u32` 时返回 [`MnemeError::TooLarge`]。
-pub(crate) fn encode_entry(entry: &EntryData) -> Result<Vec<u8>> {
-    let mut payload = Vec::new();
-    put_u64(&mut payload, entry.rowid.get());
-    put_u64(&mut payload, entry.seqno.get());
-    put_u32(&mut payload, entry.ns_id.get());
-    payload.push(entry_flags(entry));
-    encode_entry_fields(&mut payload, entry);
+#[cfg(test)]
+pub(crate) fn encode_entry(entry: &EntryData, compression: Compression) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    encode_entry_into(&mut out, entry, compression)?;
+    Ok(out)
+}
 
-    let total_len = u32::try_from(payload.len()).map_err(|_| MnemeError::TooLarge {
+/// 追加编码记录体到 `out`(含 `u32 total_len` 前缀,单缓冲免中间 `Vec`)。
+///
+/// # Errors
+/// 记录体长度超出 `u32` 时返回 [`MnemeError::TooLarge`];出错时 `out` 尾部
+/// 可能残留半写字节,调用方必须丢弃该缓冲。
+pub(crate) fn encode_entry_into(
+    out: &mut Vec<u8>,
+    entry: &EntryData,
+    compression: Compression,
+) -> Result<()> {
+    let len_pos = out.len();
+    out.extend_from_slice(&[0_u8; 4]);
+    let payload_start = out.len();
+    put_u64(out, entry.rowid.get());
+    put_u64(out, entry.seqno.get());
+    put_u32(out, entry.ns_id.get());
+    out.push(entry_flags(entry));
+    let (flags2, fields) = encode_entry_fields(entry, compression)?;
+    out.push(flags2);
+    out.extend_from_slice(&fields);
+
+    let payload_len = out.len() - payload_start;
+    let total_len = u32::try_from(payload_len).map_err(|_| MnemeError::TooLarge {
         field: "msec entry",
         limit: u32::MAX as usize,
-        got: payload.len(),
+        got: payload_len,
     })?;
-    let mut out = Vec::with_capacity(payload.len() + 4);
-    put_u32(&mut out, total_len);
-    out.extend_from_slice(&payload);
-    Ok(out)
+    out[len_pos..len_pos + 4].copy_from_slice(&total_len.to_le_bytes());
+    Ok(())
 }
 
 /// 计算记录体的 flags 字节。
@@ -212,15 +236,76 @@ fn entry_flags(entry: &EntryData) -> u8 {
     flags
 }
 
-/// 按 flags 写入记录体的可选字段(不含固定头与 flags)。
-fn encode_entry_fields(payload: &mut Vec<u8>, entry: &EntryData) {
+/// 按 flags 写入记录体的可选字段(不含固定头与 flags/flags2)。
+///
+/// 返回 `(flags2, 字段区)`:`flags2` 标记 text/meta/provenance 是否压缩;
+/// 压缩字段以自描述 blob 写入(见 [`crate::compress`]),无收益时存原文。
+fn encode_entry_fields(entry: &EntryData, compression: Compression) -> Result<(u8, Vec<u8>)> {
+    let codec = crate::compress::codec_for(compression)?;
+    let codec_id = codec_id_for(compression);
+    // text/provenance 可选:仅当字段存在且压缩确有收益时才产出 blob。
+    let text_blob = entry
+        .text
+        .as_deref()
+        .and_then(|text| crate::compress::encode_field(codec, codec_id, text.as_bytes()));
+    let meta_bytes = meta::to_bytes(&entry.meta);
+    let meta_blob = crate::compress::encode_field(codec, codec_id, &meta_bytes);
+    let provenance_bytes = entry.provenance.as_ref().map(meta::to_bytes);
+    let provenance_blob = provenance_bytes
+        .as_ref()
+        .and_then(|bytes| crate::compress::encode_field(codec, codec_id, bytes));
+
+    let flags2 = compression_flags(&text_blob, &meta_blob, &provenance_blob);
+    let mut payload = Vec::new();
     if let Some(key) = &entry.key {
-        put_bytes_u32(payload, key.as_str().as_bytes());
+        put_bytes_u32(&mut payload, key.as_str().as_bytes());
     }
     if let Some(text) = &entry.text {
-        put_bytes_u32(payload, text.as_bytes());
+        put_field(&mut payload, text_blob.as_deref(), text.as_bytes());
     }
-    put_bytes_u32(payload, &meta::to_bytes(&entry.meta));
+    put_field(&mut payload, meta_blob.as_deref(), &meta_bytes);
+    encode_scalar_fields(entry, &mut payload);
+    if let Some(raw) = provenance_bytes.as_deref() {
+        put_field(&mut payload, provenance_blob.as_deref(), raw);
+    }
+    Ok((flags2, payload))
+}
+
+/// 压缩配置 → 落盘 codec 标识(`None` 为 0,不写压缩 blob)。
+fn codec_id_for(compression: Compression) -> u8 {
+    match compression {
+        Compression::None => 0,
+        Compression::Lz4 => crate::compress::CODEC_ID_LZ4,
+        Compression::Zstd => crate::compress::CODEC_ID_ZSTD,
+    }
+}
+
+/// 汇总三个变长字段的 `flags2` 压缩标记位。
+fn compression_flags(
+    text_blob: &Option<Vec<u8>>,
+    meta_blob: &Option<Vec<u8>>,
+    provenance_blob: &Option<Vec<u8>>,
+) -> u8 {
+    let mut flags2 = 0_u8;
+    if text_blob.is_some() {
+        flags2 |= FLAG2_TEXT_COMPRESSED;
+    }
+    if meta_blob.is_some() {
+        flags2 |= FLAG2_META_COMPRESSED;
+    }
+    if provenance_blob.is_some() {
+        flags2 |= FLAG2_PROVENANCE_COMPRESSED;
+    }
+    flags2
+}
+
+/// 写一个变长字段:有压缩 blob 用 blob,否则写原文。
+fn put_field(payload: &mut Vec<u8>, blob: Option<&[u8]>, raw: &[u8]) {
+    put_bytes_u32(payload, blob.unwrap_or(raw));
+}
+
+/// 写记录体的定长/标量字段(时间戳、重要度、访问、有效时间、可信度)。
+fn encode_scalar_fields(entry: &EntryData, payload: &mut Vec<u8>) {
     put_i64(payload, entry.created_at_ms);
     if let Some(expires) = entry.expires_at_ms {
         put_i64(payload, expires);
@@ -244,9 +329,6 @@ fn encode_entry_fields(payload: &mut Vec<u8>, entry: &EntryData) {
     }
     if let Some(confidence) = entry.confidence {
         payload.extend_from_slice(&confidence.to_le_bytes());
-    }
-    if let Some(provenance) = &entry.provenance {
-        put_bytes_u32(payload, &meta::to_bytes(provenance));
     }
 }
 

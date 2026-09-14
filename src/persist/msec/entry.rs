@@ -9,7 +9,8 @@ use crate::persist::Cursor;
 
 use super::{
     EntryData, FLAG_ACCESS, FLAG_CONFIDENCE, FLAG_IMPORTANCE, FLAG_KEY, FLAG_PROVENANCE, FLAG_TEXT,
-    FLAG_TTL, FLAG_VALID_TIME,
+    FLAG_TTL, FLAG_VALID_TIME, FLAG2_META_COMPRESSED, FLAG2_PROVENANCE_COMPRESSED,
+    FLAG2_TEXT_COMPRESSED,
 };
 
 /// 解码单个记录体(不含长度前缀的 `body` 字节)。
@@ -22,10 +23,17 @@ pub(super) fn decode_entry(body: &[u8]) -> Result<EntryData> {
     let seqno = SeqNo::new(cursor.u64()?);
     let ns_id = NsId::new(cursor.u32()?);
     let flags = cursor.u8()?;
+    let flags2 = cursor.u8()?;
+    if flags2 & !(FLAG2_TEXT_COMPRESSED | FLAG2_META_COMPRESSED | FLAG2_PROVENANCE_COMPRESSED) != 0
+    {
+        return Err(MnemeError::Corrupted {
+            segment: None,
+            reason: "msec: flags2 含未知位".to_string(),
+        });
+    }
     let key = decode_key(&mut cursor, flags)?;
-    let text = decode_text(&mut cursor, flags)?;
-    let meta_len = cursor.u32()? as usize;
-    let meta = meta::from_bytes(cursor.take(meta_len)?)?;
+    let text = decode_text(&mut cursor, flags, flags2)?;
+    let meta = decode_meta(&mut cursor, flags2)?;
     let created_at_ms = cursor.i64()?;
     let expires_at_ms = if flags & FLAG_TTL != 0 {
         Some(cursor.i64()?)
@@ -36,7 +44,7 @@ pub(super) fn decode_entry(body: &[u8]) -> Result<EntryData> {
     let access = decode_access(&mut cursor, flags)?;
     let valid_time = decode_valid_time(&mut cursor, flags)?;
     let confidence = decode_flag_f32(&mut cursor, flags, FLAG_CONFIDENCE)?;
-    let provenance = decode_provenance(&mut cursor, flags)?;
+    let provenance = decode_provenance(&mut cursor, flags, flags2)?;
     if !cursor.is_empty() {
         return Err(MnemeError::Corrupted {
             segment: None,
@@ -94,21 +102,40 @@ fn read_utf8(cursor: &mut Cursor<'_>, field: &str) -> Result<Arc<str>> {
     Ok(Arc::from(value))
 }
 
-/// 按标志位解码可选 key。
+/// 按标志位解码可选 key(复用 `read_utf8` 的 `Arc`,免二次分配)。
 fn decode_key(cursor: &mut Cursor<'_>, flags: u8) -> Result<Option<Key>> {
     if flags & FLAG_KEY == 0 {
         return Ok(None);
     }
     let text = read_utf8(cursor, "key")?;
-    Ok(Some(Key::new(&*text)))
+    Ok(Some(Key::from_arc(text)))
 }
 
-/// 按标志位解码可选 text。
-fn decode_text(cursor: &mut Cursor<'_>, flags: u8) -> Result<Option<Arc<str>>> {
+/// 按标志位解码可选 text(压缩字段先解压再校验 UTF-8)。
+fn decode_text(cursor: &mut Cursor<'_>, flags: u8, flags2: u8) -> Result<Option<Arc<str>>> {
     if flags & FLAG_TEXT == 0 {
         return Ok(None);
     }
+    if flags2 & FLAG2_TEXT_COMPRESSED != 0 {
+        let len = cursor.u32()? as usize;
+        let raw = crate::compress::decode_field(cursor.take(len)?)?;
+        let value = std::str::from_utf8(&raw).map_err(|error| MnemeError::Corrupted {
+            segment: None,
+            reason: format!("msec: text 非 UTF-8:{error}"),
+        })?;
+        return Ok(Some(Arc::from(value)));
+    }
     Ok(Some(read_utf8(cursor, "text")?))
+}
+
+/// 解码 meta(压缩字段先解压)。
+fn decode_meta(cursor: &mut Cursor<'_>, flags2: u8) -> Result<Meta> {
+    let len = cursor.u32()? as usize;
+    if flags2 & FLAG2_META_COMPRESSED != 0 {
+        let raw = crate::compress::decode_field(cursor.take(len)?)?;
+        return meta::from_bytes(&raw);
+    }
+    meta::from_bytes(cursor.take(len)?)
 }
 
 /// 按标志位解码访问统计 `(last_access_ms, access_count)`。
@@ -141,12 +168,16 @@ fn decode_valid_time(cursor: &mut Cursor<'_>, flags: u8) -> Result<Option<(i64, 
     Ok(Some((valid_from, valid_to)))
 }
 
-/// 按标志位解码 provenance。
-fn decode_provenance(cursor: &mut Cursor<'_>, flags: u8) -> Result<Option<Meta>> {
+/// 按标志位解码 provenance(压缩字段先解压)。
+fn decode_provenance(cursor: &mut Cursor<'_>, flags: u8, flags2: u8) -> Result<Option<Meta>> {
     if flags & FLAG_PROVENANCE == 0 {
         return Ok(None);
     }
     let len = cursor.u32()? as usize;
+    if flags2 & FLAG2_PROVENANCE_COMPRESSED != 0 {
+        let raw = crate::compress::decode_field(cursor.take(len)?)?;
+        return Ok(Some(meta::from_bytes(&raw)?));
+    }
     Ok(Some(meta::from_bytes(cursor.take(len)?)?))
 }
 
@@ -175,7 +206,8 @@ mod tests {
             confidence: None,
             provenance: None,
         };
-        let encoded = encode_entry(&entry).expect("encode");
+        let encoded =
+            encode_entry(&entry, crate::core::options::Compression::None).expect("encode");
         let mut body = encoded[4..].to_vec();
         let pattern = i64::MIN.to_le_bytes();
         let pos = body

@@ -58,14 +58,16 @@ pub(crate) fn encode_frame(seqno: u64, kind: FrameKind, payload: &[u8]) -> Vec<u
     // 远小于 u32::MAX,转换可证明不会失败;静默截断会破坏帧布局。
     let payload_len =
         u32::try_from(payload.len()).expect("WAL 单帧负载远小于 u32::MAX(FC-GLOBAL-PRE-003 限额)");
-    let mut covered = Vec::with_capacity(4 + 8 + 1 + payload.len());
-    covered.extend_from_slice(&payload_len.to_le_bytes());
-    covered.extend_from_slice(&seqno.to_le_bytes());
-    covered.push(kind.as_u8());
-    covered.extend_from_slice(payload);
-    let mut out = Vec::with_capacity(4 + covered.len());
-    out.extend_from_slice(&crc32(&covered).to_le_bytes());
-    out.extend_from_slice(&covered);
+    // 单缓冲:先占 CRC 位,被覆盖区连续写入后一次回填 CRC,免中间缓冲再整段拷出。
+    let mut out = Vec::with_capacity(4 + 4 + 8 + 1 + payload.len());
+    out.extend_from_slice(&[0_u8; 4]);
+    let covered_start = out.len();
+    out.extend_from_slice(&payload_len.to_le_bytes());
+    out.extend_from_slice(&seqno.to_le_bytes());
+    out.push(kind.as_u8());
+    out.extend_from_slice(payload);
+    let crc = crc32(&out[covered_start..]);
+    out[..4].copy_from_slice(&crc.to_le_bytes());
     out
 }
 

@@ -40,9 +40,10 @@ agent_memory/
 约定:整数**小端**(LE);变长字段自带长度前缀;每个文件头部与数据尾部各一个 CRC-32。
 头内定长字段按 8 字节自然对齐摆放,便于 mmap 后零拷贝读取。
 
-> **feature 扩展区**:`encrypt` / `compress` 默认关闭。关闭时下述字节图**逐字节成立**;
-> 开启后,各文件头在基础字段之后追加一段由 `header_len` 界定的扩展区(§2.5),数据区起点
-> 相应后移。扩展区仅在对应 feature 开启时出现,关闭时字节图逐字节成立(§12)。
+> **feature 可选项**:`encrypt` / `compress` 默认关闭,且**不改变文件头字段布局**
+> (无扩展区)。加密以整文件/整帧信封封装(读取时透明解封装),压缩只改变 msec
+> 记录体内变长字段(新增 `flags2` 字节),详见 [11](11-security-storage.md) 与 §2.5;
+> 关闭时下述字节图逐字节成立。
 
 > **可移植性**:文件格式固定小端。小端平台上 mmap 后可直接零拷贝读取;大端平台需
 > 逐字段字节交换(或整体走 `FileSource` 解码路径),正确性不变,但不在性能承诺内。
@@ -141,6 +142,8 @@ agent_memory/
 [u64 rowid][u64 seqno][u32 ns_id]  # rowid = 稳定逻辑标识(更新时不变,见 §2.3)
 [u8 flags]  # bit0=有key bit1=有text bit2=有ttl bit3=有importance bit4=有access
             # bit5=有valid_time bit6=有confidence bit7=有provenance
+[u8 flags2] # bit0/1/2 = text/meta/provenance 字段为压缩 blob(恒写;未压缩时恒 0)
+            #            feature `compress`/`compress-zstd`,FORMAT_VERSION = 0x0006
 [key: len+bytes(可选)]
 [text: len+bytes(可选)]
 [meta: u32 json_len + serde_json 字节]
@@ -150,6 +153,10 @@ agent_memory/
 [f32 confidence](可选,bit6;默认 1.0)
 [provenance: u32 len + JSON 字节](可选,bit7;来源/派生链)
 ```
+
+> **压缩字段**:`flags2` 对应位置位时,该变长字段为自描述压缩 blob
+> `[u8 codec_id][u32 uncompressed_len][compressed]`;压缩无收益时存原文且对应位为 0
+> (`Compression::None` 时所有位恒 0,字段布局与未压缩定义一致)。
 
 > **RowId 是稳定逻辑标识,一个 RowId 可有多个物理版本(版本链)**:更新/upsert 时保留 RowId、
 > 递增 seqno 写入新记录体,形成按 seqno 升序的版本链;记录体的 `created_at_ms` 即**事务时间**
@@ -339,21 +346,22 @@ MANIFEST 是**命名空间路径的唯一事实来源**(`NsEntry` 表);删除命
 `next_rel_kind` 只增不减,保证关系类型编号跨崩溃/重启稳定([09 §2.2](09-memory-model.md))。
 HNSW 入口是**每段一个**(与 [05 §7/§9](05-l3-hnsw.md) 的"每段独立图"一致),不存在全局单入口。
 
-### 2.5 可选 feature 的头部扩展(encrypt / compress)
+### 2.5 可选 feature 的落盘形态(encrypt / compress)
 
-基础字节图中的头部均有 `header_len`(vsec/msec/MANIFEST)或保留区(WAL),据此承载
-可选 feature 的扩展字段。扩展区按固定顺序、定长排布,`header_crc32` 一并覆盖:
+加密与压缩**不使用段头扩展字段**,而是各自独立地作用于文件字节流:
 
-| 字段 | 类型 | 缺省 | 含义 |
-|---|---|---|---|
-| `key_id` | `u32` | `0`(未加密) | 加密时指向 `KeyProvider` 的密钥标识,见 [11 §2.3](11-security-storage.md) |
-| `codec` | `u8` | `0`(None) | 记录体 `text`/`meta` 所用压缩 codec(0=None 1=Lz4 2=Zstd),见 [11 §3.2](11-security-storage.md) |
-
-- 扩展字段出现在 **vsec / msec / WAL / MANIFEST** 四类文件头中;同一段的三个文件
-  (vsec/msec/hidx)的 `key_id` 与 `codec` 必须一致,不一致视为 `Corrupted`;
-- feature 关闭时扩展区为空(`header_len` = 基础值),磁盘布局与 §2.1–§2.4 逐字节一致;
-  开启时 `header_len` 增大、次版本号递增(项目未发布期版本不一致即拒绝,不保留旧读者);
-- 加密页布局与压缩字段前缀的细节见 [11 §2.2](11-security-storage.md) / [11 §3.2](11-security-storage.md)。
+- **加密(feature `encrypt`)**:段/MANIFEST/关系段为整文件自描述信封
+  `[MNEC][format_version u16][key_id u32][plaintext_len u32][nonce 12B][ciphertext][tag]`,
+  WAL 为逐帧信封;AAD 绑定用途与段号/版本,读路径先解信封再按 §2.1–§2.4 的
+  原布局解析(见 [11 §2.2](11-security-storage.md))。各文件信封自带 `key_id`,
+  由 `KeyProvider` 按 id 解密;轮换迁移期间新旧 `key_id` 并存可读。加密段
+  mmap 零拷贝失效,走自有缓冲解码;
+- **压缩(feature `compress` / `compress-zstd`)**:仅作用于 msec 记录体的
+  `text`/`meta`/`provenance` 字段(记录体格式见 §2.2 的 `flags2`),blob 自描述
+  codec id 与 `uncompressed_len`,无收益回退原文(见 [11 §3](11-security-storage.md));
+- 两者分别受 feature 门控:未开 feature 却配置对应能力时 `build()` 返回
+  `Unsupported`,绝不静默明文落盘或跳过压缩(`FC-SEC-ERR-001`);关闭时磁盘布局
+  与 §2.1–§2.4 逐字节一致(压缩仅多一个恒 0 的 `flags2` 字节)。
 
 ### 2.6 一次写入的字节旅程(把本章串起来)
 
@@ -384,7 +392,7 @@ HNSW 入口是**每段一个**(与 [05 §7/§9](05-l3-hnsw.md) 的"每段独立�
 ```text
 偏移   内容
 0      "VSC1" = 56 53 43 31
-4      05 00                        format_version = 0x0005
+4      06 00                        format_version = 0x0006
 6      40 00                        header_len = 64
 8      04 00 00 00                  dimension = 4
 12     00                           metric = 0(Cosine)
@@ -410,6 +418,16 @@ HNSW 入口是**每段一个**(与 [05 §7/§9](05-l3-hnsw.md) 的"每段独立�
 > **L5 落地状态(增量段)**:自 L5 起 `flush` 不再重写整个可变表——只把未落盘槽位与
 > 自上次 flush 的访问/关系 delta 物化为**新段**,旧段保持活跃(write-once),MANIFEST
 > 追加新段并 Checkpoint WAL,段数由 compaction 合并控制;当前实现见 [07 §4](07-l5-life.md)。
+> 大规模物化按 `MNEME_FLUSH_CHUNK_ROWS`(默认 65_536 行)**每块至多该行数**切开
+> (块数 = ⌈行数 / 块行数⌉),块级并行度由 `MNEME_FLUSH_THREADS` 显式覆盖、
+> 默认 **1(块级串行)**;每块内部的 HNSW 构建使用 `Builder::parallelism` 的
+> **批内并行**(见 [05 §4.4](05-l3-hnsw.md)、`FC-INDEX-POST-012`)。默认块级串行是
+> 4 核机实测结论:块级并行与块内批并行嵌套会争抢内存带宽,100k×1536 实测
+> (2 块 × 4 线程)506s,而块级串行 + 块内批并行 295s。块级并行仅建议在大内存/
+> 多核 runner 上显式开启,此时内层自动降为 1 避免过度订阅;调大
+> `CompactionPolicy.wal_bytes` 可让单次 flush 覆盖更多行、切出更多块。并行块数
+> 另受**内存预算**(6GiB,按单块 `行数 ×(维度×4+256)×2` 估算)约束:超预算时降低
+> 并发,宁慢不换页。
 
 ### 3.1 提交流程(写路径)
 
@@ -444,8 +462,11 @@ last_error }`。提交者追加后 `wait_while(last_durable < my_seqno)`。
   `WalWriter::reset` 截断活动 WAL 文件并删除已覆盖旧文件。截断发生在 MANIFEST 提交
   **之后**,故任何已确认的覆盖操作(删除/更新/访问/关系)都已随快照段物化——**这是防止
   "删除复活/更新丢失"的关键**(不变量 I19):只要某条墓碑或更新还只存在于 WAL,就不得截断它。
-- **WAL 压力兜底**:WAL 总量超限(默认 256MB,`CompactionPolicy.wal_bytes`)即触发增量段
-  flush,保证 WAL 有界(I4)。
+- **WAL 压力兜底(软阈值 + 硬上限)**:WAL 达到软阈值(`CompactionPolicy.wal_bytes`,
+  默认 256MiB)后,若未落盘行数不足以切满并行块(「并行度 × 块行数」,默认
+  `min(核数,8) × 65,536`)则继续累积;行数达标或 WAL 达硬上限(12×软阈值)即触发
+  增量段 flush——大维度(1536 维 256MiB 仅约 4 万行)不再因每次只物化一个块而单核
+  串行,WAL 有界性由硬上限保证(I4)。
 - **轮转节拍**:活动文件达 `wal_file_bytes`(默认 64MB)换新文件,旧文件保留到
   Checkpoint;**整批不跨文件提交**——`BatchBegin…BatchCommit` 必须完整落在同一文件内,由此批
   原子性(I15)不依赖跨文件逻辑,回放器单文件即可判定整批取舍(FC-PERSIST-POST-011)。
@@ -627,6 +648,9 @@ Mneme 在 msec 当前为 `key` 字段放一个 bloom(fpp 1%,默认;元素数 ≤
 > 新段 `inverted` 区;恢复时从磁盘倒排经重排映射重建。"段倒排 + 可变表增量"两套结构在
 > L5 前全量快照(单活跃段)与 L5 多段增量下均与之语义等价,故实现取统一结构。墓碑与被遮蔽版本
 > 不从索引删除,由查询期按视图可见性过滤——`as_of` 历史视图因此仍可检索旧版本文本。
+> 内存结构本身按**命名空间分桶、桶内按词条哈希与槽位块号分片**(postings 以
+> `Arc<Vec<Posting>>` 独立共享):写事务只对命中分片做写时复制,不再整表深拷
+> (设计 03 §3 的写放大控制)。
 
 ### 5.5 key 索引(为 `get(key)` 与去重供路)
 
@@ -796,6 +820,15 @@ ReaderView(不可变):
 > 跨段访问/关系变更经 `delta` 区承载(L5 起,§2.2a)。因此 `flush` 之后即便 WAL 被
 > 重置截断,删除与更新依然有效(I19)。
 
+> **段句柄惰性驻留(已落地,L1–L6 收尾)**:生产实现在此骨架下引入
+> `SegmentHandle`/`ByteFile`(`persist/source.rs`):打开段只解析头部与
+> `node_table`(hidx),**向量/量化码/HNSW 邻接字节挂在段句柄上按需切片解码**
+> (`SlotData.vector: Arc<VectorStorage>`、`QuantCopy.rows: LazyRows`、
+> `HnswIndex.graph: GraphStore::Mapped`;FC-PERSIST-INV-021)。记录元数据
+> (`SlotData` 的 key/text/可见性字段与版本链)仍在打开期物化——把这一层也改为
+> 惰性(ReaderView 持段集 + 按需解 msec entry)是冷启动门槛 <1s 的后续工作,
+> 见 [14 §4](14-testing.md)。
+
 > **可变表也是检索数据源**:除可见性合并外,可变表中**尚未落段**的记录同时参与检索——
 > 向量侧作为一个"内存段"参与暴力扫描([05 §9](05-l3-hnsw.md)),BM25 侧经内存增量倒排
 > 参与两遍统计(见 §5.4、[06 §3.2](06-l4-query.md))。因此新写入无需
@@ -866,17 +899,21 @@ pub trait Clock: Send + Sync { fn now_unix_ms(&self) -> i64; }
 ## 11. source.rs:两种段读取后端
 
 ```rust
-pub trait SegmentSource: Send + Sync {
+pub(crate) trait SegmentSource: Send + Sync {   // crate 内部抽象,非公开 API
     fn slice(&self) -> Option<&[u8]>;                 // mmap 后端返回整段切片
     fn read_at(&self, off: u64, buf: &mut [u8]) -> io::Result<()>;
 }
 ```
 
 L2 提供 `FileSource`(std,`seek+read`);`MmapSource`(feature `mmap`,memmap2)按依赖
-白名单([01 §5](01-overview.md))**自 L3 起已实现**:段读取经 `source::read_whole` 统一走
-`MmapSource`(默认开)或 `FileSource`(feature 关闭)。索引层与恢复层只依赖此 trait——
-mmap 是**优化**而非功能依赖,按 feature `mmap` 二选一(关闭后编译为 `FileSource`,读吞吐降、正确性不变)。
-L3 恢复阶段仍需自有字节以重建内存表,真正的"零拷贝驻留"待段句柄重构(**尚未落地**,属后续收尾,见 [14 §4](14-testing.md))。
+白名单([01 §5](01-overview.md))**自 L3 起已实现**,保留给 `read_whole`(测试/诊断)使用。
+**段句柄惰性驻留已落地**(L1–L6 收尾,FC-PERSIST-INV-021):生产打开路径由
+`SegmentHandle` 长期持有三个 `ByteFile`(vsec/msec/hidx),`ByteFile` 实现 L1
+`memory::lazy::ByteSource`——feature `mmap`(默认)下按页惰性映射,关闭 mmap 时把
+整文件读入自有缓冲(功能等价)。向量(`SlotData.vector`)、量化码(`LazyRows`)与
+HNSW 邻接(`MappedGraph`)经这些句柄按需读取;compaction 把旧段移入 `trash/` 只影响
+目录项,已打开的描述符/映射在句柄存活期内继续可读(POSIX unlink/rename 语义)。
+记录元数据层仍为打开期物化(见 §8 说明);`read_whole` 仅保留给测试与诊断路径。
 
 ---
 
@@ -892,7 +929,7 @@ L3 恢复阶段仍需自有字节以重建内存表,真正的"零拷贝驻留"�
 | 魔数不符 | 视为损坏,走 §7 隔离/拒绝流程 |
 
 - **版本号策略**:`format_version` 是 16 位,**高 8 位为主版本、低 8 位为次版本**
-  (如 `0x0005` = 主 0 次 5)。破坏性布局变更 → 主版本 +1 且次版本归零;
+  (如 `0x0006` = 主 0 次 6)。破坏性布局变更 → 主版本 +1 且次版本归零;
   仅新增可选字段/保留位 → 次版本 +1。**项目发布前不维护兼容矩阵**:版本不同即拒绝,
   不保留"读旧开发格式"的读取分支、不在后台升级旧段、不支持混合版本库
   (见 `AGENTS.md`「项目状态与兼容纪律」)。

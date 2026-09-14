@@ -3,19 +3,30 @@
 > **本章目标**:补齐产品化的两块存储能力——**数据静止加密**(Agent 记忆含用户隐私)
 > 与**文本/元数据压缩**(超长期下文本是体积大头),同时守住"默认零成本、依赖可选"。
 > **前置阅读**:[04](04-l2-persist.md)(文件布局/WAL/MANIFEST)、[02 §7](02-l0-core.md)(meta 隔离)、[01 §5](01-overview.md)(依赖白名单)。
-> **本章你将学到**:威胁模型与边界 → 页级 AEAD 加密与密钥提供者 → 密钥轮换 →
+> **本章你将学到**:威胁模型与边界 → 整文件/整帧 AEAD 加密与密钥提供者 → 密钥轮换 →
 > 文本压缩与 BM25 的交互 → 层边界契约。
 >
-> 两者均为**可选 feature**,默认关闭时磁盘布局与
-> [04](04-l2-persist.md) 完全一致,依赖白名单不扩大。
+> 两者均为**可选 feature**,默认关闭时磁盘布局与 [04](04-l2-persist.md) 定义一致
+> (压缩仅多一个恒 0 的 msec `flags2` 字节,`FORMAT_VERSION = 0x0006`),
+> 依赖白名单不扩大。
 >
-> **落地状态(2026-09)**:**本章尚未落地**——`src/` 无 `crypto/`/`compress/` 模块,
-> feature `encrypt`/`compress` 尚未定义;`Builder` 无加密/密钥相关 API,`Config` 中的
-> `Compression` 仅记录配置、尚未接线压缩实现;磁盘格式仅按 [04 §2.5](04-l2-persist.md)
-> 预留扩展区(`key_id`/`codec` 当前恒 0)。`FC-SEC-*` 契约均为 `Planned`;真实威胁
-> 模型与接口见下文目标设计。
+> **落地状态(2026-09,已落地)**:`src/crypto/`(feature `encrypt`)提供
+> `KeyId`/`Key`(导出名 `CryptoKey`)/`Cipher`/`KeyProvider`/`Encryption`/`Keyring`;
+> 段/WAL/MANIFEST 写盘为**自描述整文件/整帧 AEAD 信封**(`[MNEC][版本][key_id]
+> [明文长度][nonce][密文][tag]`,AAD 绑定用途/标识/格式版本),读路径自动解密;
+> 加密段走自有缓冲(mmap 失效,与设计取舍一致)。`Mneme::rotate_encryption_key()`
+> 以 provider 轮换 + 全量段重写完成迁移,`stats().storage` 报 `encryption` 与
+> `migrated_segments/total_segments`。`src/compress/`(feature `compress` /
+> `compress-zstd`)对记录体 `text`/`meta`/`provenance` 按字段压缩,自描述 codec 与
+> 原始长度、无收益回退原文;`Compression::None` 语义不变(记录体新增恒 0 的
+> `flags2` 字节,`FORMAT_VERSION = 0x0006`)。`FC-SEC-*` 均已转正,见
+> `tests/security_contracts.rs`。
+>
+> **实现口径与目标设计的差异**(登记):采用**整文件/整帧信封**而非页级加密
+> (加密段已放弃 mmap,页级零拷贝无收益);头部定长字段也随之密文化(而非保留明文),
+> 版本/维度在解密后校验(`I18` 语义不变)。
 
-模块:`crypto/{aead.rs, keyring.rs}`(feature `encrypt`)、`compress/{codec.rs, lz4.rs}`(feature `compress`)(规划)
+模块:`src/crypto/mod.rs`(feature `encrypt`)、`src/compress/mod.rs` + `src/compress/lz4.rs`(feature `compress` / `compress-zstd`)
 
 ---
 
@@ -42,67 +53,87 @@
 AES-256-GCM 是**带认证的加密(AEAD)**:加密数据的同时生成认证标签,解密时校验
 "密钥不对 / 数据被改"都会失败——天然满足不变量 I2(不静默返回错误数据)的加密版本。
 
-### 2.2 单元与布局
+### 2.2 单元与布局(整文件/整帧信封)
 
 | 单元 | 加密粒度 | 说明 |
 |---|---|---|
-| 段数据区 | 每 **64 KiB 页** 一个 AEAD 记录 | 页内明文连续;页头存 nonce(12B)+ tag(16B)+ 明文长度 |
-| 段头/索引区 | 整块加密 | 头部定长字段(维度/度量/版本)保留**明文**,以便打开时判版本(I18)与维度校验 |
-| WAL 帧 | 每帧 payload 加密 | 帧头(crc/len/seqno/type)明文,便于撕裂写定位与回放 |
-| MANIFEST | 变长区加密 | 头部明文 |
+| 段文件(vsec/msec/hidx) | 整文件信封 | 固定头字段(维度/度量/版本)也密文化,版本/维度在解密后校验 |
+| WAL 帧 | 每帧 payload 信封 | 帧头(crc/len/seqno/type)保留明文,便于撕裂写定位与回放 |
+| MANIFEST | 整文件信封 | 段表/命名空间注册表/关系类型注册表随密文一并保护 |
+| 关系段(edges) | 整文件信封 | 与段文件同口径 |
 
 ```text
-加密页布局:[u32 cipher_len][12B nonce][ciphertext][16B tag]
-nonce = 随机 96 bit(每页独立;随机碰撞概率在 2^32 页内 < 2^-32,可接受)
-AAD   = [segment_id | page_index | format_version]   # 绑定位置,防页重排/跨文件搬运
+信封布局:
+[MNEC 4B][format_version u16][key_id u32][plaintext_len u32][nonce 12B][ciphertext][tag 16B]
+AAD = (用途标签, 段号/版本标识, 上述定长头)   # 绑定位置与长度,防跨文件搬运
 ```
 
-- **页级**加密使 mmap 零拷贝读失效(需解密),因此开启加密时该段自动走
-  `FileSource` 解码路径([04 §11](04-l2-persist.md)),读吞吐下降(经验值 1.5–3×);
+- **整文件/整帧信封**使加密段无法 mmap 零拷贝(需整段解密),开启加密后该段自动走
+  自有缓冲解码路径([04 §11](04-l2-persist.md)),读吞吐下降(经验值 1.5–3×);
   这是安全换性能的显式取舍;[01 §1.1](01-overview.md)/[14 §4](14-testing.md) 的
   性能目标默认在**未加密**下衡量,加密开启后需重新基准;
-- 页大小 64 KiB 是 OS 页(通常 4 KiB)的整数倍,便于对齐与复用解密缓冲区。
+- 版本/key_id/明文长度/nonce 全部参与 AAD:版本不符 → `UnsupportedVersion`,
+  字段被改或密钥不对 → `Corrupted`,绝不按明文误读(I18);
+- 页级方案(每 64 KiB 页一个 AEAD 记录)是设计初稿,已废弃,差异见本章开头
+  "实现口径与目标设计的差异"。
 
 ### 2.3 密钥提供者
 
 ```rust
-/// 密钥标识:写入文件头,解密时按 id 向 provider 取密钥。
+/// 密钥标识:写入信封头,解密时按 id 向 provider 取密钥。
 pub struct KeyId(pub u32);
-/// 32 字节对称密钥(刻意不实现打印明文内容的 `Debug`)。
+/// 32 字节对称密钥(刻意不实现打印明文内容的 `Debug`);以 `mneme::CryptoKey` 导出。
 pub struct Key([u8; 32]);
-/// 支持的 AEAD 算法。
+impl Key {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self;
+    #[cfg(feature = "encrypt")]
+    pub fn generate() -> Result<Self>;            // OS 熵源(CSPRNG)
+}
+/// 支持的 AEAD 算法(当前仅 AES-256-GCM)。
 pub enum Cipher { Aes256Gcm }
 
 pub trait KeyProvider: Send + Sync {
-    /// 当前用于写入的密钥及其 id(用于把 key_id 写入文件头,解密时按 id 取密钥)。
+    /// 当前用于写入的密钥及其 id(用于把 key_id 写入信封头,解密时按 id 取密钥)。
     fn active_key(&self) -> KeyId;
     fn key(&self, id: KeyId) -> Result<Key>;      // 32 字节
-    fn rotate(&self) -> Result<KeyId>;            // 生成新密钥并设为 active(可选)
+    fn rotate(&self) -> Result<KeyId>;            // 生成新密钥并设为 active(可选能力,默认 Unsupported)
 }
 pub struct Encryption { pub provider: Arc<dyn KeyProvider>, pub cipher: Cipher }  // Cipher::Aes256Gcm
+
+/// 内存密钥环(测试与宿主便捷实现):多密钥共存、active 切换与退役。
+pub struct Keyring { /* .. */ }
+impl Keyring {
+    pub fn new(id: KeyId, key: Key) -> Self;      // 单密钥即 active
+    pub fn insert(&self, id: KeyId, key: Key);    // 登记历史密钥(不改变 active)
+    pub fn retire(&self, id: KeyId) -> bool;      // 退役(active 密钥不可退役)
+}
+// `Keyring` 实现 `KeyProvider`,可直接用于 `Builder::encryption`。
 ```
 
 - 引擎**不管理密钥文件**,只经 `KeyProvider` 取密钥;密钥可来自环境变量、OS keychain、
   KMS 或宿主自管(依赖不进入引擎);
-- 每个段/WAL/MANIFEST 头部记录 `key_id`(头部扩展区定义见 [04 §2.5](04-l2-persist.md));
-  解密按 id 查 provider,支持旧密钥仍可读。
+- 每个段/WAL/MANIFEST 的**信封头**记录 `key_id`(见 §2.2 布局);
+  解密按 id 查 provider,支持旧密钥仍可读(轮换迁移期)。
 
 ### 2.4 密钥轮换
 
 ```text
 1. provider.rotate() → 新 key_id
-2. 后台任务逐段重写:旧段解密 → 新密钥加密 → 提交新 MANIFEST(复用 compaction 流程)
-3. 全部段迁移完成后,旧 key_id 可退役
+2. Mneme::rotate_encryption_key() 以"全部活跃段"为计划强制重写:
+   旧段解密 → 新密钥加密 → 提交新 MANIFEST(复用 compaction 段组替换流程,旧段入 trash/)
+3. 全部段迁移完成后,宿主可 Keyring::retire(旧 key_id) 退役旧密钥
 ```
 
-轮换复用 compaction 的逐段重写流程(尚未落地,属后续层);项目未发布期不保留
-混合版本兼容,`db.stats().storage` 的"已迁移段/总段"随该能力一并落地。
+轮换**已落地**(`FC-SEC-POST-001`):`provider.rotate()` 获取新密钥后全量段重写,
+迁移期间新旧密钥均可读(`KeyProvider` 需同时持有两者);`db.stats().storage` 的
+`migrated_segments/total_segments` 以信封头 `key_id` 是否等于 active 实计。
+纯内存库 → `Unsupported`,库未启用加密 → `Config`。项目未发布期不保留混合版本兼容。
 
 ### 2.5 复杂度与不变量
 
 - 加密/解密吞吐取决于 AES-NI(经验值数 GB/s),相对磁盘带宽通常不是瓶颈;
 - **不变量 I28**:开启加密后,磁盘上任何段/WAL/MANIFEST 的密文区不含明文记录字段;
-  `db.check()` 校验每个页的认证标签,篡改/错误密钥 → `Corrupted`,绝不返回错误数据。
+  `db.check()` 校验每个信封的认证标签,篡改/错误密钥 → `Corrupted`,绝不返回错误数据。
 
 ---
 
@@ -116,16 +147,19 @@ pub struct Encryption { pub provider: Arc<dyn KeyProvider>, pub cipher: Cipher }
 ### 3.2 编解码抽象
 
 ```rust
-pub trait Codec: Send + Sync {
-    fn compress(&self, src: &[u8], dst: &mut Vec<u8>);
-    fn decompress(&self, src: &[u8], dst: &mut Vec<u8>) -> Result<()>;
+/// 单字段压缩/解压抽象(pub(crate) 内部细节,不是公开 API)。
+pub(crate) trait Codec: Send + Sync {
+    fn compress(&self, src: &[u8]) -> Vec<u8>;
+    fn decompress(&self, src: &[u8], expected_len: usize) -> Result<Vec<u8>>;
 }
 pub enum Compression { None, Lz4, Zstd }   // 默认 None;`Lz4` 为内置自研实现(feature `compress`),`Zstd` 需 feature `compress-zstd`
 ```
 
-- 压缩作用于**记录体内的 `text` 与 `meta` 字段**(`[04 §2.2](04-l2-persist.md)` entry 的变长区),
-  按字段独立压缩并带 `uncompressed_len` 前缀;向量/norm 不压缩(已定长且量化另有手段);
-- 每段头部记录所用 codec(头部扩展区定义见 [04 §2.5](04-l2-persist.md));`Compression::None` 时字节布局与未压缩定义逐字节一致;
+- 压缩作用于**记录体内的 `text`/`meta`/`provenance` 字段**(见 [04 §2.2](04-l2-persist.md) 的 entry 变长区),
+  按字段独立压缩,压缩 blob 自描述 codec id 并带 `uncompressed_len` 前缀;向量/norm 不压缩
+  (已定长且量化另有手段);
+- 记录体新增恒 0 的 `flags2` 字节标记三个字段是否压缩(`FORMAT_VERSION = 0x0006`);
+  `Compression::None` 时字段布局与未压缩定义逐字节一致;
 - 可选 feature `compress-zstd` 允许接入更强 codec,默认不引入依赖。
 
 ### 3.3 与 BM25 / 过滤的交互
@@ -153,7 +187,7 @@ pub enum Compression { None, Lz4, Zstd }   // 默认 None;`Lz4` 为内置自研�
 
 1. `Encryption` + `KeyProvider`(feature `encrypt`)与密钥轮换;
 2. `Compression` + `Codec`(feature `compress`)与内置 codec;
-3. `Stats.storage` 暴露加密/压缩的配置值与迁移进度(压缩实现随 L11;见 [16 §5](16-api-reference.md))。
+3. `Stats.storage` 暴露加密/压缩的配置值与迁移进度(均已随 L11 落地;见 [16 §5](16-api-reference.md))。
 
 **依赖**:L0(类型)、L2(段/WAL/MANIFEST 布局、`SegmentSource`)、L5(后台迁移复用 compaction)。
 
@@ -162,9 +196,10 @@ pub enum Compression { None, Lz4, Zstd }   // 默认 None;`Lz4` 为内置自研�
 ## 本章小结
 
 - 威胁模型:保护**静态介质**,不保护进程内存、密钥持有者、侧信道与回滚攻击。
-- 页级 AEAD 加密 + `KeyProvider` + 密钥轮换;加密时 mmap 失效,需重新基准。
+- 整文件/整帧 AEAD 信封(段/WAL/MANIFEST/关系段)+ `KeyProvider` +
+  `Mneme::rotate_encryption_key` 密钥轮换;加密段 mmap 失效,需重新基准。
 - 文本/元数据压缩;倒排不受影响,只有行级过滤才解压。
-- 默认关闭时磁盘布局与 [04](04-l2-persist.md) 完全一致。
+- 默认关闭时磁盘布局与 [04](04-l2-persist.md) 定义一致(仅 msec 记录体多一个恒 0 的 `flags2` 字节)。
 - **本章不变量**:I28(不落明文),以及 I2 的加密版。
 
 ## 下一章

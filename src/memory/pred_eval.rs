@@ -89,24 +89,20 @@ fn eval_or(parts: &[Expr], ctx: &EvalCtx<'_>) -> Tri {
 
 /// `Cmp` 分支:字段缺失或类型不可比时保持 `Unknown`(三值逻辑,绝不按 `False` 处理)。
 fn eval_cmp(op: CmpOp, field: &str, val: &Val, ctx: &EvalCtx<'_>) -> Tri {
-    match resolve(field, ctx).and_then(|fv| to_val(&fv)) {
-        Some(left) => tri_opt(cmp_vals(op, &left, val)),
-        None => Tri::Unknown,
+    match resolve(field, ctx) {
+        Some(fv) if is_scalar(&fv) => tri_opt(cmp_field(op, &fv, val)),
+        _ => Tri::Unknown,
     }
 }
 
-/// `In` 分支:命中任一元素即 `True`,字段缺失保持 `Unknown`。
+/// `In` 分支:命中任一元素即 `True`,字段缺失或不可标量化保持 `Unknown`。
 fn eval_in(field: &str, vals: &[Val], ctx: &EvalCtx<'_>) -> Tri {
-    match resolve(field, ctx).and_then(|fv| to_val(&fv)) {
-        Some(left)
-            if vals
-                .iter()
-                .any(|candidate| cmp_vals(CmpOp::Eq, &left, candidate) == Some(true)) =>
-        {
-            Tri::True
-        }
-        Some(_) => Tri::False,
-        None => Tri::Unknown,
+    match resolve(field, ctx) {
+        Some(fv) if is_scalar(&fv) => tri_bool(
+            vals.iter()
+                .any(|candidate| cmp_field(CmpOp::Eq, &fv, candidate) == Some(true)),
+        ),
+        _ => Tri::Unknown,
     }
 }
 
@@ -116,17 +112,20 @@ fn eval_contains(field: &str, val: &Val, ctx: &EvalCtx<'_>) -> Tri {
         Some(FieldValue::Meta(Meta::Array(items))) => tri_bool(
             items
                 .iter()
-                .filter_map(json_to_val)
-                .any(|item| cmp_vals(CmpOp::Eq, &item, val) == Some(true)),
+                .any(|item| cmp_meta(CmpOp::Eq, item, val) == Some(true)),
         ),
-        Some(fv) => match to_val(&fv) {
-            Some(Val::Str(text)) => match val {
-                Val::Str(needle) => tri_bool(text.contains(&**needle)),
-                _ => Tri::Unknown,
-            },
-            _ => Tri::Unknown,
-        },
-        None => Tri::Unknown,
+        Some(FieldValue::Reserved(Val::Str(text))) => contains_str(&text, val),
+        Some(FieldValue::Text(text)) => contains_str(text, val),
+        Some(FieldValue::Meta(Meta::String(text))) => contains_str(text, val),
+        _ => Tri::Unknown,
+    }
+}
+
+/// 字符串包含子串;取值非字符串时保持 `Unknown`(与三值语义一致)。
+fn contains_str(text: &str, val: &Val) -> Tri {
+    match val {
+        Val::Str(needle) => tri_bool(text.contains(&**needle)),
+        _ => Tri::Unknown,
     }
 }
 
@@ -134,6 +133,7 @@ fn eval_contains(field: &str, val: &Val, ctx: &EvalCtx<'_>) -> Tri {
 fn eval_string_op(field: &str, needle: &Arc<str>, op: StringOp, ctx: &EvalCtx<'_>) -> Tri {
     match resolve(field, ctx) {
         Some(FieldValue::Reserved(Val::Str(text))) => tri_bool(op.matches(&text, needle)),
+        Some(FieldValue::Text(text)) => tri_bool(op.matches(text, needle)),
         Some(FieldValue::Meta(Meta::String(text))) => tri_bool(op.matches(text, needle)),
         _ => Tri::Unknown,
     }
@@ -161,12 +161,58 @@ fn eval(expr: &Expr, ctx: &EvalCtx<'_>) -> Tri {
     }
 }
 
-/// 已解析的字段值。
+/// 已解析的字段值(借用优先,免逐行堆分配)。
 enum FieldValue<'a> {
     /// 引擎保留字段。
     Reserved(Val),
     /// 用户 metadata。
     Meta(&'a Meta),
+    /// 借用的字符串字段(如 `key`),比较期无需转成 owned。
+    Text(&'a str),
+}
+
+/// 字段值是否可转为比较标量(对象/数组/null/无值保持 `Unknown` 口径)。
+fn is_scalar(value: &FieldValue<'_>) -> bool {
+    match value {
+        FieldValue::Reserved(_) | FieldValue::Text(_) => true,
+        FieldValue::Meta(meta) => matches!(meta, Meta::Bool(_) | Meta::Number(_) | Meta::String(_)),
+    }
+}
+
+/// 字段值与过滤取值的比较;类型不可比返回 `None`(三值 `Unknown`)。
+fn cmp_field(op: CmpOp, field: &FieldValue<'_>, val: &Val) -> Option<bool> {
+    match field {
+        FieldValue::Reserved(reserved) => cmp_vals(op, reserved, val),
+        FieldValue::Text(text) => match val {
+            Val::Str(expected) => Some(order(op, (*text).cmp(&**expected))),
+            _ => None,
+        },
+        FieldValue::Meta(meta) => cmp_meta(op, meta, val),
+    }
+}
+
+/// metadata 标量与过滤取值比较(整数优先、`f64` 回退,与 JSON 取值口径一致)。
+fn cmp_meta(op: CmpOp, meta: &Meta, val: &Val) -> Option<bool> {
+    match meta {
+        Meta::Bool(value) => match val {
+            Val::Bool(expected) => Some(order(op, value.cmp(expected))),
+            _ => None,
+        },
+        Meta::Number(number) => {
+            if let Some(int) = number.as_i64() {
+                cmp_vals(op, &Val::Int(int), val)
+            } else {
+                number
+                    .as_f64()
+                    .and_then(|num| cmp_vals(op, &Val::Num(num), val))
+            }
+        }
+        Meta::String(text) => match val {
+            Val::Str(expected) => Some(order(op, text.as_str().cmp(&**expected))),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 /// 引擎保留字段名全表(与 [`resolve`] 的保留分支一一对应)。
@@ -196,10 +242,7 @@ fn resolve<'a>(field: &str, ctx: &EvalCtx<'a>) -> Option<FieldValue<'a>> {
     let slot = ctx.slot;
     match field {
         "rowid" => Some(FieldValue::Reserved(Val::Int(slot.rowid.get() as i64))),
-        "key" => slot
-            .key
-            .as_ref()
-            .map(|key| FieldValue::Reserved(Val::Str(Arc::from(key.as_str())))),
+        "key" => slot.key.as_ref().map(|key| FieldValue::Text(key.as_str())),
         "created_at" => Some(FieldValue::Reserved(Val::Ts(slot.created_at))),
         "expires_at" => slot
             .expires_at
@@ -218,28 +261,6 @@ fn resolve<'a>(field: &str, ctx: &EvalCtx<'a>) -> Option<FieldValue<'a>> {
         )))),
         "__ns" => Some(FieldValue::Reserved(Val::Str(slot.ns_path.clone()))),
         _ => meta::get_path(&slot.meta, field).map(FieldValue::Meta),
-    }
-}
-
-fn to_val(fv: &FieldValue<'_>) -> Option<Val> {
-    match fv {
-        FieldValue::Reserved(val) => Some(val.clone()),
-        FieldValue::Meta(meta) => json_to_val(meta),
-    }
-}
-
-fn json_to_val(meta: &Meta) -> Option<Val> {
-    match meta {
-        Meta::Bool(value) => Some(Val::Bool(*value)),
-        Meta::Number(number) => {
-            if let Some(int) = number.as_i64() {
-                Some(Val::Int(int))
-            } else {
-                number.as_f64().map(Val::Num)
-            }
-        }
-        Meta::String(text) => Some(Val::Str(Arc::from(text.as_str()))),
-        _ => None,
     }
 }
 
@@ -284,11 +305,37 @@ fn tri_opt(value: Option<bool>) -> Tri {
     }
 }
 
+thread_local! {
+    /// 最近一次 Glob 模式的字符表:同一过滤表达式逐行求值时模式不变,
+    /// 缓存后每行只收集待匹配文本,免重复解析模式串。
+    static GLOB_PATTERN: std::cell::RefCell<Option<(Arc<str>, Vec<char>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// 通配符匹配:`*` 匹配任意串,`?` 匹配单个字符。
 fn glob_match(pattern: &str, text: &str) -> bool {
-    let pat: Vec<char> = pattern.chars().collect();
     let txt: Vec<char> = text.chars().collect();
-    // 经典双指针回溯:O(n·m) 最坏,模式串短时开销可忽略。
+    GLOB_PATTERN.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut slot) => {
+            let hit = slot
+                .as_ref()
+                .is_some_and(|(cached, _)| cached.as_ref() == pattern);
+            if !hit {
+                *slot = Some((Arc::from(pattern), pattern.chars().collect()));
+            }
+            let pat: &[char] = match slot.as_ref() {
+                Some((_, chars)) => chars.as_slice(),
+                None => &[],
+            };
+            glob_match_chars(pat, &txt)
+        }
+        // reason: 重入借用冲突时一次性解析模式串,语义不变(仅多一次分配)。
+        Err(_) => glob_match_chars(&pattern.chars().collect::<Vec<_>>(), &txt),
+    })
+}
+
+/// 双指针回溯匹配主体(经典 $O(n\cdot m)$ 最坏;模式串短时开销可忽略)。
+fn glob_match_chars(pat: &[char], txt: &[char]) -> bool {
     let (mut p, mut t) = (0_usize, 0_usize);
     let mut star: Option<usize> = None;
     let mut star_match = 0_usize;
@@ -326,7 +373,9 @@ mod tests {
             ns_path: Arc::from("a"),
             seqno: crate::core::types::SeqNo::new(1),
             key: Some(crate::core::types::Key::new("k")),
-            vector: Arc::from(vec![0.0_f32].into_boxed_slice()),
+            vector: crate::memory::lazy::VectorStorage::owned(Arc::from(
+                vec![0.0_f32].into_boxed_slice(),
+            )),
             norm_sq: 0.0,
             text: Some(Arc::from("hello world")),
             text_hash: None,
@@ -398,7 +447,7 @@ mod tests {
                     access: Some(access),
                 },
             ) {
-                Some(FieldValue::Reserved(_)) => {}
+                Some(FieldValue::Reserved(_) | FieldValue::Text(_)) => {}
                 Some(FieldValue::Meta(_)) => panic!("{name} 落入 metadata 分支"),
                 None => panic!("{name} 未按保留值解析"),
             }

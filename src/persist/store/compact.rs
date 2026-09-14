@@ -111,9 +111,28 @@ impl Store {
             created_ms: context.now_ms,
             encoded: &merged.encoded,
         })?;
-        manifest_io::commit_manifest(&self.root, &new_manifest, self.hook.as_deref())?;
+        manifest_io::commit_manifest(
+            self.storage.as_ref(),
+            &new_manifest,
+            self.hook.as_deref(),
+            self.encryption.as_ref(),
+        )?;
         self.install_merge(ws, input, &merged, &new_manifest);
         self.cleanup_old_segments(&input.plan.segments);
+        // 事件可观测:一次 compaction 提交(被合并段 / 新段行数)。
+        crate::core::observe::emit(
+            self.observer.as_ref(),
+            crate::core::observe::Event::Compaction {
+                segments: input
+                    .plan
+                    .segments
+                    .iter()
+                    .map(|id| crate::core::types::SegmentId::new(*id))
+                    .collect(),
+                took: std::time::Duration::from_millis(0),
+                rows_out: input.keep_slots.len() as u64,
+            },
+        );
         Ok(true)
     }
 
@@ -135,10 +154,11 @@ impl Store {
                 slots: input.keep_slots,
                 delta: &carried,
                 full_relations: true,
+                parallelism: config.parallelism,
             },
         )?;
         let names = segment_file_names(segment_id);
-        self.write_merged_files(&names, &encoded)?;
+        self.write_merged_files(segment_id, &names, &encoded)?;
         input.control.mark_progress(MERGE_PROGRESS_WRITTEN);
         if input.control.is_paused() {
             // 提交前中止:删除刚写的孤儿新段,活跃段集与数据不变。
@@ -168,7 +188,12 @@ impl Store {
         let mut carried = Vec::new();
         for segment in group {
             let rel = format!("{SEGMENTS_DIR}/{}", msec_name(segment.segment_id));
-            let bytes = storage::read_file(&self.root, &rel)?;
+            let bytes = crate::crypto::decrypt_file(
+                self.encryption.as_ref(),
+                b"msec",
+                u64::from(segment.segment_id),
+                storage::read_file(&self.root, &rel)?,
+            )?;
             let view = msec::parse(&bytes)?;
             for entry in msec::decode_delta(view.delta_bytes())? {
                 let msec::DeltaEntry::Access { rowid, .. } = entry else {
@@ -187,11 +212,16 @@ impl Store {
     }
 
     /// 写入新段的 vsec/msec(以及可选的 hidx)文件。
-    fn write_merged_files(&self, names: &[String; 3], encoded: &EncodedSegment) -> Result<()> {
-        self.write_file(&names[0], &encoded.vsec)?;
-        self.write_file(&names[1], &encoded.msec)?;
+    fn write_merged_files(
+        &self,
+        segment_id: u32,
+        names: &[String; 3],
+        encoded: &EncodedSegment,
+    ) -> Result<()> {
+        self.write_file(&names[0], b"vsec", u64::from(segment_id), &encoded.vsec)?;
+        self.write_file(&names[1], b"msec", u64::from(segment_id), &encoded.msec)?;
         if let Some(hidx) = &encoded.hidx {
-            self.write_file(&names[2], hidx)?;
+            self.write_file(&names[2], b"hidx", u64::from(segment_id), hidx)?;
         }
         Ok(())
     }
@@ -229,9 +259,9 @@ impl Store {
             .flat_map(|id| [vsec_name(*id), msec_name(*id), hidx_name(*id)])
             .collect();
         // reason: 提交已生效;移动/清理失败只遗留孤儿文件,不影响正确性与可读性。
-        if trash::move_to_trash(&self.root, &old_names).is_ok() {
+        if trash::move_to_trash(self.storage.as_ref(), &old_names).is_ok() {
             // reason: purge 失败同样只遗留 trash 垃圾,不影响数据集正确性。
-            let _ = trash::purge(&self.root).ok();
+            let _ = trash::purge(self.storage.as_ref()).ok();
         }
     }
 }
@@ -268,6 +298,20 @@ fn resolve_group(previous: &Manifest, plan: &CompactionPlan) -> Result<Vec<Segme
     Ok(group)
 }
 
+/// 由写状态的关系类型注册表构造 MANIFEST 条目(按编号升序,确定性编码)。
+fn manifest_rel_kinds(ws: &WriterState) -> Vec<crate::persist::manifest::RelKindEntry> {
+    let mut entries: Vec<crate::persist::manifest::RelKindEntry> = ws
+        .rel_kind_names
+        .iter()
+        .map(|(&kind, name)| crate::persist::manifest::RelKindEntry {
+            kind,
+            name: Arc::clone(name),
+        })
+        .collect();
+    entries.sort_by_key(|entry| entry.kind);
+    entries
+}
+
 /// 构造"段组替换为新段"的 MANIFEST(watermark 不变,WAL 不重置)。
 ///
 /// # Errors
@@ -301,7 +345,7 @@ fn next_manifest_after_merge(input: &MergeManifestInput<'_>) -> Result<Manifest>
         dimension: input.previous.dimension,
         metric: input.previous.metric,
         stopwords: input.previous.stopwords,
-        next_rel_kind: input.previous.next_rel_kind,
+        next_rel_kind: input.ws.next_rel_kind,
         manifest_version: crate::persist::manifest::next_manifest_version(
             input.previous.manifest_version,
         )?,
@@ -310,7 +354,7 @@ fn next_manifest_after_merge(input: &MergeManifestInput<'_>) -> Result<Manifest>
         next_segment_id: crate::persist::manifest::next_segment_id(input.segment_id)?,
         next_ns_id: input.ws.next_ns_id,
         namespaces,
-        rel_kinds: input.previous.rel_kinds.clone(),
+        rel_kinds: manifest_rel_kinds(input.ws),
         segments,
     })
 }

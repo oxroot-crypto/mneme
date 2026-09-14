@@ -257,7 +257,7 @@ fn chain_all_in_scope(
     let chain = ws
         .versions
         .get(&rowid)
-        .map(Vec::as_slice)
+        .map(|chain| chain.as_slice())
         .unwrap_or_default();
     chain.iter().all(|chain_slot| {
         ws.slot_segment
@@ -288,7 +288,9 @@ mod tests {
             ns_path: Arc::from("n"),
             seqno: SeqNo::new(seqno),
             key: None,
-            vector: Arc::from(vec![0.0_f32, 1.0].into_boxed_slice()),
+            vector: crate::memory::lazy::VectorStorage::owned(Arc::from(
+                vec![0.0_f32, 1.0].into_boxed_slice(),
+            )),
             norm_sq: 1.0,
             text: None,
             text_hash: None,
@@ -310,13 +312,12 @@ mod tests {
         let mut ws = WriterState::new();
         for (index, data) in slots.iter().enumerate() {
             Arc::make_mut(&mut ws.slots).push(Arc::clone(data));
-            Arc::make_mut(&mut ws.slot_segment).push(Some(segments));
-            Arc::make_mut(&mut ws.versions)
-                .entry(data.rowid)
-                .or_default()
-                .push(SlotId::new(index as u32));
+            ws.slot_segment.push(Some(segments));
+            let chain = ws.versions.get_or_insert_default(data.rowid);
+            Arc::make_mut(chain).push(SlotId::new(index as u32));
         }
-        Arc::make_mut(&mut ws.latest).insert(slots[latest].rowid, SlotId::new(latest as u32));
+        ws.latest
+            .insert(slots[latest].rowid, SlotId::new(latest as u32));
         ws
     }
 

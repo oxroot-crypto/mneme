@@ -44,7 +44,7 @@ Mneme 是一个**纯 Rust 的进程内嵌入型向量存储库**,面向 **AI Age
 
 **可选能力**(默认关闭,不扩大依赖白名单):
 
-- **静态加密**:可选 feature `encrypt`,AES-256-GCM 页级加密([11 §2](11-security-storage.md));
+- **静态加密**:可选 feature `encrypt`,AES-256-GCM 整文件/整帧信封加密([11 §2](11-security-storage.md));
 - **文本/元数据压缩**:可选 feature `compress`,内置 LZ4 风格 codec([11 §3](11-security-storage.md));
 - **多进程只读共享**:`read_only(true)`([12 §2](12-deployment.md))。
 
@@ -146,7 +146,7 @@ flowchart LR
 | L3 | `index/` | 自研 HNSW、hidx 持久化、过滤三档搜索 | 同一 API 下暴力→ANN 无感升级;mmap 引入(可关) | Recall@10 ≥ 0.95 |
 | L4 | `query/` | 过滤 DSL 解析、zone map 下推、BM25+RRF、去重 | 混合检索可用 | 混合检索集成测试 |
 | L5 | `life/` | TTL、遗忘曲线、size-tiered compaction、命名空间、快照/备份、stats | **超长期闭环**:段数有界、安全遗忘 | 24h 长跑测试 |
-| L6 | `quant/` | i8/f16 量化+两阶段重打分、建段抽样回退、async 门面、基准、fuzz | 查询带宽 i8 ÷4;async 门面可用 | 召回损失 ≤2%;1M×1536 基准属 CI 收尾 |
+| L6 | `quant/` | i8/f16 量化+两阶段重打分、建段抽样回退、async 门面、基准、fuzz | 查询带宽 i8 ÷4;async 门面可用 | 召回损失 ≤2%;1M×1536 门槛已接线 CI heavy 档(待 runner 首跑) |
 
 > **产品能力层(09–12)** 不改变 L0–L6 的建造顺序,而是横切其上:
 > 记忆模型/排序在 L1 冻结的 API 上追加类型与语义([09](09-memory-model.md)/[10](10-scoring.md)),
@@ -161,7 +161,8 @@ flowchart LR
 > size-tiered compaction + 后台维护 + TTL 块剪枝 + 命名空间/快照/备份/统计运维面,
 > 验收 `tests/l5_contracts.rs`;L6 = `src/quant/` i8/f16 量化副本 + 两阶段检索 +
 > 建段抽样回退 + `feature = "async"` 门面 + `benches/quant.rs` + `fuzz/` 骨架,
-> 验收 `tests/l6_contracts.rs`)。1M×1536 性能门槛与 fuzz 长跑仍属 CI 收尾。
+> 验收 `tests/l6_contracts.rs`)。1M×1536 性能门槛与 fuzz 长跑已接线 CI
+> heavy/夜跑档,待 runner 首跑验证。
 
 1. **接口先于实现**:公开 API 在 L1 冻结(暴力与 HNSW 同签名),L3 **引入内部 trait
    `memory::index::{VectorIndex, IndexFactory}`** 作为暴力→HNSW 的替换缝;L2 的段文件头从第一天就带 `format_version` 字段。
@@ -191,12 +192,12 @@ mneme/
 │   ├── life/           # L5:compact.rs(选段/幸存版本)maintenance.rs(后台维护)
 │   ├── quant/          # L6(纯原语,依赖等级同 L0):scalar_i8.rs f16.rs(quant-f16) rescore.rs support.rs
 │   ├── fuzzing.rs      # feature fuzzing:cargo-fuzz 专用解析入口(不参与运行时)
-│   ├── (规划) model/       # 记忆模型;当前实现见 memory/{relation,temporal}.rs、score.rs、namespace/life.rs (09)
-│   ├── (规划) score/       # 排序层;当前实现见 memory/{score,expand,rerank}.rs               (10)
-│   ├── (规划) crypto/      # feature encrypt:aead.rs keyring.rs                               (11)
-│   ├── (规划) compress/    # feature compress:codec.rs lz4.rs                                 (11)
-│   ├── (规划) deploy/      # readonly.rs                                                      (12)
-│   └── (规划) obs/         # observer.rs                                                      (12)
+│   ├── model/(未独立成目录) # 记忆模型:当前实现见 memory/{relation,temporal}.rs、score.rs、namespace/life.rs (09)
+│   ├── score/(未独立成目录) # 排序层:当前实现见 memory/{score,expand,rerank}.rs               (10)
+│   ├── crypto/         # feature encrypt:mod.rs 整文件/整帧 AES-256-GCM 信封 + 密钥环(已落地) (11)
+│   ├── compress/       # feature compress/compress-zstd:mod.rs + lz4.rs(已落地)             (11)
+│   ├── persist/storage.rs  # Storage/FsStorage/MemStorage 与文件锁(已落地)                   (12)
+│   └── core/observe.rs # Observer/Event/WriteOp(已落地)                                      (12)
 ├── benches/            # criterion 基准(L3 起;L6 增 quant.rs)
 ├── fuzz/               # cargo-fuzz 五目标(L6 起;需 nightly + cargo-fuzz)
 ├── tests/              # 契约验收 + contract_traceability.rs 追溯门禁
@@ -221,7 +222,7 @@ compaction 调度、分词)**全部自研**。
 | `memmap2` | mmap 零拷贝读 | L3 起 | feature `mmap`(默认开);关闭走 `Read+Seek` 兜底 |
 | `half` | f16 转换 | L6 | feature `quant-f16` |
 | `tokio` | async 门面 | 门面 | feature `async`(默认关);核心零 tokio |
-| `aes-gcm` | 静态加密 AEAD | L11 | feature `encrypt`(默认关);仅 `crypto/` 接触([11 §2](11-security-storage.md)) |
+| `aes-gcm` + `getrandom` | 静态加密 AEAD 与 OS 熵源 | L11 | feature `encrypt`(默认关);仅 `crypto/` 接触([11 §2](11-security-storage.md)) |
 | `zstd` | 可选更强压缩 | L11 | feature `compress-zstd`(默认关);内置 LZ4 风格 codec 无依赖([11 §3](11-security-storage.md)) |
 
 > **默认构建口径**:`thiserror` + `serde` + `serde_json` + `crc32fast` = 4 个**直接**强依赖
@@ -247,13 +248,13 @@ dev-dependencies(不进入发布产物):`proptest`、`tempfile`、`criterion`。
 | `quant-f16` | ❌ 关 | `half` | f16 量化副本;关闭时 `VectorFormat::F16` 构造期/打开期报 `Unsupported` |
 | `async` | ❌ 关 | `tokio`(`rt`) | `AsyncNamespace`(spawn_blocking 薄包装);核心零 tokio |
 | `fuzzing` | ❌ 关 | 无 | 暴露 `fuzz/` 专用解析入口,不改变运行时行为 |
-
-| feature(规划) | 默认 | 引入 | 说明 |
-|---|---|---|---|
-| `encrypt` | ❌ 关 | `aes-gcm` | 静态加密([11 §2](11-security-storage.md)) |
-| `compress` | ❌ 关 | 无 | 内置 LZ4 风格压缩([11 §3](11-security-storage.md)) |
+| `encrypt` | ❌ 关 | `aes-gcm` + `getrandom` | AES-256-GCM 整文件/整帧信封与密钥轮换([11 §2](11-security-storage.md)) |
+| `compress` | ❌ 关 | 无 | 记录体 text/meta/provenance 压缩(内置 LZ4 风格 codec,[11 §3](11-security-storage.md)) |
 | `compress-zstd` | ❌ 关 | `zstd` | 可选更强压缩 |
-| `wasm` | ❌ 关 | 无 | 关闭 mmap/线程并行,WASM 适配([12 §3](12-deployment.md)) |
+| `wasm` | ❌ 关 | 无 | 关闭 mmap/线程并行,WASM 适配(目标构建验证留 CI `wasm-check`,[12 §3](12-deployment.md)) |
+
+> 上述八个 feature 均已定义并落地对应能力;加密/压缩/`wasm` 均默认关闭,开启不改变
+> 默认构建的磁盘布局与依赖面。
 
 ---
 
@@ -369,8 +370,8 @@ db.close()?;                // flush + 停后台维护 + 释放文件锁;Drop �
 | `Scoring` / `ScoreBreakdown` / `Diversity` / `RelationExpand` / `TimeAxis` | 综合打分及其因子分解 / MMR / 联想扩展 / 时间轴(见 10) |
 | `RelationKind` / `RelationIndex` / `Edge` / `Feedback` / `QueryId` | 记忆关系、反向索引与检索反馈(见 09/10) |
 | `ConsolidationPolicy` / `Summarizer` / `ConsolidateReport` | 记忆沉淀(见 09) |
-| `Encryption` / `KeyProvider` / `Cipher` / `Compression` / `Codec` | 静态加密与压缩(见 11;**L11 规划**,`Compression` 配置已接线、实现未落地) |
-| `Storage` / `Observer` / `Event` / `WriteOp` | 存储抽象与可观测(见 12;**L12 规划**,当前无此 API) |
+| `Encryption` / `KeyProvider` / `Cipher` / `CryptoKey` / `KeyId` / `Keyring` / `Compression` | 静态加密与压缩(见 11;加密需 feature `encrypt`,压缩需 `compress`/`compress-zstd`;`Codec` 为 `pub(crate)` 内部细节) |
+| `Storage` / `FileMeta` / `FsStorage` / `MemStorage` / `Observer` / `Event` / `WriteOp` | 存储抽象、内置后端与可观测(见 12;`Observer` 经 `Builder::observer` 注册) |
 | `VectorFormat` | `F32 / F16 / I8Rescored`;持久库才可配量化(纯内存库构造期 `Unsupported`) |
 | `HnswParams` / `CompactionPolicy` / `Tuning` / `Limits` | 索引 / 合并 / 进阶调参 / 数据限额配置 |
 | `Clock` | 时间源注入(测试确定性) |

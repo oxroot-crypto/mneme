@@ -222,12 +222,23 @@ impl ZoneIndex {
             .copied()
     }
 
-    /// 字段的取值类别;未索引或出现过类型冲突返回 `None`(不参与块级剪枝)。
-    pub(crate) fn kind_of(&self, name: &str) -> Option<ZoneKind> {
+    /// 一次定位取某字段的块统计切片与类别(查询期热路径免逐块哈希)。
+    ///
+    /// 字段未索引或出现过类型冲突时返回 `None`(调用方据此保持全 1 位图,
+    /// 绝不按不完整统计误剪)。
+    pub(crate) fn field_zones(&self, name: &str) -> Option<(&[BlockStat], ZoneKind)> {
         self.fields
             .get(name)
             .filter(|field| !field.mixed)
-            .map(|field| field.kind)
+            .map(|field| (field.blocks.as_slice(), field.kind))
+    }
+
+    /// 一次定位取某字段的块统计切片(不做 `mixed` 过滤)。
+    ///
+    /// 供只依赖块统计本身、不依赖字段类别的保守判定使用(如 TTL 块级剪枝):
+    /// 与逐块 [`block_stat`](Self::block_stat) 口径一致,含类型冲突字段的统计。
+    pub(crate) fn field_blocks(&self, name: &str) -> Option<&[BlockStat]> {
+        self.fields.get(name).map(|field| field.blocks.as_slice())
     }
 
     /// 已索引的全部字段(落盘编码用)。
@@ -260,7 +271,9 @@ mod tests {
             ns_path: Arc::from("n"),
             seqno: SeqNo::new(index as u64 + 1),
             key: Some(Key::new(format!("k{index}"))),
-            vector: Arc::from(vec![0.0_f32].into_boxed_slice()),
+            vector: crate::memory::lazy::VectorStorage::owned(Arc::from(
+                vec![0.0_f32].into_boxed_slice(),
+            )),
             norm_sq: 0.0,
             text: None,
             text_hash: None,
@@ -315,7 +328,7 @@ mod tests {
         assert!(note.has_null);
         assert!(!note.has_value);
         assert!(note.has_any, "null 也是存在的取值");
-        assert!(zones.kind_of("note").is_some());
+        assert!(zones.field_zones("note").is_some());
     }
 
     #[test]
@@ -345,10 +358,13 @@ mod tests {
     fn kind_conflict_disables_block_pruning() {
         let mut zones = ZoneIndex::new(16);
         zones.observe_int("conflict", ZoneKind::Ts, 1_000, 0);
-        assert_eq!(zones.kind_of("conflict"), Some(ZoneKind::Ts));
+        assert_eq!(
+            zones.field_zones("conflict").map(|(_, kind)| kind),
+            Some(ZoneKind::Ts)
+        );
         zones.observe_int("conflict", ZoneKind::Num, 7, 0);
         assert_eq!(
-            zones.kind_of("conflict"),
+            zones.field_zones("conflict").map(|(_, kind)| kind),
             None,
             "类型冲突字段必须退出块级剪枝"
         );
@@ -360,8 +376,8 @@ mod tests {
         // 上限 5 时恰好还能注册一个 metadata 字段(a 与 b 按字典序,a 先)。
         let mut zones = ZoneIndex::new(5);
         zones.observe(0, &slot(0, 0.5, json!({"a": 1, "b": 2})));
-        assert!(zones.kind_of("a").is_some());
-        assert!(zones.kind_of("b").is_none(), "超上限字段不再注册");
+        assert!(zones.field_zones("a").is_some());
+        assert!(zones.field_zones("b").is_none(), "超上限字段不再注册");
     }
 
     /// FC-QUERY-POST-005(保留字段同名的 metadata 不进 zone map,行级以保留值为准)
@@ -373,12 +389,15 @@ mod tests {
             &slot(0, 0.5, json!({"created_at": 5, "key": 9, "rowid": 99})),
         );
         assert_eq!(
-            zones.kind_of("created_at"),
+            zones.field_zones("created_at").map(|(_, kind)| kind),
             Some(ZoneKind::Ts),
             "created_at 的统计只来自保留值"
         );
-        assert!(zones.kind_of("key").is_none(), "保留名 metadata 不注册");
-        assert!(zones.kind_of("rowid").is_none(), "保留名 metadata 不注册");
+        assert!(zones.field_zones("key").is_none(), "保留名 metadata 不注册");
+        assert!(
+            zones.field_zones("rowid").is_none(),
+            "保留名 metadata 不注册"
+        );
         let stat = zones.block_stat("created_at", 0).expect("created_at");
         assert!(stat.min >= 1_000.0, "不得混入 metadata 的 5");
     }
@@ -388,7 +407,7 @@ mod tests {
     fn reserved_object_subpaths_are_still_indexed() {
         let mut zones = ZoneIndex::new(16);
         zones.observe(0, &slot(0, 0.5, json!({"key": {"x": 5}})));
-        assert!(zones.kind_of("key").is_none(), "保留名自身仍不注册");
+        assert!(zones.field_zones("key").is_none(), "保留名自身仍不注册");
         let stat = zones.block_stat("key.x", 0).expect("key.x 子路径");
         assert_eq!((stat.min, stat.max), (5.0, 5.0));
     }

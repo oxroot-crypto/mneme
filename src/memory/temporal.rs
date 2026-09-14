@@ -20,15 +20,16 @@ pub(crate) fn snapshot_at(view: &ReaderView, tx_ms: i64) -> ReaderView {
     ReaderView {
         slots: Arc::clone(&view.slots),
         dead: Arc::new(dead),
-        key_index: Arc::new(key_index),
-        versions: Arc::clone(&view.versions),
-        latest: Arc::new(latest),
-        out_edges: Arc::clone(&view.out_edges),
-        in_edges: Arc::clone(&view.in_edges),
-        access: Arc::clone(&view.access),
+        key_index: key_index.into_iter().collect(),
+        versions: view.versions.clone(),
+        latest,
+        out_edges: view.out_edges.clone(),
+        in_edges: view.in_edges.clone(),
+        access: view.access.clone(),
         ns_registry: Arc::clone(&view.ns_registry),
+        ns_by_path: Arc::clone(&view.ns_by_path),
         indexes: Arc::clone(&view.indexes),
-        slot_segment: Arc::clone(&view.slot_segment),
+        slot_segment: view.slot_segment.clone(),
         reclaimed_versions: view.reclaimed_versions,
         inv: Arc::clone(&view.inv),
         zones: Arc::clone(&view.zones),
@@ -42,8 +43,8 @@ pub(crate) fn snapshot_at(view: &ReaderView, tx_ms: i64) -> ReaderView {
 fn historical_latest(
     view: &ReaderView,
     tx_ms: i64,
-) -> HashMap<crate::core::types::RowId, crate::core::types::SlotId> {
-    let mut latest: HashMap<crate::core::types::RowId, crate::core::types::SlotId> = HashMap::new();
+) -> crate::core::sharded::ShardedMap<crate::core::types::RowId, crate::core::types::SlotId> {
+    let mut latest = crate::core::sharded::ShardedMap::new();
     for (rowid, chain) in view.versions.iter() {
         let mut chosen = None;
         for &slot in chain.iter() {
@@ -64,7 +65,10 @@ fn historical_latest(
 /// 历史视图的 `dead` 位图、`key` 索引与水位(墓碑不可见,活版本清除 `dead`)。
 fn history_visibility(
     view: &ReaderView,
-    latest: &HashMap<crate::core::types::RowId, crate::core::types::SlotId>,
+    latest: &crate::core::sharded::ShardedMap<
+        crate::core::types::RowId,
+        crate::core::types::SlotId,
+    >,
 ) -> (
     BitSet,
     HashMap<(crate::core::types::NsId, crate::core::types::Key), crate::core::types::RowId>,
@@ -76,7 +80,7 @@ fn history_visibility(
     }
     let mut key_index = HashMap::new();
     let mut seqno = SeqNo::new(0);
-    for (rowid, slot) in latest {
+    for (rowid, slot) in latest.iter() {
         let slot_data = &view.slots[slot.get() as usize];
         seqno = SeqNo::new(seqno.get().max(slot_data.seqno.get()));
         if slot_data.deleted {

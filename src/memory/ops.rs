@@ -112,12 +112,15 @@ pub struct QuantStat {
     pub recall_est: Option<f32>,
 }
 
-/// 存储安全配置与迁移统计(加密未落地;压缩配置已接线,压缩实现待 L11)。
+/// 存储安全配置与迁移统计(加密/压缩均已落地并接线;分别受 feature
+/// `encrypt` 与 `compress`/`compress-zstd` 门控)。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageStat {
-    /// 是否启用静态加密(当前恒 `false`,加密随 L11 落地)。
+    /// 是否启用静态加密:库以加密配置打开时为 `true`(需 feature `encrypt`;
+    /// 纯内存库恒 `false`)。
     pub encryption: bool,
-    /// 文本/元数据压缩的配置值(实现待 L11,尚未影响磁盘编码)。
+    /// 文本/元数据压缩的配置值(已作用于 msec 记录体与 WAL 负载的字节编码;
+    /// `Lz4` 需 feature `compress`,`Zstd` 需 feature `compress-zstd`)。
     pub compression: Compression,
     /// 已迁移段数。
     pub migrated_segments: usize,
@@ -183,7 +186,7 @@ pub struct Stats {
     pub relations: u64,
     /// 版本链/历史保留统计。
     pub history: HistoryStat,
-    /// 存储安全配置与迁移统计(压缩实现待 L11)。
+    /// 存储安全配置与迁移统计(加密/压缩均已落地,字段语义见 [`StorageStat`])。
     pub storage: StorageStat,
 }
 
