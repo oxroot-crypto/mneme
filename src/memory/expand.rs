@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 
+use crate::core::simd;
 use crate::core::types::{NsId, RowId};
 use crate::memory::dedup::ResultDedup;
 use crate::memory::pred::{self, EvalCtx, Expr};
@@ -23,50 +24,89 @@ pub(crate) struct ExpandCtx<'a> {
     pub(crate) expand: &'a RelationExpand,
     pub(crate) filter: Option<&'a Expr>,
     pub(crate) now: i64,
+    /// 过滤是否引用访问统计(行级求值按需查访问表)。
+    pub(crate) uses_access: bool,
 }
 
 /// 逐节点推进的关系扩展器。
+///
+/// 传播分按多路径取最大:`best(v) = max(种子分, max_p boost(p))`;命中更优路径时
+/// 更新并继续传播(有界 `max_nodes` 封顶)。输出覆盖"分数被提升的种子"与"新扩展
+/// 节点",由调用方按 `max(自身分, boost)` 合并(`FC-SCORE-POST-006`)。
 struct Expander<'a> {
     view: &'a ReaderView,
     ns_id: NsId,
     expand: &'a RelationExpand,
     filter: Option<&'a Expr>,
     now: i64,
-    visited: HashSet<RowId>,
-    result: Vec<(RowId, f32, Edge)>,
+    /// 过滤是否引用访问统计(行级求值按需查访问表)。
+    uses_access: bool,
+    /// 节点当前最优传播分(种子预置为其原始分;键有序保证确定性)。
+    best: std::collections::BTreeMap<RowId, f32>,
+    /// 种子原始分(用于判定"扩展是否提升")。
+    seed_scores: std::collections::BTreeMap<RowId, f32>,
+    /// 取得最优分的入边(种子无)。
+    via: std::collections::BTreeMap<RowId, Edge>,
 }
 
 impl<'a> Expander<'a> {
     fn new(ctx: &ExpandCtx<'a>, seeds: &[Scored]) -> Self {
+        let mut best = std::collections::BTreeMap::new();
+        let mut seed_scores = std::collections::BTreeMap::new();
+        for seed in seeds {
+            let entry = best.entry(seed.rowid).or_insert(f32::NEG_INFINITY);
+            if seed.score.total_cmp(entry).is_gt() {
+                *entry = seed.score;
+            }
+            seed_scores.insert(seed.rowid, seed.score);
+        }
         Self {
             view: ctx.view,
             ns_id: ctx.ns_id,
             expand: ctx.expand,
             filter: ctx.filter,
             now: ctx.now,
-            visited: seeds.iter().map(|seed| seed.rowid).collect(),
-            result: Vec::new(),
+            uses_access: ctx.uses_access,
+            best,
+            seed_scores,
+            via: std::collections::BTreeMap::new(),
         }
     }
 
-    /// 从种子集合出发逐跳扩展,返回 `(rowid, score, edge)` 列表。
+    /// 从种子集合出发逐跳扩展,返回被扩展提升/引入的 `(rowid, score, edge)` 列表。
     fn run(mut self, seeds: &[Scored]) -> Vec<(RowId, f32, Edge)> {
         let mut frontier: Vec<(RowId, f32)> =
             seeds.iter().map(|seed| (seed.rowid, seed.score)).collect();
         for _ in 0..self.expand.hops.min(MAX_EXPAND_HOPS) {
-            let mut next = Vec::new();
+            let mut next: Vec<(RowId, f32)> = Vec::new();
             for (from, seed_score) in &frontier {
                 self.visit(*from, *seed_score, &mut next);
             }
+            next.sort_by_key(|(rowid, _)| *rowid);
+            next.dedup_by_key(|(rowid, _)| *rowid);
             frontier = next;
             if frontier.is_empty() {
                 break;
             }
         }
-        self.result
+        self.best
+            .into_iter()
+            .filter_map(|(rowid, score)| {
+                let improved = self
+                    .seed_scores
+                    .get(&rowid)
+                    .is_none_or(|seed| score.total_cmp(seed).is_gt());
+                if !improved {
+                    return None;
+                }
+                self.via
+                    .get(&rowid)
+                    .map(|edge| (rowid, score, edge.clone()))
+            })
+            .collect()
     }
 
-    /// 展开单个节点的出边,命中者写入 `self.result` 与下一跳 `next`。
+    /// 展开单个节点的出边:更优路径才更新并继续传播。
     fn visit(&mut self, from: RowId, seed_score: f32, next: &mut Vec<(RowId, f32)>) {
         let Some(edges) = self.view.out_edges.get(&from) else {
             return;
@@ -75,39 +115,41 @@ impl<'a> Expander<'a> {
             if !self.expand.kinds.is_empty() && !self.expand.kinds.contains(&edge.kind) {
                 continue;
             }
-            // `visited` 与 `result` 同受 `max_nodes` 封顶:否则大量被命名空间/存活/
-            // 过滤拒绝的边会持续占用 `visited`,空间上界退化为 O(边数)
-            // (FC-SCORE-CPLX-002 声明空间 O(max_nodes))。
-            if self.result.len() >= self.expand.max_nodes
-                || self.visited.len() >= self.expand.max_nodes
-            {
-                return;
+            let candidate_score = seed_score * edge.weight * self.expand.decay;
+            let current = self
+                .best
+                .get(&edge.to)
+                .copied()
+                .unwrap_or(f32::NEG_INFINITY);
+            if !candidate_score.total_cmp(&current).is_gt() {
+                continue; // 无提升:已访问且不更优,不再传播
             }
-            if !self.visited.insert(edge.to) {
-                continue;
+            // 空间封顶(FC-SCORE-CPLX-002):新节点才占额度,已有节点只做提升。
+            if !self.best.contains_key(&edge.to) && self.best.len() >= self.expand.max_nodes {
+                return;
             }
             let Some(slot) = self.view.live_slot(edge.to) else {
                 continue;
             };
             let slot_data = &self.view.slots[slot.get() as usize];
-            if slot_data.ns_id != self.ns_id {
-                continue;
-            }
-            if !slot_data.is_live(self.now) {
+            if slot_data.ns_id != self.ns_id || !slot_data.is_live(self.now) {
                 continue;
             }
             if let Some(expr) = self.filter {
                 let ctx = EvalCtx {
                     slot: slot_data,
-                    access: self.view.access.get(&edge.to).copied(),
+                    access: self
+                        .uses_access
+                        .then(|| self.view.access.get(&edge.to).copied())
+                        .flatten(),
                 };
                 if !pred::matches(expr, &ctx) {
                     continue;
                 }
             }
-            let score_value = seed_score * edge.weight * self.expand.decay;
-            self.result.push((edge.to, score_value, edge.clone()));
-            next.push((edge.to, score_value));
+            self.best.insert(edge.to, candidate_score);
+            self.via.insert(edge.to, edge.clone());
+            next.push((edge.to, candidate_score));
         }
     }
 }
@@ -134,14 +176,25 @@ pub(crate) fn apply_result_dedup(
         }
         ResultDedup::Near { threshold } => {
             let mut kept: Vec<(Scored, ScoreBreakdown)> = Vec::new();
+            // 已保留向量的自范数缓存:候选自范数各算一次,两两比较复用(结果逐位不变)。
+            let mut kept_norms: Vec<f32> = Vec::new();
             for candidate in ranked {
                 let vector = &view.slots[candidate.0.slot.get() as usize].vector;
-                let near = kept.iter().any(|(existing, _)| {
-                    score::cosine_sim(&view.slots[existing.slot.get() as usize].vector, vector)
-                        >= threshold
-                });
+                let norm = simd::dot(vector, vector);
+                let near = kept
+                    .iter()
+                    .zip(&kept_norms)
+                    .any(|((existing, _), existing_norm)| {
+                        let existing_vector = &view.slots[existing.slot.get() as usize].vector;
+                        score::cosine_from_norms(
+                            simd::dot(existing_vector, vector),
+                            *existing_norm,
+                            norm,
+                        ) >= threshold
+                    });
                 if !near {
                     kept.push(candidate);
+                    kept_norms.push(norm);
                 }
             }
             kept

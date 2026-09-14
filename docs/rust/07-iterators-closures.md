@@ -65,16 +65,20 @@ a.iter()                       // &f32
  .sum::<f32>()                 // 消费:求和
 ```
 
-这是 mneme 的标量点积实现,见 [`src/core/simd.rs:86-97`](../../src/core/simd.rs):
+这是 mneme 的标量点积实现(下为教学简化片段),见 [`src/core/simd.rs:86-99`](../../src/core/simd.rs):
 
 ```rust
 pub fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()   // 简化:实际闭包里还有 #[cfg(test)] 计数块
 }
 ```
 
-> `zip` 在**较短的迭代器耗尽时停止**,所以 `dot_scalar` 对长度不等的切片按较短者计算,不会 panic。
-> `dot`(SIMD 版)也显式用 `n = a.len().min(b.len())` 保持同样语义;两者只对等长向量在 debug 下断言。
+> 上面略去了闭包内的 `#[cfg(test)]` 计数块(`MUL_ADDS` 逐元素累加乘加次数,与
+> `heap.rs::COMPARES` 同口径,只有测试构建才编译);其余与源码一致。
+> `zip` 在**较短的迭代器耗尽时停止**,所以 `dot_scalar` 对长度不等的切片按较短者计算,
+> 不会 panic。`dot`(SIMD 版)也显式用 `n = a.len().min(b.len())` 保持同样语义;
+> 只有 `dot` 在 debug 构建下对等长做 `debug_assert`(见 [09 章](09-cfg-unsafe-simd.md)),
+> `dot_scalar` 本身没有断言。
 
 常用适配器:
 

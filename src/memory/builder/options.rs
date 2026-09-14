@@ -9,8 +9,8 @@ use std::time::Duration;
 
 use crate::core::metric::Metric;
 use crate::core::options::{
-    Clock, CompactionPolicy, Compression, FsyncPolicy, HnswParams, InsertMode, Limits,
-    RelationIndex, Tuning, VectorFormat,
+    BuildPrecision, Clock, CompactionPolicy, Compression, FsyncPolicy, HnswParams, InsertMode,
+    Limits, RelationIndex, Tuning, VectorFormat,
 };
 use crate::memory::dedup::Dedup;
 use crate::memory::lifecycle::Retention;
@@ -145,6 +145,66 @@ impl Builder {
         self
     }
 
+    /// 是否启动后台维护线程(默认 `true`;`FC-LIFE-POST-010`)。
+    ///
+    /// `false` 时不自动 compaction、不自动遗忘、不周期落访问统计——适合批量导入/
+    /// 建库期"先闸住维护、建完统一整理"的场景(避免维护与导入争抢 CPU/IO)。
+    /// 手动 [`Mneme::maintenance_tick`](crate::memory::Mneme::maintenance_tick)/
+    /// [`Mneme::compact`](crate::memory::Mneme::compact)/
+    /// [`Namespace::retain`](crate::memory::Namespace::retain) 不受影响;只读实例的
+    /// MANIFEST 探测线程与本开关无关。
+    ///
+    /// # Arguments
+    ///
+    /// * `enabled` - `true` 启动后台维护线程;`false` 不启动。
+    ///
+    /// # Returns
+    ///
+    /// 携带维护开关的构建器(链式)。
+    ///
+    /// # Examples
+    /// ```
+    /// use mneme::Builder;
+    /// let db = Builder::default()
+    ///     .dimension(2)
+    ///     .maintenance(false)
+    ///     .build()
+    ///     .unwrap();
+    /// let _ = db.namespace("demo");
+    /// ```
+    pub fn maintenance(mut self, enabled: bool) -> Self {
+        self.maintenance = enabled;
+        self
+    }
+
+    /// 设置 HNSW 建图距离精度档位(默认 [`BuildPrecision::Hybrid`])。
+    ///
+    /// 只影响 flush/compaction 的**新段**构建距离;不改变磁盘格式与查询语义。
+    /// `Hybrid` 用段内临时 i8 码流近似遍历、选邻前 f32 精排;`F32` 为全精确原行为。
+    ///
+    /// # Arguments
+    ///
+    /// * `precision` - 建图精度档位。
+    ///
+    /// # Returns
+    ///
+    /// 携带建图精度的构建器(链式)。
+    ///
+    /// # Examples
+    /// ```
+    /// use mneme::{Builder, BuildPrecision};
+    /// let db = Builder::default()
+    ///     .dimension(2)
+    ///     .build_precision(BuildPrecision::F32)
+    ///     .build()
+    ///     .unwrap();
+    /// let _ = db.namespace("demo");
+    /// ```
+    pub fn build_precision(mut self, precision: BuildPrecision) -> Self {
+        self.build_precision = precision;
+        self
+    }
+
     /// 设置 compaction 策略(L5 生效)。
     ///
     /// # Arguments
@@ -201,7 +261,10 @@ impl Builder {
         self
     }
 
-    /// 设置压缩策略(仅记录,实现归 L11 安全存储;L2 预留磁盘扩展区)。
+    /// 设置压缩策略:写入时作用于 msec 记录体 `text`/`meta`/`provenance`
+    /// (feature `compress` 提供自研 LZ4 风格 codec,`compress-zstd` 提供 zstd;
+    /// 压缩无收益时回退原文)。未开对应 feature 时构造期返回 `Unsupported`
+    /// (`FC-SEC-ERR-001`)。
     ///
     /// # Arguments
     ///
@@ -212,6 +275,66 @@ impl Builder {
     /// 携带压缩策略的构建器(链式)。
     pub fn compression(mut self, compression: Compression) -> Self {
         self.compression = compression;
+        self
+    }
+
+    /// 设置只读实例探测新 MANIFEST 的周期(默认 1s;`Duration::ZERO` = 关闭)。
+    ///
+    /// # Arguments
+    ///
+    /// * `interval` - 探测周期;只读实例据此自动切换视图(I29)。
+    ///
+    /// # Returns
+    ///
+    /// 携带探测周期的构建器(链式)。
+    pub fn read_only_probe_interval(mut self, interval: std::time::Duration) -> Self {
+        self.read_only_probe_interval = interval;
+        self
+    }
+
+    /// 设置事件可观测钩子(默认无;设计 12 §4)。
+    ///
+    /// # Arguments
+    ///
+    /// * `observer` - 事件回调;回调 panic 被隔离,不影响引擎行为(I30)。
+    ///
+    /// # Returns
+    ///
+    /// 携带观察者的构建器(链式)。
+    pub fn observer(mut self, observer: std::sync::Arc<dyn crate::Observer>) -> Self {
+        self.observer = Some(observer);
+        self
+    }
+
+    /// 设置自定义存储后端(默认 `FsStorage`;设计 12 §3.1)。
+    ///
+    /// # Arguments
+    ///
+    /// * `storage` - 根代理的 [`Storage`](crate::Storage) 实现(如 [`MemStorage`](crate::MemStorage))。
+    ///
+    /// # Returns
+    ///
+    /// 携带有存储后端的构建器(链式)。
+    pub fn storage(mut self, storage: std::sync::Arc<dyn crate::Storage>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    /// 设置静态加密配置(`None` = 明文)。
+    ///
+    /// # Arguments
+    ///
+    /// * `encryption` - 密钥提供者与算法;开启后段/WAL/MANIFEST 写盘为 AEAD 信封。
+    ///
+    /// # Returns
+    ///
+    /// 携带加密配置的构建器(链式)。
+    ///
+    /// # Errors
+    ///
+    /// feature `encrypt` 未开启时在 `build()` 返回 `Unsupported`(绝不静默明文落盘)。
+    pub fn encryption(mut self, encryption: Option<crate::crypto::Encryption>) -> Self {
+        self.encryption = encryption;
         self
     }
 

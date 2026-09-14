@@ -32,3 +32,6 @@ desktop.ini
 # 日志与临时文件
 *.log
 /tmp/
+
+# CI 跨 feature fixture(GitLab/GitHub 在仓库目录下生成)
+/.ci/

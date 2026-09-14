@@ -82,6 +82,8 @@ pub(crate) struct SearchParams<'a> {
     /// 预计算的候选槽位(过滤先行,与 BM25 通道共享);
     /// `None` = 本函数内自行收集。
     pub(crate) candidates: Option<&'a [u32]>,
+    /// 重要性偏置(只改 HNSW 遍历顺序;`Scoring::bias_routing`,FC-SCORE-POST-007)。
+    pub(crate) bias: Option<&'a dyn crate::memory::index::NodeBias>,
 }
 
 /// 过滤先行的候选收集输入(与 BM25 通道共享同一份候选)。
@@ -181,6 +183,7 @@ fn search_indexed(
 /// 过滤先行:只求值元数据,得到候选槽位(不读向量)。
 pub(crate) fn collect_candidates(query: &CandidateQuery<'_>) -> Vec<u32> {
     let mut candidates: Vec<u32> = Vec::new();
+    let uses_access = query.filter.is_some_and(pred::Expr::uses_access);
     for (idx, slot) in query.view.slots.iter().enumerate() {
         if query.view.dead.get(idx) || slot.ns_id != query.ns_id || !slot.is_live(query.now_ms) {
             continue;
@@ -188,7 +191,9 @@ pub(crate) fn collect_candidates(query: &CandidateQuery<'_>) -> Vec<u32> {
         if let Some(expr) = query.filter {
             let ctx = EvalCtx {
                 slot,
-                access: query.view.access.get(&slot.rowid).copied(),
+                access: uses_access
+                    .then(|| query.view.access.get(&slot.rowid).copied())
+                    .flatten(),
             };
             if !pred::matches(expr, &ctx) {
                 continue;
@@ -232,6 +237,7 @@ fn ann_search(
             post_threshold: params.filter_post_threshold,
             brute_threshold: params.filter_brute_threshold,
             use_quant: segment.quant != VectorFormat::F32,
+            bias: params.bias,
         });
         top.merge(partial);
         covered.union_with(&segment.covered);
@@ -313,7 +319,9 @@ fn run_scan(
 /// 根据候选规模决定分块大小与线程数。
 fn plan_scan(params: &SearchParams<'_>) -> (usize, usize) {
     let chunk = params.block.max(1);
-    let threads = if params.parallelism == 0 {
+    let threads = if cfg!(feature = "wasm") {
+        1
+    } else if params.parallelism == 0 {
         std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
     } else {
         params.parallelism

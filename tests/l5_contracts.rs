@@ -9,21 +9,28 @@
 //! * FC-LIFE-POST-004(读路径访问攒批)
 //! * FC-LIFE-POST-005(命名空间规范化)、FC-LIFE-POST-006(注销持久化)
 //! * FC-LIFE-POST-007(快照统计)、FC-LIFE-POST-008(硬链接备份)、FC-LIFE-POST-009(fsck 建议)
+//! * FC-LIFE-POST-010(后台维护可控:`Builder::maintenance`)
 //! * FC-LIFE-CPLX-001(TTL 块级剪枝)、FC-LIFE-CPLX-003/004(compaction 复杂度与段数上界)
 //! * FC-LIFE-CPLX-006(后台维护单轮复杂度)
-//! * FC-MODEL-POST-004(history_horizon 回收)、FC-MODEL-POST-005(入边)、FC-MODEL-POST-007(反向关系表)
+//! * FC-MODEL-POST-004(history_horizon 回收)、FC-MODEL-POST-005(入边)、FC-MODEL-POST-007(反向关系表)、FC-MODEL-POST-008(关系类型注册表持久化)
 //! * FC-LIFE-POST-003(增量段 flush)、FC-PERSIST-STA-004(多段 MANIFEST 提交)
 //! * FC-PERSIST-POST-010(delta 区往返/回放)、FC-PERSIST-POST-011(WAL 轮转)
 //! * FC-PERSIST-POST-012(槽位归属恢复)
 //! * FC-PERSIST-ERR-006(损坏段原地跳过)
 //! * FC-PERSIST-CPLX-011(增量 flush 复杂度)
 //! * FC-INDEX-INV-008(多段 ANN + 未落盘尾归并 ≡ 全量暴力)
+//!
+//! * 不变量锚定:I2(损坏可检出/隔离)、I3(活跃段集合)、I8(段数上界)、
+//!   I10(compaction 原子)、I17(快照一致)、I23(删除可审计)
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use mneme::{Builder, CompactionPolicy, FsyncHook, IoAction, Mneme, Record, UpdatePatch};
+use mneme::{
+    Builder, CompactionPolicy, FsyncHook, IoAction, Limits, Mneme, Record, RelationKind, Retention,
+    UpdatePatch,
+};
 
 mod common;
 
@@ -669,6 +676,44 @@ fn ttl_expiry_survives_multi_segment_reopen() {
     db.close().expect("close");
 }
 
+/// FC-LIFE-POST-010:`Builder::maintenance(false)` 不启动后台维护线程——访问统计
+/// 不周期落 WAL;手动 `maintenance_tick()` 不受影响(照常执行一轮)。
+#[test]
+fn maintenance_can_be_disabled() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Builder::default()
+        .dimension(8)
+        .path(dir.path())
+        .maintenance(false)
+        .access_flush_interval(Duration::from_millis(30))
+        .build()
+        .expect("build");
+    let ns = db.namespace("t");
+    let batch: Vec<Record> = (0..64)
+        .map(|row| Record::new(vec![row as f32; 8]).key(format!("k{row}")))
+        .collect();
+    ns.insert_batch(batch).expect("insert");
+    let hits = ns
+        .search()
+        .vector(&[1.0; 8])
+        .top_k(4)
+        .execute()
+        .expect("search");
+    assert!(!hits.is_empty(), "查询须命中以进入访问缓冲");
+    let before = db.stats().expect("stats").wal_bytes;
+    std::thread::sleep(Duration::from_millis(120));
+    let after = db.stats().expect("stats").wal_bytes;
+    assert_eq!(before, after, "维护关闭时访问统计不得周期落 WAL");
+    // 手动入口不受开关影响:一轮 tick 后访问统计落 WAL。
+    db.maintenance_tick().expect("maintenance tick");
+    let after_tick = db.stats().expect("stats").wal_bytes;
+    assert!(
+        after_tick > after,
+        "手动 tick 仍应落访问统计(WAL 增长):{after} → {after_tick}"
+    );
+    db.close().expect("close");
+}
+
 /// FC-LIFE-POST-004:读路径命中攒批后落 WAL;崩溃(未 close)重开后访问计数仍在。
 #[test]
 fn access_hits_are_batched_and_flushed() {
@@ -729,6 +774,59 @@ fn access_hits_are_batched_and_flushed() {
     db.close().expect("close");
 }
 
+/// FC-LIFE-POST-004(缓冲上限,heavy):缓冲条目数达到上限 `1 << 20` 后,新的
+/// `RowId` 被丢弃(已有键继续累加)。1M+1 条记录、一次全量检索命中全部记录:
+/// 上限内的记录落盘后 `access_count ≥ 1`,被丢弃的最后一条保持无访问统计。
+/// `#[ignore]`:1M 记录约需数百 MB 内存与数十秒,由 CI heavy 档执行
+/// `cargo test --release --test l5_contracts access_buffer_cap_discards_new_rowids -- --ignored`;
+/// (实现常量 `MAX_ACCESS_BUFFER_ENTRIES` 为私有,集成测试无法用小上限构造)。
+#[test]
+#[ignore = "heavy:1M+1 条访问记录验证访问缓冲上限"]
+fn access_buffer_cap_discards_new_rowids() {
+    /// 访问缓冲上限(`MAX_ACCESS_BUFFER_ENTRIES = 1 << 20`;实现私有,此处同步)。
+    const CAP: usize = 1 << 20;
+    /// 总数 = 上限 + 1,恰好覆盖"超限后新 `RowId` 丢弃"。
+    const TOTAL: usize = CAP + 1;
+
+    let clock = FakeClock::default();
+    clock.set(1_000);
+    let db = Builder::default()
+        .dimension(2)
+        .limits(Limits {
+            top_k_max: TOTAL as u32,
+            ..Limits::default()
+        })
+        // 纯内存库经 retention 打开访问追踪(与 `tracks_access_hits` 同条件);
+        // `protect(Expr::Always)` 保证维护轮不会遗忘任何记录。
+        .retention(Some(Retention::new().protect(mneme::Expr::Always)))
+        .retain_interval(Duration::from_secs(86_400 * 365 * 10))
+        .clock(Arc::new(clock))
+        .build()
+        .expect("build");
+    let ns = db.namespace("cap");
+    let batch: Vec<Record> = (0..TOTAL).map(|_| Record::new(vec![1.0, 0.0])).collect();
+    ns.insert_batch(batch).expect("insert_batch");
+
+    let hits = ns
+        .search()
+        .vector(&[1.0, 0.0])
+        .top_k(TOTAL)
+        .execute()
+        .expect("search");
+    assert_eq!(hits.len(), TOTAL, "同一快照内全部记录命中");
+    // 手动推进一轮维护(确定性;不依赖后台线程调度):缓冲合并落盘。
+    db.maintenance_tick().expect("maintenance tick");
+
+    assert_eq!(ns.count(None).expect("count"), TOTAL as u64, "记录全部可见");
+    assert_eq!(
+        ns.count(Some(mneme::Expr::field("access_count").gt(0)))
+            .expect("count access"),
+        CAP as u64,
+        "缓冲达到上限后新 RowId 必须被丢弃:恰好 {CAP} 条计入访问统计"
+    );
+    db.close().expect("close");
+}
+
 /// FC-LIFE-INV-023:自动遗忘默认关闭(安全默认),`stats().retain` 恒 `None`。
 #[test]
 fn auto_retention_is_off_by_default() {
@@ -770,7 +868,9 @@ fn auto_retention_forgets_expired_records() {
                 .half_life(Duration::from_millis(1_000))
                 .min_importance(0.9),
         ))
-        .retain_interval(Duration::from_millis(20))
+        // 周期设得比假时钟跳变幅度(≈1_000s)大:后台维护线程不会执行 retain
+        // (避免与手动一轮抢跑并覆盖报告),手动 `maintenance_tick` 不受周期约束。
+        .retain_interval(Duration::from_secs(86_400 * 365 * 10))
         .clock(Arc::new(clock.clone()))
         .build()
         .expect("build");
@@ -815,8 +915,9 @@ fn auto_compaction_triggers_in_background() {
         .dimension(2)
         .path(dir.path())
         .compaction(tiered_policy())
-        // 借用 retain_interval 作为维护压缩检查节拍(测试加速)。
-        .retain_interval(Duration::from_millis(20))
+        // 周期设得比假时钟跳变幅度大:后台线程不执行 compaction,
+        // 合并只由手动一轮推进(确定性,不受后台调度影响)。
+        .retain_interval(Duration::from_secs(86_400 * 365 * 10))
         .clock(Arc::new(clock.clone()))
         .build()
         .expect("build");
@@ -956,7 +1057,7 @@ fn snapshot_stats_pin_view() {
     db.close().expect("close");
 }
 
-/// FC-LIFE-POST-008:同盘备份走硬链接(段文件同 inode),产物仍可独立打开。
+/// FC-LIFE-POST-008(I11:同盘备份走硬链接(段文件同 inode),产物仍可独立打开)。
 #[test]
 fn backup_hardlinks_segments_when_possible() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -1969,4 +2070,75 @@ fn malformed_region_is_isolated_or_reported_with_segment() {
         ),
         "fail-fast 错误必须带损坏段号,实际 {error:?}"
     );
+}
+
+/// FC-MODEL-POST-008:自定义关系类型经 `flush`(MANIFEST)重开后名称↔编号一致,
+/// 对应边仍可按编号读取。
+#[test]
+fn custom_relation_kind_survives_reopen() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let registered;
+    {
+        let db = build(dir.path(), 2);
+        let ns = db.namespace("demo");
+        let kind = ns.relation_kind("mentions").expect("注册");
+        registered = kind.0;
+        let a = ns.insert(Record::new(vec![1.0, 0.0]).key("a")).expect("a");
+        let b = ns.insert(Record::new(vec![0.0, 1.0]).key("b")).expect("b");
+        let (a, b) = match (a, b) {
+            (mneme::InsertOutcome::Inserted(a), mneme::InsertOutcome::Inserted(b)) => (a, b),
+            other => panic!("期望写入,得到 {other:?}"),
+        };
+        ns.relate(a, b, kind, 0.5).expect("relate");
+        db.flush().expect("flush");
+        db.close().expect("close");
+    }
+
+    let db = Mneme::open(dir.path()).expect("reopen");
+    let ns = db.namespace("demo");
+    assert_eq!(
+        ns.relation_kind("mentions").expect("重开解析"),
+        RelationKind(registered),
+        "重开后同名必须解析为原编号"
+    );
+    let a = ns.get("a").expect("get a").expect("a 存在").rowid();
+    let edges = ns
+        .neighbors(a, &[RelationKind(registered)])
+        .expect("neighbors");
+    assert_eq!(edges.len(), 1, "自定义类型的边必须随段恢复");
+    db.close().expect("close");
+}
+
+/// FC-MODEL-POST-008:注册只落 WAL(未 `flush`)时崩溃,重启后名称↔编号与边一致。
+#[test]
+fn custom_relation_kind_survives_crash() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let registered;
+    {
+        let db = build(dir.path(), 2);
+        let ns = db.namespace("demo");
+        let kind = ns.relation_kind("mentions").expect("注册");
+        registered = kind.0;
+        let a = ns.insert(Record::new(vec![1.0, 0.0]).key("a")).expect("a");
+        let b = ns.insert(Record::new(vec![0.0, 1.0]).key("b")).expect("b");
+        let (a, b) = match (a, b) {
+            (mneme::InsertOutcome::Inserted(a), mneme::InsertOutcome::Inserted(b)) => (a, b),
+            other => panic!("期望写入,得到 {other:?}"),
+        };
+        ns.relate(a, b, kind, 0.5).expect("relate");
+    } // 不 close:模拟崩溃,注册与边都只在 WAL
+
+    let db = Mneme::open(dir.path()).expect("reopen");
+    let ns = db.namespace("demo");
+    assert_eq!(
+        ns.relation_kind("mentions").expect("WAL 恢复解析"),
+        RelationKind(registered),
+        "崩溃恢复后同名必须解析为原编号"
+    );
+    let a = ns.get("a").expect("get a").expect("a 存在").rowid();
+    let edges = ns
+        .neighbors(a, &[RelationKind(registered)])
+        .expect("neighbors");
+    assert_eq!(edges.len(), 1, "自定义类型的边必须经 WAL 恢复");
+    db.close().expect("close");
 }

@@ -23,6 +23,15 @@ quant-f16 = ["dep:half"]
 async = ["dep:tokio"]
 # fuzz 专用解析入口(L6,设计 14 §5):只服务 `fuzz/` 构建,不改变运行时行为。
 fuzzing = []
+# WASM/边缘目标(L12,设计 12 §3.2):关闭 mmap 与后台线程,配合
+# `default-features = false` + `MemStorage` 在宿主内存文件系统上运行。
+wasm = []
+# 静态加密(L11,设计 11 §2):AES-256-GCM 整文件信封,引入 `aes-gcm`。
+encrypt = ["dep:aes-gcm", "dep:getrandom"]
+# 文本/元数据压缩(L11,设计 11 §3):内置自研 LZ4 风格 codec,零依赖。
+compress = []
+# 可选更强压缩(L11):引入 `zstd`。
+compress-zstd = ["dep:zstd"]
 
 [dependencies]
 # 元数据与后续 DSL 序列化的基础;L0 阶段仅经 serde_json 使用,直接声明以对齐依赖白名单
@@ -38,6 +47,12 @@ memmap2 = { version = "0.9", optional = true }
 half = { version = "2", optional = true }
 # L6 async 门面的 `spawn_blocking`(设计 08 §6);只开 `rt`,不选 runtime、不引入 async I/O。
 tokio = { version = "1", optional = true, default-features = false, features = ["rt"] }
+# L11 静态加密(设计 11 §2):RustCrypto AES-256-GCM;仅 feature `encrypt` 编译。
+aes-gcm = { version = "0.11", optional = true, default-features = false, features = ["aes", "alloc"] }
+# L11 静态加密的 nonce/密钥随机源(OS 熵;仅 feature `encrypt` 编译)。
+getrandom = { version = "0.4", optional = true }
+# L11 可选更强压缩(设计 11 §3):仅 feature `compress-zstd` 编译。
+zstd = { version = "0.14", optional = true, default-features = false }
 
 [dev-dependencies]
 proptest = "1"
@@ -57,5 +72,6 @@ harness = false
 
 [profile.release]
 # L0 为纯函数库,lto 收益有限;thin LTO 在跨 crate 内联与编译时间间折中,
-# L2 持久层落地后按 bench 数据再调。
+# L2 持久层落地后按 bench 数据再调。`codegen-units = 1` 经 quant 基准对照
+# 收益不显著(p > 0.05,查询 ±5%、建库 −2%),故保持默认以换取编译速度。
 lto = "thin"

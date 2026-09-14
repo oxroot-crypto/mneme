@@ -33,6 +33,11 @@ pub(crate) struct SegmentBuildInput<'a> {
     pub(crate) delta: &'a [DeltaEntry],
     /// 是否全量重写关系表(首个段或 compaction);否则关系变更走 delta。
     pub(crate) full_relations: bool,
+    /// 本段 HNSW 批内建图并行度(`0` = 可用核数)。
+    ///
+    /// 多块 flush 时块间已并行,内层应传 `1` 避免嵌套过度订阅;
+    /// 单块/compaction 逐段构建时传库配置并行度。
+    pub(crate) parallelism: usize,
 }
 
 /// 段内槽位及其对应的向量/范数/删除位(向量借用自写状态)。
@@ -89,10 +94,10 @@ pub(crate) fn build_segment(
 ) -> Result<EncodedSegment> {
     let built = build_slots(ws, input.slots);
     let planned = plan_quant(config, &built.vectors)?;
-    let mut built_index = build_index(ws, config, input.slots, planned.clone())?;
+    let mut built_index = build_index(ws, config, input.slots, planned.clone(), input.parallelism)?;
     let decision = finalize_quant(config, ws, &built, input.slots, &built_index.index, planned)?;
     if decision.fallback {
-        built_index = build_index(ws, config, input.slots, None)?;
+        built_index = build_index(ws, config, input.slots, None, input.parallelism)?;
     }
     encode_segment(
         config,
@@ -192,6 +197,7 @@ fn encode_msec(
         zmap: &indexes.zmap,
         bloom: &indexes.bloom,
         inverted: &indexes.inverted,
+        compression: config.compression,
     })
 }
 
@@ -204,41 +210,56 @@ fn plan_quant(config: &Config, vectors: &[&[f32]]) -> Result<Option<QuantCopy>> 
     let dimension = config.dimension.get() as usize;
     match format {
         VectorFormat::F32 => Ok(None),
-        VectorFormat::I8Rescored => {
-            let params = crate::quant::scalar_i8::build_params(vectors, dimension)?;
-            let table = params.table();
-            let rows = vectors
-                .iter()
-                .map(|vector| {
-                    Arc::<[u8]>::from(crate::quant::scalar_i8::encode_row(vector, &params))
-                })
-                .collect();
-            Ok(Some(QuantCopy {
-                format,
-                params: table,
-                rows,
-            }))
+        VectorFormat::I8Rescored => Ok(Some(plan_i8_copy(vectors, dimension)?)),
+        VectorFormat::F16 => Ok(Some(plan_f16_copy(vectors, dimension)?)),
+    }
+}
+
+/// i8 量化副本:逐维统计缩放参数,再编码全段行。
+fn plan_i8_copy(vectors: &[&[f32]], dimension: usize) -> Result<QuantCopy> {
+    let params = crate::quant::scalar_i8::build_params(vectors, dimension)?;
+    let table = params.table();
+    let mut codes = Vec::with_capacity(vectors.len() * dimension);
+    for vector in vectors {
+        crate::quant::scalar_i8::encode_row_into(&mut codes, vector, &params);
+    }
+    let rows = crate::memory::lazy::LazyRows::from_owned(codes, dimension, vectors.len()).ok_or(
+        MnemeError::Inconsistent {
+            reason: "i8 量化副本行区长度不符",
+        },
+    )?;
+    Ok(QuantCopy {
+        format: VectorFormat::I8Rescored,
+        params: table,
+        rows,
+    })
+}
+
+/// f16 量化副本(需 feature `quant-f16`;未开启显式 `Unsupported`)。
+fn plan_f16_copy(vectors: &[&[f32]], dimension: usize) -> Result<QuantCopy> {
+    #[cfg(feature = "quant-f16")]
+    {
+        let dimension_bytes = dimension * 2;
+        let mut codes = Vec::with_capacity(vectors.len() * dimension_bytes);
+        for vector in vectors {
+            crate::quant::f16::encode_row_into(&mut codes, vector);
         }
-        VectorFormat::F16 => {
-            #[cfg(feature = "quant-f16")]
-            {
-                let rows = vectors
-                    .iter()
-                    .map(|vector| Arc::<[u8]>::from(crate::quant::f16::encode_row(vector)))
-                    .collect();
-                Ok(Some(QuantCopy {
-                    format,
-                    params: Vec::new(),
-                    rows,
-                }))
-            }
-            #[cfg(not(feature = "quant-f16"))]
-            {
-                Err(MnemeError::Unsupported {
-                    feature: "quant-f16",
-                })
-            }
-        }
+        let rows = crate::memory::lazy::LazyRows::from_owned(codes, dimension_bytes, vectors.len())
+            .ok_or(MnemeError::Inconsistent {
+                reason: "f16 量化副本行区长度不符",
+            })?;
+        Ok(QuantCopy {
+            format: VectorFormat::F16,
+            params: Vec::new(),
+            rows,
+        })
+    }
+    #[cfg(not(feature = "quant-f16"))]
+    {
+        let _ = (vectors, dimension);
+        Err(MnemeError::Unsupported {
+            feature: "quant-f16",
+        })
     }
 }
 
@@ -349,6 +370,7 @@ fn search_payloads(
         post_threshold: config.tuning.filter_post_threshold,
         brute_threshold: config.tuning.filter_brute_threshold,
         use_quant,
+        bias: None,
     });
     top.into_sorted_vec()
 }
@@ -601,6 +623,7 @@ fn build_index(
     config: &Config,
     included: &[usize],
     quant: Option<QuantCopy>,
+    parallelism: usize,
 ) -> Result<BuiltIndex> {
     let Some(factory) = config.index_factory.as_ref() else {
         return Ok(BuiltIndex {
@@ -636,7 +659,15 @@ fn build_index(
             SlotId::new(u32::try_from(idx).expect("槽位下标必可转入 u32(FC-MEM-INV-004)"))
         })
         .collect();
-    let index = factory.build(&nodes, &slot_of, config.hnsw, config.metric, quant);
+    let index = factory.build(crate::memory::index::IndexBuildRequest {
+        nodes: &nodes,
+        slot_of: &slot_of,
+        params: config.hnsw,
+        metric: config.metric,
+        quant,
+        build_precision: config.build_precision,
+        build: crate::core::options::HnswBuildParams::from_tuning(&config.tuning, parallelism),
+    })?;
     let entry = index.entry();
     let bytes = index.serialize()?;
     Ok(BuiltIndex {
@@ -764,12 +795,14 @@ mod tests {
             dedup_threshold: 0.9,
             quantization: VectorFormat::default(),
             hnsw: HnswParams::default(),
+            build_precision: crate::core::options::BuildPrecision::default(),
             index_factory: None,
             compaction: CompactionPolicy::default(),
             retention: None,
             retain_interval: None,
             access_flush_interval: Duration::from_secs(60),
             compression: Compression::default(),
+            observer: None,
             relation_index: RelationIndex::default(),
             parallelism: 1,
             tuning: Tuning::default(),
@@ -787,7 +820,9 @@ mod tests {
             ns_path: Arc::from("n"),
             seqno: SeqNo::new(1),
             key: Some(Key::new("k0")),
-            vector: Arc::from(vec![0.0_f32, 1.0].into_boxed_slice()),
+            vector: crate::memory::lazy::VectorStorage::owned(Arc::from(
+                vec![0.0_f32, 1.0].into_boxed_slice(),
+            )),
             norm_sq: 1.0,
             text: None,
             text_hash: None,

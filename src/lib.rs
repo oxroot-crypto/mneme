@@ -45,6 +45,8 @@ pub mod core;
 pub mod fuzzing;
 pub mod memory;
 
+mod compress;
+pub mod crypto;
 mod index;
 mod life;
 mod persist;
@@ -56,14 +58,17 @@ pub use crate::core::heap::TopK;
 pub use crate::core::meta;
 pub use crate::core::meta::{Meta, json};
 pub use crate::core::metric::{Metric, Score};
+pub use crate::core::observe::{ErrorKind, Event, Observer, WriteOp};
 pub use crate::core::options::{
-    Clock, CompactionPolicy, Compression, Dimension, Diversity, Feedback, FsyncPolicy, HnswParams,
-    InsertMode, Limits, QueryId, RelationIndex, RelationKind, Scoring, SystemClock, TimeAxis,
-    Tuning, UpdatePatch, VectorFormat,
+    BuildPrecision, Clock, CompactionPolicy, Compression, Dimension, Diversity, Feedback,
+    FsyncPolicy, HnswParams, InsertMode, Limits, QueryId, RelationIndex, RelationKind, Scoring,
+    SystemClock, TimeAxis, Tuning, UpdatePatch, VectorFormat,
 };
 pub use crate::core::text::tokenize;
 pub use crate::core::types::{Key, NsId, RowId, SegmentId, SeqNo, SlotId};
 pub use crate::core::{simd, varint};
+pub use crate::crypto::Key as CryptoKey;
+pub use crate::crypto::{Cipher, Encryption, KeyId, KeyProvider, Keyring};
 #[cfg(feature = "async")]
 pub use crate::memory::AsyncNamespace;
 pub use crate::memory::{
@@ -75,6 +80,7 @@ pub use crate::memory::{
     Stats, StorageStat, StoredRecord, Summarizer, UpdateOutcome, Val,
 };
 pub use crate::persist::hook::{FsyncHook, IoAction};
+pub use crate::persist::storage::{FileMeta, FsStorage, MemStorage, RawBytes, Storage};
 
 /// 对写死在代码里的过滤字面量做运行时解析,失败即 panic(文档化例外,见设计 06 §1)。
 ///

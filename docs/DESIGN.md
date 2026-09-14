@@ -33,10 +33,10 @@ flowchart TD
     C["L0 原语层 core/<br/>类型 · 错误 · SIMD 距离 · TopK 堆 · varint"]
 
     subgraph 产品能力层
-        MD["model/ 记忆模型(规划)<br/>关系 · 双时态 · 沉淀"]
-        SC["score/ 排序层(规划)<br/>综合打分 · 联想 · 反馈 · MMR"]
-        SEC["crypto+compress/ 可选(规划)<br/>静态加密 · 压缩"]
-        DEP["deploy+obs/ 部署(规划)<br/>只读共享 · WASM · 可观测"]
+        MD["model/ 记忆模型(已落地)<br/>关系 · 双时态 · 沉淀 · 自定义关系注册表"]
+        SC["score/ 排序层(已落地)<br/>综合打分 · 联想 · 反馈 · MMR · 偏置路由"]
+        SEC["crypto+compress/ 可选(已落地)<br/>静态加密 · 密钥轮换 · 压缩"]
+        DEP["部署与可观测(已落地)<br/>persist/storage.rs 存储后端 · 只读共享<br/>core/observe.rs 可观测 · feature wasm"]
     end
 
     F --> Q --> L --> QL --> H --> P --> M --> C

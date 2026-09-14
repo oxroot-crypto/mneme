@@ -14,8 +14,9 @@
 | `fuzz_dsl` | `mneme::fuzzing::parse_dsl` | 非 UTF-8 / 任意 DSL 不 panic(I7) |
 
 入口经主 crate 的 `feature = "fuzzing"` 暴露(见 `src/fuzzing.rs`),不改变运行时行为。
-版本注入(随机改写 `format_version` 断言 `UnsupportedVersion`/`Corrupted`)与正式
-1h/24h 长跑仍未接线,详见 `docs/design/14-testing.md` §5/§7。
+各目标在解析入口之外统一调用 `mneme::fuzzing::version_injection`:**改写
+`format_version` 必须返回 `UnsupportedVersion`,改写魔数必须返回 `Corrupted`**
+(I18,设计 14 §5)。1h/24h 长跑用 `scripts/run_long.sh`(nightly + cargo-fuzz)。
 
 ## 运行
 
@@ -25,9 +26,11 @@ cargo install cargo-fuzz
 cd fuzz
 cargo +nightly fuzz run fuzz_vsec          # 单个目标
 cargo +nightly fuzz list                   # 列出全部目标
+DURATION=3600 ../fuzz/scripts/run_long.sh  # 全目标各 1h(夜跑)
 ```
 
-仓库内快速兜底:`src/fuzzing.rs` 的冒烟单测随 `cargo test --features fuzzing` 运行。
+仓库内快速兜底:`src/fuzzing.rs` 的冒烟单测随 `cargo test --features fuzzing` 运行
+(含版本注入定向用例)。
 
 ## 产物
 

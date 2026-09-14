@@ -10,9 +10,12 @@
 //! > MANIFEST 追加提交,段数由 compaction 控制;每条写入先追加 WAL(WAL-before-visible),
 //! > 按 [`FsyncPolicy`] 决定持久确认时机。
 
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use crate::core::error::{MnemeError, Result};
 
@@ -31,6 +34,503 @@ pub(crate) const LOCK_FILE: &str = "LOCK";
 
 /// 保留的 MANIFEST 版本数(设计 04 §6:任意一步崩溃至少留一个完整可用版本)。
 pub(crate) const MANIFEST_KEEP: usize = 2;
+
+/// 文件元数据(不依赖 `std::fs`,宿主后端同样可实现;设计 12 §3.1)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FileMeta {
+    /// 文件字节数。
+    pub len: u64,
+}
+
+/// 存储后端抽象(根目录绑定;路径均为库内相对路径,见设计 12 §3.1)。
+///
+/// 桌面/服务器默认 [`FsStorage`];WASM/宿主可注入 [`MemStorage`] 或自定义后端
+/// (`Builder::storage`)。文件锁在 trait 内提供等价能力,锁文件/目录语义由实现
+/// 负责;写路径的原子提交(`write_atomic` = 临时文件 + rename + fsync)是后端契约。
+pub trait Storage: Send + Sync + std::fmt::Debug {
+    /// 读取整个文件。
+    ///
+    /// # Errors
+    /// 文件不存在或 I/O 失败时返回结构化错误。
+    fn read_file(&self, rel: &str) -> Result<Vec<u8>>;
+
+    /// 读取整个文件;不存在返回 `None`。
+    ///
+    /// # Errors
+    /// 其他 I/O 失败返回结构化错误。
+    fn read_file_opt(&self, rel: &str) -> Result<Option<Vec<u8>>>;
+
+    /// 读取文件前缀(至多 `max` 字节;文件更短时返回全部)。
+    ///
+    /// 段打开仅需前 4 字节做信封探测,不得为此整读大段(FC-PERSIST-INV-021);
+    /// 默认实现经 [`Storage::read_file`] 整读后截断(内存后端语义正确),
+    /// 文件后端应覆写为真正的部分读取。
+    ///
+    /// # Errors
+    /// 文件不存在或 I/O 失败时返回结构化错误。
+    fn read_prefix(&self, rel: &str, max: usize) -> Result<Vec<u8>> {
+        let mut bytes = self.read_file(rel)?;
+        bytes.truncate(max);
+        Ok(bytes)
+    }
+
+    /// 原子写入:临时文件 → fsync → rename → 目录 fsync(绝不原地覆盖)。
+    ///
+    /// # Errors
+    /// 任一步 I/O 失败时返回结构化错误。
+    fn write_atomic(&self, rel: &str, bytes: &[u8]) -> Result<()>;
+
+    /// 只创建不覆盖地写入(目标已存在则失败)。
+    ///
+    /// # Errors
+    /// 目标已存在或 I/O 失败时返回结构化错误。
+    fn write_new(&self, rel: &str, bytes: &[u8]) -> Result<()>;
+
+    /// 追加写入并返回追加后的文件长度。
+    ///
+    /// # Errors
+    /// I/O 失败时返回结构化错误。
+    fn append(&self, rel: &str, bytes: &[u8]) -> Result<u64>;
+
+    /// 把文件截断到 `len` 字节并尽力 fsync。
+    ///
+    /// # Errors
+    /// 文件不存在或 I/O 失败时返回结构化错误。
+    fn truncate(&self, rel: &str, len: u64) -> Result<()>;
+
+    /// 把文件 fsync 到稳定存储。
+    ///
+    /// # Errors
+    /// I/O 失败时返回结构化错误。
+    fn sync(&self, rel: &str) -> Result<()>;
+
+    /// 列出目录下的文件名(不含子目录),目录不存在返回空。
+    ///
+    /// # Errors
+    /// I/O 失败时返回结构化错误。
+    fn list_dir(&self, rel: &str) -> Result<Vec<String>>;
+
+    /// 创建目录(幂等)。
+    ///
+    /// # Errors
+    /// I/O 失败时返回结构化错误。
+    fn ensure_dir(&self, rel: &str) -> Result<()>;
+
+    /// 删除文件;不存在视为成功。
+    ///
+    /// # Errors
+    /// 其他 I/O 失败返回结构化错误。
+    fn remove_if_exists(&self, rel: &str) -> Result<()>;
+
+    /// 重命名文件(同后端内)。
+    ///
+    /// # Errors
+    /// I/O 失败时返回结构化错误。
+    fn rename(&self, from: &str, to: &str) -> Result<()>;
+
+    /// 文件是否存在。
+    ///
+    /// # Errors
+    /// 查询失败时返回结构化错误。
+    fn exists(&self, rel: &str) -> Result<bool>;
+
+    /// 文件元数据。
+    ///
+    /// # Errors
+    /// 文件不存在或查询失败时返回结构化错误。
+    fn stat(&self, rel: &str) -> Result<FileMeta>;
+
+    /// 以只读视图打开文件:支持零拷贝的后端可返回映射,否则返回整文件自有缓冲。
+    /// 默认实现 = [`Storage::read_file`](实现者不必关心 mmap)。
+    ///
+    /// # 前置条件(返回 `RawBytes::Mmap` 的后端)
+    /// 视图存活期内文件不得被原地改写或截断;库内仅对 **write-once 段文件**
+    /// 调用本方法(段经临时文件 + rename 生成,compaction 只重命名/删除目录项)。
+    /// 对 `wal` / `current` / `MANIFEST.*` 等会被追加或截断的文件返回映射,
+    /// 存在 `SIGBUS` 风险,自定义后端必须改为返回 `RawBytes::Owned`。
+    ///
+    /// # Errors
+    /// 读取失败时返回结构化错误。
+    fn open_bytes(&self, rel: &str) -> Result<RawBytes> {
+        Ok(RawBytes::Owned(self.read_file(rel)?.into_boxed_slice()))
+    }
+
+    /// 库根目录是否存在(只读打开的前置检查;内存后端恒 `true`)。
+    ///
+    /// # Errors
+    /// 查询失败时返回结构化错误。
+    fn root_exists(&self) -> Result<bool> {
+        Ok(true)
+    }
+
+    /// 尝试获取锁文件(`LOCK`)的独占锁。
+    ///
+    /// # Returns
+    /// 成功时返回不透明守卫;`Drop` 即释放。锁被活实例持有 → [`MnemeError::Busy`]。
+    ///
+    /// # Errors
+    /// 见上;I/O 失败返回 [`MnemeError::Io`]。
+    fn try_lock(&self) -> Result<Box<dyn std::any::Any + Send + Sync>>;
+}
+
+/// [`Storage::open_bytes`] 的只读字节视图。
+#[derive(Debug)]
+pub enum RawBytes {
+    /// 内核按页惰性载入的只读映射(feature `mmap`)。
+    #[cfg(all(feature = "mmap", not(feature = "wasm")))]
+    Mmap(memmap2::Mmap),
+    /// 整文件自有缓冲。
+    Owned(Box<[u8]>),
+}
+
+impl RawBytes {
+    /// 只读字节切片。
+    ///
+    /// # Returns
+    /// 覆盖整个文件的连续只读字节;`mmap` 后端下由内核按页惰性载入。
+    pub fn as_slice(&self) -> &[u8] {
+        match self {
+            #[cfg(all(feature = "mmap", not(feature = "wasm")))]
+            Self::Mmap(map) => map,
+            Self::Owned(bytes) => bytes,
+        }
+    }
+
+    /// 字节数。
+    ///
+    /// # Returns
+    /// 文件长度(字节)。
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    /// 是否为零字节。
+    ///
+    /// # Returns
+    /// 长度为零时返回 `true`。
+    pub fn is_empty(&self) -> bool {
+        self.as_slice().is_empty()
+    }
+}
+
+/// 桌面/服务器文件系统后端(std 自由函数实现,见本模块顶部)。
+#[derive(Debug, Clone)]
+pub struct FsStorage {
+    root: PathBuf,
+}
+
+impl FsStorage {
+    /// 以库根目录建立后端。
+    pub fn new(root: impl AsRef<Path>) -> Self {
+        Self {
+            root: root.as_ref().to_path_buf(),
+        }
+    }
+}
+
+impl Storage for FsStorage {
+    fn read_file(&self, rel: &str) -> Result<Vec<u8>> {
+        read_file(&self.root, rel)
+    }
+
+    fn read_file_opt(&self, rel: &str) -> Result<Option<Vec<u8>>> {
+        read_file_opt(&self.root, rel)
+    }
+
+    fn read_prefix(&self, rel: &str, max: usize) -> Result<Vec<u8>> {
+        read_prefix(&self.root, rel, max)
+    }
+
+    fn write_atomic(&self, rel: &str, bytes: &[u8]) -> Result<()> {
+        write_atomic(&self.root, rel, bytes)
+    }
+
+    fn write_new(&self, rel: &str, bytes: &[u8]) -> Result<()> {
+        write_new(&self.root, rel, bytes)
+    }
+
+    fn append(&self, rel: &str, bytes: &[u8]) -> Result<u64> {
+        let target = resolve(&self.root, rel)?;
+        let mut file = OpenOptions::new().append(true).open(&target)?;
+        file.write_all(bytes)?;
+        Ok(file.metadata()?.len())
+    }
+
+    fn truncate(&self, rel: &str, len: u64) -> Result<()> {
+        truncate(&self.root, rel, len)
+    }
+
+    fn sync(&self, rel: &str) -> Result<()> {
+        let target = resolve(&self.root, rel)?;
+        let file = OpenOptions::new().read(true).open(target)?;
+        file.sync_all()?;
+        Ok(())
+    }
+
+    fn list_dir(&self, rel: &str) -> Result<Vec<String>> {
+        list_dir(&self.root, rel)
+    }
+
+    fn ensure_dir(&self, rel: &str) -> Result<()> {
+        ensure_dir(&self.root.join(rel))
+    }
+
+    fn remove_if_exists(&self, rel: &str) -> Result<()> {
+        remove_if_exists(&self.root.join(rel))
+    }
+
+    fn rename(&self, from: &str, to: &str) -> Result<()> {
+        let from = resolve(&self.root, from)?;
+        let to = resolve(&self.root, to)?;
+        rename(&from, &to)
+    }
+
+    fn exists(&self, rel: &str) -> Result<bool> {
+        exists(&self.root.join(rel))
+    }
+
+    fn stat(&self, rel: &str) -> Result<FileMeta> {
+        let meta = fs::metadata(self.root.join(rel))?;
+        Ok(FileMeta { len: meta.len() })
+    }
+
+    #[cfg(all(feature = "mmap", not(feature = "wasm")))]
+    fn open_bytes(&self, rel: &str) -> Result<RawBytes> {
+        let path = self.root.join(rel);
+        let file = File::open(path)?;
+        // 只读映射的安全前置(SAFETY 证明)集中在 `source::map_readonly`:
+        // 段文件 write-once,映射期不截断/改写(见 src/persist/source.rs)。
+        Ok(RawBytes::Mmap(crate::persist::source::map_readonly(&file)?))
+    }
+
+    fn root_exists(&self) -> Result<bool> {
+        Ok(self.root.try_exists()?)
+    }
+
+    fn try_lock(&self) -> Result<Box<dyn std::any::Any + Send + Sync>> {
+        Ok(Box::new(FileLock::acquire(&self.root)?))
+    }
+}
+
+/// 纯内存后端(WASM/测试;无 mmap、无 OS 锁)。
+///
+/// 布局在内存中以相对路径为键;`try_lock` 用进程内互斥模拟(单进程多实例互斥,
+/// 不跨进程——WASM/浏览器语义)。
+#[derive(Debug, Default)]
+pub struct MemStorage {
+    files: Mutex<HashMap<String, Vec<u8>>>,
+    dirs: Mutex<HashSet<String>>,
+    /// 进程内独占标志(模拟 OS 咨询锁;进程内多实例互斥)。
+    locked: Arc<AtomicBool>,
+}
+
+impl MemStorage {
+    /// 新建空后端。
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// 校验相对路径(拒绝绝对路径与 `..`)。
+    fn check(rel: &str) -> Result<()> {
+        resolve(Path::new("."), rel).map(|_path| ())
+    }
+}
+
+impl Storage for MemStorage {
+    fn read_file(&self, rel: &str) -> Result<Vec<u8>> {
+        Self::check(rel)?;
+        self.files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(rel)
+            .cloned()
+            .ok_or_else(|| {
+                MnemeError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    rel.to_string(),
+                ))
+            })
+    }
+
+    fn read_file_opt(&self, rel: &str) -> Result<Option<Vec<u8>>> {
+        match self.read_file(rel) {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(MnemeError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn read_prefix(&self, rel: &str, max: usize) -> Result<Vec<u8>> {
+        Self::check(rel)?;
+        self.files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(rel)
+            .map(|bytes| bytes[..bytes.len().min(max)].to_vec())
+            .ok_or_else(|| {
+                MnemeError::Io(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    rel.to_string(),
+                ))
+            })
+    }
+
+    fn write_atomic(&self, rel: &str, bytes: &[u8]) -> Result<()> {
+        self.write_new_or_replace(rel, bytes)
+    }
+
+    fn write_new(&self, rel: &str, bytes: &[u8]) -> Result<()> {
+        Self::check(rel)?;
+        let mut files = self
+            .files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if files.contains_key(rel) {
+            return Err(MnemeError::Io(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                rel.to_string(),
+            )));
+        }
+        files.insert(rel.to_string(), bytes.to_vec());
+        Ok(())
+    }
+
+    fn append(&self, rel: &str, bytes: &[u8]) -> Result<u64> {
+        Self::check(rel)?;
+        let mut files = self
+            .files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = files.entry(rel.to_string()).or_default();
+        entry.extend_from_slice(bytes);
+        Ok(entry.len() as u64)
+    }
+
+    fn truncate(&self, rel: &str, len: u64) -> Result<()> {
+        Self::check(rel)?;
+        let mut files = self
+            .files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let entry = files.get_mut(rel).ok_or_else(|| {
+            MnemeError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                rel.to_string(),
+            ))
+        })?;
+        entry.truncate(len as usize);
+        Ok(())
+    }
+
+    fn sync(&self, _rel: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn list_dir(&self, rel: &str) -> Result<Vec<String>> {
+        Self::check(rel)?;
+        let prefix = if rel.is_empty() {
+            String::new()
+        } else {
+            format!("{rel}/")
+        };
+        let files = self
+            .files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut names: Vec<String> = files
+            .keys()
+            .filter_map(|key| {
+                key.strip_prefix(&prefix).and_then(|rest| {
+                    (!rest.is_empty() && !rest.contains('/')).then(|| rest.to_string())
+                })
+            })
+            .collect();
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+
+    fn ensure_dir(&self, rel: &str) -> Result<()> {
+        Self::check(rel)?;
+        self.dirs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(rel.to_string());
+        Ok(())
+    }
+
+    fn remove_if_exists(&self, rel: &str) -> Result<()> {
+        Self::check(rel)?;
+        self.files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(rel);
+        Ok(())
+    }
+
+    fn rename(&self, from: &str, to: &str) -> Result<()> {
+        Self::check(from)?;
+        Self::check(to)?;
+        let mut files = self
+            .files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(bytes) = files.remove(from) else {
+            return Err(MnemeError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                from.to_string(),
+            )));
+        };
+        files.insert(to.to_string(), bytes);
+        Ok(())
+    }
+
+    fn exists(&self, rel: &str) -> Result<bool> {
+        Self::check(rel)?;
+        Ok(self
+            .files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(rel))
+    }
+
+    fn stat(&self, rel: &str) -> Result<FileMeta> {
+        let bytes = self.read_file(rel)?;
+        Ok(FileMeta {
+            len: bytes.len() as u64,
+        })
+    }
+
+    fn try_lock(&self) -> Result<Box<dyn std::any::Any + Send + Sync>> {
+        // 进程内互斥:同一进程第二个实例立即 `Busy`;守卫 Drop 即释放。
+        if self.locked.swap(true, Ordering::AcqRel) {
+            return Err(MnemeError::Busy("库已被另一实例打开(内存后端)"));
+        }
+        Ok(Box::new(MemLockToken(Arc::clone(&self.locked))))
+    }
+}
+
+impl MemStorage {
+    /// 替换写入(原子语义在内存下即直接替换)。
+    fn write_new_or_replace(&self, rel: &str, bytes: &[u8]) -> Result<()> {
+        Self::check(rel)?;
+        self.files
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(rel.to_string(), bytes.to_vec());
+        Ok(())
+    }
+}
+
+/// 内存后端的锁守卫:`Drop` 释放进程内独占标志。
+#[derive(Debug)]
+pub(crate) struct MemLockToken(Arc<AtomicBool>);
+
+impl Drop for MemLockToken {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
 
 /// MANIFEST 版本文件名(如 `MANIFEST.000042`)。
 pub(crate) fn manifest_name(version: u64) -> String {
@@ -97,7 +597,6 @@ pub(crate) fn write_atomic(root: &Path, rel: &str, bytes: &[u8]) -> Result<()> {
 ///
 /// # Errors
 /// 目标已存在或 I/O 失败时返回 [`MnemeError::Io`]。
-#[cfg(test)]
 pub(crate) fn write_new(root: &Path, rel: &str, bytes: &[u8]) -> Result<()> {
     let target = resolve(root, rel)?;
     let mut file = OpenOptions::new()
@@ -130,6 +629,29 @@ pub(crate) fn read_file(root: &Path, rel: &str) -> Result<Vec<u8>> {
     let mut file = File::open(target)?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// 读取文件前缀(至多 `max` 字节;文件更短时返回全部)。
+///
+/// 用于段打开时的 4 字节信封探测,避免为非加密大段白付一遍整读
+/// (`FC-PERSIST-INV-021`/`FC-PERSIST-CPLX-007`)。
+///
+/// # Errors
+/// 文件不存在或 I/O 失败时返回 [`MnemeError::Io`]。
+pub(crate) fn read_prefix(root: &Path, rel: &str, max: usize) -> Result<Vec<u8>> {
+    let target = resolve(root, rel)?;
+    let mut file = File::open(target)?;
+    let mut bytes = vec![0_u8; max];
+    let mut filled = 0;
+    while filled < bytes.len() {
+        let read = file.read(&mut bytes[filled..])?;
+        if read == 0 {
+            break;
+        }
+        filled += read;
+    }
+    bytes.truncate(filled);
     Ok(bytes)
 }
 
@@ -233,7 +755,8 @@ fn sync_parent(path: &Path) -> Result<()> {
 /// 互斥语义由内核持有的咨询锁提供:活实例持有时其它实例 `try_lock` 返回
 /// [`std::fs::TryLockError::WouldBlock`](→ [`MnemeError::Busy`]);进程崩溃/退出时
 /// 内核自动释放,后续实例可直接获取。无需租约刷新、心跳线程或陈旧接管
-/// (设计 16 §3;`File::try_lock` 自 MSRV 1.93 起稳定,Windows 用 `LockFileEx`)。
+/// (设计 16 §3;`File::try_lock` 自 Rust 1.89 起稳定,本库 MSRV 1.93 满足;
+/// Windows 用 `LockFileEx`)。
 pub(crate) struct FileLock {
     /// 持有 OS 咨询锁的文件句柄;`Drop` 关闭句柄即释放锁。
     _file: File,

@@ -33,3 +33,4 @@ mod wal_writer;
 pub(crate) use compact::CompactInput;
 pub(crate) use handle::{ManifestState, Store};
 pub(crate) use open::OpenOptions;
+pub(crate) use open::reload_read_only;

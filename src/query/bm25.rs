@@ -45,17 +45,17 @@ pub(crate) fn search(params: &Bm25Query<'_>) -> Vec<Scored> {
     if params.top_k == 0 {
         return Vec::new();
     }
-    let Some(docs) = params.view.inv.doc_entries(params.ns_id) else {
+    if params.view.inv.docs_of(params.ns_id).next().is_none() {
         return Vec::new();
-    };
+    }
     let query_terms = query_terms(params.query, params.stopwords);
     if query_terms.is_empty() {
         return Vec::new();
     }
-    let Some(stats) = collect_stats(params, docs, &query_terms) else {
+    let Some(stats) = collect_stats(params, &query_terms) else {
         return Vec::new();
     };
-    let scores = score_postings(params, &query_terms, docs, &stats);
+    let scores = score_postings(params, &query_terms, &stats);
     rank_scores(params, &scores)
 }
 
@@ -78,17 +78,13 @@ struct Bm25Stats {
 }
 
 /// 第一遍:统计 `N`/`avgdl`(只计可见行)与查询词 `df`。
-fn collect_stats(
-    params: &Bm25Query<'_>,
-    docs: &HashMap<SlotId, u32>,
-    query_terms: &[String],
-) -> Option<Bm25Stats> {
+fn collect_stats(params: &Bm25Query<'_>, query_terms: &[String]) -> Option<Bm25Stats> {
     let mut n = 0_u64;
     let mut total_dl = 0_u64;
-    for slot in docs.keys() {
+    for (slot, doc_len) in params.view.inv.docs_of(params.ns_id) {
         if is_visible(params, *slot) {
             n += 1;
-            total_dl += u64::from(docs[slot]);
+            total_dl += u64::from(*doc_len);
         }
     }
     if n == 0 {
@@ -116,7 +112,6 @@ fn collect_stats(
 fn score_postings(
     params: &Bm25Query<'_>,
     terms: &[String],
-    docs: &HashMap<SlotId, u32>,
     stats: &Bm25Stats,
 ) -> HashMap<SlotId, f32> {
     let mut scores: HashMap<SlotId, f32> = HashMap::new();
@@ -132,7 +127,11 @@ fn score_postings(
             if !is_visible(params, posting.slot) || !is_candidate(params, posting.slot) {
                 continue;
             }
-            let doc_len = docs.get(&posting.slot).copied().unwrap_or(0) as f32;
+            let doc_len = params
+                .view
+                .inv
+                .doc_len(params.ns_id, posting.slot)
+                .unwrap_or(0) as f32;
             let tf = posting.tf as f32;
             let norm = tf * (K1 + 1.0) / (tf + K1 * (1.0 - B + B * doc_len / stats.avgdl));
             *scores.entry(posting.slot).or_insert(0.0) += idf * norm;

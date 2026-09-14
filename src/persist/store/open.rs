@@ -8,15 +8,16 @@ use std::sync::{Arc, Mutex};
 
 use crate::core::error::{MnemeError, Result};
 use crate::core::metric::Metric;
-use crate::core::options::{FsyncPolicy, Tuning, VectorFormat};
+use crate::core::options::{Compression, FsyncPolicy, Tuning, VectorFormat};
 use crate::core::types::SlotId;
 use crate::memory::analysis::{BLOOM_INITIAL_CAPACITY, BloomSet, ZoneIndex};
 use crate::memory::index::{IndexFactory, IndexNode, QuantCopy, VectorIndex};
+use crate::memory::lazy::{ByteSource, ByteSpan, LazyRows};
 use crate::memory::table::WriterState;
 use crate::persist::hook::FsyncHook;
 use crate::persist::manifest::Manifest;
 use crate::persist::recover;
-use crate::persist::storage::{self, FileLock, SEGMENTS_DIR, WAL_DIR};
+use crate::persist::storage::{SEGMENTS_DIR, WAL_DIR};
 use crate::persist::trash;
 use crate::persist::vsec;
 use crate::persist::wal;
@@ -44,6 +45,14 @@ pub(crate) struct OpenOptions {
     pub(crate) fail_fast_on_corruption: bool,
     /// 崩溃注入钩子。
     pub(crate) hook: Option<Arc<dyn FsyncHook>>,
+    /// 文本/元数据压缩策略(记录体编码用)。
+    pub(crate) compression: Compression,
+    /// 静态加密配置(`None` = 明文;信封读写见 `crypto`)。
+    pub(crate) encryption: Option<crate::crypto::Encryption>,
+    /// 自定义存储后端(`None` = 默认 `FsStorage`;设计 12 §3.1)。
+    pub(crate) storage: Option<Arc<dyn crate::persist::storage::Storage>>,
+    /// 事件可观测钩子(`None` = 关闭;设计 12 §4)。
+    pub(crate) observer: Option<Arc<dyn crate::core::observe::Observer>>,
     /// 索引工厂(L3);`None` = 不载入 hidx(恒暴力)。
     pub(crate) index_factory: Option<Arc<dyn IndexFactory>>,
     /// WAL 单文件轮转阈值(字节;`0` = 不轮转)。
@@ -64,32 +73,21 @@ impl Store {
         root: &Path,
         options: OpenOptions,
     ) -> Result<(Arc<Store>, WriterState, u32, Metric)> {
-        // 只读实例绝不写盘:不建目录、不清 trash、不删孤儿,只要求库目录已存在。
-        if options.read_only {
-            if !storage::exists(root)? {
-                return Err(MnemeError::Config {
-                    reason: "只读模式要求库目录已存在",
-                });
-            }
-        } else {
-            prepare_dirs(root)?;
-        }
-        let lock = acquire_lock(root, options.read_only)?;
-        // 清理崩溃残留的 `Building` 半成品(ATOMIC 写的 `.tmp`);只读实例亦只读取、不删除。
-        if !options.read_only {
-            trash::purge(root)?;
-            manifest_io::cleanup_orphans(root)?;
-        }
+        let storage = resolve_storage(root, options.storage.clone());
+        prepare_root(storage.as_ref(), options.read_only)?;
+        let lock = acquire_lock(&storage, options.read_only)?;
+        // 清理崩溃残留的 `Building` 半成品(ATOMIC 写的 `.tmp`);只读实例不删除。
+        cleanup_residue(storage.as_ref(), options.read_only)?;
 
-        let (manifest, version) = load_or_init_manifest(root, &options)?;
+        let (manifest, version) = load_or_init_manifest(&storage, &options)?;
 
         // 可写实例清理 MANIFEST 未引用的段孤儿(garbage),只读实例不写盘。
         if !options.read_only {
-            manifest_io::remove_unreferenced_segments(root, &manifest)?;
+            manifest_io::remove_unreferenced_segments(storage.as_ref(), &manifest)?;
         }
 
-        let state = load_write_state(root, &manifest, &options)?;
-        let wal = WalWriter::open_or_create(root, wal_config(&manifest, &options))?;
+        let state = load_write_state(&manifest, &options, &storage)?;
+        let wal = WalWriter::open_or_create(Arc::clone(&storage), wal_config(&manifest, &options))?;
         let store = Arc::new(Store {
             root: root.to_path_buf(),
             lock: Mutex::new(lock),
@@ -103,26 +101,68 @@ impl Store {
             read_only: options.read_only,
             hook: options.hook,
             index_factory: options.index_factory,
+            compression: options.compression,
+            encryption: options.encryption,
+            storage,
+            observer: options.observer,
+            tuning: options.tuning.clone(),
         });
         Ok((store, state, manifest.dimension, manifest.metric))
     }
 }
 
+/// 解析存储后端:优先调用方注入,否则默认 [`FsStorage`](设计 12 §3.1)。
+fn resolve_storage(
+    root: &Path,
+    requested: Option<Arc<dyn crate::persist::storage::Storage>>,
+) -> Arc<dyn crate::persist::storage::Storage> {
+    requested.unwrap_or_else(|| {
+        Arc::new(crate::persist::storage::FsStorage::new(root))
+            as Arc<dyn crate::persist::storage::Storage>
+    })
+}
+
+/// 只读实例绝不写盘:只要求库目录已存在;可写实例建立目录布局。
+fn prepare_root(storage: &dyn crate::persist::storage::Storage, read_only: bool) -> Result<()> {
+    if !read_only {
+        return prepare_dirs(storage);
+    }
+    if !storage.root_exists()? {
+        return Err(MnemeError::Config {
+            reason: "只读模式要求库目录已存在",
+        });
+    }
+    Ok(())
+}
+
+/// 清理崩溃残留的 `Building` 半成品(ATOMIC 写的 `.tmp`);只读实例只读不删除。
+fn cleanup_residue(storage: &dyn crate::persist::storage::Storage, read_only: bool) -> Result<()> {
+    if read_only {
+        return Ok(());
+    }
+    trash::purge(storage)?;
+    manifest_io::cleanup_orphans(storage)?;
+    Ok(())
+}
+
 /// 确保库根、`segments/`、`wal/` 与 `trash/` 目录存在。
-fn prepare_dirs(root: &Path) -> Result<()> {
-    storage::ensure_dir(root)?;
-    storage::ensure_dir(&root.join(SEGMENTS_DIR))?;
-    storage::ensure_dir(&root.join(WAL_DIR))?;
-    storage::ensure_dir(&root.join(storage::TRASH_DIR))?;
+fn prepare_dirs(storage: &dyn crate::persist::storage::Storage) -> Result<()> {
+    storage.ensure_dir("")?;
+    storage.ensure_dir(SEGMENTS_DIR)?;
+    storage.ensure_dir(WAL_DIR)?;
+    storage.ensure_dir(crate::persist::storage::TRASH_DIR)?;
     Ok(())
 }
 
 /// 可写实例取独占锁;只读实例不持锁。
-fn acquire_lock(root: &Path, read_only: bool) -> Result<Option<FileLock>> {
+fn acquire_lock(
+    storage: &Arc<dyn crate::persist::storage::Storage>,
+    read_only: bool,
+) -> Result<Option<Box<dyn std::any::Any + Send + Sync>>> {
     if read_only {
         Ok(None)
     } else {
-        Ok(Some(FileLock::acquire(root)?))
+        Ok(Some(storage.try_lock()?))
     }
 }
 
@@ -135,13 +175,17 @@ fn wal_config(manifest: &Manifest, options: &OpenOptions) -> WalConfig {
         max_file_bytes: options.wal_file_bytes,
         hook: options.hook.clone(),
         read_only: options.read_only,
+        encryption: options.encryption.clone(),
     }
 }
 
 /// 载入既有 MANIFEST,或据请求与 WAL 头初始化一个新 MANIFEST。
-fn load_or_init_manifest(root: &Path, options: &OpenOptions) -> Result<(Manifest, u64)> {
+fn load_or_init_manifest(
+    storage: &Arc<dyn crate::persist::storage::Storage>,
+    options: &OpenOptions,
+) -> Result<(Manifest, u64)> {
     let (requested_dimension, requested_metric) = (options.dimension, options.metric);
-    let loaded = manifest_io::load_manifest(root)?;
+    let loaded = manifest_io::load_manifest(storage.as_ref(), options.encryption.as_ref())?;
     match loaded {
         Some((manifest, version)) => {
             verify_requested_identity(&manifest, requested_dimension, requested_metric)?;
@@ -153,8 +197,8 @@ fn load_or_init_manifest(root: &Path, options: &OpenOptions) -> Result<(Manifest
             //   以 WAL 为准重建、随后清理孤儿段,绝不因此拒绝打开而丢数据;
             // - 段文件存在但 WAL 无可应用帧(无 WAL / 空 WAL / 仅头)→ 来源不明
             //   (可能是 MANIFEST 丢失),拒绝当作新库覆盖(设计 16 §3)。
-            let has_segments = !manifest_io::segment_files(root)?.is_empty();
-            if has_segments && !wal_has_frames(root)? {
+            let has_segments = !manifest_io::segment_files(storage.as_ref())?.is_empty();
+            if has_segments && !wal_has_frames(storage)? {
                 return Err(MnemeError::Corrupted {
                     segment: None,
                     reason: "段文件存在但无 MANIFEST 且 WAL 无可应用帧,拒绝覆盖".to_string(),
@@ -162,7 +206,7 @@ fn load_or_init_manifest(root: &Path, options: &OpenOptions) -> Result<(Manifest
             }
             Ok((
                 init_manifest_from_wal(
-                    root,
+                    storage,
                     requested_dimension,
                     requested_metric,
                     options.tuning.stopwords,
@@ -174,9 +218,9 @@ fn load_or_init_manifest(root: &Path, options: &OpenOptions) -> Result<(Manifest
 }
 
 /// WAL 文件集是否含至少一个完整可应用帧(区分「首次 flush 崩溃」与「MANIFEST 丢失」)。
-fn wal_has_frames(root: &Path) -> Result<bool> {
-    for rel in wal_writer::wal_files(root)? {
-        let bytes = storage::read_file(root, &rel)?;
+fn wal_has_frames(storage: &Arc<dyn crate::persist::storage::Storage>) -> Result<bool> {
+    for rel in wal_writer::wal_files(storage.as_ref())? {
+        let bytes = storage.read_file(&rel)?;
         match wal::visit_frames(&bytes, |_, _, _, _| Ok(())) {
             Ok(valid_len) if valid_len > wal::FILE_HEADER_LEN => return Ok(true),
             // 头部损坏视作无可应用帧(来源不明,交由上层拒绝覆盖)。
@@ -213,16 +257,19 @@ fn verify_requested_identity(
 
 /// 无 MANIFEST 但可能有 WAL(崩溃在首次 flush 前):以最早 WAL 文件头为准初始化。
 fn init_manifest_from_wal(
-    root: &Path,
+    storage: &Arc<dyn crate::persist::storage::Storage>,
     requested_dimension: Option<u32>,
     requested_metric: Option<Metric>,
     stopwords: bool,
 ) -> Result<Manifest> {
-    let wal_header = wal_writer::wal_files(root)?.into_iter().find_map(|rel| {
-        storage::read_file(root, &rel)
-            .ok()
-            .and_then(|bytes| wal::parse_file_header(&bytes).ok())
-    });
+    let wal_header = wal_writer::wal_files(storage.as_ref())?
+        .into_iter()
+        .find_map(|rel| {
+            storage
+                .read_file(&rel)
+                .ok()
+                .and_then(|bytes| wal::parse_file_header(&bytes).ok())
+        });
     let dimension = resolve_dimension(requested_dimension, wal_header.as_ref())?;
     let metric = resolve_metric(requested_metric, wal_header.as_ref())?;
     Ok(Manifest {
@@ -272,19 +319,72 @@ fn resolve_metric(
     }
 }
 
+/// 只读实例重载:发现更新的已提交 MANIFEST 时重建写状态快照。
+///
+/// 返回 `Some((state, version))` 表示切换(`current` 或 MANIFEST 版本更新);
+/// 无新版本返回 `None`。调用方以 `Table::publish` 原子换视图,旧视图由 `Arc`
+/// 自然退役(I29/FC-DEPLOY-STA-001)。
+///
+/// # Errors
+/// 新 MANIFEST/段损坏时返回结构化错误(只读实例保持旧视图,不中断服务)。
+pub(crate) fn reload_read_only(store: &Store) -> Result<Option<(WriterState, u64)>> {
+    if !store.read_only {
+        return Err(MnemeError::Config {
+            reason: "仅只读实例支持 reload",
+        });
+    }
+    let Some(observed) = store.read_current() else {
+        return Ok(None);
+    };
+    if observed <= store.current_version() {
+        return Ok(None);
+    }
+    let Some((manifest, version)) =
+        manifest_io::load_manifest(store.storage.as_ref(), store.encryption.as_ref())?
+    else {
+        return Ok(None);
+    };
+    if version <= store.current_version() {
+        return Ok(None);
+    }
+    let options = OpenOptions {
+        dimension: None,
+        metric: None,
+        fsync: FsyncPolicy::Never,
+        read_only: true,
+        verify_on_open: false,
+        fail_fast_on_corruption: false,
+        hook: None,
+        index_factory: store.index_factory.clone(),
+        wal_file_bytes: 0,
+        tuning: store.tuning.clone(),
+        compression: store.compression,
+        encryption: store.encryption.clone(),
+        storage: Some(Arc::clone(&store.storage)),
+        observer: store.observer.clone(),
+    };
+    let state = load_write_state(&manifest, &options, &store.storage)?;
+    store.replace_manifest(manifest, version);
+    Ok(Some((state, version)))
+}
+
 /// 载入 MANIFEST 所列段并回放 WAL,重建写状态。
 ///
 /// 损坏段(头部/区级结构不可解析)在非 fail-fast 下仅内存跳过,文件原地保留
 /// (MANIFEST 仍引用,移动会使后续打开拒启)。
 fn load_write_state(
-    root: &Path,
     manifest: &Manifest,
     options: &OpenOptions,
+    storage: &Arc<dyn crate::persist::storage::Storage>,
 ) -> Result<WriterState> {
-    let mut state = recover::empty_state(manifest);
+    let mut state = recover::empty_state(manifest)?;
     prepare_rebuild_structures(&mut state, manifest, options);
-    let segments =
-        manifest_io::read_segment_bytes(root, manifest, options.fail_fast_on_corruption)?;
+    let segments = manifest_io::open_segment_handles(
+        storage,
+        manifest,
+        options.fail_fast_on_corruption,
+        options.encryption.as_ref(),
+    )?;
     let recovered = recover::load_segments(
         &mut state,
         &segments,
@@ -306,7 +406,7 @@ fn load_write_state(
             },
         )?;
     }
-    replay_all_wal(&mut state, root, manifest, options)?;
+    replay_all_wal(storage.as_ref(), &mut state, manifest, options)?;
     Ok(state)
 }
 
@@ -340,11 +440,15 @@ struct HidxxLoadInput<'a> {
 }
 
 /// 载入各段 hidx 并安装为多段索引(索引是优化:损坏时降级暴力,`check()` 报告)。
+///
+/// 各段相互独立:段数 ≥ 2 时按可用核数并行载入(打开 1M 多段库时 hidx 卸载
+/// 与量化副本解析可线性摊薄),结果按段序回收。
 fn load_hidx_indexes(
     state: &WriterState,
     input: &HidxxLoadInput<'_>,
 ) -> Result<Arc<Vec<crate::memory::index::SegmentIndex>>> {
-    let mut indexes = Vec::new();
+    // 先收集待处理段(跳过损坏段与缺失重排映射者),保持输入顺序。
+    let mut jobs: Vec<(&recover::SegmentBytes, &recover::SegmentRemap)> = Vec::new();
     for segment in input.segments {
         if input.recovered.skipped.contains(&segment.segment_id) {
             continue;
@@ -357,11 +461,62 @@ fn load_hidx_indexes(
         else {
             continue;
         };
-        if let Some(index) = build_segment_index(state, input, segment, remap)? {
-            indexes.push(index);
+        jobs.push((segment, remap));
+    }
+    let workers = if cfg!(feature = "wasm") {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map_or(1, std::num::NonZeroUsize::get)
+            .min(jobs.len())
+    };
+    if workers <= 1 {
+        let mut indexes = Vec::new();
+        for (segment, remap) in jobs {
+            if let Some(index) = build_segment_index(state, input, segment, remap)? {
+                indexes.push(index);
+            }
+        }
+        return Ok(Arc::new(indexes));
+    }
+    let chunk_size = jobs.len().div_ceil(workers);
+    let pieces: Vec<Result<Vec<(usize, crate::memory::index::SegmentIndex)>>> =
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = jobs
+                .chunks(chunk_size)
+                .enumerate()
+                .map(|(offset, chunk)| {
+                    scope.spawn(move || {
+                        let mut out = Vec::with_capacity(chunk.len());
+                        for (index, (segment, remap)) in chunk.iter().enumerate() {
+                            if let Some(built) = build_segment_index(state, input, segment, remap)?
+                            {
+                                out.push((offset * chunk_size + index, built));
+                            }
+                        }
+                        Ok(out)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| {
+                    // reason: 载入为只读解析,线程 panic 只可能来自实现 bug;显式转内部
+                    // 不一致错误而非二次 panic(绝不静默少载段)。
+                    handle.join().unwrap_or(Err(MnemeError::Inconsistent {
+                        reason: "hidx 载入线程 panic",
+                    }))
+                })
+                .collect()
+        });
+    let mut indexed: Vec<Option<crate::memory::index::SegmentIndex>> =
+        (0..jobs.len()).map(|_| None).collect();
+    for piece in pieces {
+        for (job_index, index) in piece? {
+            indexed[job_index] = Some(index);
         }
     }
-    Ok(Arc::new(indexes))
+    Ok(Arc::new(indexed.into_iter().flatten().collect()))
 }
 
 /// 载入单个段的 hidx 索引;无 hidx 或损坏且非 fail-fast 时返回 `None`
@@ -416,27 +571,34 @@ fn build_segment_index(
 
 /// 从段 vsec 还原量化副本(行顺序 = 段内槽位顺序 = hidx 节点顺序)。
 ///
+/// 码流以惰性行区挂段句柄(不拷贝码字节;FC-PERSIST-INV-021),首次粗排时按需切片。
+///
 /// # Errors
 /// vsec 解析失败、行数与索引不一致,或 f16 段在未开 `quant-f16` 的构建上打开时
 /// 返回结构化错误(FC-QUANT-ERR-002)。
 fn load_quant_copy(segment: &recover::SegmentBytes) -> Result<Option<QuantCopy>> {
-    let view = vsec::parse(&segment.vsec)?;
+    let view = vsec::parse(segment.vsec_bytes()?)?;
     let format = view.quant();
     if format == VectorFormat::F32 {
         return Ok(None);
     }
     crate::quant::ensure_format_supported(format)?;
     let node_count = view.row_count() as usize;
-    let mut rows = Vec::with_capacity(node_count);
-    for row in 0..node_count {
-        let Some(codes) = view.quant_row(row) else {
-            return Err(MnemeError::Corrupted {
-                segment: Some(crate::core::types::SegmentId::new(segment.segment_id)),
-                reason: "vsec: 量化副本行缺失".to_string(),
-            });
-        };
-        rows.push(Arc::<[u8]>::from(codes));
-    }
+    let corrupt = |reason: &'static str| MnemeError::Corrupted {
+        segment: Some(crate::core::types::SegmentId::new(segment.segment_id)),
+        reason: reason.to_string(),
+    };
+    let (offset, stride) = view
+        .quant_region()
+        .ok_or_else(|| corrupt("vsec: 量化副本区缺失"))?;
+    let byte_len = stride
+        .checked_mul(node_count)
+        .ok_or_else(|| corrupt("vsec: 量化副本区长度溢出"))?;
+    let source = Arc::clone(&segment.vsec) as Arc<dyn crate::memory::lazy::ByteSource>;
+    let span = crate::memory::lazy::ByteSpan::new(source, offset, byte_len)
+        .ok_or_else(|| corrupt("vsec: 量化副本区越界"))?;
+    let rows =
+        LazyRows::new(span, stride, node_count).ok_or_else(|| corrupt("vsec: 量化副本行区不符"))?;
     Ok(Some(QuantCopy {
         format,
         params: view.quant_params(),
@@ -446,19 +608,24 @@ fn load_quant_copy(segment: &recover::SegmentBytes) -> Result<Option<QuantCopy>>
 
 /// 回放全部 WAL 文件(仅 seqno > watermark),并截断最后一个文件的撕裂尾部。
 fn replay_all_wal(
+    storage: &dyn crate::persist::storage::Storage,
     state: &mut WriterState,
-    root: &Path,
     manifest: &Manifest,
     options: &OpenOptions,
 ) -> Result<()> {
-    let wal_files = wal_writer::wal_files(root)?;
+    let wal_files = wal_writer::wal_files(storage)?;
     for (position, rel) in wal_files.iter().enumerate() {
-        let bytes = storage::read_file(root, rel)?;
-        let valid_len = recover::replay_wal(state, &bytes, manifest.watermark_seqno)?;
+        let bytes = storage.read_file(rel)?;
+        let valid_len = recover::replay_wal(
+            state,
+            &bytes,
+            manifest.watermark_seqno,
+            options.encryption.as_ref(),
+        )?;
         // 撕裂帧之后的字节会永久屏蔽后续追加,必须物理截断后再复用该 WAL;
         // 只有最后一个文件可能带撕裂尾(轮转前该文件已完整 fsync)。
         if position + 1 == wal_files.len() && !options.read_only && valid_len < bytes.len() {
-            storage::truncate(root, rel, valid_len as u64)?;
+            storage.truncate(rel, valid_len as u64)?;
         }
     }
     Ok(())
@@ -478,11 +645,16 @@ struct SlotRemap<'a> {
 /// hidx 解析失败(损坏/版本不一致)或重排映射越界时返回结构化错误。
 fn load_index(
     factory: &Arc<dyn IndexFactory>,
-    hidx: &[u8],
+    hidx: &Arc<crate::persist::source::ByteFile>,
     slots: SlotRemap<'_>,
     metric: Metric,
     quant: Option<QuantCopy>,
 ) -> Result<Arc<dyn VectorIndex>> {
+    let source = Arc::clone(hidx) as Arc<dyn ByteSource>;
+    let span = ByteSpan::new(source, 0, hidx.len()).ok_or_else(|| MnemeError::Corrupted {
+        segment: None,
+        reason: "hidx: 句柄区间越界".to_string(),
+    })?;
     let mut nodes = Vec::with_capacity(slots.remap.len());
     let mut slot_of = Vec::with_capacity(slots.remap.len());
     for &global in slots.remap {
@@ -501,14 +673,13 @@ fn load_index(
         });
         slot_of.push(SlotId::new(global));
     }
-    factory.load(hidx, &nodes, &slot_of, metric, quant)
+    factory.load(&span, &nodes, &slot_of, metric, quant)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::heap::TopK;
-    use crate::core::options::HnswParams;
     use crate::core::types::RowId;
 
     /// 桩索引:测试只验证 `load_index` 的重排校验,本桩不会被真正调用。
@@ -542,13 +713,9 @@ mod tests {
     impl IndexFactory for StubFactory {
         fn build(
             &self,
-            _nodes: &[IndexNode],
-            _slot_of: &[SlotId],
-            _params: HnswParams,
-            _metric: Metric,
-            _quant: Option<QuantCopy>,
-        ) -> Arc<dyn VectorIndex> {
-            Arc::new(StubIndex)
+            _request: crate::memory::index::IndexBuildRequest<'_>,
+        ) -> Result<Arc<dyn VectorIndex>> {
+            Ok(Arc::new(StubIndex))
         }
 
         fn verify(&self, _bytes: &[u8]) -> Result<()> {
@@ -557,7 +724,7 @@ mod tests {
 
         fn load(
             &self,
-            _bytes: &[u8],
+            _span: &ByteSpan,
             _nodes: &[IndexNode],
             _slot_of: &[SlotId],
             _metric: Metric,
@@ -573,9 +740,10 @@ mod tests {
     fn load_index_rejects_remap_past_state_slots() {
         let state = WriterState::new();
         let factory: Arc<dyn IndexFactory> = Arc::new(StubFactory);
+        let hidx = crate::persist::source::ByteFile::from_bytes(0, vec![1]);
         let error = load_index(
             &factory,
-            &[],
+            &hidx,
             SlotRemap {
                 state: &state,
                 remap: &[0],

@@ -3,12 +3,16 @@
 //! 覆盖 `FC-INDEX-PRE-001`(参数校验)、`FC-INDEX-POST-001`(过滤三档与候选暴力等价,
 //! 档③恒精确)、`FC-INDEX-POST-002`(`ef→∞` 收敛)、`FC-INDEX-POST-005`(alive/过滤约束,
 //! 含 `as_of` 历史视图)、`FC-INDEX-POST-008`(hidx 持久化与重开载入,含非恒等重排映射)、
-//! `FC-INDEX-POST-009`(ANN 召回门槛,双分布)、`FC-INDEX-INV-008`(前缀 ANN 与未落盘尾部
-//! 暴力归并),见 `docs/spec/contracts.md` §3。文件头引用的 `FC-*` 必须与契约矩阵中引用
+//! `FC-INDEX-POST-009`(ANN 召回门槛,双分布)、`FC-INDEX-POST-011`(低精度建图召回保真,
+//! 默认档与精确档对照)、`FC-INDEX-INV-008`(前缀 ANN 与未落盘尾部暴力归并),
+//! 见 `docs/spec/contracts.md` §3。文件头引用的 `FC-*` 必须与契约矩阵中引用
 //! 本文件的条目双向相等,由 `tests/contract_traceability.rs` 机械校验。
 //!
 //! 覆盖的契约:`FC-INDEX-PRE-001`、`FC-INDEX-POST-001`、`FC-INDEX-POST-002`、
-//! `FC-INDEX-POST-005`、`FC-INDEX-POST-008`、`FC-INDEX-POST-009`、`FC-INDEX-INV-008`。
+//! `FC-INDEX-POST-005`、`FC-INDEX-POST-008`、`FC-INDEX-POST-009`、`FC-INDEX-POST-011`、
+//! `FC-INDEX-INV-008`。
+//!
+//! 不变量锚定:I5(`ef → ∞` 收敛于精确暴力,混合检索等价性的索引侧证据)。
 
 mod common;
 
@@ -17,7 +21,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mneme::{Builder, Expr, HnswParams, Metric, Mneme, MnemeError, Record, RowId, Tuning, simd};
+use mneme::{
+    BuildPrecision, Builder, Expr, HnswParams, Metric, Mneme, MnemeError, Record, RowId, Tuning,
+    simd,
+};
 
 /// 过滤与重开测试的行数。
 const RECALL_ROWS: usize = 2_500;
@@ -72,12 +79,23 @@ fn ann_tuning() -> Tuning {
     }
 }
 
-/// 以给定向量与参数建持久库、flush 并关闭;返回临时目录。
+/// 以给定向量与参数建持久库、flush 并关闭(默认建图精度档);返回临时目录。
 fn build_indexed_vectors(
     vectors: &[Vec<f32>],
     dimension: u32,
     hnsw: HnswParams,
     tuning: Tuning,
+) -> tempfile::TempDir {
+    build_indexed_vectors_with(vectors, dimension, hnsw, tuning, BuildPrecision::default())
+}
+
+/// 以显式建图精度档位建持久库、flush 并关闭;返回临时目录。
+fn build_indexed_vectors_with(
+    vectors: &[Vec<f32>],
+    dimension: u32,
+    hnsw: HnswParams,
+    tuning: Tuning,
+    precision: BuildPrecision,
 ) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("tempdir");
     let db = Builder::default()
@@ -86,6 +104,7 @@ fn build_indexed_vectors(
         .metric(Metric::Dot)
         .hnsw(hnsw)
         .tuning(tuning)
+        .build_precision(precision)
         .build()
         .expect("build");
     let ns = db.namespace("t");
@@ -94,6 +113,15 @@ fn build_indexed_vectors(
     db.flush().expect("flush");
     db.close().expect("close");
     dir
+}
+
+/// 按分布类型取样(随机均匀或 8 簇)。
+fn sample_point(seed: u64, clustered: bool) -> Vec<f32> {
+    if clustered {
+        clustered_point(seed, RECALL_DIM)
+    } else {
+        vector(seed, RECALL_DIM)
+    }
 }
 
 /// 建一个已 flush(已建 HNSW)的持久库,节点 `RowId` = 插入下标。
@@ -325,6 +353,62 @@ fn invalid_hnsw_params_and_thresholds_are_rejected() {
     );
 }
 
+/// FC-INDEX-PRE-001:建图/建段工程调参(选邻比较上限、批行数、小图阈值、
+/// 建图线程上限、块行数、块级并行)`< 1` 时建库即拒绝,取 1 合法。
+#[test]
+fn build_tuning_knobs_are_validated() {
+    for tuning in [
+        Tuning {
+            hnsw_compare_cap: 0,
+            ..Tuning::default()
+        },
+        Tuning {
+            hnsw_batch_rows: 0,
+            ..Tuning::default()
+        },
+        Tuning {
+            hnsw_serial_rows: 0,
+            ..Tuning::default()
+        },
+        Tuning {
+            hnsw_threads_max: 0,
+            ..Tuning::default()
+        },
+        Tuning {
+            flush_chunk_rows: 0,
+            ..Tuning::default()
+        },
+        Tuning {
+            flush_threads: 0,
+            ..Tuning::default()
+        },
+    ] {
+        assert!(
+            matches!(
+                Builder::default().dimension(4).tuning(tuning).build(),
+                Err(MnemeError::Config { .. })
+            ),
+            "非法建图/建段调参必须拒绝"
+        );
+    }
+    assert!(
+        Builder::default()
+            .dimension(4)
+            .tuning(Tuning {
+                hnsw_compare_cap: 1,
+                hnsw_batch_rows: 1,
+                hnsw_serial_rows: 1,
+                hnsw_threads_max: 1,
+                flush_chunk_rows: 1,
+                flush_threads: 1,
+                ..Tuning::default()
+            })
+            .build()
+            .is_ok(),
+        "下界(全部取 1)必须合法"
+    );
+}
+
 /// FC-INDEX-INV-008:索引前缀 ANN 与未落盘尾部暴力归并结果 ≡ 全量候选暴力(ef→∞)。
 #[test]
 fn ann_merges_prefix_with_unflushed_tail() {
@@ -397,7 +481,68 @@ fn ann_recall_at_ten_meets_threshold() {
     assert!(recall >= 0.95, "簇状数据 Recall@10 未达标:{recall}");
 }
 
-/// FC-INDEX-POST-002:`ef → ∞` 时 ANN 结果收敛于精确暴力。
+/// 建库(指定建图精度档)并返回 `ef=128` 的平均召回。
+fn recall_with_precision(
+    vectors: &[Vec<f32>],
+    queries: &[Vec<f32>],
+    precision: BuildPrecision,
+) -> f64 {
+    let dir = build_indexed_vectors_with(
+        vectors,
+        RECALL_DIM as u32,
+        HnswParams::default(),
+        ann_tuning(),
+        precision,
+    );
+    average_recall(dir.path(), vectors, queries, 128)
+}
+
+/// FC-INDEX-POST-011:默认 `Hybrid` 建图与 `F32` 精确建图的 Recall@10(ef=128)
+/// 差 ≤ 0.02,且 `Hybrid` 档自身 ≥ 0.95(随机均匀 + 8 簇两种分布)。
+#[test]
+fn hybrid_and_exact_builds_have_close_recall() {
+    for clustered in [false, true] {
+        let vectors: Vec<Vec<f32>> = (0..RECALL_ROWS)
+            .map(|row| sample_point(row as u64, clustered))
+            .collect();
+        let queries: Vec<Vec<f32>> = (0..RECALL_QUERIES)
+            .map(|index| sample_point(1_000_000 + index as u64, clustered))
+            .collect();
+        let exact = recall_with_precision(&vectors, &queries, BuildPrecision::F32);
+        let hybrid = recall_with_precision(&vectors, &queries, BuildPrecision::default());
+        assert!(
+            hybrid >= 0.95,
+            "分布 clustered={clustered}:Hybrid 召回未达标:{hybrid}"
+        );
+        assert!(
+            (exact - hybrid).abs() <= 0.02,
+            "分布 clustered={clustered}:Hybrid({hybrid}) 与 F32({exact}) 召回差超过 0.02"
+        );
+    }
+}
+
+/// FC-INDEX-POST-011:默认 `Hybrid` 档 `ef→∞` 仍收敛于精确暴力(档位不破坏 I5)。
+#[test]
+fn hybrid_converges_to_bruteforce_with_large_ef() {
+    let (dir, vectors) = build_indexed(RECALL_ROWS, RECALL_DIM);
+    let db = Mneme::open(dir.path()).expect("open");
+    let ns = db.namespace("t");
+    for query_index in 0..5 {
+        let query = vector(2_000_000 + query_index as u64, RECALL_DIM);
+        let hits = ns
+            .search()
+            .vector(&query)
+            .top_k(10)
+            .ef(4096)
+            .execute()
+            .expect("search");
+        let got: HashSet<usize> = hits.iter().map(|hit| hit.rowid.get() as usize).collect();
+        let want: HashSet<usize> = brute_topk(&vectors, &query, 10).into_iter().collect();
+        assert_eq!(got, want, "Hybrid 档 ef 极大时应与暴力精确一致");
+    }
+}
+
+/// FC-INDEX-POST-002(I5):`ef → ∞` 时 ANN 结果收敛于精确暴力。
 #[test]
 fn ann_converges_to_bruteforce_with_large_ef() {
     let (dir, vectors) = build_indexed(RECALL_ROWS, RECALL_DIM);

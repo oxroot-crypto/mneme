@@ -6,6 +6,8 @@
 //! * FC-MEM-ERR-001/002、FC-MEM-STA-001、FC-MEM-POST-008
 //! * FC-GLOBAL-ERR-001/002、FC-GLOBAL-PRE-004
 //!   (冒烟:任何公开 API 路径不 panic;错误分类变体语义互不混淆;策略参数非法 → Config)
+//!
+//! 不变量锚定:I23(删除可审计、自动遗忘默认关闭)
 
 use mneme::{Diversity, Expr, Mneme, Record, Retention};
 

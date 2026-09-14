@@ -7,9 +7,8 @@ use std::sync::Arc;
 
 use crate::core::error::Result;
 use crate::core::metric::Metric;
-use crate::core::options::HnswParams;
 use crate::core::types::SlotId;
-use crate::memory::index::{IndexFactory, IndexNode, QuantCopy, VectorIndex};
+use crate::memory::index::{IndexBuildRequest, IndexFactory, IndexNode, QuantCopy, VectorIndex};
 
 use super::hnsw::HnswIndex;
 use super::{hidx, rebuild};
@@ -18,33 +17,24 @@ use super::{hidx, rebuild};
 pub(crate) struct HnswFactory;
 
 impl IndexFactory for HnswFactory {
-    fn build(
-        &self,
-        nodes: &[IndexNode],
-        slot_of: &[SlotId],
-        params: HnswParams,
-        metric: Metric,
-        quant: Option<QuantCopy>,
-    ) -> Arc<dyn VectorIndex> {
-        Arc::new(rebuild::rebuild_with_slots(
-            nodes, slot_of, params, metric, quant,
-        ))
+    fn build(&self, request: IndexBuildRequest<'_>) -> Result<Arc<dyn VectorIndex>> {
+        Ok(Arc::new(rebuild::rebuild_with_slots(request)?))
     }
 
     fn verify(&self, bytes: &[u8]) -> Result<()> {
-        hidx::decode(bytes).map(|_decoded| ())
+        hidx::verify(bytes)
     }
 
     fn load(
         &self,
-        bytes: &[u8],
+        span: &crate::memory::lazy::ByteSpan,
         nodes: &[IndexNode],
         slot_of: &[SlotId],
         metric: Metric,
         quant: Option<QuantCopy>,
     ) -> Result<Arc<dyn VectorIndex>> {
         Ok(Arc::new(HnswIndex::load(
-            bytes, nodes, slot_of, metric, quant,
+            span, nodes, slot_of, metric, quant,
         )?))
     }
 }

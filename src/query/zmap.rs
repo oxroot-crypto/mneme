@@ -32,9 +32,7 @@ pub(crate) fn block_count(view: &ReaderView) -> usize {
 /// 全 1 位图(`blocks` 块全部可能命中)。
 pub(crate) fn full_mask(blocks: usize) -> BitSet {
     let mut bits = BitSet::default();
-    for block in 0..blocks {
-        bits.set(block);
-    }
+    bits.set_all(blocks);
     bits
 }
 
@@ -84,15 +82,16 @@ fn cmp_mask(op: CmpOp, field: &str, val: &Val, ctx: &MaskCtx<'_>) -> BitSet {
             _ => full_mask(ctx.blocks),
         };
     }
-    let Some(kind) = ctx.view.zones.kind_of(field) else {
+    // 字段统计一次定位:循环内直接下标访问,免逐块按字段名哈希。
+    let Some((stats, kind)) = ctx.view.zones.field_zones(field) else {
         return full_mask(ctx.blocks);
     };
     let Some(value) = numeric_value(kind, val) else {
         return full_mask(ctx.blocks);
     };
-    let mut mask = BitSet::default();
+    let mut mask = BitSet::with_capacity_bits(ctx.blocks);
     for block in 0..ctx.blocks {
-        let Some(stat) = ctx.view.zones.block_stat(field, block) else {
+        let Some(stat) = stats.get(block) else {
             continue;
         };
         if stat.has_value && possible(op, stat.min, stat.max, value) {
@@ -102,7 +101,10 @@ fn cmp_mask(op: CmpOp, field: &str, val: &Val, ctx: &MaskCtx<'_>) -> BitSet {
     mask
 }
 
-/// `In` 的块位图:各取值的等值块位图并集;`key` 走 bloom 预筛。
+/// `In` 的块位图:取值全部按字段类别折算后逐块判定;`key` 走 bloom 预筛。
+///
+/// 任一取值无法按字段类别折算时,原逐值并集必然并入全 1 位图,此处显式返回全 1,
+/// 与逐值 `cmp_mask` 并集逐位等价。
 fn in_mask(field: &str, vals: &[Val], ctx: &MaskCtx<'_>) -> BitSet {
     if field == "key" {
         let possible = vals.iter().any(|val| match val {
@@ -115,29 +117,40 @@ fn in_mask(field: &str, vals: &[Val], ctx: &MaskCtx<'_>) -> BitSet {
             BitSet::default()
         };
     }
-    if ctx.view.zones.kind_of(field).is_none() {
+    let Some((stats, kind)) = ctx.view.zones.field_zones(field) else {
         return full_mask(ctx.blocks);
-    }
-    let mut mask = BitSet::default();
+    };
+    let mut values: Vec<f64> = Vec::with_capacity(vals.len());
     for val in vals {
-        mask.union_with(&cmp_mask(CmpOp::Eq, field, val, ctx));
+        match numeric_value(kind, val) {
+            Some(value) => values.push(value),
+            None => return full_mask(ctx.blocks),
+        }
+    }
+    let mut mask = BitSet::with_capacity_bits(ctx.blocks);
+    for block in 0..ctx.blocks {
+        let Some(stat) = stats.get(block) else {
+            continue;
+        };
+        if stat.has_value
+            && values
+                .iter()
+                .any(|&value| possible(CmpOp::Eq, stat.min, stat.max, value))
+        {
+            mask.set(block);
+        }
     }
     mask
 }
 
 /// `Exists`:块内该字段完全未出现时才可剪(含字符串/布尔/null 等非数值值)。
 fn exists_mask(field: &str, ctx: &MaskCtx<'_>) -> BitSet {
-    if ctx.view.zones.kind_of(field).is_none() {
+    let Some((stats, _)) = ctx.view.zones.field_zones(field) else {
         return full_mask(ctx.blocks);
-    }
-    let mut mask = BitSet::default();
+    };
+    let mut mask = BitSet::with_capacity_bits(ctx.blocks);
     for block in 0..ctx.blocks {
-        if ctx
-            .view
-            .zones
-            .block_stat(field, block)
-            .is_some_and(|stat| stat.has_any)
-        {
+        if stats.get(block).is_some_and(|stat| stat.has_any) {
             mask.set(block);
         }
     }
@@ -146,17 +159,12 @@ fn exists_mask(field: &str, ctx: &MaskCtx<'_>) -> BitSet {
 
 /// `IsNull`:仅保留有显式 null 的块。
 fn is_null_mask(field: &str, ctx: &MaskCtx<'_>) -> BitSet {
-    if ctx.view.zones.kind_of(field).is_none() {
+    let Some((stats, _)) = ctx.view.zones.field_zones(field) else {
         return full_mask(ctx.blocks);
-    }
-    let mut mask = BitSet::default();
+    };
+    let mut mask = BitSet::with_capacity_bits(ctx.blocks);
     for block in 0..ctx.blocks {
-        if ctx
-            .view
-            .zones
-            .block_stat(field, block)
-            .is_some_and(|stat| stat.has_null)
-        {
+        if stats.get(block).is_some_and(|stat| stat.has_null) {
             mask.set(block);
         }
     }

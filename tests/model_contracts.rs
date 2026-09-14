@@ -2,13 +2,14 @@
 //!
 //! 覆盖 `docs/spec/contracts.md` 的以下条目:
 //!
-//! * FC-MODEL-INV-024/025/026、FC-MODEL-POST-001..003/005/006、FC-MODEL-STA-001
+//! * FC-MODEL-INV-024/025/026、FC-MODEL-POST-001..003/005/006/008、FC-MODEL-STA-001
 //! * FC-GLOBAL-PRE-004(关系边权:非有限值拒绝、越界钳制)
 //! * FC-MODEL-CPLX-001(`predecessors` 入边查询哨兵)、FC-MODEL-CPLX-002(consolidate 两两余弦复杂度哨兵,§9.2.8)
+//! * 不变量锚定:I24(更新原子可见)、I25(关系一致性)、I26(双时态一致)
 
 use std::sync::Arc;
 
-use mneme::{Mneme, Record, RelationKind, UpdateOutcome, UpdatePatch};
+use mneme::{Builder, Mneme, MnemeError, Record, RelationKind, UpdateOutcome, UpdatePatch};
 use proptest::prelude::*;
 
 mod common;
@@ -442,4 +443,155 @@ proptest! {
         let record = snapshot_ns.get("k").expect("get").expect("present");
         prop_assert_eq!(record.text(), Some(history[cut].1.as_str()));
     }
+}
+
+/// FC-MODEL-POST-008:自定义关系类型名称→编号稳定、幂等、可实际用于边;
+/// 空名/超长/控制字符 → `Config`,内置名解析为内置编号。
+#[test]
+fn custom_relation_kinds_are_stable_and_validated() {
+    let ns = mem(2).namespace("n");
+    let first = ns.relation_kind("mentions").expect("注册新名称");
+    assert!(
+        first.0 >= RelationKind::FIRST_CUSTOM,
+        "自定义编号必须从 16 起:{}",
+        first.0
+    );
+    assert_eq!(
+        ns.relation_kind("mentions").expect("幂等"),
+        first,
+        "同名必须返回同一编号"
+    );
+    let second = ns.relation_kind("cites").expect("第二个名称");
+    assert_ne!(first, second, "不同名称必须分配不同编号");
+    assert_eq!(
+        ns.relation_kind("supports").expect("内置名"),
+        RelationKind::SUPPORTS,
+        "内置名必须解析为内置编号"
+    );
+    assert!(matches!(
+        ns.relation_kind("").expect_err("空名必须拒绝"),
+        MnemeError::Config { .. }
+    ));
+    assert!(matches!(
+        ns.relation_kind(&"x".repeat(129))
+            .expect_err("超长必须拒绝"),
+        MnemeError::Config { .. }
+    ));
+    assert!(matches!(
+        ns.relation_kind("bad\nname").expect_err("控制字符必须拒绝"),
+        MnemeError::Config { .. }
+    ));
+
+    let a = inserted(ns.insert(Record::new(vec![1.0, 0.0])).expect("a"));
+    let b = inserted(ns.insert(Record::new(vec![0.0, 1.0])).expect("b"));
+    ns.relate(a, b, first, 0.5).expect("自定义类型可用于边");
+    let edges = ns.neighbors(a, &[first]).expect("neighbors");
+    assert_eq!(edges.len(), 1, "自定义类型边必须可查");
+    assert_eq!(edges[0].kind, first);
+}
+
+/// 建持久库并注册 `rel_a`/`rel_b` 两个自定义关系类型,返回其编号。
+fn rel_kind_fixture(dir: &std::path::Path) -> (RelationKind, RelationKind) {
+    let db = Builder::default()
+        .dimension(2)
+        .path(dir)
+        .build()
+        .expect("build");
+    let ns = db.namespace("n");
+    let first = ns.relation_kind("rel_a").expect("rel_a");
+    let second = ns.relation_kind("rel_b").expect("rel_b");
+    ns.insert(Record::new(vec![1.0, 0.0]).key("a"))
+        .expect("insert");
+    db.flush().expect("flush");
+    db.close().expect("close");
+    (first, second)
+}
+
+/// 定位 MANIFEST 定长头部之后的关系类型区偏移,返回
+/// `(rel_kinds 区起始, 第二个条目 kind 偏移, next_rel_kind 偏移)`。
+fn rel_kind_offsets(bytes: &[u8]) -> (usize, usize, usize) {
+    let ns_count = u32::from_le_bytes(bytes[60..64].try_into().unwrap()) as usize;
+    let mut offset = 72;
+    for _ in 0..ns_count {
+        offset += 4;
+        let len = u32::from_le_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4 + len;
+    }
+    let mut second = offset + 2;
+    let len = u32::from_le_bytes(bytes[second..second + 4].try_into().unwrap()) as usize;
+    second += 4 + len;
+    (offset, second, 22)
+}
+
+/// 重算 MANIFEST 头部 CRC 与 payload CRC(测试侧字节改写的合法性)。
+fn fix_manifest_crc(bytes: &mut [u8]) {
+    let header = crc32fast::hash(&[&bytes[0..8], &bytes[12..72]].concat());
+    bytes[8..12].copy_from_slice(&header.to_le_bytes());
+    let body = &bytes[72..bytes.len() - 4];
+    let payload = crc32fast::hash(body);
+    let end = bytes.len();
+    bytes[end - 4..].copy_from_slice(&payload.to_le_bytes());
+}
+
+/// 就地改写目录内全部 `MANIFEST.*` 后重开(校验冲突分支必须先在 CRC 层合法)。
+fn rewrite_manifests_and_reopen(
+    dir: &std::path::Path,
+    mut patch: impl FnMut(&mut [u8], (usize, usize, usize)),
+) -> mneme::Result<Mneme> {
+    let mut touched = 0;
+    for entry in std::fs::read_dir(dir).expect("read_dir") {
+        let path = entry.expect("entry").path();
+        let is_manifest = path
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("MANIFEST."));
+        if !is_manifest {
+            continue;
+        }
+        let mut bytes = std::fs::read(&path).expect("read manifest");
+        let offsets = rel_kind_offsets(&bytes);
+        patch(&mut bytes, offsets);
+        fix_manifest_crc(&mut bytes);
+        std::fs::write(&path, &bytes).expect("write manifest");
+        touched += 1;
+    }
+    assert!(touched > 0, "fixture 缺 MANIFEST 文件");
+    Builder::default().path(dir).build()
+}
+
+/// FC-MODEL-POST-008(MANIFEST 冲突分支):关系类型表「同编号不同名」或
+/// 「同名不同编号」→ `Corrupted`。先用合法改写做对照组,证明字节定位与 CRC
+/// 重算真实改写到 `rel_kinds` 条目(不是靠破坏 CRC 触发解析失败)。
+#[test]
+fn manifest_rejects_conflicting_relation_kinds() {
+    // 对照组:第二条改为唯一编号 18 并提升 `next_rel_kind` → 可打开且映射生效。
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (first, _second) = rel_kind_fixture(dir.path());
+    let db = rewrite_manifests_and_reopen(dir.path(), |bytes, (_, second_kind, next)| {
+        bytes[second_kind..second_kind + 2].copy_from_slice(&18_u16.to_le_bytes());
+        bytes[next..next + 2].copy_from_slice(&19_u16.to_le_bytes());
+    })
+    .expect("合法改写必须可打开");
+    let ns = db.namespace("n");
+    assert_eq!(ns.relation_kind("rel_a").expect("rel_a"), first);
+    assert_eq!(ns.relation_kind("rel_b").expect("rel_b"), RelationKind(18));
+    db.close().expect("close");
+
+    // 同编号不同名:第二条的编号改成第一条。
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (first, _second) = rel_kind_fixture(dir.path());
+    let error = rewrite_manifests_and_reopen(dir.path(), |bytes, (_, second_kind, _)| {
+        bytes[second_kind..second_kind + 2].copy_from_slice(&first.0.to_le_bytes());
+    })
+    .expect_err("同编号不同名必须拒绝");
+    assert!(matches!(error, MnemeError::Corrupted { .. }), "{error:?}");
+
+    // 同名不同编号:第二条的名称改成第一条(等长原地改写)。
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (_first, _second) = rel_kind_fixture(dir.path());
+    let error = rewrite_manifests_and_reopen(dir.path(), |bytes, (rel_start, second_kind, _)| {
+        let first_name = bytes[rel_start + 6..second_kind].to_vec();
+        bytes[second_kind + 6..second_kind + 6 + first_name.len()].copy_from_slice(&first_name);
+    })
+    .expect_err("同名不同编号必须拒绝");
+    assert!(matches!(error, MnemeError::Corrupted { .. }), "{error:?}");
 }

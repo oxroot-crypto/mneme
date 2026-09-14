@@ -324,8 +324,11 @@ impl Namespace {
             // 保证提交失败时旧版本保持原样(FC-MEM-PRE-002 零部分写入)。
             ws.commit_version(rowid, slot_data)?;
             {
-                let slots = Arc::make_mut(&mut ws.slots);
-                let old = Arc::make_mut(&mut slots[latest.get() as usize]);
+                let old = Arc::make_mut(
+                    Arc::make_mut(&mut ws.slots)
+                        .get_mut(latest.get() as usize)
+                        .expect("latest 槽位必在界内(FC-MEM-INV-004)"),
+                );
                 old.valid_to = Some(new_valid_from);
             }
             Ok(UpdateOutcome::Updated(rowid))

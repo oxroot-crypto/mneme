@@ -4,13 +4,21 @@ Mneme:纯 Rust 的嵌入式向量存储引擎(面向 AI Agent 超长期记忆)�
 MSRV 1.93。**当前实现了 L0 原语层 `src/core/`、L1 内存引擎 `src/memory/`、L2 持久层
 `src/persist/`、L3 索引层 `src/index/`、L4 检索层 `src/query/`、L5 生命周期层
 `src/life/` 与 L6 打磨层 `src/quant/` + `feature = "async"` 门面**(WAL 轮转、增量段、
-MANIFEST、崩溃恢复、size-tiered compaction、自研 HNSW、过滤三档、hidx 图持久化、
+MANIFEST、崩溃恢复、size-tiered compaction、自研 HNSW(默认混合精度建图
+`BuildPrecision::Hybrid`:i8 临时码流遍历 + f32 精排选邻,可回退全 f32)、过滤三档、hidx 图持久化、
 mmap 段读取、过滤 DSL、zone map/bloom/ttl_map 计划器、BM25、RRF/加权融合、msec
 轻量索引四区与 delta 区、后台维护线程、命名空间/快照/备份/统计、i8/f16 量化副本 +
 两阶段精排 + 建段抽样回退、`AsyncNamespace`)。L2 依赖 `crc32fast`;L3 经 feature
 `mmap`(默认开)引入 `memmap2`;L6 经 feature `async` 引入 `tokio`(仅 `rt`)、经
-feature `quant-f16` 引入 `half`;`criterion` 为 dev-dependency。
-1M×1536 性能门槛、fuzz 长跑与 mmap 惰性段句柄重构(冷启动 <1s)仍属 CI/后续收尾。
+feature `quant-f16` 引入 `half`;L11 静态加密经 feature `encrypt` 引入 `aes-gcm` +
+`getrandom`,压缩经 feature `compress`(自研 LZ4 风格,零依赖)/`compress-zstd`
+引入 `zstd`;`criterion` 为 dev-dependency。
+**L1–L6 收尾与 09/10/11/12 扩充已落地**(段句柄惰性驻留、候选放大/偏置路由、
+自定义关系注册表、加密/压缩、`Storage` 后端与只读共享、`Observer`、写视图索引分片/分块
+COW);1M×1536
+性能门槛与 fuzz 长跑由本机/专用 runner 手动执行(不上 CI),1M 正式门槛待
+≥16GB 专用 runner;
+`wasm` feature 已接线,目标构建验证留 CI 的 `wasm-check` job。
 
 ## 契约优先工作流(FSVDD,强制)
 
@@ -61,6 +69,15 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test                 # 单测 + 集成 + doctest
 cargo doc --no-deps        # 公开项须 100% 文档覆盖
+
+# 重门槛手动执行(不上 CI,需本机/专用 runner;默认 50_000×128 冒烟)
+# 建库并行:默认块级串行 + 块内 HNSW 批并行(Builder::parallelism,0=可用核数);
+# 块级并行经 MNEME_FLUSH_THREADS 显式开启(大内存/多核 runner 再试 2/4/8):
+#   MNEME_FLUSH_THREADS=2 MNEME_HEAVY=1 cargo test --release --test cold_start -- --ignored
+MNEME_HEAVY=1 cargo test --release --test cold_start --test heavy_gate -- --ignored
+cargo test --release       # FC-GLOBAL-CPLX-001 复杂度操作计数
+DURATION=3600 ./fuzz/scripts/run_long.sh    # fuzz 长跑(nightly + cargo-fuzz)
+cargo mutants --no-shuffle --timeout 300    # 变异测试(mutants.toml;不阻断)
 ```
 
 提交前按 fmt → clippy → test → doc 顺序跑。当前全绿,可作为基线。
@@ -68,16 +85,21 @@ cargo doc --no-deps        # 公开项须 100% 文档覆盖
 ## 尚未可用,别踩
 
 - `[features]` 已定义:`mmap`(默认开,引入 `memmap2`)、`quant-f16`(引入 `half`)、
-  `async`(引入 `tokio` 的 `rt`)、`fuzzing`(fuzz 专用解析入口,无依赖);
-  `encrypt`/`compress`/`compress-zstd`/`wasm` 仍待对应层落地。
+  `async`(引入 `tokio` 的 `rt`)、`fuzzing`(fuzz 专用解析入口,无依赖)、
+  `encrypt`(引入 `aes-gcm` + `getrandom`)、`compress`(零依赖)、
+  `compress-zstd`(引入 `zstd`)、`wasm`(关闭 mmap/后台线程;feature 已接线,
+  目标构建验证留 CI 的 `wasm-check` job)。
 - `cargo test --features async` / `--features quant-f16` / `--all-features` 均可跑;
   `AsyncNamespace` 的点读返回 owned `StoredRecord`(含 `RowId`)。
 - `benches/hnsw.rs` 与 `benches/quant.rs`(criterion,dev-dependency)已引入;
-  `cargo bench` 的 1M×1536 正式门槛/趋势图仍待 CI。
+  heavy 门槛(冷启动/吞吐/延迟)不上 CI,由本机/专用 runner 手动跑,规模可经
+  `MNEME_HEAVY_ROWS`/`MNEME_HEAVY_DIM` 覆盖(默认 50_000×128 冒烟、回归建议
+  100_000×128,吞吐/延迟门槛只在正式 1M×1536 下断言——待 ≥16GB 专用 runner);
+  夜间趋势图与基线回归 >10% 阻断待基线入库。
 - `fuzz/` 五目标骨架已搭起(独立 workspace,需 nightly + `cargo-fuzz`);
   `cargo test` 不编译 `fuzz/`,仓库内以 `src/fuzzing.rs` 冒烟单测兜底。
 - 契约追溯门禁为 `tests/contract_traceability.rs`(随 `cargo test` 运行,校验契约↔测试双向映射);仓库内**没有** `xtask/` 或 `xtask check-contracts`,不要试图运行。
-- 仓库内没有 CI 配置文件(`.gitlab-ci.yml` 等均缺失);CI 四档定义只在 `docs/design/14-testing.md §7`。
+- `.gitlab-ci.yml` 只跑轻量两档 fast + middle(每次 push / MR;GitLab runner 已配置并通过首跑);heavy/fuzz/mutation 等重门槛不上 CI,由本机/专用 runner 手动执行(命令见上「命令」段),档位与触发定义见 `docs/design/14-testing.md §7`。
 
 ## 测试
 

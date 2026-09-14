@@ -110,20 +110,25 @@ pub(crate) fn build_params(vectors: &[&[f32]], dimension: usize) -> Result<I8Par
 }
 
 /// 单行编码:`q_i = round((x_i − v_min_i)/Δ_i)` 钳到 `[0, 255]`;退化维恒 0。
+#[cfg(test)]
 pub(crate) fn encode_row(vector: &[f32], params: &I8Params) -> Vec<u8> {
+    let mut out = Vec::with_capacity(vector.len());
+    encode_row_into(&mut out, vector, params);
+    out
+}
+
+/// 追加单行编码到 `out`(段级批量编码用,免每行一次 `Vec` 分配)。
+pub(crate) fn encode_row_into(out: &mut Vec<u8>, vector: &[f32], params: &I8Params) {
     debug_assert_eq!(vector.len(), params.dimension());
-    vector
-        .iter()
-        .enumerate()
-        .map(|(dim, &value)| {
-            let delta = params.delta(dim);
-            if delta == 0.0 {
-                return 0_u8;
-            }
-            let code = ((value - params.min(dim)) / delta).round();
-            code.clamp(0.0, MAX_CODE) as u8
-        })
-        .collect()
+    for (dim, &value) in vector.iter().enumerate() {
+        let delta = params.delta(dim);
+        if delta == 0.0 {
+            out.push(0_u8);
+            continue;
+        }
+        let code = ((value - params.min(dim)) / delta).round();
+        out.push(code.clamp(0.0, MAX_CODE) as u8);
+    }
 }
 
 /// 单行解码 `x̂_i = v_min_i + q_i · Δ_i`(误差界验证与测试对照用)。

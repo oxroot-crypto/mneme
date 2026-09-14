@@ -157,8 +157,9 @@ pub(crate) fn validate_patch(config: &Config, patch: &UpdatePatch) -> Result<()>
 
 /// 由输入构造一个物理版本(消费记录,向量零拷贝转移)。
 pub(crate) fn build_slot(spec: SlotSpec) -> SlotData {
-    let vector: Arc<[f32]> = Arc::from(spec.rec.vector.into_boxed_slice());
-    let norm_sq = search::norm_sq(&vector);
+    let owned: Arc<[f32]> = Arc::from(spec.rec.vector.into_boxed_slice());
+    let norm_sq = search::norm_sq(&owned);
+    let vector = crate::memory::lazy::VectorStorage::owned(owned);
     let text: Option<Arc<str>> = spec.rec.text.map(Arc::from);
     let text_hash = text.as_ref().map(|text| dedup::fnv1a64(text.as_bytes()));
     let expires_at = spec

@@ -1,0 +1,99 @@
+# Mneme CI(设计 14 §7)。只保留轻量档:fast + middle。
+#
+# fast     每次推送:fmt + clippy(-D warnings)+ 单测 + feature 矩阵
+#          + rustdoc 门禁(doc-check)+ wasm32 目标构建检查(wasm-check)
+# middle   每次 MR:全量契约集成(L2–L6)+ f16 跨 feature 矩阵 + encrypt 跨 feature 矩阵
+#
+# 重门槛不上 CI(要 ≥16GB 内存或数小时,避免普通 push/MR 排队):
+# - heavy(冷启动 <1s / 建库吞吐 / 查询延迟)与复杂度操作计数:本机或专用 runner
+#   手动执行(见设计 14 §4/§7、AGENTS.md「命令」):
+#     MNEME_HEAVY=1 cargo test --release --test cold_start -- --ignored
+#     MNEME_HEAVY=1 cargo test --release --test heavy_gate -- --ignored
+#     cargo test --release            # FC-GLOBAL-CPLX-001 操作计数
+#   规模由 `MNEME_HEAVY_ROWS`/`MNEME_HEAVY_DIM` 配置(默认 50_000×128 冒烟,
+#   回归建议 100_000×128;正式门槛 1M×1536 待专用 runner)。
+# - fuzz 长跑(夜跑 5 目标)与 mutation(cargo-mutants)同理手动执行,
+#   `fuzz/scripts/run_long.sh` 与 `mutants.toml` 保持可用。
+
+stages:
+  - fast
+  - middle
+
+variables:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+default:
+  image: rust:1.93
+  cache:
+    key:
+      files:
+        - Cargo.lock
+    paths:
+      - target/
+
+fmt-clippy:
+  stage: fast
+  script:
+    - rustup component add rustfmt clippy
+    - cargo fmt --all -- --check
+    - cargo clippy --all-targets --all-features -- -D warnings
+
+test-matrix:
+  stage: fast
+  script:
+    - cargo test
+    - cargo test --all-features
+    - cargo test --no-default-features
+
+# 公开项 100% 文档覆盖(AGENTS.md 提交前 fmt → clippy → test → doc);
+# RUSTDOCFLAGS=-D warnings 使 rustdoc 告警即失败,防止文档漂移。
+doc-check:
+  stage: fast
+  script:
+    - RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+    - RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+
+# 设计 12 §3.2:feature `wasm` 关闭 mmap 与后台线程并行,配合
+# `--no-default-features` 在 wasm32-unknown-unknown 上可构建。
+# wasm 目标无法运行测试,CI 只做构建检查;默认 target 的 feature 组合
+# 已由 fmt-clippy(`--all-features`)与 test-matrix 覆盖。
+wasm-check:
+  stage: fast
+  script:
+    - rustup target add wasm32-unknown-unknown
+    - cargo check --target wasm32-unknown-unknown --no-default-features --features wasm
+
+middle-contracts:
+  stage: middle
+  script:
+    - cargo test --test persist_contracts
+    - cargo test --test hnsw_contracts
+    - cargo test --test l4_contracts
+    - cargo test --test l5_contracts
+    - cargo test --test l6_contracts
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# FC-QUANT-ERR-002 跨 feature 端到端:单构建无法覆盖,分两次构建执行。
+quant-f16-cross-feature:
+  stage: middle
+  script:
+    - export MNEME_F16_FIXTURE="$CI_PROJECT_DIR/.ci/f16_fixture"
+    - rm -rf "$MNEME_F16_FIXTURE"
+    - cargo test --features quant-f16 --test l6_contracts write_f16_fixture_for_cross_feature_check -- --ignored
+    - cargo test --test l6_contracts open_f16_fixture_requires_feature -- --ignored
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# FC-SEC-ERR-001 跨 feature 端到端:加密库在未开 `encrypt` 的构建上必须返回
+# `Unsupported`、绝不按明文解析;同样需两次不同 feature 的构建(同 f16 矩阵)。
+encrypt-cross-feature:
+  stage: middle
+  script:
+    - export MNEME_ENCRYPT_FIXTURE="$CI_PROJECT_DIR/.ci/encrypt_fixture"
+    - rm -rf "$MNEME_ENCRYPT_FIXTURE"
+    - cargo test --features encrypt --test security_contracts write_encrypted_fixture_for_cross_feature_check -- --ignored
+    - cargo test --test security_contracts open_encrypted_fixture_requires_feature -- --ignored
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"

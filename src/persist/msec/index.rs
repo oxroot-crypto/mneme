@@ -312,7 +312,9 @@ mod tests {
             ns_path: Arc::from("n"),
             seqno: SeqNo::new(index as u64 + 1),
             key: Some(Key::new(format!("k{index}"))),
-            vector: Arc::from(vec![0.0_f32].into_boxed_slice()),
+            vector: crate::memory::lazy::VectorStorage::owned(Arc::from(
+                vec![0.0_f32].into_boxed_slice(),
+            )),
             norm_sq: 0.0,
             text: None,
             text_hash: None,

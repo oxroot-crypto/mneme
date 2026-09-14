@@ -5,4 +5,5 @@ use libfuzzer_sys::fuzz_target;
 
 fuzz_target!(|data: &[u8]| {
     mneme::fuzzing::replay_wal(data);
+    mneme::fuzzing::version_injection(data);
 });

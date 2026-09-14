@@ -45,7 +45,12 @@ struct BatchCommitInput<'a> {
 /// # Errors
 /// 文件头损坏、未知帧类型(FC-PERSIST-ERR-001)或批提交计数/CRC 不符时返回错误
 /// (尾部撕裂帧由 [`wal::visit_frames`] 自行停止)。
-pub(crate) fn replay_wal(state: &mut WriterState, bytes: &[u8], watermark: u64) -> Result<usize> {
+pub(crate) fn replay_wal(
+    state: &mut WriterState,
+    bytes: &[u8],
+    watermark: u64,
+    encryption: Option<&crate::crypto::Encryption>,
+) -> Result<usize> {
     if bytes.len() < wal::FILE_HEADER_LEN {
         return Ok(0);
     }
@@ -56,6 +61,18 @@ pub(crate) fn replay_wal(state: &mut WriterState, bytes: &[u8], watermark: u64) 
         watermark,
     };
     wal::visit_frames(bytes, |seqno, kind, payload, end| {
+        // 加密帧(信封)先解密;未开 feature/未配置加密的库遇信封显式拒绝,
+        // 绝不把密文当负载继续解析(FC-SEC-INV-028)。
+        let decrypted;
+        let payload = if crate::crypto::is_envelope(payload) {
+            let Some(encryption) = encryption else {
+                return Err(MnemeError::Unsupported { feature: "encrypt" });
+            };
+            decrypted = crate::crypto::open(encryption, b"wal", seqno, payload)?;
+            decrypted.as_slice()
+        } else {
+            payload
+        };
         apply_frame(
             state,
             &mut buffers,
@@ -182,7 +199,7 @@ mod tests {
         ));
         let mut state = WriterState::new();
         assert!(matches!(
-            replay_wal(&mut state, &bytes, 0),
+            replay_wal(&mut state, &bytes, 0, None),
             Err(MnemeError::Corrupted { .. })
         ));
     }
@@ -205,7 +222,7 @@ mod tests {
         ));
         let mut state = WriterState::new();
         assert!(matches!(
-            replay_wal(&mut state, &bytes, 0),
+            replay_wal(&mut state, &bytes, 0, None),
             Err(MnemeError::Corrupted { .. })
         ));
     }
@@ -227,7 +244,7 @@ mod tests {
             &wal::encode_batch_commit(1, batch_crc(&[register])),
         ));
         let mut state = WriterState::new();
-        let committed = replay_wal(&mut state, &bytes, 0).expect("valid batch");
+        let committed = replay_wal(&mut state, &bytes, 0, None).expect("valid batch");
         assert_eq!(committed, bytes.len());
         assert_eq!(state.next_ns_id, 2);
     }
@@ -246,7 +263,7 @@ mod tests {
         bytes.extend_from_slice(&wal::encode_frame(1, FrameKind::NsRegister, &register));
         // 故意缺 BatchCommit。
         let mut state = WriterState::new();
-        let committed = replay_wal(&mut state, &bytes, 0).expect("unclosed batch");
+        let committed = replay_wal(&mut state, &bytes, 0, None).expect("unclosed batch");
         assert_eq!(committed, after_header, "未闭合批不得计入已提交长度");
     }
 
@@ -255,6 +272,9 @@ mod tests {
     fn short_wal_header_is_treated_as_torn() {
         let bytes = [b'W', b'A', b'L', b'1', 0x01];
         let mut state = WriterState::new();
-        assert_eq!(replay_wal(&mut state, &bytes, 0).expect("torn header"), 0);
+        assert_eq!(
+            replay_wal(&mut state, &bytes, 0, None).expect("torn header"),
+            0
+        );
     }
 }

@@ -19,6 +19,7 @@
 use std::sync::Arc;
 
 use crate::core::meta::Meta;
+use crate::core::options::Compression;
 use crate::core::types::{Key, NsId, RowId, SeqNo};
 
 mod decode;
@@ -30,7 +31,9 @@ mod inverted;
 
 pub(crate) use decode::{MsecView, parse};
 pub(crate) use delta::{DeltaEntry, decode_delta, encode_delta};
-pub(crate) use encode::{encode, encode_entry};
+#[cfg(test)]
+pub(crate) use encode::encode_entry;
+pub(crate) use encode::{encode, encode_entry_into};
 pub(crate) use entry::entry_from_prefix;
 pub(crate) use index::{
     FieldDef, FieldKind, decode_bloom, decode_field_dict, decode_ttl_map, encode_bloom,
@@ -72,6 +75,13 @@ const FLAG_ACCESS: u8 = 1 << 4;
 const FLAG_VALID_TIME: u8 = 1 << 5;
 const FLAG_CONFIDENCE: u8 = 1 << 6;
 const FLAG_PROVENANCE: u8 = 1 << 7;
+
+/// `flags2`:text 字段压缩(自描述 blob)。
+const FLAG2_TEXT_COMPRESSED: u8 = 1 << 0;
+/// `flags2`:meta 字段压缩。
+const FLAG2_META_COMPRESSED: u8 = 1 << 1;
+/// `flags2`:provenance 字段压缩。
+const FLAG2_PROVENANCE_COMPRESSED: u8 = 1 << 2;
 
 /// 一条记录的元数据(不含向量;向量在 vsec)。
 #[derive(Debug, Clone, PartialEq)]
@@ -178,6 +188,8 @@ pub(crate) struct MsecInput<'a> {
     pub(crate) bloom: &'a [u8],
     /// 倒排区(空表也带版头),恒非空。
     pub(crate) inverted: &'a [u8],
+    /// 文本/元数据压缩策略(仅影响记录体 text/meta/provenance 字段)。
+    pub(crate) compression: Compression,
 }
 
 /// msec 各数据区偏移/长度。
@@ -264,6 +276,7 @@ mod tests {
             zmap: &[],
             bloom: &[],
             inverted: &[],
+            compression: Compression::None,
         })
         .expect("encode")
     }
@@ -272,7 +285,7 @@ mod tests {
     #[test]
     fn msec_entry_roundtrip() {
         let entry = body(7, 9, 3, Some("k"));
-        let bytes = encode_entry(&entry).expect("encode");
+        let bytes = encode_entry(&entry, Compression::None).expect("encode");
         assert_eq!(entry_from_prefix(&bytes).expect("decode"), entry);
     }
 

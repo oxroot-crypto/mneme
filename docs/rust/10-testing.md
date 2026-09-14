@@ -604,8 +604,8 @@ b.iter(|| {
 - `sample_size(10)` / `measurement_time(Duration::from_secs(10))` 是"这个基准太重,少采几次、
   每次测久点"的取舍:默认 100 个样本对"建 4k×512 库 + 查询"太贵。采样越少统计噪声越大,
   适合前后对比而非绝对数字;
-- 为什么用微缩规模:1M×1536 的正式门槛属于 CI heavy 档,仓库当前没有 CI 配置,
-  所以 `benches/quant.rs` 先用 4k×512 / 8k×128 做趋势对照(见文件头注释
+- 为什么用微缩规模:1M×1536 的正式门槛属于 CI heavy 档(已接线 `.gitlab-ci.yml`,
+  待 runner 首跑),所以 `benches/quant.rs` 先用 4k×512 / 8k×128 做趋势对照(见文件头注释
   [`benches/quant.rs:1-6`](../../benches/quant.rs))。
 
 运行:

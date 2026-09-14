@@ -4,22 +4,22 @@
 //! 业务状态,只负责目录扫描、原子提交与保留最近 `MANIFEST_KEEP` 版。
 
 use std::collections::HashSet;
-use std::path::Path;
+use std::sync::Arc;
 
 use crate::core::error::{MnemeError, Result};
-use crate::persist::crc32;
 use crate::persist::hook::{FsyncHook, IoAction};
 use crate::persist::manifest::{self, Manifest};
 use crate::persist::recover::SegmentBytes;
+use crate::persist::source::SegmentHandle;
 use crate::persist::storage::{
-    self, CURRENT_FILE, MANIFEST_KEEP, SEGMENTS_DIR, WAL_DIR, hidx_name, manifest_name, msec_name,
-    parse_manifest_name, vsec_name,
+    CURRENT_FILE, MANIFEST_KEEP, SEGMENTS_DIR, Storage, WAL_DIR, hidx_name, manifest_name,
+    msec_name, parse_manifest_name, vsec_name,
 };
 
 /// 清理 `segments/`、`wal/` 与根目录下的 `.tmp` 半成品(崩溃点 `Building` 孤儿)。
-pub(super) fn cleanup_orphans(root: &Path) -> Result<()> {
+pub(super) fn cleanup_orphans(storage: &dyn Storage) -> Result<()> {
     for dir in [SEGMENTS_DIR, WAL_DIR, ""] {
-        for name in storage::list_dir(root, dir)? {
+        for name in storage.list_dir(dir)? {
             if !name.ends_with(".tmp") {
                 continue;
             }
@@ -28,7 +28,7 @@ pub(super) fn cleanup_orphans(root: &Path) -> Result<()> {
             } else {
                 format!("{dir}/{name}")
             };
-            storage::remove_if_exists(&storage::resolve(root, &rel)?)?;
+            storage.remove_if_exists(&rel)?;
         }
     }
     Ok(())
@@ -39,25 +39,31 @@ pub(super) fn cleanup_orphans(root: &Path) -> Result<()> {
 /// 返回 `Ok(None)` 仅表示"全新库"(`current`/`MANIFEST.*` 均不存在)。
 /// 若 `current` 存在但 `current` 指向的 MANIFEST 与目录内其余 `MANIFEST.*`
 /// 全部非法,返回 [`MnemeError::Corrupted`]——**绝不**当作新库覆盖(设计 16 §3)。
-pub(super) fn load_manifest(root: &Path) -> Result<Option<(Manifest, u64)>> {
-    let has_current = storage::exists(&root.join(CURRENT_FILE))?;
-    if let Some(bytes) = storage::read_file_opt(root, CURRENT_FILE)? {
+/// 加密库在未开 `encrypt` 的构建上打开时,信封探测的 [`MnemeError::Unsupported`]
+/// 必须原样上抛(`FC-SEC-ERR-001`):缺 feature 属全局配置错误,不得归入
+/// 「无合法 MANIFEST」的 `Corrupted` 而丢失根因。
+pub(super) fn load_manifest(
+    storage: &dyn Storage,
+    encryption: Option<&crate::crypto::Encryption>,
+) -> Result<Option<(Manifest, u64)>> {
+    let has_current = storage.exists(CURRENT_FILE)?;
+    if let Some(bytes) = storage.read_file_opt(CURRENT_FILE)? {
         let text = String::from_utf8_lossy(&bytes);
         if let Ok(version) = text.trim().parse::<u64>()
-            && let Some(bytes) = storage::read_file_opt(root, &manifest_name(version))?
-            && let Ok(manifest) = manifest::parse(&bytes)
+            && let Some(manifest) =
+                try_load_version(storage, encryption, &manifest_name(version), version)?
         {
             return Ok(Some((manifest, version)));
         }
     }
-    // 回退:扫描目录取最大的、CRC 合法的版本。
+    // 回退:扫描目录取最大的、CRC 合法的版本。用目录里的实际文件名读取
+    // (解析允许前导零等非规范写法,重建名会读空)。
     let mut best: Option<(Manifest, u64)> = None;
-    for name in storage::list_dir(root, "")? {
+    for name in storage.list_dir("")? {
         let Some(version) = parse_manifest_name(&name) else {
             continue;
         };
-        if let Some(bytes) = storage::read_file_opt(root, &name)?
-            && let Ok(manifest) = manifest::parse(&bytes)
+        if let Some(manifest) = try_load_version(storage, encryption, &name, version)?
             && best
                 .as_ref()
                 .is_none_or(|(_, best_version)| version > *best_version)
@@ -74,9 +80,36 @@ pub(super) fn load_manifest(root: &Path) -> Result<Option<(Manifest, u64)>> {
     Ok(best)
 }
 
+/// 尝试载入单个版本:`Ok(None)` = 该版本不存在或数据非法,可继续回退扫描。
+///
+/// # Errors
+/// 信封探测遇未开 `encrypt` 的构建/未配置密钥 → [`MnemeError::Unsupported`]
+/// 原样上抛(绝不归入 `Corrupted`,见 `FC-SEC-ERR-001`);读取 I/O 失败透传。
+fn try_load_version(
+    storage: &dyn Storage,
+    encryption: Option<&crate::crypto::Encryption>,
+    name: &str,
+    version: u64,
+) -> Result<Option<Manifest>> {
+    let Some(bytes) = storage.read_file_opt(name)? else {
+        return Ok(None);
+    };
+    let plain = match crate::crypto::decrypt_file(encryption, b"manifest", version, bytes) {
+        Ok(plain) => plain,
+        // reason: 缺 `encrypt` 能力或库未配置密钥时所有 MANIFEST 都解不开,属全局
+        // 配置错误;必须上抛根因,不得按「版本非法」静默回退(FC-SEC-ERR-001)。
+        Err(error @ MnemeError::Unsupported { .. }) => return Err(error),
+        // reason: 单个版本解密/认证失败可能是密钥轮换残档或该文件损坏;保留
+        // 「扫描其他合法版本」的回退语义,全部失败才报 `Corrupted`。
+        Err(_) => return Ok(None),
+    };
+    Ok(manifest::parse(&plain).ok())
+}
+
 /// 列出 `segments/` 下的段文件(`.vsec`/`.msec`/`.hidx`)。
-pub(super) fn segment_files(root: &Path) -> Result<Vec<String>> {
-    Ok(storage::list_dir(root, SEGMENTS_DIR)?
+pub(super) fn segment_files(storage: &dyn Storage) -> Result<Vec<String>> {
+    Ok(storage
+        .list_dir(SEGMENTS_DIR)?
         .into_iter()
         .filter(|name| {
             name.ends_with(".vsec") || name.ends_with(".msec") || name.ends_with(".hidx")
@@ -85,7 +118,10 @@ pub(super) fn segment_files(root: &Path) -> Result<Vec<String>> {
 }
 
 /// 删除 MANIFEST 未引用的段文件(崩溃残留的 `Building`/`Obsolete` 孤儿)。
-pub(super) fn remove_unreferenced_segments(root: &Path, manifest: &Manifest) -> Result<()> {
+pub(super) fn remove_unreferenced_segments(
+    storage: &dyn Storage,
+    manifest: &Manifest,
+) -> Result<()> {
     let referenced: HashSet<String> = manifest
         .segments
         .iter()
@@ -97,9 +133,9 @@ pub(super) fn remove_unreferenced_segments(root: &Path, manifest: &Manifest) -> 
             ]
         })
         .collect();
-    for name in segment_files(root)? {
+    for name in segment_files(storage)? {
         if !referenced.contains(&name) {
-            storage::remove_if_exists(&storage::resolve(root, &format!("{SEGMENTS_DIR}/{name}"))?)?;
+            storage.remove_if_exists(&format!("{SEGMENTS_DIR}/{name}"))?;
         }
     }
     Ok(())
@@ -107,11 +143,14 @@ pub(super) fn remove_unreferenced_segments(root: &Path, manifest: &Manifest) -> 
 
 /// 提交 MANIFEST:写 `MANIFEST.<v>` → 写 `current` → 保留最近 `MANIFEST_KEEP` 版。
 pub(super) fn commit_manifest(
-    root: &Path,
+    storage: &dyn Storage,
     manifest: &Manifest,
     hook: Option<&dyn FsyncHook>,
+    encryption: Option<&crate::crypto::Encryption>,
 ) -> Result<()> {
-    let bytes = manifest::encode(manifest)?;
+    let encoded = manifest::encode(manifest)?;
+    let bytes =
+        crate::crypto::encrypt_file(encryption, b"manifest", manifest.manifest_version, &encoded)?;
     let name = manifest_name(manifest.manifest_version);
     if let Some(hook) = hook {
         hook.before(IoAction::Write {
@@ -120,7 +159,7 @@ pub(super) fn commit_manifest(
             len: bytes.len(),
         })?;
     }
-    storage::write_atomic(root, &name, &bytes)?;
+    storage.write_atomic(&name, &bytes)?;
     if let Some(hook) = hook {
         hook.before(IoAction::Write {
             file: CURRENT_FILE,
@@ -128,121 +167,54 @@ pub(super) fn commit_manifest(
             len: manifest.manifest_version.to_string().len(),
         })?;
     }
-    storage::write_atomic(
-        root,
+    storage.write_atomic(
         CURRENT_FILE,
         manifest.manifest_version.to_string().as_bytes(),
     )?;
     // reason: 提交点已过(新的 `MANIFEST.<v>` 已写、`current` 已原子切换);裁剪旧
     // 版本失败只遗留历史文件,不影响已提交状态,绝不因此让调用方以为提交失败
     // (避免"磁盘已换、内存未换"半同步)。
-    let _ = prune_manifests(root).ok();
+    let _ = prune_manifests(storage).ok();
     Ok(())
 }
 
 /// 删除多余的历史 MANIFEST,只保留最近 `MANIFEST_KEEP` 个。
-fn prune_manifests(root: &Path) -> Result<()> {
-    let mut versions: Vec<(u64, String)> = storage::list_dir(root, "")?
+fn prune_manifests(storage: &dyn Storage) -> Result<()> {
+    let mut versions: Vec<(u64, String)> = storage
+        .list_dir("")?
         .into_iter()
         .filter_map(|name| parse_manifest_name(&name).map(|version| (version, name)))
         .collect();
     versions.sort_by_key(|(version, _)| *version);
     while versions.len() > MANIFEST_KEEP {
         let (_, name) = versions.remove(0);
-        storage::remove_if_exists(&root.join(name))?;
+        storage.remove_if_exists(&name)?;
     }
     Ok(())
 }
 
-/// 读取 MANIFEST 所列各段的字节。
+/// 打开 MANIFEST 所列各段的惰性句柄(设计 04 §8/§11、FC-PERSIST-INV-021)。
 ///
 /// vsec/msec 必须存在且非空;缺失/为空返回 [`MnemeError::Corrupted`](否则会无声丢数据)。
 /// hidx 属**可选加速器**:缺失或 CRC 不符时,`fail_fast` 下报 `Corrupted`,否则返回
 /// `None`(调用方降级暴力,`check()` 另行报告),与设计 05 §12「索引是优化」一致。
-pub(super) fn read_segment_bytes(
-    root: &Path,
+/// 打开只读头部与 `node_table` 所需的文件信息,向量/邻接字节按需缺页。
+pub(super) fn open_segment_handles(
+    storage: &Arc<dyn Storage>,
     manifest: &Manifest,
     fail_fast: bool,
+    encryption: Option<&crate::crypto::Encryption>,
 ) -> Result<Vec<SegmentBytes>> {
     let mut segments = Vec::new();
     for segment in &manifest.segments {
-        let id = segment.segment_id;
-        let vsec = read_required_segment(root, id, &vsec_name(id))?;
-        let msec = read_required_segment(root, id, &msec_name(id))?;
-        let hidx = if segment.hidx_crc == 0 {
-            None
-        } else {
-            read_optional_index(root, id, segment.hidx_crc, fail_fast)?
-        };
-        segments.push(SegmentBytes {
-            segment_id: id,
-            vsec,
-            msec,
-            hidx,
-        });
+        let handle = SegmentHandle::open(
+            storage,
+            segment.segment_id,
+            segment.hidx_crc,
+            fail_fast,
+            encryption,
+        )?;
+        segments.push(SegmentBytes::from_handle(&handle));
     }
     Ok(segments)
-}
-
-/// 读取可选的 hidx 文件:存在且整文件 CRC 与 MANIFEST 相符时返回其字节。
-///
-/// 缺失/为空/CRC 不符时:可写非 fail-fast 打开返回 `None`(降级暴力);fail-fast
-/// 返回 [`MnemeError::Corrupted`]。
-fn read_optional_index(
-    root: &Path,
-    segment_id: u32,
-    expected_crc: u32,
-    fail_fast: bool,
-) -> Result<Option<Vec<u8>>> {
-    let name = hidx_name(segment_id);
-    let rel = format!("{SEGMENTS_DIR}/{name}");
-    let path = storage::resolve(root, &rel)?;
-    let bytes = match crate::persist::source::read_whole(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return if fail_fast {
-                Err(MnemeError::Corrupted {
-                    segment: Some(crate::core::types::SegmentId::new(segment_id)),
-                    reason: format!("MANIFEST 引用的 hidx 缺失:{name}"),
-                })
-            } else {
-                Ok(None)
-            };
-        }
-        Err(error) => return Err(error.into()),
-    };
-    if bytes.is_empty() || crc32(&bytes) != expected_crc {
-        return if fail_fast {
-            Err(MnemeError::Corrupted {
-                segment: Some(crate::core::types::SegmentId::new(segment_id)),
-                reason: format!("hidx 文件 CRC 与 MANIFEST 不符:{name}"),
-            })
-        } else {
-            Ok(None)
-        };
-    }
-    Ok(Some(bytes))
-}
-
-/// 读取一个被 MANIFEST 引用的段文件;不存在或为空返回 [`MnemeError::Corrupted`]。
-fn read_required_segment(root: &Path, segment_id: u32, name: &str) -> Result<Vec<u8>> {
-    let rel = format!("{SEGMENTS_DIR}/{name}");
-    let path = storage::resolve(root, &rel)?;
-    let bytes = match crate::persist::source::read_whole(&path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Err(MnemeError::Corrupted {
-                segment: Some(crate::core::types::SegmentId::new(segment_id)),
-                reason: format!("MANIFEST 引用的段文件缺失:{name}"),
-            });
-        }
-        Err(error) => return Err(error.into()),
-    };
-    if bytes.is_empty() {
-        return Err(MnemeError::Corrupted {
-            segment: Some(crate::core::types::SegmentId::new(segment_id)),
-            reason: format!("MANIFEST 引用的段文件为空:{name}"),
-        });
-    }
-    Ok(bytes)
 }

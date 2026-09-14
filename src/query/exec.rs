@@ -54,13 +54,15 @@ impl SearchBuilder<'_> {
     /// * 查询向量维度不符 → [`MnemeError::DimensionMismatch`];
     /// * `top_k`/`ef` 超上限 → [`MnemeError::LimitExceeded`];
     /// * MMR `lambda` 含非有限值 → [`MnemeError::Config`](`clamp` 对 NaN 失效会静默退化);
-    /// * `Scoring::bias_routing = true`(依赖 HNSW 启发式路由,尚未落地)
-    ///   → [`MnemeError::Unsupported`]:设置即拒绝,绝不静默忽略;
     /// * 库已关闭 → [`MnemeError::Closed`]。
     ///
     /// # Returns
     /// 命中列表,至多 `top_k` 条;未设置 `rerank` 时按最终分从优到劣排序。
     /// 命名空间未注册或无命中时返回空 `Vec`。
+    ///
+    /// `Scoring::bias_routing = true` 时启用 HNSW 前沿遍历偏置(重要度 + 归一化
+    /// 访问频次,只改访问顺序、不参与最终打分,`FC-SCORE-POST-007`);无 HNSW
+    /// 索引的段走暴力路径,偏置不生效但绝不报错。
     ///
     /// # Examples
     /// ```
@@ -75,20 +77,39 @@ impl SearchBuilder<'_> {
         // 查询延迟采样(固定 32 桶直方图;失败查询同样计入,便于定位慢路径)。
         let started = std::time::Instant::now();
         let result = self.execute_inner();
-        self.table
-            .record_query_latency(started.elapsed().as_secs_f64() * 1000.0);
-        result
+        let took = started.elapsed();
+        self.table.record_query_latency(took.as_secs_f64() * 1000.0);
+        // 事件可观测:成功发 Query(字段与实际操作一致),失败发 Error(FC-DEPLOY-INV-030)。
+        match &result {
+            Ok((hits, candidates)) => crate::core::observe::emit(
+                self.config.observer.as_ref(),
+                crate::core::observe::Event::Query {
+                    took,
+                    candidates: *candidates,
+                    returned: hits.len(),
+                    channels: u8::from(self.vector.is_some()) + u8::from(self.text.is_some()),
+                },
+            ),
+            Err(error) => crate::core::observe::emit(
+                self.config.observer.as_ref(),
+                crate::core::observe::Event::Error {
+                    kind: crate::core::observe::ErrorKind::of(error),
+                    context: "query::execute",
+                },
+            ),
+        }
+        result.map(|(hits, _candidates)| hits)
     }
 
     /// `execute` 的实际流水线(延迟采样包裹在外层)。
-    fn execute_inner(&self) -> Result<Vec<Hit>> {
+    fn execute_inner(&self) -> Result<(Vec<Hit>, usize)> {
         let view = self.prepare_view()?;
         self.validate_query()?;
         self.validate_fusion()?;
         self.validate_diversify()?;
         self.validate_dedup()?;
         let Some(ns_id) = self.resolve_ns_id(&view) else {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), 0));
         };
         // 历史视图(`as_of`)的 TTL 判定以视图时刻为准(设计 07 §25):
         // 记录在 `as_of(t)` 中可见当且仅当 `expires_at > t`,与墙上时钟无关。
@@ -96,7 +117,7 @@ impl SearchBuilder<'_> {
             .as_of
             .unwrap_or_else(|| self.config.clock.now_unix_ms());
         let view = self.apply_as_of(view);
-        let scored = self.run_channels(&view, ns_id, now)?;
+        let (scored, candidate_count) = self.run_channels(&view, ns_id, now)?;
         let (scored, via_map) = self.apply_expansion(&view, ns_id, scored, now);
         let ranked = self.rank(&view, scored, now);
         let hits = self.build_hits(&view, ranked, self.resolve_query_id(), &via_map);
@@ -105,7 +126,7 @@ impl SearchBuilder<'_> {
         if self.pinned.is_none() && self.as_of.is_none() && self.table.tracks_access_hits() {
             self.table.record_hits(hits.iter().map(|hit| hit.rowid));
         }
-        Ok(self.apply_rerank(hits))
+        Ok((self.apply_rerank(hits), candidate_count))
     }
 
     /// 取检索视图:优先钉住的快照,否则取当前读视图;校验关闭态与通道非空。
@@ -150,17 +171,6 @@ impl SearchBuilder<'_> {
                 field: "ef",
                 limit: self.config.limits.ef_max as usize,
                 got: ef,
-            });
-        }
-        // `bias_routing` 依赖 HNSW 遍历期启发式路由,尚未落地;设置即拒绝,
-        // 绝不静默忽略(FC-MEM-ERR-002、设计 10 §2.3)。
-        if self
-            .scoring
-            .as_ref()
-            .is_some_and(|scoring| scoring.bias_routing)
-        {
-            return Err(MnemeError::Unsupported {
-                feature: "Scoring::bias_routing",
             });
         }
         Ok(())
@@ -214,13 +224,7 @@ impl SearchBuilder<'_> {
 
     /// 解析命名空间路径对应的 `NsId`(未注册则 `None`)。
     fn resolve_ns_id(&self, view: &ReaderView) -> Option<NsId> {
-        view.ns_registry.iter().find_map(|(id, path)| {
-            if **path == *self.ns_path {
-                Some(*id)
-            } else {
-                None
-            }
-        })
+        view.ns_by_path.get(&*self.ns_path).copied()
     }
 
     /// 指定 `as_of` 时在版本链上重建历史视图。
@@ -235,8 +239,14 @@ impl SearchBuilder<'_> {
     ///
     /// 计划器做块级下推(zone map/bloom),两通道共享同一份候选位图(过滤先行,
     /// 与融合顺序无关,I6);双通道各取 `2k` 再融合取 `k`,单通道直接取 `k`。
-    fn run_channels(&self, view: &ReaderView, ns_id: NsId, now: i64) -> Result<Vec<Scored>> {
+    fn run_channels(
+        &self,
+        view: &ReaderView,
+        ns_id: NsId,
+        now: i64,
+    ) -> Result<(Vec<Scored>, usize)> {
         let plan = plan::compile(view, ns_id, self.filter.as_ref(), now);
+        let candidate_count = plan.candidates.len();
         // 不变量:选择性是候选/活行的比值,必落在 [0,1]。
         debug_assert!((0.0..=1.0).contains(&plan.selectivity));
         let candidates = &plan.candidates;
@@ -268,6 +278,16 @@ impl SearchBuilder<'_> {
                 candidates: Some(&plan.bits),
             })
         });
+        let fused = self.fuse_channels(vector_hits, text_hits)?;
+        Ok((fused, candidate_count))
+    }
+
+    /// 融合两通道结果:单通道直取;双通道按 `fusion` 策略融合(缺省 RRF)。
+    fn fuse_channels(
+        &self,
+        vector_hits: Option<Vec<Scored>>,
+        text_hits: Option<Vec<Scored>>,
+    ) -> Result<Vec<Scored>> {
         match (vector_hits, text_hits) {
             (Some(vector), Some(text)) => Ok(fusion::fuse(
                 vector,
@@ -287,14 +307,36 @@ impl SearchBuilder<'_> {
     }
 
     /// 向量通道(带共享候选位图)。
+    ///
+    /// `Scoring` 开启任一非相似度因子时把 ANN 探查宽度放大到
+    /// `ef' = max(ef, 4·top_k)`,让"相似度略低但综合分高"的记忆进入候选池;
+    /// 默认 `Scoring`(仅相似度)与未开启时不放大,排序与纯相似度路径全等
+    /// (FC-SCORE-POST-003)。
     fn run_vector(&self, ctx: &ChannelCtx<'_>, query: &[f32]) -> Result<Vec<Scored>> {
+        let ef = self.ef.unwrap_or(self.config.hnsw.ef_search as usize);
+        let ef = if self.scoring_needs_oversample() {
+            ef.max(ctx.top_k.saturating_mul(4))
+        } else {
+            ef
+        };
+        let bias_holder;
+        let bias = match self.scoring.as_ref() {
+            Some(scoring) if scoring.bias_routing => {
+                bias_holder = ScoringBias {
+                    view: ctx.view,
+                    c_norm: (scoring.c_norm.max(1)) as f32,
+                };
+                Some(&bias_holder as &dyn crate::memory::index::NodeBias)
+            }
+            _ => None,
+        };
         search::search(&search::SearchParams {
             view: ctx.view,
             ns_id: ctx.ns_id,
             query,
             metric: self.config.metric,
             top_k: ctx.top_k,
-            ef: self.ef.unwrap_or(self.config.hnsw.ef_search as usize),
+            ef,
             filter: self.filter.as_ref(),
             now_ms: ctx.now,
             block: self.config.tuning.parallel_block,
@@ -304,6 +346,18 @@ impl SearchBuilder<'_> {
             filter_brute_threshold: self.config.tuning.filter_brute_threshold,
             rescore_oversample: self.config.tuning.rescore_oversample,
             candidates: Some(ctx.candidates),
+            bias,
+        })
+    }
+
+    /// `Scoring` 是否开启了任一非相似度因子(决定候选放大与偏置路由的必要性)。
+    fn scoring_needs_oversample(&self) -> bool {
+        self.scoring.as_ref().is_some_and(|scoring| {
+            scoring.w_recency != 0.0
+                || scoring.w_importance != 0.0
+                || scoring.w_access != 0.0
+                || scoring.w_confidence != 0.0
+                || scoring.floor > 0.0
         })
     }
 
@@ -316,6 +370,9 @@ impl SearchBuilder<'_> {
     /// 沿关系边做联想扩展,返回扩展后的候选与来源边映射。
     ///
     /// 扩展只在本命名空间内推进,跨命名空间边视为不存在(`FC-SCORE-POST-004`)。
+    /// 与既有通道候选按 `RowId` 合并,分数取 `max(自身分, boost)`,同一记录绝不
+    /// 重复出现;`via` 只在扩展确有贡献(新增候选或提升分数)时记录
+    /// (`FC-SCORE-POST-006`)。
     fn apply_expansion(
         &self,
         view: &ReaderView,
@@ -324,21 +381,50 @@ impl SearchBuilder<'_> {
         now: i64,
     ) -> (Vec<Scored>, HashMap<RowId, Edge>) {
         let mut via_map: HashMap<RowId, Edge> = HashMap::new();
-        if let Some(expand) = &self.expand {
-            let ctx = ExpandCtx {
-                view,
-                ns_id,
-                expand,
-                filter: self.filter.as_ref(),
-                now,
+        if self.expand.is_none() {
+            return (scored, via_map);
+        }
+        let mut index_of: HashMap<RowId, usize> = scored
+            .iter()
+            .enumerate()
+            .map(|(index, candidate)| (candidate.rowid, index))
+            .collect();
+        // reason: `expand` 已在上方判空;此处取得引用供 `ExpandCtx` 使用。
+        let Some(expand) = &self.expand else {
+            return (scored, via_map);
+        };
+        let ctx = ExpandCtx {
+            view,
+            ns_id,
+            expand,
+            filter: self.filter.as_ref(),
+            now,
+            uses_access: self
+                .filter
+                .as_ref()
+                .is_some_and(crate::memory::pred::Expr::uses_access),
+        };
+        for (rowid, boost, edge) in expand_candidates(&ctx, &scored) {
+            let Some(slot) = view.live_slot(rowid) else {
+                continue;
             };
-            for (rowid, score_value, edge) in expand_candidates(&ctx, &scored) {
-                if let Some(slot) = view.live_slot(rowid) {
-                    via_map.insert(rowid, edge);
+            match index_of.get(&rowid).copied() {
+                Some(index) => {
+                    let existing = &mut scored[index];
+                    // max 合并:扩展分仅在更高时提升自身分(不比自身分差时保留原分)。
+                    if boost.total_cmp(&existing.score) == std::cmp::Ordering::Greater {
+                        existing.score = boost;
+                        existing.slot = slot;
+                        via_map.insert(rowid, edge);
+                    }
+                }
+                None => {
+                    index_of.insert(rowid, scored.len());
+                    via_map.insert(rowid, edge.clone());
                     scored.push(Scored {
                         slot,
                         rowid,
-                        score: score_value,
+                        score: boost,
                     });
                 }
             }
@@ -424,5 +510,29 @@ impl SearchBuilder<'_> {
             hits = reranker.rerank(&ctx, hits);
         }
         hits
+    }
+}
+
+/// `Scoring::bias_routing` 的遍历偏置:重要度 + 归一化访问频次。
+///
+/// 只被 [`crate::memory::search`] 传给 HNSW 前沿优先级,**不参与最终打分**
+/// (`FC-SCORE-POST-007`);`c_norm` 由调用方夹到 ≥1 防除零。
+struct ScoringBias<'a> {
+    view: &'a ReaderView,
+    c_norm: f32,
+}
+
+impl crate::memory::index::NodeBias for ScoringBias<'_> {
+    fn bias(&self, slot: crate::core::types::SlotId) -> f32 {
+        let Some(slot_data) = self.view.slots.get(slot.get() as usize) else {
+            return 0.0;
+        };
+        let access = self
+            .view
+            .access
+            .get(&slot_data.rowid)
+            .copied()
+            .unwrap_or_default();
+        slot_data.importance + (access.access_count as f32 / self.c_norm).min(1.0)
     }
 }

@@ -64,6 +64,7 @@ fn apply_frame(state: &mut WriterState, seqno: u64, kind: FrameKind, payload: &[
     match kind {
         FrameKind::NsRegister => apply_ns_register(state, payload),
         FrameKind::NsUnregister => apply_ns_unregister(state, payload),
+        FrameKind::RelKindRegister => apply_rel_kind_register(state, payload),
         FrameKind::Insert => apply_insert(state, payload),
         FrameKind::DeleteRow => {
             let (rowid, tx_ms) = wal::decode_delete_row(payload)?;
@@ -74,9 +75,7 @@ fn apply_frame(state: &mut WriterState, seqno: u64, kind: FrameKind, payload: &[
         }
         FrameKind::TouchRow => {
             let (rowid, at_ms, access_delta, _importance) = wal::decode_touch_row(payload)?;
-            let stat = Arc::make_mut(&mut state.access)
-                .entry(RowId::new(rowid))
-                .or_default();
+            let stat = state.access.get_or_insert_default(RowId::new(rowid));
             stat.access_count = stat.access_count.saturating_add(access_delta);
             stat.last_access_ms = at_ms;
             Ok(())
@@ -112,14 +111,23 @@ fn apply_ns_unregister(state: &mut WriterState, payload: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// 应用 `RelKindRegister` 帧:登记自定义关系类型;冲突/编号非法 → `Corrupted`。
+fn apply_rel_kind_register(state: &mut WriterState, payload: &[u8]) -> Result<()> {
+    let (kind, name) = wal::decode_rel_kind_register(payload)?;
+    state.register_recovered_rel_kind(kind, name)
+}
+
 /// 应用 `Insert` 帧。
 fn apply_insert(state: &mut WriterState, payload: &[u8]) -> Result<()> {
     let (entry, vector, tx_ms) = wal::decode_insert(payload)?;
+    let norm_sq = crate::memory::search::norm_sq(&vector);
+    let vector = crate::memory::lazy::VectorStorage::owned(Arc::from(vector.into_boxed_slice()));
     let slot = slot_from_entry(
         state,
         SlotFromEntry {
             entry: &entry,
             vector,
+            norm_sq,
             tx_ms,
             deleted: false,
         },
@@ -139,8 +147,8 @@ fn apply_relate(state: &mut WriterState, payload: &[u8]) -> Result<()> {
         weight,
         metadata: meta,
     };
-    relation::upsert_edge(Arc::make_mut(&mut state.out_edges), edge.clone());
-    relation::upsert_edge(Arc::make_mut(&mut state.in_edges), edge);
+    relation::upsert_edge_sharded(&mut state.out_edges, edge.clone());
+    relation::upsert_edge_sharded(&mut state.in_edges, edge);
     Ok(())
 }
 
@@ -149,8 +157,8 @@ fn apply_unrelate(state: &mut WriterState, payload: &[u8]) -> Result<()> {
     let (from, to, kind) = wal::decode_unrelate(payload)?;
     let (from, to) = (RowId::new(from), RowId::new(to));
     let kind = RelationKind(kind);
-    relation::remove_edge(Arc::make_mut(&mut state.out_edges), from, to, kind);
-    relation::remove_edge(Arc::make_mut(&mut state.in_edges), to, from, kind);
+    relation::remove_edge_sharded(&mut state.out_edges, from, to, kind);
+    relation::remove_edge_sharded(&mut state.in_edges, to, from, kind);
     Ok(())
 }
 
@@ -171,7 +179,7 @@ mod tests {
         ));
         let mut state = WriterState::new();
         assert!(matches!(
-            crate::persist::recover::replay_wal(&mut state, &bytes, 0),
+            crate::persist::recover::replay_wal(&mut state, &bytes, 0, None),
             Err(MnemeError::Corrupted { .. })
         ));
     }
@@ -188,7 +196,7 @@ mod tests {
         ));
         let mut state = WriterState::new();
         assert!(matches!(
-            crate::persist::recover::replay_wal(&mut state, &bytes, 0),
+            crate::persist::recover::replay_wal(&mut state, &bytes, 0, None),
             Err(MnemeError::Corrupted { .. })
         ));
     }
@@ -214,12 +222,18 @@ mod tests {
             confidence: None,
             provenance: None,
         };
-        let payload = wal::encode_insert(&entry, &[1.0, 0.0], 0).expect("encode_insert");
+        let payload = wal::encode_insert(
+            &entry,
+            &[1.0, 0.0],
+            0,
+            crate::core::options::Compression::None,
+        )
+        .expect("encode_insert");
         let mut bytes = wal::encode_file_header(1, Metric::Cosine).to_vec();
         bytes.extend_from_slice(&wal::encode_frame(1, FrameKind::Insert, &payload));
         let mut state = WriterState::new();
         assert!(matches!(
-            crate::persist::recover::replay_wal(&mut state, &bytes, 0),
+            crate::persist::recover::replay_wal(&mut state, &bytes, 0, None),
             Err(MnemeError::Corrupted { .. })
         ));
     }

@@ -57,9 +57,9 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 | `debug_assertions` | debug 构建 |
 | `not(...)` / `any(...)` / `all(...)` | 逻辑组合 |
 
-> `feature = "..."` 只在 `Cargo.toml` 声明了对应 feature 时才有意义。mneme 目前声明了
-> `mmap`(默认开启,见 [01 §4.2](01-toolchain.md))、`quant-f16`、`async` 与 `fuzzing`;
-> `encrypt`/`compress`/`compress-zstd`/`wasm` 等尚未定义,上表仅作语法示例。
+> `feature = "..."` 只在 `Cargo.toml` 声明了对应 feature 时才有意义。mneme 声明了
+> `mmap`(默认开启,见 [01 §4.2](01-toolchain.md))、`quant-f16`、`async`、`fuzzing`、
+> `encrypt`、`compress`、`compress-zstd` 与 `wasm`,上表仅作语法示例。
 
 ### 1.1 `cfg!` 宏:运行期用的布尔值
 

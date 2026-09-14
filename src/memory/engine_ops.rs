@@ -150,9 +150,15 @@ impl Mneme {
                 horizon: self.config.compaction.history_horizon,
             },
             storage: StorageStat {
-                encryption: false,
+                encryption: self
+                    .store
+                    .as_ref()
+                    .is_some_and(|store| store.encryption_enabled()),
                 compression: self.config.compression,
-                migrated_segments: 0,
+                migrated_segments: self
+                    .store
+                    .as_ref()
+                    .map_or(0, |store| store.migrated_segments()),
                 total_segments: store.total_segments,
             },
         })
@@ -274,6 +280,114 @@ fn append_fsck_suggestions(
 }
 
 impl Mneme {
+    /// 只读实例重载:发现更新的已提交 MANIFEST 时原子切换视图。
+    ///
+    /// # Returns
+    /// 切换后的新 MANIFEST 版本号;无新版本时 `None`(旧视图保持)。
+    ///
+    /// # Errors
+    /// 纯内存库/可写实例调用返回结构化错误;新版本损坏时保持旧视图并返回错误。
+    pub fn reload(&self) -> Result<Option<u64>> {
+        let Some(store) = &self.store else {
+            return Err(MnemeError::Unsupported {
+                feature: "纯内存库 reload",
+            });
+        };
+        if !store.read_only {
+            return Err(MnemeError::Config {
+                reason: "仅只读实例支持 reload",
+            });
+        }
+        match crate::persist::store::reload_read_only(store)? {
+            Some((state, version)) => {
+                self.table.publish(&state);
+                Ok(Some(version))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// 轮换静态加密密钥:`provider.rotate()` 后全量重写段与 MANIFEST。
+    ///
+    /// 迁移期间新旧密钥均可读(`KeyProvider` 需同时持有两者);全部段迁移完成后
+    /// 宿主可退役旧密钥(`Keyring::retire`)。纯内存库/未启用加密 → 结构化拒绝。
+    ///
+    /// # Returns
+    /// 新的 active 密钥标识。
+    ///
+    /// # Errors
+    /// 未启用加密、provider 未实现轮换、提交/写入失败时返回结构化错误
+    /// (`FC-SEC-POST-001`)。
+    pub fn rotate_encryption_key(&self) -> Result<crate::KeyId> {
+        let Some(store) = &self.store else {
+            return Err(MnemeError::Unsupported {
+                feature: "纯内存库密钥轮换",
+            });
+        };
+        let Some(encryption) = store.encryption_config().cloned() else {
+            return Err(MnemeError::Config {
+                reason: "库未启用加密,无密钥可轮换",
+            });
+        };
+        let new_id = encryption.provider.rotate()?;
+        self.rewrite_all_segments()?;
+        Ok(new_id)
+    }
+
+    /// 以"全部活跃段"为计划强制合并重写一次(密钥轮换/迁移专用)。
+    ///
+    /// 复用 compaction 的段组替换流程:新段以 active 密钥落盘、MANIFEST 同步重写,
+    /// 旧段进入 `trash/`;保留口径与常规 compaction 一致(`history_horizon`)。
+    fn rewrite_all_segments(&self) -> Result<()> {
+        let Some(store) = &self.store else {
+            return Ok(());
+        };
+        let view = self.table.view();
+        if view.closed {
+            return Err(MnemeError::Closed);
+        }
+        drop(view);
+        let mut ws = self.table.write();
+        if ws.closed {
+            return Err(MnemeError::Closed);
+        }
+        let manifest = store.manifest_snapshot();
+        let segments: Vec<u32> = manifest
+            .segments
+            .iter()
+            .map(|segment| segment.segment_id)
+            .filter(|id| !ws.unavailable_segments.contains(id))
+            .collect();
+        if segments.is_empty() {
+            return Ok(());
+        }
+        self.control
+            .mark_running(segments.iter().map(|id| SegmentId::new(*id)).collect());
+        let plan = crate::memory::ops::CompactionPlan { segments };
+        let now_ms = self.config.clock.now_unix_ms();
+        let survivors =
+            compact::select_survivors(&ws, &plan, now_ms, self.config.compaction.history_horizon);
+        let input = crate::persist::store::CompactInput {
+            plan: &plan,
+            keep_slots: &survivors.keep,
+            control: &self.control,
+        };
+        match store.compact(&mut ws, &self.config, &input) {
+            Ok(false) => {
+                self.control.mark_idle();
+                Ok(())
+            }
+            Ok(true) => {
+                self.finish_compaction(&mut ws, &survivors);
+                Ok(())
+            }
+            Err(error) => {
+                self.control.mark_idle();
+                Err(error)
+            }
+        }
+    }
+
     /// 返回后台合并控制句柄(与库共享同一状态)。
     ///
     /// # Returns

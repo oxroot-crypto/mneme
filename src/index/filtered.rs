@@ -126,6 +126,7 @@ fn brute_candidates(
                 vector: params.query,
                 norm_sq: params.query_norm,
                 quant: prepared,
+                bias: params.bias,
             },
             node,
         );
@@ -147,6 +148,7 @@ fn graph_candidates(
         vector: params.query,
         norm_sq: params.query_norm,
         quant: prepared,
+        bias: params.bias,
     };
     let top_level = index.max_level() as usize;
     let mut entry = index.entry_node();
@@ -194,7 +196,9 @@ mod tests {
                 let norm_sq = crate::core::simd::dot(&vector, &vector);
                 IndexNode {
                     rowid: RowId::new(row),
-                    vector: Arc::from(vector.into_boxed_slice()),
+                    vector: crate::memory::lazy::VectorStorage::owned(Arc::from(
+                        vector.into_boxed_slice(),
+                    )),
                     norm_sq,
                 }
             })
@@ -230,6 +234,7 @@ mod tests {
             post_threshold: post,
             brute_threshold: brute,
             use_quant: false,
+            bias: None,
         }
     }
 

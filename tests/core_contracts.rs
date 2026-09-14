@@ -17,6 +17,8 @@
 //! * FC-CORE-CPLX-002 —— `Metric::better` / `needs_norm` O(1)(解析证明哨兵)
 //! * FC-CORE-CPLX-005 —— varint 编解码 10 字节上界与最小编码(§9.2.1)
 //! * FC-CORE-CPLX-006 —— `meta::get_path` / 访问器复杂度(解析证明哨兵)
+//!
+//! 不变量锚定:无(I1–I30 自持久化/内存层起,L0 纯原语经 `FC-CORE-*` 锚定)。
 
 use std::cmp::Ordering;
 

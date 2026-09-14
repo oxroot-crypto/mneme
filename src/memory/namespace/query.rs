@@ -75,13 +75,7 @@ impl Namespace {
             return Err(MnemeError::Closed);
         }
         let now = self.config.clock.now_unix_ms();
-        let Some(ns_id) = view.ns_registry.iter().find_map(|(id, path)| {
-            if **path == *self.ns_path {
-                Some(*id)
-            } else {
-                None
-            }
-        }) else {
+        let Some(ns_id) = view.ns_by_path.get(&*self.ns_path).copied() else {
             return Ok(None);
         };
         Ok(point_get(&view, ns_id, &Key::new(key), now))
@@ -149,13 +143,7 @@ impl Namespace {
             return Err(MnemeError::Closed);
         }
         let now = self.config.clock.now_unix_ms();
-        let ns_id = view.ns_registry.iter().find_map(|(id, path)| {
-            if **path == *self.ns_path {
-                Some(*id)
-            } else {
-                None
-            }
-        });
+        let ns_id = view.ns_by_path.get(&*self.ns_path).copied();
         Ok(keys
             .iter()
             .map(|key| ns_id.and_then(|ns_id| point_get(&view, ns_id, &Key::new(*key), now)))

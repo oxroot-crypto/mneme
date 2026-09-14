@@ -9,7 +9,7 @@ use crate::core::error::{MnemeError, Result};
 ///
 /// 项目尚未发布,不存在需要读取的旧开发格式;任何版本差异都直接拒绝
 /// (不保留旧版本读取分支),详见 `AGENTS.md`「项目状态与兼容纪律」。
-pub(crate) const FORMAT_VERSION: u16 = 0x0005;
+pub(crate) const FORMAT_VERSION: u16 = 0x0006;
 
 /// 校验文件格式版本必须与 `expected` 完全一致(I18)。
 ///

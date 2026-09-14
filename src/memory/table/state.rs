@@ -4,12 +4,15 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::core::bitset::BitSet;
+use crate::core::chunked::ChunkedVec;
 use crate::core::error::{MnemeError, Result};
 use crate::core::meta::Meta;
 use crate::core::options::{RelationKind, VectorFormat};
+use crate::core::sharded::ShardedMap;
 use crate::core::types::{Key, NsId, RowId, SeqNo, SlotId};
 use crate::memory::analysis::{BLOOM_INITIAL_CAPACITY, BloomSet, InvertedIndex, ZoneIndex};
 use crate::memory::index::{SegmentIndex, VectorIndex};
+use crate::memory::lazy::VectorStorage;
 use crate::memory::relation::Edge;
 
 use super::view::ReaderView;
@@ -22,6 +25,20 @@ pub struct AccessStat {
     pub last_access_ms: i64,
     /// 累计访问次数。
     pub access_count: u32,
+}
+
+/// 自定义关系类型名称最大字节数(防注册表被超长名称膨胀)。
+const REL_KIND_NAME_MAX: usize = 128;
+
+/// 内置关系类型的名称解析(与 [`RelationKind`] 常量同名,便于宿主用字符串配置)。
+fn builtin_relation_kind(name: &str) -> Option<RelationKind> {
+    match name {
+        "derived_from" => Some(RelationKind::DERIVED_FROM),
+        "supports" => Some(RelationKind::SUPPORTS),
+        "contradicts" => Some(RelationKind::CONTRADICTS),
+        "related" => Some(RelationKind::RELATED),
+        _ => None,
+    }
 }
 
 /// 把槽位下标映射为 `SlotId`;超出 `u32::MAX` 时返回结构化错误,绝不静默饱和
@@ -44,7 +61,8 @@ pub(crate) struct SlotData {
     pub(crate) ns_path: Arc<str>,
     pub(crate) seqno: SeqNo,
     pub(crate) key: Option<Key>,
-    pub(crate) vector: Arc<[f32]>,
+    /// 向量(自有或段句柄惰性;统一经 `Deref` 读为 `&[f32]`)。
+    pub(crate) vector: Arc<VectorStorage>,
     pub(crate) norm_sq: f32,
     pub(crate) text: Option<Arc<str>>,
     pub(crate) text_hash: Option<u64>,
@@ -84,22 +102,33 @@ impl SlotData {
 pub(crate) struct WriterState {
     pub(crate) slots: Arc<Vec<Arc<SlotData>>>,
     pub(crate) dead: Arc<BitSet>,
-    pub(crate) key_index: Arc<HashMap<(NsId, Key), RowId>>,
-    pub(crate) text_index: Arc<HashMap<(NsId, u64), RowId>>,
-    pub(crate) versions: Arc<HashMap<RowId, Vec<SlotId>>>,
-    pub(crate) latest: Arc<HashMap<RowId, SlotId>>,
-    pub(crate) out_edges: Arc<HashMap<RowId, Vec<Edge>>>,
-    pub(crate) in_edges: Arc<HashMap<RowId, Vec<Edge>>>,
-    pub(crate) access: Arc<HashMap<RowId, AccessStat>>,
+    pub(crate) key_index: ShardedMap<(NsId, Key), RowId>,
+    pub(crate) text_index: ShardedMap<(NsId, u64), RowId>,
+    pub(crate) versions: ShardedMap<RowId, Arc<Vec<SlotId>>>,
+    pub(crate) latest: ShardedMap<RowId, SlotId>,
+    pub(crate) out_edges: ShardedMap<RowId, Vec<Edge>>,
+    pub(crate) in_edges: ShardedMap<RowId, Vec<Edge>>,
+    pub(crate) access: ShardedMap<RowId, AccessStat>,
     pub(crate) seqno: SeqNo,
+    /// 已物化(落盘进段)的槽位数量;`slots.len() - materialized_rows` 即未落盘行数。
+    ///
+    /// 槽位只追加,故用「总数 - 已物化数」维护未落盘计数,避免每次写事务 O(N) 扫描
+    /// (WAL 阈值检查决定是否 flush,见 `persist::store::hook::maybe_flush`)。
+    pub(crate) materialized_rows: usize,
     pub(crate) next_rowid: u64,
     pub(crate) next_ns_id: u32,
     pub(crate) ns_registry: Arc<HashMap<NsId, Arc<str>>>,
     pub(crate) ns_by_path: Arc<HashMap<Arc<str>, NsId>>,
+    /// 自定义关系类型名称 → 编号(编号 ≥ [`RelationKind::FIRST_CUSTOM`],库内唯一)。
+    pub(crate) rel_kinds: Arc<HashMap<Arc<str>, u16>>,
+    /// 自定义关系类型编号 → 名称(与 `rel_kinds` 互逆)。
+    pub(crate) rel_kind_names: Arc<HashMap<u16, Arc<str>>>,
+    /// 下一个可分配的关系类型编号(永不复用,`u16::MAX` 表示空间耗尽)。
+    pub(crate) next_rel_kind: u16,
     /// 各已落盘段的向量索引(多段架构;空 = 恒暴力扫描)。
     pub(crate) indexes: Arc<Vec<SegmentIndex>>,
     /// 与 `slots` 平行的"槽位 → 所属段编号";`None` = 尚未落盘的尾部槽位。
-    pub(crate) slot_segment: Arc<Vec<Option<u32>>>,
+    pub(crate) slot_segment: ChunkedVec<Option<u32>>,
     /// 恢复期因损坏被隔离(内存跳过、文件原地保留)的段编号。
     ///
     /// 这些段仍在 MANIFEST 中,但内容不可用;compaction 计划必须排除它们,
@@ -141,20 +170,24 @@ impl WriterState {
         Self {
             slots: Arc::new(Vec::new()),
             dead: Arc::new(BitSet::default()),
-            key_index: Arc::new(HashMap::new()),
-            text_index: Arc::new(HashMap::new()),
-            versions: Arc::new(HashMap::new()),
-            latest: Arc::new(HashMap::new()),
-            out_edges: Arc::new(HashMap::new()),
-            in_edges: Arc::new(HashMap::new()),
-            access: Arc::new(HashMap::new()),
+            key_index: ShardedMap::new(),
+            text_index: ShardedMap::new(),
+            versions: ShardedMap::new(),
+            latest: ShardedMap::new(),
+            out_edges: ShardedMap::new(),
+            in_edges: ShardedMap::new(),
+            access: ShardedMap::new(),
             seqno: SeqNo::new(0),
+            materialized_rows: 0,
             next_rowid: 0,
             next_ns_id: 1,
             ns_registry: Arc::new(HashMap::new()),
             ns_by_path: Arc::new(HashMap::new()),
+            rel_kinds: Arc::new(HashMap::new()),
+            rel_kind_names: Arc::new(HashMap::new()),
+            next_rel_kind: RelationKind::FIRST_CUSTOM,
             indexes: Arc::new(Vec::new()),
-            slot_segment: Arc::new(Vec::new()),
+            slot_segment: ChunkedVec::new(),
             unavailable_segments: Arc::new(HashSet::new()),
             access_dirty: Arc::new(HashMap::new()),
             edge_dirty: Arc::new(HashSet::new()),
@@ -273,13 +306,89 @@ impl WriterState {
         Ok(())
     }
 
+    /// 注册/解析一个自定义关系类型名称(编号单调分配、永不复用)。
+    ///
+    /// 内置名(`derived_from`/`supports`/`contradicts`/`related`)解析为内置编号;
+    /// 同名重复调用幂等返回既有编号。名称须非空、≤ 128 字节、不含控制字符。
+    ///
+    /// # Errors
+    /// - 名称为空/超长/含控制字符 → [`MnemeError::Config`];
+    /// - 编号空间耗尽(`next_rel_kind == u16::MAX`)→ [`MnemeError::TooLarge`];
+    /// - `SeqNo` 空间耗尽 → [`MnemeError::IdExhausted`]。
+    pub(crate) fn register_relation_kind(&mut self, name: &str) -> Result<RelationKind> {
+        if let Some(kind) = builtin_relation_kind(name) {
+            return Ok(kind);
+        }
+        if let Some(&kind) = self.rel_kinds.get(name) {
+            return Ok(RelationKind(kind));
+        }
+        if name.is_empty() || name.len() > REL_KIND_NAME_MAX || name.chars().any(char::is_control) {
+            return Err(MnemeError::Config {
+                reason: "关系类型名须非空、≤128 字节且不含控制字符",
+            });
+        }
+        if self.next_rel_kind == u16::MAX {
+            return Err(MnemeError::TooLarge {
+                field: "rel_kind",
+                limit: u16::MAX as usize,
+                got: self.next_rel_kind as usize,
+            });
+        }
+        let kind = self.next_rel_kind;
+        self.next_rel_kind += 1;
+        let name: Arc<str> = Arc::from(name);
+        Arc::make_mut(&mut self.rel_kinds).insert(Arc::clone(&name), kind);
+        Arc::make_mut(&mut self.rel_kind_names).insert(kind, Arc::clone(&name));
+        let seqno = self.alloc_seqno()?;
+        self.pending
+            .push(WriteOp::RelKindRegister { kind, name, seqno });
+        Ok(RelationKind(kind))
+    }
+
+    /// 恢复期登记一个自定义关系类型(来自 MANIFEST 或 WAL 帧)。
+    ///
+    /// 编号必须 ≥ [`RelationKind::FIRST_CUSTOM`];同名不同号或同号不同名一律
+    /// [`MnemeError::Corrupted`],绝不静默改写注册表;水位推进失败同样拒绝
+    /// (FC-MODEL-POST-008、FC-PERSIST-ERR-012)。
+    ///
+    /// # Errors
+    /// 见上。
+    pub(crate) fn register_recovered_rel_kind(&mut self, kind: u16, name: Arc<str>) -> Result<()> {
+        let corrupt = |reason: &str| MnemeError::Corrupted {
+            segment: None,
+            reason: format!("rel_kind 注册表:{reason}"),
+        };
+        if kind < RelationKind::FIRST_CUSTOM || name.is_empty() {
+            return Err(corrupt("编号低于自定义起点或名称为空"));
+        }
+        if let Some(existing) = self.rel_kinds.get(&name).copied()
+            && existing != kind
+        {
+            return Err(corrupt("同名不同编号"));
+        }
+        if let Some(existing) = self.rel_kind_names.get(&kind)
+            && existing.as_ref() != name.as_ref()
+        {
+            return Err(corrupt("同编号不同名"));
+        }
+        Arc::make_mut(&mut self.rel_kinds).insert(Arc::clone(&name), kind);
+        Arc::make_mut(&mut self.rel_kind_names).insert(kind, name);
+        let next = kind
+            .checked_add(1)
+            .ok_or_else(|| corrupt("编号已达 u16::MAX"))?;
+        if next > self.next_rel_kind {
+            self.next_rel_kind = next;
+        }
+        Ok(())
+    }
+
     /// 建立/更新关系边并记录 WAL 操作。
     ///
     /// # Errors
     /// `SeqNo` 空间耗尽时返回 [`MnemeError::IdExhausted`]。
     pub(crate) fn relate_edge(&mut self, edge: Edge) -> Result<()> {
-        crate::memory::relation::upsert_edge(Arc::make_mut(&mut self.out_edges), edge.clone());
-        crate::memory::relation::upsert_edge(Arc::make_mut(&mut self.in_edges), edge.clone());
+        crate::memory::relation::upsert_edge_sharded(&mut self.out_edges, edge.clone());
+        crate::memory::relation::upsert_edge_sharded(&mut self.in_edges, edge.clone());
         Arc::make_mut(&mut self.edge_dirty).insert((edge.from, edge.to, edge.kind.0));
         let seqno = self.alloc_seqno()?;
         self.pending.push(WriteOp::Relate {
@@ -303,13 +412,9 @@ impl WriterState {
         to: RowId,
         kind: RelationKind,
     ) -> Result<bool> {
-        let removed = crate::memory::relation::remove_edge(
-            Arc::make_mut(&mut self.out_edges),
-            from,
-            to,
-            kind,
-        );
-        crate::memory::relation::remove_edge(Arc::make_mut(&mut self.in_edges), to, from, kind);
+        let removed =
+            crate::memory::relation::remove_edge_sharded(&mut self.out_edges, from, to, kind);
+        crate::memory::relation::remove_edge_sharded(&mut self.in_edges, to, from, kind);
         if removed {
             Arc::make_mut(&mut self.edge_dirty).insert((from, to, kind.0));
             let seqno = self.alloc_seqno()?;
@@ -338,20 +443,18 @@ impl WriterState {
         if let Some((ns_id, old_key)) = self.previous_key(rowid) {
             let new_key = self.slots[slot.get() as usize].key.as_ref();
             if new_key != Some(&old_key) {
-                Arc::make_mut(&mut self.key_index).remove(&(ns_id, old_key));
+                self.key_index.remove(&(ns_id, old_key));
             }
         }
-        Arc::make_mut(&mut self.versions)
-            .entry(rowid)
-            .or_default()
-            .push(slot);
-        Arc::make_mut(&mut self.latest).insert(rowid, slot);
+        let chain = self.versions.get_or_insert_default(rowid);
+        Arc::make_mut(chain).push(slot);
+        self.latest.insert(rowid, slot);
         let slot_data = Arc::clone(&self.slots[slot.get() as usize]);
         if let Some(key) = &slot_data.key {
-            Arc::make_mut(&mut self.key_index).insert((slot_data.ns_id, key.clone()), rowid);
+            self.key_index.insert((slot_data.ns_id, key.clone()), rowid);
         }
         if let Some(hash) = slot_data.text_hash {
-            Arc::make_mut(&mut self.text_index).insert((slot_data.ns_id, hash), rowid);
+            self.text_index.insert((slot_data.ns_id, hash), rowid);
         }
     }
 
@@ -379,7 +482,7 @@ impl WriterState {
         self.hide_latest(rowid);
         let arc = Arc::new(slot_data);
         Arc::make_mut(&mut self.slots).push(Arc::clone(&arc));
-        Arc::make_mut(&mut self.slot_segment).push(None);
+        self.slot_segment.push(None);
         self.link_version(rowid, slot);
         if !deleted && !self.is_indexing_paused {
             self.index_observe(slot, &arc);
@@ -394,6 +497,31 @@ impl WriterState {
         } else {
             self.pending.push(WriteOp::Insert { slot: arc });
         }
+        Ok(slot)
+    }
+
+    /// 恢复专用提交:只建立版本链与槽位,不记 WAL 操作、不动索引增量。
+    ///
+    /// 段数据在写入时已落 WAL/段,恢复期重复记录 pending 纯属开销;key 占用校验
+    /// 保留(损坏段可能携带重复 key,绝不静默覆盖他人 `key_index`),语义与逐步
+    /// [`commit_version`] 的可见性结果等价(`link_version` 仍维护 key/text 索引)。
+    pub(crate) fn commit_recovered(
+        &mut self,
+        rowid: RowId,
+        slot_data: SlotData,
+        previous_exists: bool,
+    ) -> Result<SlotId> {
+        let slot = slot_id_for(self.slots.len())?;
+        ensure_key_available(self, &slot_data)?;
+        // 恢复输入按 `(rowid, seqno)` 排序:该 `rowid` 的首个版本无旧版本可遮蔽,
+        // 跳过 `hide_latest` 的一次哈希查找(大批量恢复的每行常数项)。
+        if previous_exists {
+            self.hide_latest(rowid);
+        }
+        let arc = Arc::new(slot_data);
+        Arc::make_mut(&mut self.slots).push(Arc::clone(&arc));
+        self.slot_segment.push(None);
+        self.link_version(rowid, slot);
         Ok(slot)
     }
 
@@ -487,12 +615,9 @@ impl WriterState {
         quant: VectorFormat,
         recall_est: Option<f32>,
     ) {
-        {
-            let slot_segment = Arc::make_mut(&mut self.slot_segment);
-            for &idx in slot_indices {
-                if let Some(entry) = slot_segment.get_mut(idx) {
-                    *entry = Some(segment_id);
-                }
+        for &idx in slot_indices {
+            if let Some(entry) = self.slot_segment.get_mut(idx) {
+                *entry = Some(segment_id);
             }
         }
         if let Some(index) = index {
@@ -529,6 +654,29 @@ impl WriterState {
             .entry(rowid)
             .or_insert(0);
         *entry = entry.saturating_add(delta);
+    }
+
+    /// 尚未落盘的槽位数量(槽位只追加,总数减已物化数)。
+    pub(crate) fn unpersisted_count(&self) -> usize {
+        self.slots.len().saturating_sub(self.materialized_rows)
+    }
+
+    /// 登记 `count` 个槽位已随段落盘(flush 安装段后调用)。
+    pub(crate) fn note_materialized(&mut self, count: usize) {
+        self.materialized_rows = self.materialized_rows.saturating_add(count);
+    }
+
+    /// 按 `slot_segment` 归属重算已物化行数(恢复完成后调用一次)。
+    ///
+    /// 恢复路径的槽位要么来自已落盘段(`Some`),要么来自 WAL 重放(`None`,未落盘);
+    /// 计数不能让 WAL 阈值误判,故以归属位图为准校准。
+    pub(crate) fn recount_materialized(&mut self) {
+        let unpersisted = self
+            .slot_segment
+            .iter()
+            .filter(|entry| entry.is_none())
+            .count();
+        self.materialized_rows = self.slots.len().saturating_sub(unpersisted);
     }
 
     /// 返回尚未落盘的槽位下标(升序;delta 段物化输入)。
@@ -569,13 +717,16 @@ impl WriterState {
 
     /// 从版本链移除槽位;该 RowId 已无版本时移除 `latest` 并返回 `true`。
     fn detach_slot_from_versions(&mut self, rowid: RowId, slot: SlotId) -> bool {
-        let versions = Arc::make_mut(&mut self.versions);
-        let Some(entries) = versions.get_mut(&rowid) else {
-            return false;
+        let empty = match self.versions.get_mut(&rowid) {
+            Some(chain) => {
+                let entries = Arc::make_mut(chain);
+                entries.retain(|entry| *entry != slot);
+                entries.is_empty()
+            }
+            None => return false,
         };
-        entries.retain(|entry| *entry != slot);
-        if entries.is_empty() {
-            versions.remove(&rowid);
+        if empty {
+            self.versions.remove(&rowid);
             return true;
         }
         false
@@ -583,21 +734,21 @@ impl WriterState {
 
     /// 整链清空时移除 `latest` 与 key/text/访问统计。
     fn purge_row_indexes(&mut self, rowid: RowId, index: usize) {
-        Arc::make_mut(&mut self.latest).remove(&rowid);
+        self.latest.remove(&rowid);
         // 访问统计与待落盘增量一并清理,避免幽灵条目在后续 delta 中复活。
-        Arc::make_mut(&mut self.access).remove(&rowid);
+        self.access.remove(&rowid);
         Arc::make_mut(&mut self.access_dirty).remove(&rowid);
         let slot_data = &self.slots[index];
         if let Some(key) = &slot_data.key {
             let key = (slot_data.ns_id, key.clone());
             if self.key_index.get(&key) == Some(&rowid) {
-                Arc::make_mut(&mut self.key_index).remove(&key);
+                self.key_index.remove(&key);
             }
         }
         if let Some(hash) = slot_data.text_hash {
             let key = (slot_data.ns_id, hash);
             if self.text_index.get(&key) == Some(&rowid) {
-                Arc::make_mut(&mut self.text_index).remove(&key);
+                self.text_index.remove(&key);
             }
         }
     }
@@ -624,15 +775,16 @@ impl WriterState {
         ReaderView {
             slots: Arc::clone(&self.slots),
             dead: Arc::clone(&self.dead),
-            key_index: Arc::clone(&self.key_index),
-            versions: Arc::clone(&self.versions),
-            latest: Arc::clone(&self.latest),
-            out_edges: Arc::clone(&self.out_edges),
-            in_edges: Arc::clone(&self.in_edges),
-            access: Arc::clone(&self.access),
+            key_index: self.key_index.clone(),
+            versions: self.versions.clone(),
+            latest: self.latest.clone(),
+            out_edges: self.out_edges.clone(),
+            in_edges: self.in_edges.clone(),
+            access: self.access.clone(),
             ns_registry: Arc::clone(&self.ns_registry),
+            ns_by_path: Arc::clone(&self.ns_by_path),
             indexes: Arc::clone(&self.indexes),
-            slot_segment: Arc::clone(&self.slot_segment),
+            slot_segment: self.slot_segment.clone(),
             reclaimed_versions: self.reclaimed_versions,
             inv: Arc::clone(&self.inv),
             zones: Arc::clone(&self.zones),
@@ -708,6 +860,49 @@ mod tests {
         assert!(matches!(
             state.register_ns("耗尽"),
             Err(MnemeError::IdExhausted { kind: "ns_id" })
+        ));
+    }
+}
+
+#[cfg(test)]
+mod relation_kind_tests {
+    use std::sync::Arc;
+
+    use super::*;
+
+    /// FC-MODEL-POST-008:编号空间耗尽 → `TooLarge`;恢复登记冲突/越界 → `Corrupted`。
+    #[test]
+    fn relation_kind_registry_rejects_exhaustion() {
+        let mut state = WriterState::new();
+        state.next_rel_kind = u16::MAX;
+        assert!(matches!(
+            state.register_relation_kind("耗尽"),
+            Err(MnemeError::TooLarge {
+                field: "rel_kind",
+                ..
+            })
+        ));
+
+        let mut state = WriterState::new();
+        state
+            .register_recovered_rel_kind(16, Arc::from("mentions"))
+            .expect("首次登记");
+        assert_eq!(state.next_rel_kind, 17, "水位必须推进");
+        assert!(matches!(
+            state.register_recovered_rel_kind(17, Arc::from("mentions")),
+            Err(MnemeError::Corrupted { .. })
+        ));
+        assert!(matches!(
+            state.register_recovered_rel_kind(16, Arc::from("other")),
+            Err(MnemeError::Corrupted { .. })
+        ));
+        assert!(matches!(
+            state.register_recovered_rel_kind(3, Arc::from("builtin")),
+            Err(MnemeError::Corrupted { .. })
+        ));
+        assert!(matches!(
+            state.register_recovered_rel_kind(18, Arc::from("")),
+            Err(MnemeError::Corrupted { .. })
         ));
     }
 }

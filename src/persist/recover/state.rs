@@ -8,23 +8,57 @@ use std::sync::Arc;
 
 use crate::core::error::{MnemeError, Result};
 use crate::core::types::{NsId, SeqNo};
+use crate::memory::lazy::ByteSource;
 use crate::memory::table::WriterState;
 use crate::persist::manifest::Manifest;
 use crate::persist::msec::{self, VersionRow};
+use crate::persist::source::{ByteFile, SegmentHandle};
 use crate::persist::vsec;
 
 use super::segment::{apply_delta, apply_relations, apply_versions, load_segment_views};
 
-/// 一个待恢复的段:`(segment_id, vsec 字节, msec 字节, 可选 hidx 字节)`。
+/// 一个待恢复的段:段号与三文件句柄(向量/邻接按需读,FC-PERSIST-INV-021)。
 pub(crate) struct SegmentBytes {
     /// 段编号。
     pub(crate) segment_id: u32,
-    /// 向量段字节。
-    pub(crate) vsec: Vec<u8>,
-    /// 元数据段字节。
-    pub(crate) msec: Vec<u8>,
-    /// HNSW 图段字节(`hidx_crc == 0` 时为 `None`)。
-    pub(crate) hidx: Option<Vec<u8>>,
+    /// 向量段文件句柄。
+    pub(crate) vsec: Arc<ByteFile>,
+    /// 元数据段文件句柄。
+    pub(crate) msec: Arc<ByteFile>,
+    /// HNSW 图文件句柄(`hidx_crc == 0` 时为 `None`)。
+    pub(crate) hidx: Option<Arc<ByteFile>>,
+}
+
+impl SegmentBytes {
+    /// 由段句柄构造恢复输入。
+    pub(crate) fn from_handle(handle: &SegmentHandle) -> Self {
+        Self {
+            segment_id: handle.segment_id,
+            vsec: Arc::clone(&handle.vsec),
+            msec: Arc::clone(&handle.msec),
+            hidx: handle.hidx.as_ref().map(Arc::clone),
+        }
+    }
+
+    /// vsec 整段切片(句柄存活期内有效)。
+    pub(crate) fn vsec_bytes(&self) -> Result<&[u8]> {
+        self.vsec
+            .slice_at(0, self.vsec.len())
+            .ok_or_else(|| MnemeError::Corrupted {
+                segment: Some(crate::core::types::SegmentId::new(self.segment_id)),
+                reason: "vsec: 句柄切片失败".to_string(),
+            })
+    }
+
+    /// msec 整段切片(句柄存活期内有效)。
+    pub(crate) fn msec_bytes(&self) -> Result<&[u8]> {
+        self.msec
+            .slice_at(0, self.msec.len())
+            .ok_or_else(|| MnemeError::Corrupted {
+                segment: Some(crate::core::types::SegmentId::new(self.segment_id)),
+                reason: "msec: 句柄切片失败".to_string(),
+            })
+    }
 }
 
 /// 一个已解析段及其"段内槽位 → 全局槽位"重排映射。
@@ -35,6 +69,16 @@ pub(crate) struct SegmentRemap {
     pub(crate) remap: Vec<u32>,
 }
 
+/// 一个已解析段的视图与向量文件句柄(惰性向量构造用)。
+pub(super) struct ParsedSegment<'a> {
+    /// vsec 只读视图(借用段文件切片)。
+    pub(super) vsec_view: vsec::VsecView<'a>,
+    /// msec 只读视图(借用段文件切片)。
+    pub(super) msec_view: msec::MsecView<'a>,
+    /// 向量文件句柄(惰性向量长期持有,保证文件不提前回收)。
+    pub(super) vsec_file: Arc<ByteFile>,
+}
+
 /// [`load_segments`] 的恢复结果。
 pub(crate) struct RecoveredSegments {
     /// 被隔离(跳过)的段 id 列表。
@@ -43,18 +87,28 @@ pub(crate) struct RecoveredSegments {
     pub(crate) remaps: Vec<SegmentRemap>,
 }
 
-/// 从零构建写状态,并载入命名空间注册表与 ID 水位。
-pub(crate) fn empty_state(manifest: &Manifest) -> WriterState {
+/// 从零构建写状态,并载入命名空间/关系类型注册表与 ID 水位。
+///
+/// # Errors
+/// MANIFEST 的关系类型注册表冲突或编号非法时返回 [`MnemeError::Corrupted`]
+/// (FC-MODEL-POST-008)。
+pub(crate) fn empty_state(manifest: &Manifest) -> Result<WriterState> {
     let mut state = WriterState::new();
     for ns in &manifest.namespaces {
         let id = NsId::new(ns.ns_id);
         Arc::make_mut(&mut state.ns_registry).insert(id, Arc::clone(&ns.path));
         Arc::make_mut(&mut state.ns_by_path).insert(Arc::clone(&ns.path), id);
     }
+    for rel in &manifest.rel_kinds {
+        state.register_recovered_rel_kind(rel.kind, Arc::clone(&rel.name))?;
+    }
+    if manifest.next_rel_kind > state.next_rel_kind {
+        state.next_rel_kind = manifest.next_rel_kind;
+    }
     state.next_ns_id = manifest.next_ns_id;
     state.next_rowid = manifest.next_rowid;
     state.seqno = SeqNo::new(manifest.watermark_seqno);
-    state
+    Ok(state)
 }
 
 /// 把各段记录重建成写状态(调用前请先用 [`empty_state`] 载入注册表/水位)。
@@ -91,15 +145,15 @@ pub(crate) fn load_segments(
     // 每段构建"段内槽位 → 全局槽位"重排映射(倒排载入与 hidx 载入均需要)。
     let row_counts: Vec<usize> = parsed
         .iter()
-        .map(|(view, _)| view.row_count() as usize)
+        .map(|segment| segment.vsec_view.row_count() as usize)
         .collect();
     let remaps = build_remaps(&versions, &row_counts, &parsed_ids)?;
 
     apply_versions(state, &versions, &parsed)?;
     backfill_slot_segments(state, &remaps);
-    for (_, msec_view) in parsed.iter() {
-        apply_relations(state, msec_view)?;
-        apply_delta(state, msec_view)?;
+    for segment in parsed.iter() {
+        apply_relations(state, &segment.msec_view)?;
+        apply_delta(state, &segment.msec_view)?;
     }
     state.pending.clear();
     apply_indexes(state, &parsed, &remaps, fail_fast)?;
@@ -111,8 +165,8 @@ pub(crate) fn load_segments(
 struct CollectedSegments<'a> {
     /// `(版本行, 所属已解析段下标)`。
     versions: Vec<(VersionRow, usize)>,
-    /// 已解析段的 vsec/msec 视图。
-    parsed: Vec<(vsec::VsecView<'a>, msec::MsecView<'a>)>,
+    /// 已解析段的 vsec/msec 视图与向量文件句柄。
+    parsed: Vec<ParsedSegment<'a>>,
     /// 已解析段编号。
     parsed_ids: Vec<u32>,
     /// 被隔离(跳过)的损坏段编号。
@@ -120,41 +174,35 @@ struct CollectedSegments<'a> {
 }
 
 /// 逐段解析视图并收集全部版本行;损坏段按 `fail_fast` 上报或跳过。
+///
+/// 段间解析只读且互不依赖,**按段并行**(每段产出视图 + 版本行),再按段号串行
+/// 合并——合并顺序决定 `fail_fast` 首个错误的确定性,与串行逐段语义等价。
+/// 大库冷开时该步是 O(段数 × 段内行数) 的解码成本,并行后从多核兑现。
 fn collect_versions<'a>(
     segments: &'a [SegmentBytes],
     verify_payload: bool,
     fail_fast: bool,
 ) -> Result<CollectedSegments<'a>> {
-    let mut versions: Vec<(VersionRow, usize)> = Vec::new();
-    let mut parsed: Vec<(vsec::VsecView<'a>, msec::MsecView<'a>)> = Vec::new();
-    let mut parsed_ids: Vec<u32> = Vec::new();
-    let mut skipped: Vec<u32> = Vec::new();
     // 显式按段号升序回放:全量关系段必须排在其覆盖的旧段之后(写路径恒追加新段,
     // 此处排序是对手工修复/MANIFEST 乱序的防御,FC-PERSIST-POST-012)。
     let mut ordered: Vec<&SegmentBytes> = segments.iter().collect();
     ordered.sort_by_key(|segment| segment.segment_id);
-    for segment in ordered {
-        let Some((vsec_view, msec_view)) = load_segment_views(segment, verify_payload, fail_fast)?
-        else {
-            skipped.push(segment.segment_id);
-            continue;
-        };
-        // 区级结构预校验:版本表/关系区/delta 区畸形在非 fail-fast 下按段隔离,
-        // 避免单段区损坏令整库拒启(与 vsec/msec 解析同口径,FC-PERSIST-ERR-006);
-        // fail-fast 时补上段号便于定位。
-        if let Err(error) = precheck_segment(&msec_view) {
-            if fail_fast {
-                return Err(with_segment(error, segment.segment_id));
+    let results = parse_segments_parallel(&ordered, verify_payload, fail_fast)?;
+
+    let mut versions: Vec<(VersionRow, usize)> = Vec::new();
+    let mut parsed: Vec<ParsedSegment<'a>> = Vec::new();
+    let mut parsed_ids: Vec<u32> = Vec::new();
+    let mut skipped: Vec<u32> = Vec::new();
+    for (segment, result) in ordered.iter().zip(results) {
+        match result? {
+            Some((view, rows)) => {
+                let index = parsed.len();
+                versions.extend(rows.into_iter().map(|row| (row, index)));
+                parsed.push(view);
+                parsed_ids.push(segment.segment_id);
             }
-            skipped.push(segment.segment_id);
-            continue;
+            None => skipped.push(segment.segment_id),
         }
-        let index = parsed.len();
-        for row in msec_view.version_rows()? {
-            versions.push((row, index));
-        }
-        parsed.push((vsec_view, msec_view));
-        parsed_ids.push(segment.segment_id);
     }
     Ok(CollectedSegments {
         versions,
@@ -164,9 +212,110 @@ fn collect_versions<'a>(
     })
 }
 
-/// 预校验区级结构(版本表 / 关系区 / delta 区)。
-fn precheck_segment(msec_view: &msec::MsecView<'_>) -> Result<()> {
-    msec_view.version_rows()?;
+/// 单段解析结果:视图 + 版本行;`None` = 损坏段被隔离(非 fail-fast)。
+type SegmentParse<'a> = Option<(ParsedSegment<'a>, Vec<VersionRow>)>;
+
+/// 按段并行解析(线程数 = min(可用核数, 段数));结果按段序回收。
+///
+/// # Errors
+/// 解析线程 panic 收敛为 `Inconsistent`;`fail_fast` 的单段错误原样保留在
+/// 对应槽位,由调用方按段序返回首个错误。
+fn parse_segments_parallel<'a>(
+    ordered: &[&'a SegmentBytes],
+    verify_payload: bool,
+    fail_fast: bool,
+) -> Result<Vec<Result<SegmentParse<'a>>>> {
+    let threads = std::thread::available_parallelism()
+        .map_or(1, |count| count.get())
+        .min(ordered.len())
+        .max(1);
+    if threads <= 1 {
+        return Ok(ordered
+            .iter()
+            .map(|segment| parse_one(segment, verify_payload, fail_fast))
+            .collect());
+    }
+    let cursor = std::sync::atomic::AtomicUsize::new(0);
+    let mut slots: Vec<Option<Result<SegmentParse<'a>>>> =
+        (0..ordered.len()).map(|_| None).collect();
+    std::thread::scope(|scope| -> Result<()> {
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                scope.spawn(|| -> Vec<(usize, Result<SegmentParse<'a>>)> {
+                    let mut produced = Vec::new();
+                    loop {
+                        let index = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if index >= ordered.len() {
+                            break;
+                        }
+                        produced
+                            .push((index, parse_one(ordered[index], verify_payload, fail_fast)));
+                    }
+                    produced
+                })
+            })
+            .collect();
+        for handle in handles {
+            let produced = handle.join().map_err(|_| MnemeError::Inconsistent {
+                reason: "段解析线程 panic",
+            })?;
+            for (index, parsed) in produced {
+                slots[index] = Some(parsed);
+            }
+        }
+        Ok(())
+    })?;
+    slots
+        .into_iter()
+        .map(|slot| {
+            slot.ok_or(MnemeError::Inconsistent {
+                reason: "段解析结果缺失",
+            })
+        })
+        .collect()
+}
+
+/// 解析单段:视图 + 版本表(只解码一次,兼作版本表结构校验)+ 关系/delta 区预校验。
+fn parse_one<'a>(
+    segment: &'a SegmentBytes,
+    verify_payload: bool,
+    fail_fast: bool,
+) -> Result<SegmentParse<'a>> {
+    let Some((vsec_view, msec_view)) = load_segment_views(segment, verify_payload, fail_fast)?
+    else {
+        return Ok(None);
+    };
+    // 版本表只解码一次:其结果既是结构预校验,也是本次收集的数据(此前
+    // `precheck` 会先解码全表再丢弃,大库冷开时是 O(N) 的重复成本)。
+    let version_rows = match msec_view.version_rows() {
+        Ok(rows) => rows,
+        Err(error) => {
+            if fail_fast {
+                return Err(with_segment(error, segment.segment_id));
+            }
+            return Ok(None);
+        }
+    };
+    // 其余区级结构预校验:关系区/delta 区畸形在非 fail-fast 下按段隔离,避免
+    // 单段区损坏令整库拒启(与 vsec/msec 解析同口径,FC-PERSIST-ERR-006)。
+    if let Err(error) = precheck_segment_aux(&msec_view) {
+        if fail_fast {
+            return Err(with_segment(error, segment.segment_id));
+        }
+        return Ok(None);
+    }
+    Ok(Some((
+        ParsedSegment {
+            vsec_view,
+            msec_view,
+            vsec_file: Arc::clone(&segment.vsec),
+        },
+        version_rows,
+    )))
+}
+
+/// 预校验关系区与 delta 区结构(版本表由 [`parse_one`] 解码时一并校验)。
+fn precheck_segment_aux(msec_view: &msec::MsecView<'_>) -> Result<()> {
     crate::persist::edges::parse(msec_view.relations_bytes())?;
     msec::decode_delta(msec_view.delta_bytes())?;
     Ok(())
@@ -190,9 +339,8 @@ fn with_segment(error: MnemeError, segment_id: u32) -> MnemeError {
 /// 会以空段替换活跃段集(永久丢数据,FC-PERSIST-POST-012)。
 fn backfill_slot_segments(state: &mut WriterState, remaps: &[SegmentRemap]) {
     for remap in remaps {
-        let slot_segment = Arc::make_mut(&mut state.slot_segment);
         for &global in &remap.remap {
-            if let Some(entry) = slot_segment.get_mut(global as usize) {
+            if let Some(entry) = state.slot_segment.get_mut(global as usize) {
                 *entry = Some(remap.segment_id);
             }
         }
@@ -206,15 +354,15 @@ fn backfill_slot_segments(state: &mut WriterState, remaps: &[SegmentRemap]) {
 /// 否则降级为从槽位全量重建——两条路径产生等价的索引。
 fn apply_indexes(
     state: &mut WriterState,
-    parsed: &[(vsec::VsecView<'_>, msec::MsecView<'_>)],
+    parsed: &[ParsedSegment<'_>],
     remaps: &[SegmentRemap],
     fail_fast: bool,
 ) -> Result<()> {
     if parsed.is_empty() {
         return Ok(());
     }
-    if let ([(_, msec_view)], [remap]) = (parsed, remaps) {
-        match load_disk_indexes(state, msec_view, &remap.remap) {
+    if let ([segment], [remap]) = (parsed, remaps) {
+        match load_disk_indexes(state, &segment.msec_view, &remap.remap) {
             // 四区结构校验通过:直接复用磁盘索引。
             Ok(()) => return Ok(()),
             Err(error) if fail_fast => return Err(error),
@@ -227,8 +375,8 @@ fn apply_indexes(
 
     // 多段:逐段解码倒排(经各自重排映射)并合并;任一结构不一致即整库重建。
     let mut merged = crate::memory::analysis::InvertedIndex::default();
-    for ((_, msec_view), remap) in parsed.iter().zip(remaps.iter()) {
-        match decode_segment_index(msec_view, &remap.remap) {
+    for (segment, remap) in parsed.iter().zip(remaps.iter()) {
+        match decode_segment_index(&segment.msec_view, &remap.remap) {
             Ok(inv) => merged.merge_from(inv),
             Err(error) if fail_fast => return Err(error),
             // 索引是查询加速器而非数据来源:损坏时降级全量重建仍然正确。
@@ -380,6 +528,7 @@ mod tests {
             zmap: &[],
             bloom: &[],
             inverted: &[],
+            compression: crate::core::options::Compression::None,
         })
         .expect("encode")
     }
@@ -401,8 +550,8 @@ mod tests {
         let empty_edges = crate::persist::edges::encode(&[], false, false).expect("edges");
         SegmentBytes {
             segment_id: id,
-            vsec,
-            msec: msec_only_segment(&empty_edges),
+            vsec: ByteFile::from_bytes(id, vsec),
+            msec: ByteFile::from_bytes(id, msec_only_segment(&empty_edges)),
             hidx: None,
         }
     }

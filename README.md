@@ -6,8 +6,10 @@
 **状态**:开发中(尚未发布到 crates.io)。**L0 原语层(`src/core/`)、L1 内存引擎(`src/memory/`)、
 L2 持久层(`src/persist/`)、L3 索引层(`src/index/`)、L4 检索层(`src/query/`)、
 L5 生命周期层(`src/life/`)与 L6 打磨层(`src/quant/` + `feature = "async"` 门面)**
-已实现并通过形式化契约验收;1M×1536 性能门槛与 fuzz 长跑仍属 CI 收尾,
-每层完成时都是一个可独立交付的完整产品。
+已实现并通过形式化契约验收;L11 静态加密/压缩与 L12 部署形态(`Storage` 后端、
+多进程只读共享、`Observer` 可观测)已落地;1M×1536 性能门槛与 fuzz 长跑由本机/专用
+runner 手动执行(不上 CI,1M 正式门槛待 ≥16GB 专用 runner)。每层完成时都是一个
+可独立交付的完整产品。
 设计与验收标准见 [docs/DESIGN.md](docs/DESIGN.md)。
 
 ---
@@ -34,8 +36,8 @@ LLM 每次对话结束就"忘光"上下文之外的一切。要让 Agent 长期�
 | 持久化 | WAL + 不可变段 + MANIFEST 原子提交,任意点掉电可恢复、删除不复活 |
 | 超长期 | size-tiered compaction,写放大 O(log N)、活跃段数有界 |
 | 量化 | i8 / f16 量化副本 + 两阶段精排重打分,查询带宽 i8 ÷4 / f16 ÷2(f32 原向量保留供精排,故磁盘不缩减);建段抽样不达标自动回退 f32 |
-| **存储安全**(规划) | AES-256-GCM 静态加密、文本/元数据压缩;L11 落地 |
-| **部署形态**(规划) | 多进程只读共享;`Storage` 抽象支持 WASM/边缘适配;可观测事件钩子;L12 落地 |
+| **存储安全**(已落地) | AES-256-GCM 静态加密(feature `encrypt`,整文件/整帧 AEAD 信封 + 密钥轮换)、文本/元数据压缩(feature `compress`/`compress-zstd`,无收益回退原文) |
+| **部署形态**(已落地) | 多进程只读共享(周期探测 + `Mneme::reload`);`Storage`/`FsStorage`/`MemStorage` 抽象支持 WASM/边缘适配;`Observer` 可观测事件钩子 |
 | 依赖极简 | 当前非 feature 强依赖白名单 4 个小 crate(均为直接依赖,`serde_json` 另带入 itoa/ryu/memchr 等极少数传递依赖);默认开 `mmap` 时额外引入 1 个(`memmap2`,可经 feature 关闭);复杂算法全部自研;加密/压缩均为可选 feature |
 
 ## 安装
@@ -96,13 +98,13 @@ fn main() -> mneme::Result<()> {
 | `async` | ❌ 关 | `AsyncNamespace` async 门面(`spawn_blocking` 薄包装);核心零 tokio |
 | `quant-f16` | ❌ 关 | f16 量化副本;关闭时只有 f32 / i8,`F16` 构造期报 `Unsupported` |
 | `fuzzing` | ❌ 关 | fuzz 专用解析入口(服务 `fuzz/`,不改变运行时行为) |
-| `encrypt` | ❌ 关 | AES-256-GCM 静态加密;待 L11 |
-| `compress` | ❌ 关 | 文本/元数据压缩(内置 LZ4 风格 codec);待 L11 |
-| `compress-zstd` | ❌ 关 | 可选更强压缩(引入 `zstd`);待 L11 |
-| `wasm` | ❌ 关 | 关闭 mmap/线程并行,WASM 目标;待 L12 |
+| `encrypt` | ❌ 关 | AES-256-GCM 整文件/整帧信封静态加密(引入 `aes-gcm` + `getrandom`);密钥轮换见 `Mneme::rotate_encryption_key` |
+| `compress` | ❌ 关 | 记录体 text/meta/provenance 压缩(内置 LZ4 风格 codec,零依赖);压缩无收益自动回退原文 |
+| `compress-zstd` | ❌ 关 | 可选更强压缩(引入 `zstd`) |
+| `wasm` | ❌ 关 | 关闭 mmap/线程并行,WASM 目标;配合 `MemStorage`;目标构建验证留 CI `wasm-check` |
 
-> `encrypt`/`compress`/`compress-zstd`/`wasm` 尚未在 `Cargo.toml` 定义,系 L11/L12 目标;
-> 启用会因 feature 未定义报错。
+> 八个 feature 均已定义并落地对应能力;加密与压缩见
+> `tests/security_contracts.rs`,存储后端与只读共享见 `tests/deploy_contracts.rs`。
 
 ## 文档
 
@@ -140,7 +142,10 @@ mdbook build               # 输出到 book/
 
 > 当前已实现 L0–L6 全部层,L1–L6 契约测试与追溯门禁随 `cargo test` 运行;
 > `cargo test --features async` / `--features quant-f16` / `--all-features` 均可跑。
-> `cargo bench` 已有 `benches/hnsw.rs` 与 `benches/quant.rs`(1M×1536 正式门槛待 CI)。
+> `cargo bench` 已有 `benches/hnsw.rs` 与 `benches/quant.rs`(heavy 门槛由本机/专用
+> runner 手动跑,1M×1536 正式门槛待 ≥16GB 专用 runner);heavy 用例规模可经
+> `MNEME_HEAVY_ROWS`/`MNEME_HEAVY_DIM` 覆盖(默认 50_000×128 冒烟,吞吐/延迟门槛
+> 只在正式规模断言)。
 
 ```bash
 cargo fmt --all -- --check
@@ -150,12 +155,15 @@ cargo doc --no-deps              # 公开项 100% 文档覆盖(#![deny(missing_d
 cargo bench                      # criterion 基准(L3 起)
 ```
 
-CI 阶段(fast / middle / heavy / fuzz 四档,矩阵覆盖 Linux 与 Windows)**目前仅在
-[14 §7](docs/design/14-testing.md) 中定义**;仓库尚未提交 CI 配置文件,上列命令需手动运行。
+CI 在 `.gitlab-ci.yml` 里只跑轻量两档(**fast + middle**,每次 push / MR;GitLab
+runner 已通过首跑);heavy 门槛、fuzz 长跑与 mutation 等重任务由本机/专用 runner
+手动执行(命令见 [14 §7](docs/design/14-testing.md) 与 `AGENTS.md`)。平台矩阵
+(Linux aarch64 / Windows)为**目标矩阵,待 runner 接入**。
 
 ## MSRV
 
-最低支持的 Rust 版本(MSRV)在 `Cargo.toml` 的 `rust-version` 中声明。
+最低支持的 Rust 版本(MSRV)当前为 **1.93**(edition 2024),在 `Cargo.toml` 的
+`rust-version` 中声明;CI 以 `rust:1.93` 镜像构建与测试,保证声明真实。
 
 ## 贡献
 

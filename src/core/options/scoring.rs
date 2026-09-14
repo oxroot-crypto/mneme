@@ -32,8 +32,9 @@ pub struct Scoring {
     pub time_axis: TimeAxis,
     /// HNSW 遍历是否按重要性偏置(只改访问顺序),默认 `false`。
     ///
-    /// **尚未落地**:查询入口对 `true` 返回 `Unsupported`(拒绝静默忽略),
-    /// 见设计 10 §2.3 与 `FC-MEM-ERR-002`。
+    /// 落地于 L4(`FC-SCORE-POST-007`):以前沿优先级
+    /// `close_key + β·(importance + min(access/c_norm, 1))` 出堆,只改访问顺序、
+    /// 不改最终打分;默认关闭。
     pub bias_routing: bool,
 }
 

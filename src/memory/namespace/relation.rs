@@ -224,6 +224,43 @@ impl Namespace {
     }
 }
 
+impl Namespace {
+    /// 注册/解析一个自定义关系类型名称,返回库内稳定编号。
+    ///
+    /// 内置名(`derived_from`/`supports`/`contradicts`/`related`)解析为内置编号;
+    /// 新名称从 16 起单调分配、同名幂等;注册经 WAL/MANIFEST 持久化,重启后
+    /// 名称↔编号一致(FC-MODEL-POST-008)。
+    ///
+    /// # Arguments
+    /// * `name` - 关系类型名;非空、≤128 字节、不含控制字符。
+    ///
+    /// # Returns
+    /// 该名称对应的 [`RelationKind`];重复调用恒返回同一编号。
+    ///
+    /// # Errors
+    /// 名称为空/超长/含控制字符 → [`MnemeError::Config`];编号空间耗尽 →
+    /// [`MnemeError::TooLarge`];库已关闭 → [`MnemeError::Closed`]。
+    ///
+    /// # Examples
+    /// ```
+    /// use mneme::{Mneme, RelationKind};
+    /// let db = Mneme::in_memory(2).unwrap();
+    /// let ns = db.namespace("demo");
+    /// let kind = ns.relation_kind("mentions").unwrap();
+    /// assert!(kind.0 >= RelationKind::FIRST_CUSTOM);
+    /// assert_eq!(ns.relation_kind("mentions").unwrap(), kind);
+    /// ```
+    pub fn relation_kind(&self, name: &str) -> Result<RelationKind> {
+        let name = name.to_string();
+        self.table.write_tx(move |ws| {
+            if ws.closed {
+                return Err(MnemeError::Closed);
+            }
+            ws.register_relation_kind(&name)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

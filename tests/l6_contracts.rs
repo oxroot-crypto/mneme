@@ -12,6 +12,9 @@
 //! * FC-QUANT-ERR-001(f16 feature 门控)
 //! * FC-QUANT-ERR-002(纯内存库配置量化 → `Unsupported`)
 //! * FC-QUANT-ERR-003(qvec 区损坏可检出)
+//!
+//! 不变量锚定:I12(量化 `Hit.score` = f32 精排分)、I13(召回不达标自动回退)、
+//! I14(async 与 sync 等价)
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -632,5 +635,52 @@ fn async_and_sync_namespace_sequences_are_equivalent() {
         format!("{:?}", sync_dup),
         format!("{:?}", async_dup),
         "重复写入的返回语义必须一致"
+    );
+}
+
+/// FC-QUANT-ERR-002 跨 feature 第 1 阶段(CI,`--features quant-f16`):
+/// 在 `MNEME_F16_FIXTURE` 指定目录建一个含 f16 段的持久库,供默认构建打开断言。
+#[cfg(feature = "quant-f16")]
+#[test]
+#[ignore = "CI 跨 feature 矩阵 phase 1:先用 --features quant-f16 建库"]
+fn write_f16_fixture_for_cross_feature_check() {
+    let dir = std::env::var("MNEME_F16_FIXTURE").expect("MNEME_F16_FIXTURE 未设置");
+    let path = Path::new(&dir);
+    std::fs::create_dir_all(path).expect("创建 fixture 目录");
+    let db = Builder::default()
+        .dimension(DIM)
+        .path(path)
+        .quantization(VectorFormat::F16)
+        .build()
+        .expect("建库");
+    db.namespace("f16")
+        .insert(Record::new(vec![1.0_f32; DIM as usize]).key("a"))
+        .expect("写入");
+    db.flush().expect("flush");
+    db.close().expect("close");
+    assert!(
+        path.join("segments").join("seg_000000.vsec").exists(),
+        "fixture 必须写出段文件"
+    );
+}
+
+/// FC-QUANT-ERR-002 跨 feature 第 2 阶段(CI,默认构建):打开含 f16 段的库
+/// 必须返回 `Unsupported`,绝不静默按 f32 服务。
+#[cfg(not(feature = "quant-f16"))]
+#[test]
+#[ignore = "CI 跨 feature 矩阵 phase 2:默认构建打开 f16 库必须拒绝"]
+fn open_f16_fixture_requires_feature() {
+    let dir = std::env::var("MNEME_F16_FIXTURE").expect("MNEME_F16_FIXTURE 未设置");
+    let error = Mneme::open(Path::new(&dir))
+        .err()
+        .expect("未开 quant-f16 的构建必须拒绝 f16 段");
+    assert!(
+        matches!(
+            error,
+            MnemeError::Unsupported {
+                feature: "quant-f16"
+            }
+        ),
+        "必须返回 Unsupported {{ feature: quant-f16 }},实际:{error:?}"
     );
 }

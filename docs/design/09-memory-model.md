@@ -11,7 +11,7 @@
 
 模块:实现落在 `memory/`(`relation.rs` 关系图、`temporal.rs` 双时态、
 `namespace/life.rs` 与 `score.rs` 沉淀、`Record` 的 provenance 字段);
-独立的 `model/` 目录为规划形态
+`model/` 未独立成目录(实现并入 `memory/`)
 
 ---
 
@@ -51,8 +51,9 @@ impl RelationKind {
     pub const SUPPORTS: Self;              // =1 支持
     pub const CONTRADICTS: Self;           // =2 矛盾
     pub const RELATED: Self;               // =3 弱相关
-    pub fn custom(name: &str) -> Result<Self>;  // 名称→稳定编号(≥16;名称注册表未落地,当前不提供此 API)
+    pub const FIRST_CUSTOM: u16;           // =16 自定义类型编号起点
 }
+// 自定义类型注册:`Namespace::relation_kind(name) -> Result<RelationKind>`(见 §2.2)
 pub struct Edge { pub from: RowId, pub to: RowId, pub kind: RelationKind, pub weight: f32, pub metadata: Meta }
 
 ns.relate(from, to, kind, weight)?;        // 幂等:同 (from,to,kind) 覆盖 weight(metadata 不变)
@@ -67,13 +68,14 @@ let in_edges: Vec<Edge> = ns.predecessors(to, &[RelationKind::SUPPORTS])?;  // �
 
 - 关系边以 `(from, to, kind)` 为唯一键,重复 `relate` 为 upsert;
 - 边可携带 `weight ∈ [0,1]`(影响联想扩展的传播强度,[10 §3](10-scoring.md))与任意 metadata;
-- **自定义关系**(`custom(name)`,尚未落地):设计为经名称注册表映射为稳定 u16:内置固定
-  占用 `0..=3`,`4..=15` 预留给未来内置类型,自定义从 **16** 起分配;同一名称全局唯一,编号
-  空间耗尽(约 65520 个自定义类型)时返回 `TooLarge`。注册计划经 WAL
+- **自定义关系**(**已落地**):经 `Namespace::relation_kind(name)` 注册,名称注册表映射为
+  稳定 u16:内置名(`derived_from`/`supports`/`contradicts`/`related`)解析为内置编号;
+  自定义从 **16** 起分配,同一名称库内唯一且幂等;名称须非空、≤128 字节、不含控制字符
+  (否则 `Config`),编号空间耗尽(`next_rel_kind == u16::MAX`)→ `TooLarge`。注册经 WAL
   `RelKindRegister` 帧落盘([04 §2.3](04-l2-persist.md)),并由 MANIFEST 的关系类型注册表
   持久化(`RelKindEntry` + `next_rel_kind` 水位,[04 §2.4](04-l2-persist.md)),
-  不同进程/重启后编号一致(与 `NsRegister` 同一恢复机制,[04 §3.3](04-l2-persist.md))。
-  **当前实现不提供 `custom`**(内置 `0..=3` 可用),落地前不承诺语义。
+  不同进程/重启后编号一致(与 `NsRegister` 同一恢复机制,[04 §3.3](04-l2-persist.md));
+  恢复遇同名不同号/同号不同名 → `Corrupted`。
 
 ### 2.3 存储与一致性
 
@@ -259,7 +261,7 @@ DERIVED_FROM: S→m1, S→m2, S→m4
 ## 本章小结
 
 - 记忆 ≠ 向量:关系图、双时态、来源/可信度、沉淀是引擎级一等公民。
-- `relate` 以 `(from,to,kind)` 幂等;悬挂边不可见(I25);内置关系类型 `0..=3` 固定,自定义注册表为规划(尚未落地,见 §2.2)。
+- `relate` 以 `(from,to,kind)` 幂等;悬挂边不可见(I25);内置关系类型 `0..=3` 固定,自定义注册表经 `Namespace::relation_kind` 已落地(见 §2.2)。
 - 双时态 = 事务时间 + 有效时间;`as_of` 时间旅行、`supersede` 信念修订(I26)。
 - 版本状态:`Active → Shadowed → Reclaimed`,默认永久保留。
 - `consolidate` 聚类→摘要→`DERIVED_FROM`,默认不删除来源。

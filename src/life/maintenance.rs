@@ -112,10 +112,23 @@ pub(crate) fn spawn(
         stop: Arc::clone(&stop),
         join: Arc::new(Mutex::new(None)),
     };
-    // reason: 线程创建失败(资源耗尽)时维护退化为「仅显式调用」,不影响正确性。
-    let join = std::thread::Builder::new()
-        .name("mneme-maintenance".to_string())
-        .spawn(move || run(context, stop));
+    // reason: 线程创建失败(资源耗尽)时维护退化为「仅显式调用」,不影响正确性;
+    // wasm 目标无后台线程,退化为显式 `maintenance_tick`(分支保留以便类型检查)。
+    let join: std::io::Result<std::thread::JoinHandle<()>> = if cfg!(feature = "wasm") {
+        Err(std::io::Error::other("wasm 无后台线程"))
+    } else {
+        std::thread::Builder::new()
+            .name("mneme-maintenance".to_string())
+            .spawn(move || run(context, stop))
+    };
+    attach_join(handle, join)
+}
+
+/// 挂接线程 join 句柄;创建失败时退化为无 join 句柄(调用方仍可显式停止/驱动)。
+fn attach_join(
+    handle: MaintenanceHandle,
+    join: std::io::Result<std::thread::JoinHandle<()>>,
+) -> MaintenanceHandle {
     if let Ok(join) = join {
         *handle
             .join
@@ -123,6 +136,70 @@ pub(crate) fn spawn(
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(join);
     }
     handle
+}
+
+/// 启动只读探测线程:每 `interval` 检查 `current`,有新提交版本时原子换视图。
+///
+/// 只读实例不参与写维护;探测失败(新版本损坏等)发 `Error` 事件并保留旧视图,
+/// 绝不中断服务(设计 12 §2.1、I29)。
+pub(crate) fn spawn_read_only_probe(
+    table: &Arc<Table>,
+    store: &Arc<Store>,
+    interval: Duration,
+) -> MaintenanceHandle {
+    let table = Arc::downgrade(table);
+    let store = Arc::downgrade(store);
+    let stop = Arc::new((Mutex::new(false), Condvar::new()));
+    let handle = MaintenanceHandle {
+        stop: Arc::clone(&stop),
+        join: Arc::new(Mutex::new(None)),
+    };
+    // reason: 线程创建失败时退化为"仅显式 reload()",不影响正确性;
+    // wasm 目标无后台线程,只读探测退化为显式 `reload()`(分支保留以便类型检查)。
+    let join: std::io::Result<std::thread::JoinHandle<()>> = if cfg!(feature = "wasm") {
+        Err(std::io::Error::other("wasm 无后台线程"))
+    } else {
+        std::thread::Builder::new()
+            .name("mneme-readonly-probe".to_string())
+            .spawn(move || probe_loop(table, store, stop, interval))
+    };
+    attach_join(handle, join)
+}
+
+/// 只读探测线程主循环:周期重载已提交版本,失败上报并保留旧视图。
+fn probe_loop(
+    table: Weak<Table>,
+    store: Weak<Store>,
+    stop: Arc<(Mutex<bool>, Condvar)>,
+    interval: Duration,
+) {
+    let handle = MaintenanceHandle {
+        stop,
+        join: Arc::new(Mutex::new(None)),
+    };
+    loop {
+        if handle.is_stopped() {
+            break;
+        }
+        handle.wait(interval);
+        if handle.is_stopped() {
+            break;
+        }
+        let (Some(table), Some(store)) = (table.upgrade(), store.upgrade()) else {
+            break;
+        };
+        match crate::persist::store::reload_read_only(&store) {
+            Ok(Some((state, _version))) => table.publish(&state),
+            Ok(None) => {}
+            Err(error) => crate::core::observe::emit(
+                store.observer.as_ref(),
+                crate::core::observe::Event::Error {
+                    kind: crate::core::observe::ErrorKind::of(&error),
+                    context: "read_only_probe",
+                },
+            ),
+        }
+    }
 }
 
 /// 维护线程主循环。

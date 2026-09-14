@@ -23,6 +23,12 @@ const DEFAULT_MAX_CLUSTER: usize = 32;
 /// 余弦相似度分母的零向量判定阈值。
 const COSINE_EPSILON: f32 = 1e-12;
 
+#[cfg(test)]
+thread_local! {
+    /// `cosine_from_norms` 调用次数(操作计数:验证 MMR/去重的对级计算上界)。
+    static COSINE_PAIRS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 /// 综合打分的各因子贡献(调试/审计用)。
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ScoreBreakdown {
@@ -99,11 +105,19 @@ pub struct ConsolidateReport {
 
 /// 余弦相似度(零向量返回 0)。
 pub(crate) fn cosine_sim(a: &[f32], b: &[f32]) -> f32 {
-    let denom = (simd::dot(a, a) * simd::dot(b, b)).sqrt();
+    cosine_from_norms(simd::dot(a, b), simd::dot(a, a), simd::dot(b, b))
+}
+
+/// 由点积与两侧**自范数平方**求余弦:自范数可预计算复用(MMR/去重热路径),
+/// 分母低于 `COSINE_EPSILON`(含零向量)时返回 0,与 [`cosine_sim`] 同口径。
+pub(crate) fn cosine_from_norms(dot: f32, a_norm_sq: f32, b_norm_sq: f32) -> f32 {
+    #[cfg(test)]
+    COSINE_PAIRS.with(|count| count.set(count.get() + 1));
+    let denom = (a_norm_sq * b_norm_sq).sqrt();
     if denom < COSINE_EPSILON {
         0.0
     } else {
-        simd::dot(a, b) / denom
+        dot / denom
     }
 }
 
@@ -255,6 +269,10 @@ pub(crate) fn rerank_composite(input: CompositeRerank<'_>) -> Vec<(Scored, Score
 }
 
 /// 以 MMR 贪心选出至多 `k` 条,保证相关且互相不同。
+///
+/// 维护各候选与已选集的最大余弦 `max_sim`:每选中一条只对剩余候选各算一次对级
+/// 余弦并增量取最大,每个候选-已选对至多计算一次,自范数预计算复用
+/// (设计 10 §5.1,FC-SCORE-CPLX-003)。
 pub(crate) fn mmr_select(
     view: &ReaderView,
     mut candidates: Vec<(Scored, ScoreBreakdown)>,
@@ -262,24 +280,23 @@ pub(crate) fn mmr_select(
     k: usize,
 ) -> Vec<(Scored, ScoreBreakdown)> {
     let lambda = lambda.clamp(0.0, 1.0);
-    let mut selected: Vec<(Scored, ScoreBreakdown)> = Vec::new();
+    let mut selected: Vec<(Scored, ScoreBreakdown)> = Vec::with_capacity(k.min(candidates.len()));
+    let mut norms: Vec<f32> = candidates
+        .iter()
+        .map(|candidate| {
+            let vector = &view.slots[candidate.0.slot.get() as usize].vector;
+            simd::dot(vector, vector)
+        })
+        .collect();
+    let mut max_sim: Vec<f32> = vec![f32::NEG_INFINITY; candidates.len()];
     while selected.len() < k && !candidates.is_empty() {
         let mut best_idx = 0;
         let mut best_score = f32::NEG_INFINITY;
         for (idx, candidate) in candidates.iter().enumerate() {
-            let redundancy = selected
-                .iter()
-                .map(|chosen| {
-                    cosine_sim(
-                        &view.slots[chosen.0.slot.get() as usize].vector,
-                        &view.slots[candidate.0.slot.get() as usize].vector,
-                    )
-                })
-                .fold(f32::NEG_INFINITY, f32::max);
-            let redundancy = if redundancy == f32::NEG_INFINITY {
+            let redundancy = if max_sim[idx] == f32::NEG_INFINITY {
                 0.0
             } else {
-                redundancy
+                max_sim[idx]
             };
             let mmr = lambda * candidate.0.score - (1.0 - lambda) * redundancy;
             if mmr > best_score {
@@ -287,7 +304,20 @@ pub(crate) fn mmr_select(
                 best_idx = idx;
             }
         }
-        selected.push(candidates.remove(best_idx));
+        let chosen_norm = norms[best_idx];
+        let chosen = candidates.remove(best_idx);
+        norms.remove(best_idx);
+        max_sim.remove(best_idx);
+        if !candidates.is_empty() {
+            let chosen_vector = &view.slots[chosen.0.slot.get() as usize].vector;
+            for (idx, candidate) in candidates.iter().enumerate() {
+                let vector = &view.slots[candidate.0.slot.get() as usize].vector;
+                let sim =
+                    cosine_from_norms(simd::dot(chosen_vector, vector), chosen_norm, norms[idx]);
+                max_sim[idx] = max_sim[idx].max(sim);
+            }
+        }
+        selected.push(chosen);
     }
     selected
 }
@@ -302,9 +332,15 @@ pub(crate) fn mmr_select(
 pub(crate) fn cluster_by_similarity(vectors: &[&[f32]], threshold: f32) -> Vec<Vec<usize>> {
     let n = vectors.len();
     let mut parent: Vec<usize> = (0..n).collect();
+    // 自范数只算一次,两两比较复用(O(n²·d) 主项不变,常量降为 1/3)。
+    let norms: Vec<f32> = vectors
+        .iter()
+        .map(|vector| simd::dot(vector, vector))
+        .collect();
     for i in 0..n {
         for j in (i + 1)..n {
-            if cosine_sim(vectors[i], vectors[j]) >= threshold {
+            if cosine_from_norms(simd::dot(vectors[i], vectors[j]), norms[i], norms[j]) >= threshold
+            {
                 union(&mut parent, i, j);
             }
         }
@@ -352,5 +388,41 @@ mod tests {
         let c = [0.0_f32, 1.0];
         let groups = cluster_by_similarity(&[&a, &b, &c], 0.99);
         assert_eq!(groups.len(), 2);
+    }
+
+    /// FC-SCORE-CPLX-003(操作计数:MMR 每个候选-已选对至多计算一次对级余弦,
+    /// 总次数 ≤ `k·m − k(k+1)/2`;未缓存的逐轮重算实现会远超该上界)。
+    #[test]
+    fn mmr_caches_pairwise_similarity() {
+        let db = crate::memory::Mneme::in_memory(2).expect("in_memory");
+        let ns = db.namespace("mmr");
+        for index in 0..8 {
+            ns.insert(crate::memory::Record::new(vec![index as f32, 1.0]))
+                .expect("insert");
+        }
+        let view = db.table.view();
+        let candidates: Vec<(Scored, ScoreBreakdown)> = (0..8)
+            .map(|index| {
+                (
+                    Scored {
+                        slot: crate::core::types::SlotId::new(index),
+                        rowid: RowId::new(u64::from(index)),
+                        score: index as f32,
+                    },
+                    ScoreBreakdown::default(),
+                )
+            })
+            .collect();
+        let (k, m) = (4_usize, candidates.len());
+        COSINE_PAIRS.with(|count| count.set(0));
+        let selected = mmr_select(&view, candidates, 0.7, k);
+        assert_eq!(selected.len(), k);
+        let calls = COSINE_PAIRS.with(std::cell::Cell::get) as usize;
+        let bound = k * m - k * (k + 1) / 2;
+        let uncached: usize = (1..=k).map(|t| t * (m - t + 1)).sum();
+        assert!(
+            calls <= bound,
+            "对级余弦计算 {calls} 超过缓存化上界 {bound}(未缓存实现约 {uncached})"
+        );
     }
 }

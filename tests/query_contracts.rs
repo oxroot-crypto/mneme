@@ -5,8 +5,11 @@
 //! * FC-MEM-CPLX-001..003/005(暴力扫描、过滤求值、并行归并、iter 过滤/排序)
 //! * FC-MEM-PRE-003/004、FC-MEM-POST-005、FC-MEM-INV-003
 //! * FC-INDEX-INV-005、FC-INDEX-POST-003、FC-QUERY-ERR-002、FC-QUERY-POST-001
-//! * FC-SCORE-INV-027、FC-SCORE-POST-001、FC-SCORE-POST-002、FC-SCORE-POST-004/005、FC-GLOBAL-PRE-001/004
+//! * FC-SCORE-INV-027、FC-SCORE-POST-001、FC-SCORE-POST-002、FC-SCORE-POST-004/005/006/007、FC-GLOBAL-PRE-001/004
+//! * FC-MEM-ERR-002(`Scoring::bias_routing` 落地后不再返回 `Unsupported`)
 //! * FC-SCORE-CPLX-001..003
+//!
+//! 不变量锚定:I5(混合检索等价性)、I27(反馈幂等)
 
 use std::sync::Arc;
 
@@ -19,7 +22,7 @@ mod common;
 
 use common::{FakeClock, inserted, mem, reference_dot};
 
-/// FC-MEM-CPLX-001(暴力检索 ≡ 参考实现)
+/// FC-MEM-CPLX-001(I5:暴力检索 ≡ 参考实现)
 #[test]
 fn brute_force_matches_reference() {
     let ns = mem(4).namespace("n");
@@ -589,4 +592,111 @@ proptest! {
             .expect("count");
         prop_assert_eq!(count, expected);
     }
+}
+
+/// FC-SCORE-POST-006:扩展候选与既有通道候选按 `RowId` 合并,分数取
+/// `max(自身分, boost)`(不重复出现);`via` 只在扩展确有贡献时记录。
+#[test]
+fn expansion_max_merges_with_existing_candidates() {
+    use std::collections::HashSet;
+
+    let ns = mem(2).namespace("n");
+    let a = inserted(ns.insert(Record::new(vec![0.9, 0.1]).key("a")).expect("a"));
+    let b = inserted(ns.insert(Record::new(vec![1.0, 0.0]).key("b")).expect("b"));
+    let d = inserted(ns.insert(Record::new(vec![0.0, 1.0]).key("d")).expect("d"));
+    ns.relate(a, b, mneme::RelationKind::RELATED, 0.3)
+        .expect("a→b");
+    ns.relate(a, d, mneme::RelationKind::RELATED, 0.8)
+        .expect("a→d");
+    let hits = ns
+        .search()
+        .vector(&[1.0, 0.0])
+        .top_k(3)
+        .ef(16)
+        .expand(RelationExpand {
+            hops: 1,
+            kinds: vec![mneme::RelationKind::RELATED],
+            decay: 0.5,
+            max_nodes: 64,
+        })
+        .execute()
+        .expect("search");
+
+    let unique: HashSet<_> = hits.iter().map(|hit| hit.rowid).collect();
+    assert_eq!(unique.len(), hits.len(), "同一 RowId 不得重复出现");
+    let hit_b = hits
+        .iter()
+        .find(|hit| hit.key.as_ref().map(|key| key.as_str()) == Some("b"))
+        .expect("b 在向量候选中");
+    assert!(
+        (hit_b.score - 1.0).abs() < 1e-6,
+        "boost 低于自身相似度时必须保留自身分,实际 {}",
+        hit_b.score
+    );
+    assert!(hit_b.via.is_none(), "扩展未提升分数时不得把 via 记成来源");
+    let hit_d = hits
+        .iter()
+        .find(|hit| hit.key.as_ref().map(|key| key.as_str()) == Some("d"))
+        .expect("d 由扩展进入");
+    assert!(
+        hit_d.score > 0.0,
+        "boost 高于自身相似度时必须提升分数,实际 {}",
+        hit_d.score
+    );
+    assert!(hit_d.via.is_some(), "扩展引入/提升的候选必须记录 via");
+}
+
+/// FC-SCORE-POST-007:偏置路由只改 HNSW 前沿出堆顺序;`ef` 收敛时返回的
+/// 候选与分数与关闭时一致,且 `bias_routing = true` 不再返回 `Unsupported`。
+#[test]
+fn bias_routing_only_changes_visit_order() {
+    use mneme::{Builder, Tuning};
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Builder::default()
+        .dimension(4)
+        .path(dir.path())
+        .tuning(Tuning {
+            brute_force_max_rows: 1,
+            ..Tuning::default()
+        })
+        .build()
+        .expect("build");
+    let ns = db.namespace("n");
+    for row in 0..256_u32 {
+        let vector: Vec<f32> = (0..4)
+            .map(|col| ((row * 7 + col * 13) % 101) as f32 / 101.0)
+            .collect();
+        ns.insert(Record::new(vector).importance((row % 10) as f32 / 9.0))
+            .expect("insert");
+    }
+    db.flush().expect("flush");
+    let query = [0.5_f32, 0.5, 0.5, 0.5];
+    let run = |bias: bool| {
+        ns.search()
+            .vector(&query)
+            .top_k(10)
+            .ef(2048)
+            .score(Scoring {
+                bias_routing: bias,
+                w_importance: 0.2,
+                ..Scoring::default()
+            })
+            .execute()
+            .expect("search")
+    };
+    let plain = run(false);
+    let biased = run(true);
+    let plain_ids: Vec<_> = plain.iter().map(|hit| hit.rowid).collect();
+    let biased_ids: Vec<_> = biased.iter().map(|hit| hit.rowid).collect();
+    assert_eq!(plain_ids, biased_ids, "ef 收敛后偏置不得改变候选集或次序");
+    for (left, right) in plain.iter().zip(&biased) {
+        assert!(
+            (left.score - right.score).abs() < 1e-6,
+            "偏置不得改变最终分数:{} vs {}",
+            left.score,
+            right.score
+        );
+    }
+    db.close().expect("close");
 }

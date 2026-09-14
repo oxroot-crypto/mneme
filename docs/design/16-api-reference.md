@@ -17,10 +17,9 @@
 
 > **实现状态**:本参考按冻结签名描述目标语义。L4 起 `text`(BM25)、`Fusion`、
 > `Expr::from_str`/`Display`/JSON 往返与 `filter!` 均已落地;L6 起量化(含
-> `stats().quant` 实况)与 `feature = "async"` 门面已落地。正文逐项标注了规划 API
-> (L11/L12)与未落地能力。**已接线但未落地**的配置项(如 `compression`)当前仅记录配置、
-> 不生效,并以 `stats()` 如实反映;其余未落地能力以结构化错误返回、绝不静默降级
-> (FC-MEM-ERR-002),见 §4 错误表。
+> `stats().quant` 实况)与 `feature = "async"` 门面已落地;**L11 静态加密/压缩与
+> L12 存储后端/只读刷新/可观测均已落地**(签名见 §1.9)。能力未开启或对当前形态
+> 不适用时,一律以结构化错误返回、绝不静默降级(FC-MEM-ERR-002),见 §4 错误表。
 
 ### 1.1 构建与打开
 
@@ -48,24 +47,26 @@ impl Builder {
     pub fn dedup_threshold(self, t: f32) -> Self;           // 默认 0.95;近似去重余弦阈值,`[0,1]` 内的有限值(越界建库即拒绝)
     pub fn quantization(self, f: VectorFormat) -> Self;     // 默认 F32;持久库才可配量化(纯内存库构造期 Unsupported);见 08
     pub fn hnsw(self, p: HnswParams) -> Self;               // 默认 M=16/M0=32/efc=200/ef=64
+    pub fn build_precision(self, p: BuildPrecision) -> Self; // 建图距离精度,默认 Hybrid(见下);F32 = 全精确原行为
     pub fn compaction(self, p: CompactionPolicy) -> Self;   // 默认见 §2
     pub fn retention(self, r: Option<Retention>) -> Self;   // 后台自动遗忘;默认 None = 关闭(见 07 §3.4)
     pub fn retain_interval(self, d: Duration) -> Self;      // 开启自动遗忘时的周期,默认 半衰期/4
     pub fn access_flush_interval(self, d: Duration) -> Self; // 默认 30s
-    pub fn compression(self, c: Compression) -> Self;       // 文本/元数据压缩,默认 None(见 11;配置已接线,压缩实现待 L11)
-    pub fn encryption(self, e: Option<Encryption>) -> Self; // 静态加密,feature `encrypt`(见 11;L11 落地,当前无此 API)
-    pub fn storage(self, s: Arc<dyn Storage>) -> Self;      // 存储后端,默认 FsStorage;WASM/边缘自定义(见 12 §3;L12 落地,当前无此 API,内部直接 std::fs)
-    pub fn read_only(self, yes: bool) -> Self;              // 只读共享模式(见 12 §2;L2 已实现单进程只读,不创建锁/WAL)
-    pub fn read_only_probe_interval(self, d: Duration) -> Self; // 只读实例探测新 MANIFEST 的周期,默认 1s(见 12 §2;L12 落地,当前无此 API)
+    pub fn compression(self, c: Compression) -> Self;       // 记录体 text/meta/provenance 压缩,默认 None(见 11;已落地)
+    pub fn encryption(self, e: Option<Encryption>) -> Self; // 静态加密,feature `encrypt`(见 11;已落地)
+    pub fn storage(self, s: Arc<dyn Storage>) -> Self;      // 存储后端,默认 FsStorage;WASM/边缘自定义(见 12 §3;已落地)
+    pub fn read_only(self, yes: bool) -> Self;              // 只读共享模式:不创建/不争抢写锁,后台周期探测新 MANIFEST(见 12 §2;已落地)
+    pub fn read_only_probe_interval(self, d: Duration) -> Self; // 只读实例探测新 MANIFEST 的周期,默认 1s;0 = 关闭(见 12 §2;已落地)
     pub fn verify_on_open(self, yes: bool) -> Self;         // 打开时全量校验各段 payload CRC,默认 false(见 04 §4.3)
     pub fn fail_fast_on_corruption(self, yes: bool) -> Self; // 损坏段直接拒绝启动,默认 false = 隔离剔除(见 04 §7)
     pub fn relation_index(self, r: RelationIndex) -> Self;  // 关系反向索引,默认 Outgoing(见 09 §2.3)
     pub fn parallelism(self, n: usize) -> Self;             // 默认 0 = available_parallelism()
+    pub fn maintenance(self, enabled: bool) -> Self;        // 后台维护线程开关,默认 true;false = 导入期闸住自动 compaction/遗忘/访问落盘(见 07;FC-LIFE-POST-010)
     pub fn tuning(self, t: Tuning) -> Self;                 // 进阶调参,默认见 §2
     pub fn limits(self, l: Limits) -> Self;                 // 数据限额,见 §8
     pub fn clock(self, c: Arc<dyn Clock>) -> Self;          // 测试注入;默认 SystemClock
     pub fn fsync_hook(self, hook: Arc<dyn FsyncHook>) -> Self; // 测试崩溃注入,见 04 §10.1
-    pub fn observer(self, o: Arc<dyn Observer>) -> Self;    // 可选可观测钩子,默认无(见 12 §4;L12 落地,当前无此 API)
+    pub fn observer(self, o: Arc<dyn Observer>) -> Self;    // 可选可观测钩子,默认无(见 12 §4;已落地)
     pub fn build(self) -> Result<Mneme>;
 }
 ```
@@ -304,6 +305,11 @@ impl Namespace {
     /// `RelationIndex::Both` 时走反向索引(见 [09 §2.3](09-memory-model.md))。
     pub fn predecessors(&self, to: RowId, kinds: &[RelationKind]) -> Result<Vec<Edge>>;
 
+    /// 注册/解析自定义关系类型:内置名解析为内置编号,新名称从 16 起分配、同名幂等;
+    /// 名称非空、≤128 字节、不含控制字符(否则 `Config`),编号空间耗尽 → `TooLarge`;
+    /// 注册经 WAL/MANIFEST 持久化,重启后名称↔编号一致(见 [09 §2.2](09-memory-model.md))。
+    pub fn relation_kind(&self, name: &str) -> Result<RelationKind>;
+
     // ---- 记忆沉淀(见 09 §5)----
     pub fn consolidate(&self, policy: ConsolidationPolicy) -> Result<ConsolidateReport>;
 }
@@ -334,6 +340,15 @@ impl Mneme {
     pub fn compact(&self) -> Result<()>;         // 显式触发一轮 size-tiered compaction(无触发/暂停/纯内存库时空操作,见 07 §4)
     pub fn maintenance_tick(&self) -> Result<()>; // 手动执行一轮后台维护(访问攒批/自动遗忘/自动 compaction,见 07 §2–§4)
     pub fn flush(&self) -> Result<()>;           // 把可变表落成增量段并 fsync WAL
+    /// 只读实例重载:发现更新的已提交 MANIFEST 时原子切换视图,返回新版本号
+    /// (无新版本 → `None`,旧视图保持);纯内存库 → `Unsupported`,可写实例 → `Config`
+    /// (见 [12 §2.1](12-deployment.md);已落地)。
+    pub fn reload(&self) -> Result<Option<u64>>;
+    /// 轮换静态加密密钥:`provider.rotate()` 后全量重写段与 MANIFEST,返回新 key_id;
+    /// 迁移期间新旧密钥均可读,迁移完成后宿主可 `Keyring::retire` 旧密钥。
+    /// 未启用加密 → `Config`,纯内存库 → `Unsupported`,feature `encrypt` 未开或
+    /// provider 未实现轮换 → `Unsupported`(见 [11 §2.4](11-security-storage.md);已落地)。
+    pub fn rotate_encryption_key(&self) -> Result<KeyId>;
     pub fn close(self) -> Result<()>;            // flush + 停后台维护 + 释放文件锁;幂等(对已关闭的库经其他句柄再调返回 Ok)
 }
 
@@ -415,13 +430,19 @@ pub struct Stats {
     pub retain: Option<RetainReport>,             // 最近一次后台遗忘(未开启则 None,见 07 §3.4)
     pub relations: u64,                           // 关系边数(见 09 §2)
     pub history: HistoryStat,                     // 版本链/历史保留统计(见 07 §4.2a)
-    pub storage: StorageStat,                     // 存储安全配置与迁移进度(压缩实现待 L11;见 11)
+    pub storage: StorageStat,                     // 存储安全配置与迁移进度(加密/压缩均已落地;见 11)
 }
 // `SegmentStat` 标注 #[non_exhaustive](字段随层扩展,下游不得穷尽构造/匹配);
 // `bytes` = 段内 vsec + 已落盘 hidx 字节数(不含 msec);`rows` 含墓碑与历史版本。
 pub struct SegmentStat { pub id: SegmentId, pub rows: u64, pub bytes: u64, pub dead_ratio: f32, pub created: i64, pub index_nodes: u64, pub index_levels: u8, pub quant: VectorFormat, pub recall_est: Option<f32> }  // index_* 为 L3 HNSW 图统计(无索引段为 0;小段可能预建但查询恒暴力);quant/recall_est 为 L6 量化状态(重开后 recall_est 为 None)
 pub struct NsStat      { pub doc_count: u64, pub total_doc_len: u64 }
 pub struct Histogram   { /* 固定 32 桶边界与计数,详见 07 §7 */ }
+impl Histogram {
+    /// 记录一次延迟样本(毫秒),超范围钳制到端点桶。
+    pub fn record(&mut self, latency_ms: f64);
+    /// 32 个桶的累计计数:下标 0 = ≤1ms、31 = ≥1s,其余按对数刻度;读取不清零。
+    pub fn buckets(&self) -> &[u64; 32];
+}
 pub struct StorageStat { pub encryption: bool, pub compression: Compression, pub migrated_segments: usize, pub total_segments: usize }
 ```
 
@@ -457,6 +478,7 @@ pub enum CompactionState {
 impl CompactionControl {
     pub fn pause(&self);
     pub fn resume(&self);
+    pub fn is_paused(&self) -> bool;   // 暂停标志;空闲时 pause() 也置位,此时 state() 仍为 Idle
     pub fn state(&self) -> CompactionState;
 }
 
@@ -616,7 +638,8 @@ pub struct RelationKind(pub u16);
 impl RelationKind {
     pub const DERIVED_FROM: Self; pub const SUPPORTS: Self;
     pub const CONTRADICTS: Self;  pub const RELATED: Self;
-    pub fn custom(name: &str) -> Result<Self>;   // 名称→稳定编号(注册表见 09 §2;未落地,当前不提供)
+    pub const FIRST_CUSTOM: u16;  // =16,自定义类型编号起点
+    // 自定义类型注册经 `Namespace::relation_kind(name)`(名称→稳定编号;见 09 §2.2)
 }
 /// 一条关系边。
 pub struct Edge { pub from: RowId, pub to: RowId, pub kind: RelationKind, pub weight: f32, pub metadata: Meta }
@@ -660,6 +683,98 @@ pub struct ConsolidateReport {
 }
 ```
 
+### 1.9 存储安全与部署后端(feature `encrypt` / `compress` / `wasm`)
+
+> 以下类型均已落地;加密需 feature `encrypt`,压缩需 `compress`(Lz4)或
+> `compress-zstd`(Zstd),WASM 适配需 `wasm`。未开启 feature 却设置对应配置时,
+> `build()`/写入路径返回 `Unsupported`,绝不静默明文落盘或跳过压缩(FC-SEC-ERR-001)。
+
+```rust
+// ---- 静态加密(feature `encrypt`;见 [11 §2](11-security-storage.md))----
+
+/// 密钥标识:写入信封头,解密时按 id 向 provider 取密钥。
+pub struct KeyId(pub u32);
+
+/// 32 字节对称密钥(不实现会打印明文内容的 `Debug`);以 `mneme::CryptoKey` 导出。
+pub struct Key([u8; 32]);   // 别名导出:CryptoKey
+impl Key {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self;
+    #[cfg(feature = "encrypt")] pub fn generate() -> Result<Self>;  // OS 熵源
+}
+
+/// 支持的 AEAD 算法(当前仅 AES-256-GCM)。
+pub enum Cipher { Aes256Gcm }
+
+/// 密钥提供者:宿主实现(环境变量 / OS keychain / KMS / 自管)。
+pub trait KeyProvider: Send + Sync {
+    fn active_key(&self) -> KeyId;
+    fn key(&self, id: KeyId) -> Result<Key>;
+    fn rotate(&self) -> Result<KeyId>;   // 默认返回 Unsupported(可选能力)
+}
+
+/// 加密配置:密钥提供者 + 算法。
+pub struct Encryption { pub provider: Arc<dyn KeyProvider>, pub cipher: Cipher }
+
+/// 内存密钥环(便捷实现):多密钥共存、active 切换与退役;实现 `KeyProvider`。
+pub struct Keyring { /* .. */ }
+impl Keyring {
+    pub fn new(id: KeyId, key: Key) -> Self;
+    pub fn insert(&self, id: KeyId, key: Key);
+    pub fn retire(&self, id: KeyId) -> bool;   // active 密钥不可退役
+}
+
+// ---- 存储后端(见 [12 §3](12-deployment.md))----
+
+/// 存储后端的文件元数据。
+pub struct FileMeta { pub len: u64 }
+
+/// 存储后端抽象(根目录绑定;路径均为库内相对路径)。
+pub trait Storage: Send + Sync + std::fmt::Debug {
+    fn read_file(&self, rel: &str) -> Result<Vec<u8>>;
+    fn read_file_opt(&self, rel: &str) -> Result<Option<Vec<u8>>>;
+    fn read_prefix(&self, rel: &str, max: usize) -> Result<Vec<u8>>;  // 段打开前缀探测;默认整读后截断,文件后端应覆写
+    fn write_atomic(&self, rel: &str, bytes: &[u8]) -> Result<()>;  // 临时文件 + rename + fsync
+    fn write_new(&self, rel: &str, bytes: &[u8]) -> Result<()>;     // 只创建不覆盖
+    fn append(&self, rel: &str, bytes: &[u8]) -> Result<u64>;       // 追加并返回新长度
+    fn truncate(&self, rel: &str, len: u64) -> Result<()>;
+    fn sync(&self, rel: &str) -> Result<()>;
+    fn list_dir(&self, rel: &str) -> Result<Vec<String>>;
+    fn ensure_dir(&self, rel: &str) -> Result<()>;
+    fn remove_if_exists(&self, rel: &str) -> Result<()>;
+    fn rename(&self, from: &str, to: &str) -> Result<()>;
+    fn exists(&self, rel: &str) -> Result<bool>;
+    fn stat(&self, rel: &str) -> Result<FileMeta>;
+    // 默认实现:
+    fn open_bytes(&self, rel: &str) -> Result<RawBytes>;            // 默认整文件读入;mmap 后端可覆写
+    fn root_exists(&self) -> Result<bool>;
+    fn try_lock(&self) -> Result<Box<dyn std::any::Any + Send + Sync>>;  // 独占锁;`Drop` 即释放
+}
+
+/// `open_bytes` 的只读字节视图:`Mmap`(feature `mmap`)或整文件自有缓冲 `Owned`。
+pub enum RawBytes { /* Mmap(memmap2::Mmap) | Owned(Box<[u8]>) */ }
+impl RawBytes {
+    pub fn as_slice(&self) -> &[u8];
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+}
+
+/// 桌面/服务器默认文件系统后端。
+pub struct FsStorage { /* .. */ }
+impl FsStorage { pub fn new(root: impl AsRef<Path>) -> Self; }
+
+/// 纯内存后端(WASM/测试;进程内互斥模拟文件锁)。
+pub struct MemStorage { /* .. */ }
+impl MemStorage { pub fn new() -> Self; }
+```
+
+- `.encryption(Some(..))` / `.compression(..)` / `.storage(Arc::new(MemStorage::new()))`
+  均经 `Builder` 注入(见 §1.1、§2);
+- `Compression::{None, Lz4, Zstd}` 作用于 msec 记录体 `text`/`meta`/`provenance`
+  字段,压缩无收益(不短于原文)自动回退存原文;`FORMAT_VERSION = 0x0006`,
+  记录体新增恒 0 的 `flags2` 字节承载压缩位(未压缩时布局与旧定义逐字节一致);
+- `wasm` feature 关闭 mmap/后台线程,配合 `MemStorage` 或宿主后端;目标构建验证
+  留 CI 的 `wasm-check` job。
+
 ---
 
 ## 2. Builder 与配置总表
@@ -677,19 +792,21 @@ pub struct ConsolidateReport {
 | 去重阈值 | `.dedup_threshold` | `0.95` | 近似去重阈值,**统一按余弦相似度口径**(非余弦度量下引擎内部先归一化);`[0,1]` 内的有限值,越界建库即拒绝;与 `ResultDedup::Near` 独立 |
 | 量化格式 | `.quantization` | `F32` | `F32/F16/I8Rescored`,[08](08-l6-quant.md);持久库才可配,纯内存库构造期 `Unsupported`;`F16` 需 feature `quant-f16` |
 | HNSW 参数 | `.hnsw` | 见下 | `HnswParams` |
+| 建图精度 | `.build_precision` | `Hybrid` | `F32`(全 f32 精确原行为)/`Hybrid`(遍历 i8 近似 + 选邻 f32 精排);临时码流不落盘,见 [05 §4.4](05-l3-hnsw.md)、`FC-INDEX-POST-010/011`;flush/compaction 按当前配置生效 |
 | compaction | `.compaction` | 见下 | `CompactionPolicy` |
 | 历史保留窗口 | `.compaction(p)` 的 `p.history_horizon` | `None`(永久) | `Option<Duration>`;有限值可回收超期历史版本,见 [07 §4.2a](07-l5-life.md) |
 | 自动遗忘 | `.retention` | **`None`(关闭)** | `Option<Retention>`;显式传入才开启后台 retain,见 [07 §3.4](07-l5-life.md) |
 | 遗忘扫描周期 | `.retain_interval` | 半衰期/4 | 开启自动遗忘后的触发间隔 |
 | 访问统计落盘 | `.access_flush_interval` | `30s` | 内存访问计数批量写 WAL 的周期,见 [07 §2](07-l5-life.md) |
-| 压缩 | `.compression` | `None` | 文本/元数据压缩,见 [11 §3](11-security-storage.md);**L11 落地**,当前仅记录配置、不生效 |
-| 加密 | `.encryption` | `None` | 静态加密(feature `encrypt`),见 [11 §2](11-security-storage.md);**L11 落地**,当前无此 API |
-| 存储后端 | `.storage` | `FsStorage` | `Arc<dyn Storage>`;WASM/边缘自定义后端,见 [12 §3](12-deployment.md);**L12 落地**,当前无此 API |
+| 压缩 | `.compression` | `None` | 记录体 `text`/`meta`/`provenance` 压缩(feature `compress`/`compress-zstd`),见 [11 §3](11-security-storage.md);无收益回退原文 |
+| 加密 | `.encryption` | `None` | 静态加密(feature `encrypt`,整文件/整帧 AEAD 信封),见 [11 §2](11-security-storage.md) |
+| 存储后端 | `.storage` | `FsStorage` | `Arc<dyn Storage>`;WASM/边缘自定义后端,见 [12 §3](12-deployment.md) |
 | 只读共享 | `.read_only` | `false` | 多进程只读打开,见 [12 §2](12-deployment.md) |
-| 只读探测周期 | `.read_only_probe_interval` | `1s` | 只读实例发现新 MANIFEST 的周期,见 [12 §2.1](12-deployment.md);**L12 落地**,当前无此 API |
+| 只读探测周期 | `.read_only_probe_interval` | `1s` | 只读实例发现新 MANIFEST 的周期(`Duration::ZERO` = 关闭显式探测),见 [12 §2.1](12-deployment.md);已落地 |
 | 关系索引 | `.relation_index` | `Outgoing` | `Outgoing/Both`;`Both` 空间 ×2,见 [09 §2.3](09-memory-model.md) |
-| 并行度 | `.parallelism` | `0`(自动) | 并行扫描的线程数(当前仅用于暴力扫描分块);0 = `available_parallelism()` |
-| 可观测 | `.observer` | 无 | 可选事件钩子,见 [12 §4](12-deployment.md);**L12 落地**,当前无此 API |
+| 并行度 | `.parallelism` | `0`(自动) | 并行线程数(暴力扫描分块 + HNSW 批内建图,上限 `Tuning.hnsw_threads_max`);0 = `available_parallelism()`;建图结果与线程数无关 |
+| 后台维护 | `.maintenance` | `true` | `false` 时不启动维护线程(自动 compaction/遗忘/访问统计落盘均停),手动 `maintenance_tick`/`compact`/`retain` 照常;批量导入期闸住维护用,见 [07](07-l5-life.md)、`FC-LIFE-POST-010` |
+| 可观测 | `.observer` | 无 | 可选事件钩子,见 [12 §4](12-deployment.md);已落地 |
 | 进阶调参 | `.tuning` | 见下 | `Tuning` |
 | 数据限额 | `.limits` | 见 §8 | `Limits` |
 | 启动全量校验 | `.verify_on_open` | `false` | `true` 时打开即校验各段 payload CRC(慢),见 [04 §4.3](04-l2-persist.md) |
@@ -705,6 +822,16 @@ pub struct HnswParams {
 }
 // 违反上述域 → Config/LimitExceeded(FC-INDEX-PRE-001),绝不静默。
 // 层级骰子系数 m_L = 1/ln(m) 为派生量,不单独暴露(见 05 §3.2、05 §11)。
+
+/// HNSW 建图距离精度档位(05 §4.4;FC-INDEX-POST-010/011)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BuildPrecision {
+    /// 全 f32 精确建图(原行为;逐位可复现)。
+    F32,
+    /// 默认:遍历用段内临时 i8 码流近似距离、选邻/剪枝前按 f32 原向量精排候选。
+    #[default]
+    Hybrid,
+}
 
 pub struct CompactionPolicy {
     pub tier_ratio: u32,     // 默认 4   分级比 r
@@ -728,6 +855,12 @@ pub struct Tuning {
     pub stopwords: bool,                // 默认 true  启用内置停用词表(06 §3.5;建库即锁定,既存库以 MANIFEST 为准)
     pub rescore_oversample: usize,      // 默认 4     两阶段粗排候选 = top_k × 本值(08 §4.2;仅量化段生效)
     pub quant_recall_floor: f32,        // 默认 0.98  建段抽样召回一致率门槛(0.0 关回退,>1 恒回退;08 §4.3)
+    pub hnsw_compare_cap: usize,        // 默认 4     选邻"新方向"比较上限:只与最近至多该数量的已选项比(05 §4.3/§4.4)
+    pub hnsw_batch_rows: usize,         // 默认 8     批内建图批行数(只依赖节点数,与线程数无关;FC-INDEX-POST-012)
+    pub hnsw_serial_rows: usize,        // 默认 64    节点数 ≤ 本值不分批(等价串行)
+    pub hnsw_threads_max: usize,        // 默认 8     建图批内并行度上限(实际线程数还受 Builder::parallelism 与批行数约束)
+    pub flush_chunk_rows: usize,        // 默认 65536 大 flush 切块行数;env MNEME_FLUSH_CHUNK_ROWS 优先
+    pub flush_threads: usize,           // 默认 1     块级并行度(1 = 块级串行,并行交给块内批并行);env MNEME_FLUSH_THREADS 优先
 }
 ```
 
@@ -739,6 +872,7 @@ pub struct Tuning {
 | 长期偏好/事实 | `importance` 显式设高 + `Retention::min_importance` 提高 + `Dedup::Replace` 或 `Merge` |
 | 只读/分析副本 | `.fsync(Never)` 仅限测试;生产只读副本仍用 `Batched`,备份目录 `open` 后勿写 |
 | 延迟敏感 | `.quantization(I8Rescored)` + `ef=64~128`;`.parallelism(0)` 交给运行时 |
+| 建库吞吐优先 | 默认 `Hybrid` 建图;需逐位复现 f32 图时 `.build_precision(BuildPrecision::F32)` |
 | 内存受限 | 默认 mmap + i8;定期 `backup_to` 后重建更小的段 |
 
 > 以上只是起点:所有旋钮都有默认值,先用默认跑通,再按 `stats()` 的延迟直方图与召回基准调参。
@@ -830,8 +964,8 @@ pub struct Tuning {
 | `SearchBuilder` | ✅ | ✅ | 短生命周期构建器,通常单线程用完即 `execute`(仅不承诺跨线程可变使用) |
 | `Record` / `StoredRecord` / `Hit` / `InsertOutcome` / `UpdatePatch` / `QueryId` | ✅ | ✅ | 值类型 |
 | `RecordRef<'_>` | ✅ | ✅ | 以 `Arc` 持有记录数据的只读视图 |
-| `Reranker` / `Clock` / `Summarizer` / `KeyProvider` / `Observer` | ✅ | ✅ | 宿主实现需满足(`KeyProvider`/`Observer` 为 L11/L12 规划,当前无此类型) |
-| `Storage` | ✅ | ✅ | 平台存储后端(见 12 §3,`trait` 为 L12 规划) |
+| `Reranker` / `Clock` / `Summarizer` / `KeyProvider` | ✅ | ✅ | 宿主实现需满足(`KeyProvider` 见 [11 §2](11-security-storage.md)) |
+| `Storage` / `Observer` | ✅ | ✅ | 平台存储后端 / 事件钩子(见 [12 §3](12-deployment.md)/[12 §4](12-deployment.md),均已落地) |
 
 **并发语义**:
 
@@ -940,7 +1074,7 @@ b.check()?;                  // 全绿 = 备份有效(写进 CI,见 14 §6)
 | `ef` | 4096 | 仅 L3+ |
 | WAL 单帧 payload | 16 MiB | 撕裂写检测与内存上界;**当前保留限额,尚未在写路径强制** |
 | 命名空间深度 | 32 级 | `a/b/c/...`,对应 `Limits.ns_depth` |
-| 自定义关系类型 | 65520 个 | u16 编号空间,内置占用 0..=15;超限 `TooLarge`;**规划,当前 `custom` 未提供** |
+| 自定义关系类型 | 65519 个 | u16 编号空间,内置占用 0..=15(自定义可用 16..=65534);超限 `TooLarge`;经 `Namespace::relation_kind(name)` 注册 |
 
 限额通过 `.limits(Limits { .. })` 调整;调大以内存/恢复时间为代价,请评估后再改。
 

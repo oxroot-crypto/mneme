@@ -47,10 +47,8 @@ fn sorted_terms(
 ) -> Vec<(u32, Arc<str>, &[crate::memory::analysis::Posting])> {
     let mut terms: Vec<(u32, Arc<str>, &[crate::memory::analysis::Posting])> = Vec::new();
     for ns_id in index.ns_ids() {
-        if let Some(bucket) = index.terms_of(ns_id) {
-            for (term, postings) in bucket {
-                terms.push((ns_id.get(), Arc::clone(term), postings.as_slice()));
-            }
+        for (term, postings) in index.terms_of(ns_id) {
+            terms.push((ns_id.get(), Arc::clone(term), postings));
         }
     }
     terms.sort_by(|left, right| (left.0, left.1.as_ref()).cmp(&(right.0, right.1.as_ref())));
@@ -108,10 +106,8 @@ fn encode_term_dict(
 fn encode_doc_region(index: &InvertedIndex, out: &mut Vec<u8>) -> Result<()> {
     let mut docs: Vec<(u32, u32, u32)> = Vec::new();
     for ns_id in index.ns_ids() {
-        if let Some(entries) = index.doc_entries(ns_id) {
-            for (slot, doc_len) in entries {
-                docs.push((ns_id.get(), slot.get(), *doc_len));
-            }
+        for (slot, doc_len) in index.docs_of(ns_id) {
+            docs.push((ns_id.get(), slot.get(), *doc_len));
         }
     }
     docs.sort_unstable();
@@ -321,7 +317,10 @@ mod tests {
         assert_eq!(beta.len(), 2);
         assert_eq!(beta[0].slot, SlotId::new(0));
         assert_eq!(beta[1].slot, SlotId::new(1));
-        let docs = decoded.doc_entries(ns).expect("docs");
+        let docs: std::collections::HashMap<SlotId, u32> = decoded
+            .docs_of(ns)
+            .map(|(slot, doc_len)| (*slot, *doc_len))
+            .collect();
         assert_eq!(docs.get(&SlotId::new(0)), Some(&3));
         assert_eq!(docs.get(&SlotId::new(1)), Some(&2));
     }

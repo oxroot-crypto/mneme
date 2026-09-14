@@ -128,6 +128,26 @@ pub enum Expr {
 }
 
 impl Expr {
+    /// 表达式是否引用访问统计字段(`access_count` / `last_access`)。
+    ///
+    /// 扫描热路径据此按需填充求值上下文的访问统计:未引用时传 `None`,
+    /// 省去每行一次访问统计查找;求值结果不变(两个字段只在引用时读取)。
+    pub(crate) fn uses_access(&self) -> bool {
+        match self {
+            Expr::Always | Expr::Never => false,
+            Expr::And(parts) | Expr::Or(parts) => parts.iter().any(Expr::uses_access),
+            Expr::Not(inner) => inner.uses_access(),
+            Expr::Cmp { field, .. }
+            | Expr::In(field, _)
+            | Expr::Contains(field, _)
+            | Expr::StartsWith(field, _)
+            | Expr::EndsWith(field, _)
+            | Expr::Glob(field, _)
+            | Expr::Exists(field)
+            | Expr::IsNull(field) => field == "last_access" || field == "access_count",
+        }
+    }
+
     /// 字段组合器入口:`Expr::field("importance").gt(0.5)`。
     ///
     /// # Arguments

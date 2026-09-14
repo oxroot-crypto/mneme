@@ -4,10 +4,8 @@
 //! 重新执行 §4 构建。**L3 的构建输入是段内全部物理版本(含墓碑与历史版本)**:
 //! 死节点只可穿越、不可入选(设计 05 §7),节点集剔除属 L5 compaction 的目标。
 
-use crate::core::metric::Metric;
-use crate::core::options::HnswParams;
-use crate::core::types::SlotId;
-use crate::memory::index::{IndexNode, QuantCopy};
+use crate::core::error::Result;
+use crate::memory::index::IndexBuildRequest;
 
 use super::hnsw::HnswIndex;
 
@@ -15,13 +13,18 @@ use super::hnsw::HnswIndex;
 ///
 /// 增量段只覆盖部分全局槽位,节点 id 与全局槽位不再恒等,必须显式映射
 /// (设计 07 §4;查询期 `alive`/过滤位图按全局槽位索引)。
-/// `quant` 只服务查询期粗排打分,图结构仍由 f32 向量构建(设计 08 §落地状态)。
-pub(crate) fn rebuild_with_slots(
-    nodes: &[IndexNode],
-    slot_of: &[SlotId],
-    params: HnswParams,
-    metric: Metric,
-    quant: Option<QuantCopy>,
-) -> HnswIndex {
-    HnswIndex::build_with_slots(nodes, slot_of, params, metric, quant)
+/// 构建档位/并行度语义见 [`IndexBuildRequest`]。
+///
+/// # Errors
+/// 建图期段内量化或索引装配失败时返回结构化错误,绝不静默降级档位。
+pub(crate) fn rebuild_with_slots(request: IndexBuildRequest<'_>) -> Result<HnswIndex> {
+    HnswIndex::build_with_slots(
+        request.nodes,
+        request.slot_of,
+        request.params,
+        request.metric,
+        request.quant,
+        request.build_precision,
+        request.build,
+    )
 }
