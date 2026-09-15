@@ -3,11 +3,11 @@
 > **本章目标**:理解 `#[cfg(...)]` 条件编译、`unsafe` 的含义与边界,以及 mneme 如何用 SIMD
 > 内联指令加速点积。
 > **前置**:[04 章](04-borrowing-strings-slices.md)(切片与引用)、[08 章](08-modules-docs.md)。
-> **对应源码**:[`src/core/simd.rs`](../../src/core/simd.rs)、[`src/quant/support.rs`](../../src/quant/support.rs)、
+> **对应源码**:[`src/core/simd/`](../../src/core/simd/)、[`src/quant/support.rs`](../../src/quant/support.rs)、
 > [`src/quant/mod.rs`](../../src/quant/mod.rs)。
 
 这一章涉及 Rust 里唯一"绕过编译器保护"的部分。**mneme 把 `unsafe` 压缩到全库仅两处**
-(L0 `src/core/simd.rs` 的 arch 内联与 L2 `src/persist/source.rs` 的 `MmapSource`),
+(L0 `src/core/simd/` 的 arch 内联与 L2 `src/persist/source/` 的 `MmapSource`),
 每处都附 `// SAFETY:` 证明,是学习"如何负责任地使用 unsafe"的范本。
 
 ---
@@ -37,12 +37,12 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 ```
 
-见 [`src/core/simd.rs:50-65`](../../src/core/simd.rs)。
+见 [`src/core/simd/mod.rs:60-75`](../../src/core/simd/)。
 
 > **`#[cfg]` 不只用在函数/模块上**,也能用在 `struct` 字段、`match` 分支,以及函数体里的
 > **语句/块表达式**上。上面 `dot` 就是后者:三个互斥的块各自带 `#[cfg]`,编译后只留下一个。
 > 注意块本身仍要写成 `{ ... }`,属性写在块前面。注意:上例为教学而把
-`simd.rs` 不同位置的片段拼在一起——`dot` 内部三段 `#[cfg]` 分发(含
+`simd/` 不同位置的片段拼在一起——`dot` 内部三段 `#[cfg]` 分发(含
 `not(any(...))` 兜底)才是 50–65 行的连续原文;`fn dot_x86` 在 128 行附近,
 `mod neon` 在 247 行附近。
 
@@ -99,7 +99,7 @@ if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
 }
 ```
 
-见 [`src/core/simd.rs:128-136`](../../src/core/simd.rs)。
+见 [`src/core/simd/mod.rs:138-146`](../../src/core/simd/)。
 
 - `is_x86_feature_detected!` 是标准库宏,在**运行时**查询 CPU 是否支持某指令集。
 - 这样同一个二进制能跑在支持 AVX2 的新 CPU(快)和不支持的旧 CPU(回退 SSE2)上。
@@ -130,7 +130,7 @@ pub unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 {
 }
 ```
 
-见 [`src/core/simd.rs:152-158`](../../src/core/simd.rs)。
+见 [`src/core/simd/mod.rs:153-164`](../../src/core/simd/mod.rs)。
 
 - `unsafe fn` 表示"调用此函数需要满足某些前提"。
 - `unsafe { ... }` 块表示"这里我做了不安全操作,并为此负责"。
@@ -146,7 +146,7 @@ mneme 规范要求**每个 `unsafe` 块必须有 `// SAFETY:` 注释**,逐条说
 let mut sum = unsafe { ... };
 ```
 
-见 [`src/core/simd.rs:156-157`](../../src/core/simd.rs)。
+见 [`src/core/simd/mod.rs:29-30`](../../src/core/simd/)。
 
 调用处也要证明:
 
@@ -155,7 +155,7 @@ let mut sum = unsafe { ... };
 unsafe { x86::dot_avx2(a, b) }
 ```
 
-见 [`src/core/simd.rs:130-131`](../../src/core/simd.rs)。
+见 [`src/core/simd/mod.rs:139-140`](../../src/core/simd/)。
 
 > 没有 `// SAFETY:` 的 `unsafe` 一律视为违规。这不是形式主义:它把"为什么这段代码是安全的"
 > 写进代码,让后来者能审计。
@@ -169,7 +169,7 @@ unsafe { x86::dot_avx2(a, b) }
 pub unsafe fn dot_avx2(a: &[f32], b: &[f32]) -> f32 { ... }
 ```
 
-见 [`src/core/simd.rs:152-153`](../../src/core/simd.rs)。
+见 [`src/core/simd/mod.rs:162-163`](../../src/core/simd/)。
 
 - 它让编译器为这个函数生成使用 AVX2/FMA 指令的代码。
 - 因为目标 CPU 不一定支持,函数被标记为 `unsafe`,调用者必须先检测(§1.2)。
@@ -184,7 +184,7 @@ SIMD 内联函数需要指针:
 let va = _mm256_loadu_ps(a.as_ptr().add(i));
 ```
 
-见 [`src/core/simd.rs:160`](../../src/core/simd.rs)。
+见 [`src/core/simd/x86.rs:8`](../../src/core/simd/)。
 
 - `a.as_ptr()` 得到 `*const f32` 裸指针。
 - `.add(i)` 指针算术,向后移动 `i` 个元素(不是字节)。
@@ -201,7 +201,7 @@ SIMD 加载分两种:`_mm256_loadu_ps`(u = unaligned)不要求地址按 32 字�
 `.add(i)` 是**按元素**移动指针(不是按字节):`a.as_ptr().add(i)` 指向第 `i` 个 `f32`。指针算术
 越界即使不解引用也是 UB,所以循环条件 `i + 8 <= n` 是安全证明的核心。裸指针不携带生命周期,
 `unsafe` 块里的正确性完全由程序员用 `// SAFETY:` 论证——这正是 mneme 把 `unsafe` 压缩到
-全库仅两处(L0 `simd.rs` 与 L2 `persist/source.rs` 的 `MmapSource`)、且每处必写证明的原因。
+全库仅两处(L0 `simd/` 与 L2 `persist/source/` 的 `MmapSource`)、且每处必写证明的原因。
 
 ### 4.2 第二处 `unsafe`:L2 的 mmap
 
@@ -214,7 +214,7 @@ L2 用 `memmap2` 把段文件映射成内存,`Mmap::map` 本身是 `unsafe fn`:
 let map = unsafe { memmap2::Mmap::map(&file)? };
 ```
 
-见 [`src/persist/source.rs:100-107`](../../src/persist/source.rs)。为什么必须 `unsafe`:
+见 [`src/persist/source/backend.rs:85-92`](../../src/persist/source/)。为什么必须 `unsafe`:
 mmap 把文件"变成"一段内存,但**文件可能被其他进程截断或改写**,这段内存就可能失效
 ——Rust 的类型系统无法校验这一点,所以由调用者承担"映射期间文件不被修改"的责任并写进
 `// SAFETY:`。mneme 的段文件是 write-once(内容不可变),这个前提成立。
@@ -229,8 +229,8 @@ pub(crate) struct MmapSource { map: memmap2::Mmap }
 pub(crate) struct FileSource { file: Mutex<File> }
 ```
 
-见 [`src/persist/source.rs:36-39`](../../src/persist/source.rs) 与
-[`src/persist/source.rs:89-92`](../../src/persist/source.rs)。`#[cfg]` 不止能加在
+见 [`src/persist/source/backend.rs:21-24`](../../src/persist/source/) 与
+[`src/persist/source/backend.rs:74-77`](../../src/persist/source/)。`#[cfg]` 不止能加在
 `use`/函数上,还能加在**整个类型**、方法甚至语句/块上;`#[cfg_attr(feature = "mmap", allow(dead_code))]`
 则是"条件满足时才附加属性"(见 [01 §4.2](01-toolchain.md))。
 
@@ -257,7 +257,7 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 ```
 
-见 [`src/core/simd.rs:50-65`](../../src/core/simd.rs)。
+见 [`src/core/simd/mod.rs:60-75`](../../src/core/simd/)。
 
 - `debug_assert_eq!` 只在 debug 构建生效;release 下不检查(性能考虑)。
 - 于是 SIMD 内核自己用 `n = a.len().min(b.len())` 收敛到较短长度,保证不越界。
@@ -282,13 +282,13 @@ pub fn dot(a: &[f32], b: &[f32]) -> f32 {
 - `unsafe` 只解锁底层操作,不关闭借用/类型检查;每处必须写 `// SAFETY:` 证明。
 - `#[target_feature]` 为函数启用指令集,因此函数必须 `unsafe` 且调用前检测。
 - SIMD 用一条指令处理多个数据;mneme 对外统一 `dot`,内部按架构分发,`dot_scalar` 作参照。
-- mneme 把 `unsafe` 限制在全库两处(`simd.rs` 与 `persist/source.rs` 的 `MmapSource`),
+- mneme 把 `unsafe` 限制在全库两处(`simd/` 与 `persist/source/` 的 `MmapSource`),
   配合 `#![deny(unsafe_op_in_unsafe_fn)]` 强制显式。
 
 ## 动手练习
 
 1. 写一个 `fn is_big_endian() -> bool { cfg!(target_endian = "big") }`,在两个平台上都编译通过。
-2. 阅读 [`src/core/simd.rs`](../../src/core/simd.rs) 的 `dot_sse2`,找出循环条件如何保证不越界,
+2. 阅读 [`src/core/simd/`](../../src/core/simd/) 的 `dot_sse2`,找出循环条件如何保证不越界,
    并在纸上写出对应的 `// SAFETY:` 论证。
 3. 运行 `cargo test`,观察 `dot_matches_scalar_reference`(在 [10 章](10-testing.md))如何验证 SIMD 正确性。
 

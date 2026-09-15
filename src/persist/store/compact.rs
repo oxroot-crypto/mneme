@@ -9,7 +9,7 @@ use std::sync::Arc;
 use crate::core::error::{MnemeError, Result};
 use crate::memory::config::Config;
 use crate::memory::ops::{CompactionControl, CompactionPlan};
-use crate::memory::table::WriterState;
+use crate::memory::table::{InstallSegmentInput, WriterState};
 use crate::persist::flush::{self, EncodedSegment, SegmentBuildInput};
 use crate::persist::manifest::{Manifest, NsEntry, SegmentEntry};
 use crate::persist::msec;
@@ -119,7 +119,12 @@ impl Store {
         )?;
         self.install_merge(ws, input, &merged, &new_manifest);
         self.cleanup_old_segments(&input.plan.segments);
-        // 事件可观测:一次 compaction 提交(被合并段 / 新段行数)。
+        self.emit_compaction(input);
+        Ok(true)
+    }
+
+    /// 事件可观测:一次 compaction 提交(被合并段 / 新段行数)。
+    fn emit_compaction(&self, input: &CompactInput<'_>) {
         crate::core::observe::emit(
             self.observer.as_ref(),
             crate::core::observe::Event::Compaction {
@@ -133,7 +138,6 @@ impl Store {
                 rows_out: input.keep_slots.len() as u64,
             },
         );
-        Ok(true)
     }
 
     /// 写新段三件套;运行中暂停时删除孤儿并返回 `None`。
@@ -241,13 +245,13 @@ impl Store {
             index.segment_id != merged.segment_id
                 && !input.plan.segments.contains(&index.segment_id)
         });
-        ws.install_segment(
-            merged.segment_id,
-            input.keep_slots,
-            merged.encoded.index.clone(),
-            merged.encoded.quant,
-            merged.encoded.recall_est,
-        );
+        ws.install_segment(InstallSegmentInput {
+            segment_id: merged.segment_id,
+            slot_indices: input.keep_slots,
+            index: merged.encoded.index.clone(),
+            quant: merged.encoded.quant,
+            recall_est: merged.encoded.recall_est,
+        });
         ws.clear_edge_dirty();
         self.publish_manifest(new_manifest);
     }

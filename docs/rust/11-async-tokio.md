@@ -4,8 +4,8 @@
 > `AsyncNamespace` 如何用 `tokio::task::spawn_blocking` 把同步阻塞 API 包成异步门面。
 > **前置**:[04 章](04-borrowing-strings-slices.md)(借用与生命周期)、[05 章](05-errors.md)
 > (`Result`)、[06 §3.3](06-generics-traits.md)(`Send`/`Sync`)。
-> **对应源码**:[`src/memory/async_facade.rs`](../../src/memory/async_facade.rs)、
-> [`src/memory/record.rs`](../../src/memory/record.rs)、[`src/memory/namespace.rs`](../../src/memory/namespace.rs)、
+> **对应源码**:[`src/memory/async_facade/`](../../src/memory/async_facade/)、
+> [`src/memory/record/`](../../src/memory/record/)、[`src/memory/namespace.rs`](../../src/memory/namespace.rs)、
 > [`src/lib.rs`](../../src/lib.rs)、[`tests/l6_contracts.rs`](../../tests/l6_contracts.rs)、
 > [`Cargo.toml`](../../Cargo.toml)。
 
@@ -26,7 +26,7 @@ pub async fn insert(&self, rec: Record) -> Result<InsertOutcome> {
 }
 ```
 
-见 [`src/memory/async_facade.rs:106-109`](../../src/memory/async_facade.rs)。三个语法点:
+见 [`src/memory/async_facade/write.rs:40-43`](../../src/memory/async_facade/)。三个语法点:
 
 - `async fn f(...) -> T` 约等于 `fn f(...) -> impl Future<Output = T>`:调用它返回一个
   **future(未来值)**,函数体被编译器改写成状态机;
@@ -92,7 +92,7 @@ where
 }
 ```
 
-见 [`src/memory/async_facade.rs:35-45`](../../src/memory/async_facade.rs)。逐个概念:
+见 [`src/memory/async_facade/facade.rs:11-21`](../../src/memory/async_facade/facade.rs)。逐个概念:
 
 - `spawn_blocking(task)` 把闭包交给**专门跑阻塞任务的线程池**,不占异步执行器;返回的
   `JoinHandle<T>` 本身是 future,`.await` 得到 `Result<T, JoinError>`;
@@ -123,7 +123,7 @@ pub async fn get(&self, key: &str) -> Result<Option<StoredRecord>> {
 }
 ```
 
-见 [`src/memory/async_facade.rs:179-188`](../../src/memory/async_facade.rs)。为什么每个方法
+见 [`src/memory/async_facade/read.rs:19-28`](../../src/memory/async_facade/)。为什么每个方法
 都要先 `clone`:
 
 - `self` 是 `&AsyncNamespace`。若直接 `move || self.inner.insert(rec)`,移进闭包的是**借用**,
@@ -134,10 +134,10 @@ pub async fn get(&self, key: &str) -> Result<Option<StoredRecord>> {
   的标准手法,和 [02 §3.7](02-values-and-ownership.md) 的 `Arc` 共享是同一件事;
 - `key: &str` 同理:先 `key.to_string()` 变成 owned `String` 才能进 `'static` 闭包;
   `get_many` 甚至先把 `keys: &[&str]` 收成 `Vec<String>` 再整体 `move`
-  (见 [`src/memory/async_facade.rs:208-220`](../../src/memory/async_facade.rs))。
+  (见 [`src/memory/async_facade/read.rs:48-60`](../../src/memory/async_facade/))。
 
 由于字段都能跨线程,`AsyncNamespace` 本身是 `Send + Sync` 的,还能 `Clone` 到多个任务里
-并发调用(见 [`src/memory/async_facade.rs:52-56`](../../src/memory/async_facade.rs))。
+并发调用(见 [`src/memory/async_facade/facade.rs:28-32`](../../src/memory/async_facade/))。
 
 ---
 
@@ -171,7 +171,7 @@ runtime.block_on(async {
 });
 ````
 
-见 [`src/memory/async_facade.rs:96-105`](../../src/memory/async_facade.rs)。要点:
+见 [`src/memory/async_facade/write.rs:30-39`](../../src/memory/async_facade/)。要点:
 
 - `Builder::new_current_thread()` 建一个"单线程"运行时,`block_on(future)` 在当前线程把它
   一直跑到完成——嵌入场景最省事;
@@ -185,7 +185,7 @@ runtime.block_on(async {
 
 ## 4. 取消语义:drop future 不会撤回已派发的阻塞任务
 
-`async_facade.rs` 的文件头专门写了这条语义:
+`async_facade/` 的文件头专门写了这条语义:
 
 ```rust
 //! 所有方法经 `spawn_blocking` 执行,阻塞任务一经派发不可取消:drop 返回的
@@ -193,7 +193,7 @@ runtime.block_on(async {
 //! 「取消即中止」的调用方应在业务层以句柄/标志做协作取消。
 ```
 
-见 [`src/memory/async_facade.rs:13-17`](../../src/memory/async_facade.rs)(文件头)。理解:
+见 [`src/memory/async_facade/mod.rs:13-17`](../../src/memory/async_facade/mod.rs)(文件头)。理解:
 
 - future 被 drop(比如 `select!` 输了、`timeout` 到点、作用域结束)只表示**等待方不等了**;
   阻塞线程池里的那个任务没有"可中断点",会继续跑完;
@@ -224,7 +224,7 @@ pub struct RecordRef<'a> {
 }
 ```
 
-见 [`src/memory/record.rs:313-320`](../../src/memory/record.rs)。两个原因让它上不了
+见 [`src/memory/record/view.rs:13-20`](../../src/memory/record/)。两个原因让它上不了
 `spawn_blocking`:
 
 - 它是在阻塞闭包**内部**、从局部 `inner` 借出来的,闭包一结束生命周期就到头,没法当返回值
@@ -237,7 +237,7 @@ pub struct RecordRef<'a> {
 pub async fn get(&self, key: &str) -> Result<Option<StoredRecord>> { ... }
 ```
 
-见 [`src/memory/async_facade.rs:179-188`](../../src/memory/async_facade.rs),转换在闭包里由
+见 [`src/memory/async_facade/read.rs:19-28`](../../src/memory/async_facade/),转换在闭包里由
 `to_stored()` 完成:
 
 ```rust
@@ -246,13 +246,13 @@ pub fn to_stored(&self) -> StoredRecord {
 }
 ```
 
-见 [`src/memory/record.rs:490-492`](../../src/memory/record.rs)。`StoredRecord` 把 key/text
+见 [`src/memory/record/view.rs:190-192`](../../src/memory/record/)。`StoredRecord` 把 key/text
 复制成 `String`、向量复制成 `Vec<f32>`,字段全是 owned 类型
-(见 [`src/memory/record.rs:183-200`](../../src/memory/record.rs)),于是天然满足
+(见 [`src/memory/record/stored.rs:9-26`](../../src/memory/record/)),于是天然满足
 `Send + 'static`。代价是一次深拷贝,换来的是"结果可以安全地跨线程回到 await 处"。
 
 > 同样的理由,`iter`/`iter_with` 这类返回**迭代器**的同步方法没有异步版本:迭代器借自读
-> 视图,无法跨线程移动(见 [`src/memory/async_facade.rs:9-11`](../../src/memory/async_facade.rs))。
+> 视图,无法跨线程移动(见 [`src/memory/async_facade/mod.rs:9-11`](../../src/memory/async_facade/mod.rs))。
 
 ---
 
@@ -267,14 +267,14 @@ pub fn to_stored(&self) -> StoredRecord {
 
 - **推荐用门面**:宿主已经是 async 生态(web 服务、Agent 循环),不希望一次 `get` 把整个
   reactor 卡住;门面覆盖 `Namespace` 的全部阻塞入口(方法清单见
-  [`src/memory/async_facade.rs`](../../src/memory/async_facade.rs))。
+  [`src/memory/async_facade/`](../../src/memory/async_facade/))。
 - **不必包装 `search()` 构建器**:`.vector()`/`.top_k()`/`.ef()` 只是往结构体里填字段,
   纯内存、不阻塞(见 [`src/memory/search_builder.rs:18-58`](../../src/memory/search_builder.rs)),
   用同步版构建最自然。
 - **`execute()` 由宿主包装**:它是真正的检索,仍是阻塞调用;文件头明确给出分工
   "`search()` 构建器本身是轻量纯内存操作,`execute()` 为阻塞调用,异步场景请由宿主对
   `execute()` 自行 `spawn_blocking`"(见
-  [`src/memory/async_facade.rs:3-7`](../../src/memory/async_facade.rs))。
+  [`src/memory/async_facade/mod.rs:3-7`](../../src/memory/async_facade/mod.rs))。
 - **`Mneme` 级操作不走门面**:`flush`/`close`/`backup_to`/`snapshot` 同样由宿主处理
   (理由同上)。门面只包 `Namespace`,不做"全库异步"这种过度设计。
 - **别为异步而异步**:`spawn_blocking` 每次都有线程池调度开销;纯内存、微秒级的同步调用
@@ -318,7 +318,7 @@ pub fn to_stored(&self) -> StoredRecord {
    不 `.await`,断言 `Vec` 仍为空,再 `block_on` 看它变化(体会惰性)。
 3. 在宿主 runtime 里把同步 `search().execute()` 用 `spawn_blocking` 包起来调用,和直接同步
    调用对拍,确认命中结果一致。
-4. 读 [`src/memory/async_facade.rs:208-220`](../../src/memory/async_facade.rs) 的 `get_many`,
+4. 读 [`src/memory/async_facade/read.rs:48-60`](../../src/memory/async_facade/) 的 `get_many`,
    解释为什么 `keys: &[&str]` 要先收集成 `Vec<String>`,以及 `to_stored()` 在返回值转换里
    的角色。
 

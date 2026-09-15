@@ -48,6 +48,8 @@ pub(crate) struct Store {
     pub(crate) observer: Option<Arc<dyn crate::core::observe::Observer>>,
     /// 打开时的调优口径(只读重载重建加速结构用)。
     pub(super) tuning: crate::core::options::Tuning,
+    /// 打开时的数据限额(帧上限等写入路径防线;设计 16 §8)。
+    pub(crate) limits: crate::core::options::Limits,
 }
 
 impl Store {
@@ -157,6 +159,36 @@ impl Store {
             .len()
     }
 
+    /// 指定段集的段文件字节合计(`vsec` + `msec` + `hidx`;compaction 输入预算用)。
+    ///
+    /// `stat` 失败按 0 计——预算只用于削合并节奏,绝不因此中断或改变合并语义
+    /// (FC-LIFE-POST-011)。
+    pub(crate) fn segments_bytes(&self, ids: &[u32]) -> u64 {
+        use crate::persist::storage::{SEGMENTS_DIR, hidx_name, msec_name, vsec_name};
+        ids.iter()
+            .map(|id| {
+                [vsec_name(*id), msec_name(*id), hidx_name(*id)]
+                    .iter()
+                    .map(|name| {
+                        let rel = format!("{SEGMENTS_DIR}/{name}");
+                        self.storage.stat(&rel).map_or(0, |meta| meta.len)
+                    })
+                    .sum::<u64>()
+            })
+            .sum()
+    }
+
+    /// 活跃段文件字节合计(排除损坏隔离段;口径见 [`Store::segments_bytes`])。
+    pub(crate) fn active_segment_bytes(&self, exclude: &std::collections::HashSet<u32>) -> u64 {
+        let segments = self.manifest_snapshot().segments;
+        let ids: Vec<u32> = segments
+            .iter()
+            .map(|segment| segment.segment_id)
+            .filter(|id| !exclude.contains(id))
+            .collect();
+        self.segments_bytes(&ids)
+    }
+
     /// 校验全部活跃段:头部 + payload CRC + 版本链记录体可解析。
     ///
     /// 返回损坏段的 id 列表(供 `check()` 报告);不修改任何状态。
@@ -165,13 +197,13 @@ impl Store {
         let segments = self.manifest_snapshot().segments;
         let mut corrupt = Vec::new();
         for segment in &segments {
-            if verify_one_segment(
-                self.storage.as_ref(),
-                segment.segment_id,
-                segment.hidx_crc,
-                self.index_factory.as_deref(),
-                self.encryption.as_ref(),
-            )
+            if verify_one_segment(&VerifyOneSegmentInput {
+                storage: self.storage.as_ref(),
+                segment_id: segment.segment_id,
+                hidx_crc: segment.hidx_crc,
+                factory: self.index_factory.as_deref(),
+                encryption: self.encryption.as_ref(),
+            })
             .is_err()
             {
                 corrupt.push(crate::core::types::SegmentId::new(segment.segment_id));
@@ -258,16 +290,30 @@ fn segment_stat(
     }
 }
 
-/// 校验单个段:头部 + payload CRC + 版本链记录体可解析 + hidx(若有)。
-fn verify_one_segment(
-    storage: &dyn crate::persist::storage::Storage,
+/// [`verify_one_segment`] 的输入参数。
+struct VerifyOneSegmentInput<'a> {
+    /// 存储后端。
+    storage: &'a dyn crate::persist::storage::Storage,
+    /// 段编号。
     segment_id: u32,
+    /// MANIFEST 记录的 hidx 整文件 CRC(`0` = 无索引)。
     hidx_crc: u32,
-    factory: Option<&dyn IndexFactory>,
-    encryption: Option<&crate::crypto::Encryption>,
-) -> Result<()> {
-    verify_segment_files(storage, segment_id, encryption)?;
-    verify_hidx(storage, segment_id, hidx_crc, factory, encryption)
+    /// 索引工厂(`None` = 不校验 hidx)。
+    factory: Option<&'a dyn IndexFactory>,
+    /// 静态加密配置(`None` = 明文)。
+    encryption: Option<&'a crate::crypto::Encryption>,
+}
+
+/// 校验单个段:头部 + payload CRC + 版本链记录体可解析 + hidx(若有)。
+fn verify_one_segment(input: &VerifyOneSegmentInput<'_>) -> Result<()> {
+    verify_segment_files(input.storage, input.segment_id, input.encryption)?;
+    verify_hidx(&VerifyHidxInput {
+        storage: input.storage,
+        segment_id: input.segment_id,
+        hidx_crc: input.hidx_crc,
+        factory: input.factory,
+        encryption: input.encryption,
+    })
 }
 
 /// 校验 vsec/msec 两个必选段文件:payload CRC、行数一致、索引与版本链可解析。
@@ -311,29 +357,39 @@ fn verify_segment_files(
     Ok(())
 }
 
-/// 校验可选 hidx:整文件 CRC 与索引内部布局(经 L1 工厂,避免 L2 依赖 L3)。
-fn verify_hidx(
-    storage: &dyn crate::persist::storage::Storage,
+/// [`verify_hidx`] 的输入参数。
+struct VerifyHidxInput<'a> {
+    /// 存储后端。
+    storage: &'a dyn crate::persist::storage::Storage,
+    /// 段编号。
     segment_id: u32,
+    /// MANIFEST 记录的 hidx 整文件 CRC(`0` = 无索引)。
     hidx_crc: u32,
-    factory: Option<&dyn IndexFactory>,
-    encryption: Option<&crate::crypto::Encryption>,
-) -> Result<()> {
-    if hidx_crc == 0 {
+    /// 索引工厂(`None` = 不校验 hidx)。
+    factory: Option<&'a dyn IndexFactory>,
+    /// 静态加密配置(`None` = 明文)。
+    encryption: Option<&'a crate::crypto::Encryption>,
+}
+
+/// 校验可选 hidx:整文件 CRC 与索引内部布局(经 L1 工厂,避免 L2 依赖 L3)。
+fn verify_hidx(input: &VerifyHidxInput<'_>) -> Result<()> {
+    if input.hidx_crc == 0 {
         return Ok(());
     }
-    let Some(factory) = factory else {
+    let Some(factory) = input.factory else {
         return Ok(());
     };
     let hidx_bytes = crate::crypto::decrypt_file(
-        encryption,
+        input.encryption,
         b"hidx",
-        u64::from(segment_id),
-        storage.read_file(&format!("{SEGMENTS_DIR}/{}", hidx_name(segment_id)))?,
+        u64::from(input.segment_id),
+        input
+            .storage
+            .read_file(&format!("{SEGMENTS_DIR}/{}", hidx_name(input.segment_id)))?,
     )?;
-    if crate::persist::crc32(&hidx_bytes) != hidx_crc {
+    if crate::persist::crc32(&hidx_bytes) != input.hidx_crc {
         return Err(MnemeError::Corrupted {
-            segment: Some(crate::core::types::SegmentId::new(segment_id)),
+            segment: Some(crate::core::types::SegmentId::new(input.segment_id)),
             reason: "hidx 文件 CRC 与 MANIFEST 不符".to_string(),
         });
     }

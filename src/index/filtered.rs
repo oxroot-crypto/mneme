@@ -100,7 +100,13 @@ pub(crate) fn search(index: &HnswIndex, params: &IndexSearch<'_>) -> TopK<(RowId
     };
     #[cfg(test)]
     record_tier(if tier == GraphTier::Post { 1 } else { 2 });
-    graph_candidates(index, params, selectivity, tier, prepared.as_ref())
+    graph_candidates(GraphCandidatesInput {
+        index,
+        params,
+        selectivity,
+        tier,
+        prepared: prepared.as_ref(),
+    })
 }
 
 /// 节点是否可选:全局槽位在 alive 位图内,且(无过滤或)命中过滤位图。
@@ -135,14 +141,29 @@ fn brute_candidates(
     top
 }
 
-/// 档①/②:全图遍历(保证连通),结果再按候选取舍;区别仅在 `ef` 放大倍数。
-fn graph_candidates(
-    index: &HnswIndex,
-    params: &IndexSearch<'_>,
+/// [`graph_candidates`] 的输入参数。
+struct GraphCandidatesInput<'a> {
+    /// 段索引(HNSW 图)。
+    index: &'a HnswIndex,
+    /// 搜索参数。
+    params: &'a IndexSearch<'a>,
+    /// 过滤选择性(候选数 / 活行数)。
     selectivity: f32,
+    /// 图搜索档位(档①后过滤 / 档②放大后过滤)。
     tier: GraphTier,
-    prepared: Option<&QuantQuery>,
-) -> TopK<(RowId, SlotId)> {
+    /// 量化粗排预计算(`None` = 精确 f32)。
+    prepared: Option<&'a QuantQuery>,
+}
+
+/// 档①/②:全图遍历(保证连通),结果再按候选取舍;区别仅在 `ef` 放大倍数。
+fn graph_candidates(input: GraphCandidatesInput<'_>) -> TopK<(RowId, SlotId)> {
+    let GraphCandidatesInput {
+        index,
+        params,
+        selectivity,
+        tier,
+        prepared,
+    } = input;
     let mut top = TopK::new(params.k, index.metric());
     let query = QueryRef {
         vector: params.query,

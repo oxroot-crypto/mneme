@@ -6,7 +6,7 @@
 > **本套文档想解决什么**:让你能**独立读懂 `mneme` 的源码**。本套以 L0 原语层
 > `src/core/` 为教材,并把 L1 内存引擎 `src/memory/`、L2 持久层 `src/persist/`、
 > L3 索引层 `src/index/`、L4 检索层 `src/query/`、L5 生命周期层 `src/life/`
-> 与 L6 打磨层 `src/quant/` + async 门面(`src/memory/async_facade.rs`)
+> 与 L6 打磨层 `src/quant/` + async 门面(`src/memory/async_facade/`)
 > 新引入的 Rust 知识(`Arc` 共享所有权、写时复制,`Mutex`/`RwLock` 守卫、原子类型与
 > CAS,`std::thread` 后台线程、`Weak` 弱引用与 `Condvar`,`thread::scope` 借用式并行,
 > `Drop`/RAII,`move` 闭包写事务,`dyn` 策略与函数指针,构建者模式,手写 `Ord` 与
@@ -15,8 +15,7 @@
 > 解析器与切片借用,`PhantomData`,`HashMap` entry API,运算符重载,`Option` 组合子,
 > `fmt::Write`,`thread_local!` 测试探针,`proptest` 自定义策略,`half::f16` 半精度,
 > `async`/`.await`/`Future`,`tokio::task::spawn_blocking`,criterion 基准与 fuzz 骨架)
-> **回填到各章对应小节**
-> (见 §4 对照表);L1–L6 的业务语义与分文件阅读路线见
+> 分散在各章对应小节(见 §4 对照表);L1–L6 的业务语义与分文件阅读路线见
 > [设计 03 L1 内存引擎](../design/03-l1-memory.md)、
 > [设计 04 L2 持久层](../design/04-l2-persist.md)、
 > [设计 05 L3 HNSW](../design/05-l3-hnsw.md)、
@@ -71,7 +70,7 @@ Rust 的通用教材很多(见 §5),但它们有两个问题:
 | [06](06-generics-traits.md) | 泛型与 trait | 一套代码适配多种类型 | `TopK<T: Ord>`、`Clock`、`From`/`Display`、`dyn` 策略 |
 | [07](07-iterators-closures.md) | 迭代器与闭包 | 用链式调用替代手写循环 | `dot_scalar`、`TopK::into_sorted_vec`、`write_tx` 闭包、`BinaryHeap` 图搜索 |
 | [08](08-modules-docs.md) | 模块、可见性与文档 | 代码怎么分文件、怎么暴露 | `lib.rs`、`core/mod.rs`、`//!` 与 `///` |
-| [09](09-cfg-unsafe-simd.md) | 条件编译、unsafe 与 SIMD | 跨平台与手写向量指令 | `simd.rs` 的 `#[cfg(target_arch)]`、`unsafe` |
+| [09](09-cfg-unsafe-simd.md) | 条件编译、unsafe 与 SIMD | 跨平台与手写向量指令 | `simd/` 的 `#[cfg(target_arch)]`、`unsafe` |
 | [10](10-testing.md) | 测试与属性测试 | `#[test]`、doctest、`proptest`、criterion 与 fuzz | `tests/core_contracts.rs`、契约测试、proptest 自定义策略、复杂度探针、`benches/quant.rs`、`fuzz/` |
 | [11](11-async-tokio.md) | 异步与 tokio 最小封装 | `async`/`.await`、future 与阻塞线程池 | `AsyncNamespace`、`spawn_blocking`、`no_run` doctest、取消语义 |
 
@@ -91,15 +90,15 @@ Rust 的通用教材很多(见 §5),但它们有两个问题:
 | `src/core/types.rs` | newtype、`derive`、`const fn`、`From`/`Display`、`Arc<str>` | [02](02-values-and-ownership.md)、[03](03-structs-enums-impl.md)、[04](04-borrowing-strings-slices.md)、[06](06-generics-traits.md) |
 | `src/core/error.rs` | `enum`、`thiserror`、`#[from]`、`#[non_exhaustive]`、`Result` 别名 | [03](03-structs-enums-impl.md)、[05](05-errors.md) |
 | `src/core/metric.rs` | `enum`、方法、`match`、`matches!`、常量、doctest | [03](03-structs-enums-impl.md)、[05](05-errors.md)、[10](10-testing.md) |
-| `src/core/simd.rs` | `unsafe`、`#[cfg]`、`#[target_feature]`、切片、迭代器 | [04](04-borrowing-strings-slices.md)、[07](07-iterators-closures.md)、[09](09-cfg-unsafe-simd.md) |
-| `src/core/heap.rs` | 泛型 + trait bound、`Vec`、闭包、`Ordering`、`Option` | [02](02-values-and-ownership.md)、[06](06-generics-traits.md)、[07](07-iterators-closures.md) |
+| `src/core/simd/` | `unsafe`、`#[cfg]`、`#[target_feature]`、切片、迭代器 | [04](04-borrowing-strings-slices.md)、[07](07-iterators-closures.md)、[09](09-cfg-unsafe-simd.md) |
+| `src/core/heap/` | 泛型 + trait bound、`Vec`、闭包、`Ordering`、`Option` | [02](02-values-and-ownership.md)、[06](06-generics-traits.md)、[07](07-iterators-closures.md) |
 | `src/core/varint.rs` | 位运算、`Result`、`?`、迭代器、边界校验 | [02](02-values-and-ownership.md)、[05](05-errors.md)、[07](07-iterators-closures.md) |
 | `src/core/meta.rs` | 类型别名、生命周期、`Option` 链、`serde_json` | [04](04-borrowing-strings-slices.md)、[05](05-errors.md) |
 | `src/core/options/*.rs` | `struct`、`enum`、`Default`、`#[default]`、嵌套 `Option` | [03](03-structs-enums-impl.md)、[06](06-generics-traits.md) |
 | `src/core/mod.rs` | 模块组织、`//!` 模块文档 | [08](08-modules-docs.md) |
 | `tests/core_contracts.rs` | 集成测试、`proptest`、契约追溯 | [10](10-testing.md) |
 
-L1(`src/memory/`)新引入的 Rust 特性已**回填到对应章节**,不在上表重复:
+L1(`src/memory/`)引入的 Rust 特性落在以下章节:
 
 | L1 新特性 | 落在哪一节 |
 |---|---|
@@ -110,7 +109,7 @@ L1(`src/memory/`)新引入的 Rust 特性已**回填到对应章节**,不在上�
 | `move` 闭包、`FnOnce` 与 `write_tx` 写事务 | [07 §4.3](07-iterators-closures.md) |
 | `include_str!` 契约追溯门禁(元测试) | [10 §5.1](10-testing.md) |
 
-L3(`src/index/`)新引入的 Rust 特性同样已**回填到对应章节**:
+L3(`src/index/`)引入的 Rust 特性落在以下章节:
 
 | L3 新特性 | 落在哪一节 |
 |---|---|
@@ -128,7 +127,7 @@ L3(`src/index/`)新引入的 Rust 特性同样已**回填到对应章节**:
 | `proptest` 自定义 `Strategy`/`prop_oneof!`/变异策略 | [10 §4.5](10-testing.md) |
 | `thread_local!`+`Cell` 操作计数探针(复杂度验证) | [10 §4.6](10-testing.md) |
 
-L4(`src/query/`)新引入的 Rust 特性同样已**回填到对应章节**:
+L4(`src/query/`)引入的 Rust 特性落在以下章节:
 
 | L4 新特性 | 落在哪一节 |
 |---|---|
@@ -159,7 +158,7 @@ L4(`src/query/`)新引入的 Rust 特性同样已**回填到对应章节**:
 | proptest 字符串正则策略(`".{0,200}"`) | [10 §4](10-testing.md) |
 | `format!("{month:02}")` 宽度与补零 | [01 §6](01-toolchain.md) |
 
-L2(`src/persist/`)与 L5(`src/life/`)新引入的 Rust 特性同样已**回填到对应章节**:
+L2(`src/persist/`)与 L5(`src/life/`)引入的 Rust 特性落在以下章节:
 
 | L2/L5 新特性 | 落在哪一节 |
 |---|---|
@@ -180,7 +179,7 @@ L2(`src/persist/`)与 L5(`src/life/`)新引入的 Rust 特性同样已**回填�
 | 跨线程共享的测试状态用原子(`FsyncHook` 实现的 `AtomicUsize` 计数器) | [10 §4.6](10-testing.md) |
 | 共享测试助手全貌(`tests/common/mod.rs`) | [10 §2](10-testing.md) |
 
-L6(`src/quant/`、`src/memory/async_facade.rs`、`benches/quant.rs` 与 `fuzz/`)新引入的 Rust 特性同样已**回填到对应章节**:
+L6(`src/quant/`、`src/memory/async_facade/`、`benches/quant.rs` 与 `fuzz/`)引入的 Rust 特性落在以下章节:
 
 | L6 新特性 | 落在哪一节 |
 |---|---|

@@ -5,7 +5,7 @@
 > **前置阅读**:[00 §3–§4](00-fundamentals.md)(嵌入向量与相似度)、[00 §7](00-fundamentals.md)(大 O)。
 > **本章你将学到**:ID/错误设计 → 距离度量的完整数学与 SIMD 实现 → TopK 堆 → varint 编码。
 
-模块清单:`core/{types.rs, error.rs, metric.rs, simd.rs, varint.rs, meta.rs, heap.rs, bitset.rs, text.rs, options/}`
+模块清单:`core/{types.rs, error.rs, metric.rs, simd/, varint.rs, meta.rs, heap/, bitset.rs, text.rs, options/}`
 (`options/` 为按主题拆分的模块目录,见 §8)
 
 ---
@@ -18,7 +18,7 @@
 | 类型 | 角色 / 范围 | 含义 | 生命周期 |
 |---|---|---|---|
 | `RowId(u64)` | **全局稳定逻辑标识**,首次写入时分配 | 公开 API 的稳定句柄(`Hit.rowid`、`get_by_rowid`);访问统计、关系边均以它为主键;更新/upsert **保留 RowId**(写新物理版本) | 永不复用;跨更新、跨段、跨 compaction 稳定不变 |
-| `SlotId(u32)` | **内部**段内物理槽位(每物理版本一个) | vectors 下标 / 删除位图 bit / HNSW 节点 id;仅库根 re-export 类型名,当前公开签名不使用其数值,调用方不得依赖 | 段内追加写、永不复用;仅 compaction 重建新段时按新段重新编号(见 [03 §3](03-l1-memory.md)) |
+| `SlotId(u32)` | **内部**段内物理槽位(每物理版本一个) | vectors 下标 / 删除位图 bit / HNSW 节点 id;仅库根 re-export 类型名,公开签名不暴露其数值,调用方不得依赖 | 段内追加写、永不复用;仅 compaction 重建新段时按新段重新编号(见 [03 §3](03-l1-memory.md)) |
 | `SeqNo(u64)` | 全局提交序号,单调递增 | MVCC 快照的基石([00 §6.6](00-fundamentals.md)) | 永不复用 |
 | `SegmentId(u32)` | 段文件编号 | 与文件名 `seg_000042.vsec` 对应 | 永不复用 |
 | `NsId(u32)` | 命名空间编号 | `(NsId, Key)` 是复合主键;WAL 帧、key_index 均引用 | 永不复用 |
@@ -43,14 +43,14 @@ compaction 重排了物理位置,`get_by_rowid` / `Hit.rowid` / 访问统计仍�
 (枚举体积 = 最大变体大小,无装箱):
 
 ```rust
-#[non_exhaustive] // 预留后续层新增变体而不破坏下游穷尽匹配
+#[non_exhaustive] // 预留新增变体而不破坏下游穷尽匹配
 pub enum MnemeError {
     Io(#[from] std::io::Error),
     Corrupted { segment: Option<SegmentId>, reason: String }, // CRC 不过/魔数不符;None = 文件级损坏(如 MANIFEST 全坏)
     DimensionMismatch { expected: u32, got: usize },    // 建库时已锁维度
     MetricMismatch { existing: Metric, requested: Metric }, // 打开时参数与库不符
     KeyMismatch { expected: Key, got: Key },            // supersede 新记录 key 与目标冲突
-    KeyNotFound(Key),                                   // 保留变体,当前无 API 产生(见 16 §4)
+    KeyNotFound(Key),                                   // 预留变体,任何 API 不产生(见 16 §4)
     DuplicateKey(Key),                                  // InsertMode::RejectDuplicate 时
     FilterParse(String),                                // DSL 语法错误,带位置信息
     Busy(&'static str),                                 // 独占锁被占/备份中
@@ -61,7 +61,7 @@ pub enum MnemeError {
     Closed,                                             // 库已关闭后经任意句柄读写
     NonFinite,                                          // 向量分量或标量因子 NaN/±Inf
     Config { reason: &'static str },                    // 建库/查询配置或策略参数非法
-    Unsupported { feature: &'static str },              // 能力延后到后续层,绝不静默降级
+    Unsupported { feature: &'static str },              // 与 feature 门控/形态不符的能力,绝不静默降级
     Inconsistent { reason: &'static str },              // 内部不变量被破坏
 }
 pub type Result<T> = std::result::Result<T, MnemeError>;
@@ -140,7 +140,7 @@ $\|\mathbf{q}\|^2$ 是常数,于是**三种度量全部归结为一次点积**(n
 
 ---
 
-## 4. SIMD:`simd.rs`
+## 4. SIMD:`simd/`
 
 ### 4.1 【直觉】什么是 SIMD
 
@@ -211,7 +211,7 @@ FMA:      8 个通道同时各得 a_i·b_i → [1, 2, 3, 4, 5, 6, 7, 8]
 
 ---
 
-## 5. TopK 有界堆:`heap.rs`
+## 5. TopK 有界堆:`heap/`
 
 检索的终点永远是"从 N 个分数里挑最大的 k 个"。比完全排序更聪明的做法:
 
@@ -318,7 +318,7 @@ pub fn as_f64(v: &Meta) -> Option<f64>;   // as_i64 / as_bool / as_str / as_ts �
   (不同应用记不同字段),schema-free 是需求,不是妥协;
 - 代价:每条多几十字节与解析开销;缓解:字段字典 + zone map 前推(见
   [04 §5](04-l2-persist.md)),查询不解析整条 JSON;
-- 替换性:若未来要换自研 JSON,只改此文件。
+- 替换性:若要换自研 JSON,只改此文件。
 
 **复杂度**(FC-CORE-CPLX-006):`get_path` 按 `.` 分段逐级下降,每级一次
 `Value::get`(map/数组索引,平均 $O(1)$),时间 $O(p)$($p$ = 分段数);
@@ -345,7 +345,7 @@ pub struct Limits { key_bytes, text_bytes, meta_bytes, meta_depth, ns_depth, top
 pub struct Scoring { w_sim, w_recency, w_importance, w_access, w_confidence, half_life, c_norm, floor, time_axis, bias_routing }  // L4 排序打分,见 10
 pub enum TimeAxis { ValidTime, TransactionTime }  // 新鲜度时间轴,见 10
 pub enum Diversity { Off, Mmr { lambda: f32 } }                                     // 结果多样性,见 10
-pub struct RelationKind(pub u16); // 关系类型:内置占用 0..=15(当前 0..=3),自定义从 16 起,见 09 §2.2
+pub struct RelationKind(pub u16); // 关系类型:内置占用 0..=15(内置 0..=3),自定义从 16 起,见 09 §2.2
 pub enum RelationIndex { Outgoing, Both }  // 关系反向索引,见 09
 pub enum Feedback { Used, Ignored, Corrected { by: RowId } }  // 检索反馈,见 10
 pub struct QueryId(pub u64);      // 一次检索的幂等标识(feedback 幂等键的一半),见 10 §4
@@ -386,7 +386,7 @@ L0 向上提供,且**只**提供:
    口径见 [06 §3.5](06-l4-query.md);契约 `FC-CORE-POST-008`);
 5. 错误:`MnemeError` 与 `Result`。
 
-**禁止**:任何 I/O、任何全局状态、任何锁、任何 `unsafe`(除 `simd.rs` 的 arch 内联)、
+**禁止**:任何 I/O、任何全局状态、任何锁、任何 `unsafe`(除 `simd/` 的 arch 内联)、
 对 `serde` 的直接使用(只经 `meta.rs`)。所有函数必须是无 panic 的 `Result` 或
 数学上可证明无 panic(切片长度由调用方断言)。
 

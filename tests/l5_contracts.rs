@@ -10,6 +10,7 @@
 //! * FC-LIFE-POST-005(命名空间规范化)、FC-LIFE-POST-006(注销持久化)
 //! * FC-LIFE-POST-007(快照统计)、FC-LIFE-POST-008(硬链接备份)、FC-LIFE-POST-009(fsck 建议)
 //! * FC-LIFE-POST-010(后台维护可控:`Builder::maintenance`)
+//! * FC-LIFE-POST-011(单轮 compaction 输入字节预算 `io_budget`)
 //! * FC-LIFE-CPLX-001(TTL 块级剪枝)、FC-LIFE-CPLX-003/004(compaction 复杂度与段数上界)
 //! * FC-LIFE-CPLX-006(后台维护单轮复杂度)
 //! * FC-MODEL-POST-004(history_horizon 回收)、FC-MODEL-POST-005(入边)、FC-MODEL-POST-007(反向关系表)、FC-MODEL-POST-008(关系类型注册表持久化)
@@ -361,6 +362,72 @@ fn compaction_bounds_segment_count() {
     }
     assert!(db.check().expect("check").ok);
     db.close().expect("close");
+}
+
+/// **FC-LIFE-POST-011**:`io_budget` 约束单轮 compaction 的输入字节预算——
+/// `io_budget = 0` 时每轮只合并一个段组;`io_budget = 1` 时一轮可连续合并到
+/// 预算耗尽(余下段组留待下一次,收敛性不变)。
+#[test]
+fn compaction_respects_io_budget() {
+    /// 6 个同层小段(4 行/段、2 段一层),便于确定性触发多轮合并。
+    fn fill(dir: &std::path::Path, io_budget: f32) -> Mneme {
+        let db = Builder::default()
+            .dimension(2)
+            .path(dir)
+            .compaction(CompactionPolicy {
+                io_budget,
+                ..tiered_policy()
+            })
+            .build()
+            .expect("build");
+        let ns = db.namespace("demo");
+        for batch in 0..6_u32 {
+            let records: Vec<Record> = (0..4_u32)
+                .map(|row| {
+                    Record::new(vec![(batch * 4 + row) as f32, 1.0])
+                        .key(format!("k{}", batch * 4 + row))
+                })
+                .collect();
+            ns.insert_batch(records).expect("batch");
+            db.flush().expect("flush");
+        }
+        assert_eq!(db.stats().expect("stats").segments.len(), 6);
+        db
+    }
+
+    let tight_dir = tempfile::tempdir().expect("tempdir");
+    let loose_dir = tempfile::tempdir().expect("tempdir");
+    let tight = fill(tight_dir.path(), 0.0);
+    let loose = fill(loose_dir.path(), 1.0);
+
+    tight.compact().expect("tight compact");
+    loose.compact().expect("loose compact");
+    let tight_segments = tight.stats().expect("stats").segments.len();
+    let loose_segments = loose.stats().expect("stats").segments.len();
+    assert_eq!(tight_segments, 5, "io_budget = 0 每轮只合并一个段组(6 → 5)");
+    assert!(
+        loose_segments < tight_segments,
+        "io_budget = 1 应在预算内连续合并,实际 {loose_segments} vs {tight_segments}"
+    );
+
+    // 预算耗尽不改变收敛性:下一次 compact 继续推进;数据一条不丢。
+    tight.compact().expect("second compact");
+    assert_eq!(
+        tight.stats().expect("stats").segments.len(),
+        4,
+        "余下段组留待下一次"
+    );
+    for key in 0..24_u32 {
+        assert!(
+            tight
+                .namespace("demo")
+                .get(&format!("k{key}"))
+                .expect("get")
+                .is_some()
+        );
+    }
+    tight.close().expect("close");
+    loose.close().expect("close");
 }
 
 /// FC-MODEL-POST-004:有限 `history_horizon` 下,超期墓碑整链物理回收;

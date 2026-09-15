@@ -13,7 +13,7 @@
 //! `FC-PERSIST-POST-004`、`FC-PERSIST-POST-005`、`FC-PERSIST-POST-006`、
 //! `FC-PERSIST-STA-001`、`FC-PERSIST-STA-002`、`FC-PERSIST-STA-003`、`FC-PERSIST-STA-004`、
 //! `FC-PERSIST-ERR-002`、`FC-PERSIST-ERR-003`、`FC-PERSIST-ERR-004`、
-//! `FC-PERSIST-ERR-005`、`FC-PERSIST-ERR-006`、`FC-PERSIST-ERR-007`、`FC-PERSIST-CPLX-001`、`FC-PERSIST-CPLX-007`、
+//! `FC-PERSIST-ERR-005`、`FC-PERSIST-ERR-006`、`FC-PERSIST-ERR-007`、`FC-PERSIST-ERR-013`、`FC-PERSIST-CPLX-001`、`FC-PERSIST-CPLX-007`、
 //! `FC-PERSIST-CPLX-008`、`FC-PERSIST-CPLX-009`、`FC-PERSIST-CPLX-010`、`FC-INDEX-ERR-002`、
 //! `FC-LIFE-INV-011`(备份独立打开 + 校验)、`FC-LIFE-CPLX-005`(backup/check 哨兵)。
 //!
@@ -1174,6 +1174,53 @@ fn read_only_open_does_not_mutate() {
     assert!(!missing.exists(), "只读打开不得创建目录");
 }
 
+/// **FC-PERSIST-ERR-013**:`Limits.wal_frame_max` 在写入路径强制——超限 WAL
+/// 帧的写事务整批回滚(`LimitExceeded`),记录不持久;常规小帧不受影响。
+#[test]
+fn wal_frame_limit_rejects_oversized_write() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    {
+        let db = Builder::default()
+            .dimension(4)
+            .path(dir.path())
+            .limits(mneme::Limits {
+                wal_frame_max: 512,
+                ..mneme::Limits::default()
+            })
+            .build()
+            .expect("build");
+        let ns = db.namespace("demo");
+        // text 限额(默认 1 MiB)允许该记录,但 WAL 帧负载超 512 B → 拒写。
+        let result = ns.insert(
+            Record::new(vec![1.0, 0.0, 0.0, 0.0])
+                .key("big")
+                .text("x".repeat(4096)),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(mneme::MnemeError::LimitExceeded { limit: 512, .. })
+            ),
+            "超限帧必须报 LimitExceeded,实际 {result:?}"
+        );
+        // 同库的小帧照常落盘(限额只拦超限帧,不误伤常规写入)。
+        ns.insert(Record::new(vec![0.0, 1.0, 0.0, 0.0]).key("small"))
+            .expect("小记录可写");
+        db.close().expect("close");
+    }
+    let db = Mneme::open(dir.path()).expect("reopen");
+    let ns = db.namespace("demo");
+    assert!(
+        ns.get("big").expect("get big").is_none(),
+        "被拒写入绝不持久"
+    );
+    assert!(
+        ns.get("small").expect("get small").is_some(),
+        "常规写入必须持久"
+    );
+    db.close().expect("close");
+}
+
 /// **FC-INDEX-ERR-002(L3)**:MANIFEST 引用的 hidx 缺失时,fail-fast 打开直接拒绝;
 /// 可写非 fail-fast 打开降级为暴力(`stats.index_nodes == 0`)且 `check()` 报告损坏。
 #[test]
@@ -1428,7 +1475,7 @@ fn segment_open_probes_prefix_without_full_read() {
 /// 提交多段;段集与数据完整、`check` 通过、重开一致。小规模保持单段。
 ///
 /// `#[ignore]`:70k 行建索引在 debug 下约 3 分钟(切分逻辑由
-/// `src/persist/store/snapshot.rs::split_slot_chunks_covers_all_slots_in_order`
+/// `src/persist/store/snapshot/tests.rs::split_slot_chunks_covers_all_slots_in_order`
 /// 常规覆盖);需重跑时用
 /// `cargo test --test persist_contracts large_flush_splits_into_parallel_segments -- --ignored`。
 #[test]

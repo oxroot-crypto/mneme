@@ -1,24 +1,21 @@
 # AGENTS.md
 
 Mneme:纯 Rust 的嵌入式向量存储引擎(面向 AI Agent 超长期记忆)。单 crate,edition 2024,
-MSRV 1.93。**当前实现了 L0 原语层 `src/core/`、L1 内存引擎 `src/memory/`、L2 持久层
-`src/persist/`、L3 索引层 `src/index/`、L4 检索层 `src/query/`、L5 生命周期层
-`src/life/` 与 L6 打磨层 `src/quant/` + `feature = "async"` 门面**(WAL 轮转、增量段、
-MANIFEST、崩溃恢复、size-tiered compaction、自研 HNSW(默认混合精度建图
-`BuildPrecision::Hybrid`:i8 临时码流遍历 + f32 精排选邻,可回退全 f32)、过滤三档、hidx 图持久化、
-mmap 段读取、过滤 DSL、zone map/bloom/ttl_map 计划器、BM25、RRF/加权融合、msec
-轻量索引四区与 delta 区、后台维护线程、命名空间/快照/备份/统计、i8/f16 量化副本 +
-两阶段精排 + 建段抽样回退、`AsyncNamespace`)。L2 依赖 `crc32fast`;L3 经 feature
-`mmap`(默认开)引入 `memmap2`;L6 经 feature `async` 引入 `tokio`(仅 `rt`)、经
-feature `quant-f16` 引入 `half`;L11 静态加密经 feature `encrypt` 引入 `aes-gcm` +
-`getrandom`,压缩经 feature `compress`(自研 LZ4 风格,零依赖)/`compress-zstd`
-引入 `zstd`;`criterion` 为 dev-dependency。
-**L1–L6 收尾与 09/10/11/12 扩充已落地**(段句柄惰性驻留、候选放大/偏置路由、
-自定义关系注册表、加密/压缩、`Storage` 后端与只读共享、`Observer`、写视图索引分片/分块
-COW);1M×1536
-性能门槛与 fuzz 长跑由本机/专用 runner 手动执行(不上 CI),1M 正式门槛待
-≥16GB 专用 runner;
-`wasm` feature 已接线,目标构建验证留 CI 的 `wasm-check` job。
+MSRV 1.93。引擎为 L0–L6 分层实现(`src/core/`、`src/memory/`、`src/persist/`、
+`src/index/`、`src/query/`、`src/life/`、`src/quant/` + `feature = "async"` 门面):
+WAL 轮转、增量段、MANIFEST、崩溃恢复、size-tiered compaction、自研 HNSW(默认混合精度
+建图 `BuildPrecision::Hybrid`:i8 临时码流遍历 + f32 精排选邻,可回退全 f32)、过滤三档、
+hidx 图持久化、mmap 段读取、过滤 DSL、zone map/bloom/ttl_map 计划器、BM25、RRF/加权
+融合、msec 轻量索引四区与 delta 区、后台维护线程、命名空间/快照/备份/统计、i8/f16
+量化副本 + 两阶段精排 + 建段抽样回退、`AsyncNamespace`、静态加密/压缩、`Storage`
+后端与只读共享、`Observer`,以及段句柄惰性驻留、候选放大/偏置路由、自定义关系注册表、
+写视图索引分片/分块 COW。L2 依赖 `crc32fast`;L3 经 feature `mmap`(默认开)引入
+`memmap2`;L6 经 feature `async` 引入 `tokio`(仅 `rt`)、经 feature `quant-f16` 引入
+`half`;L11 静态加密经 feature `encrypt` 引入 `aes-gcm` + `getrandom`,压缩经
+feature `compress`(自研 LZ4 风格,零依赖)/`compress-zstd` 引入 `zstd`;`criterion`
+为 dev-dependency。1M×1536 性能门槛与 fuzz 长跑由本机/专用 runner 手动执行
+(不上 CI,正式门槛需 ≥16GB 专用 runner);`wasm` feature 的目标构建由 CI 的
+`wasm-check` job 验证。
 
 ## 契约优先工作流(FSVDD,强制)
 
@@ -34,8 +31,8 @@ COW);1M×1536
 
 ## 项目状态与兼容纪律(强制)
 
-- 项目**尚未发布**:L1–L6 仍在 `feat/*` 分支开发,不存在任何外部旧库、旧段、旧
-  MANIFEST、旧 WAL 或旧 API 消费者;开发中的磁盘格式一律视为**未发布**。
+- 项目**尚未发布**:不存在任何外部旧库、旧段、旧 MANIFEST、旧 WAL 或旧 API 消费者;
+  当前的磁盘格式一律视为**未发布**。
 - **禁止为开发中的中间格式写兼容代码或兼容测试**:段/MANIFEST/WAL/hidx/msec 布局需要
   变更时,直接改当前定义并同步契约与测试;不保留"读旧开发格式"的读取分支、不写
   "旧库升级"回归、不为假想的旧读者升主/次版本或维护兼容矩阵。
@@ -52,14 +49,14 @@ COW);1M×1536
   compaction 门面);②`src/quant/` 为**纯原语模块**(无 I/O、无锁、无全局态,依赖等级同 L0),
   L2 段编码与 L3 索引打分可直接复用。两条例外都不改变 L0→L6 的业务依赖方向。
 - `src/core/`(L0)无 I/O、无全局状态、无锁,只有类型与纯函数。
-- `unsafe` 只允许两处:`src/core/simd.rs` 的 arch 内联与 `src/persist/source.rs` 的 `MmapSource`
+- `unsafe` 只允许两处:`src/core/simd/` 的 arch 内联与 `src/persist/source/` 的 `MmapSource`
   (mmap 固有 unsafe);每处必须附 `// SAFETY:` 证明。
 - L1 起公开 API 冻结;改签名需单独 RFC 并同步 `docs/design/16-api-reference.md`。
 - `#![deny(missing_docs)]` + `#![deny(unsafe_op_in_unsafe_fn)]`:新增公开项必须有 rustdoc。
 
 ## 依赖与算法
 
-- 依赖白名单:`Cargo.toml` 非 feature 直接依赖白名单上限 4 个(`serde`/`serde_json`/`thiserror`,以及 L2 的 `crc32fast`);L3 的 `memmap2` 随 feature `mmap`(默认开)引入,关后可回退 `FileSource`;L6 的 `half` 随 `quant-f16`、`tokio`(仅 `rt`)随 `async` 引入,均默认关。新增任何外部依赖都要在 PR 中论证必要性。
+- 依赖白名单:`Cargo.toml` 非 feature 直接依赖白名单上限 4 个(`serde`/`serde_json`/`thiserror`,以及 L2 的 `crc32fast`);L3 的 `memmap2` 随 feature `mmap`(默认开)引入,关后可回退 `FileSource`;L6 的 `half` 随 `quant-f16`、`tokio`(仅 `rt`)随 `async` 引入,均默认关。新增任何外部依赖都要在 PR 中论证必要性。dev-dependencies 另计(`proptest`/`tempfile`/`criterion`,以及示例 `examples/memory` 用的 `async-openai`/`tokio`),只在 dev 构建生效,不进发布依赖树。
 - HNSW、BM25、量化、bloom、compaction 调度、分词等复杂算法一律自研。
 
 ## 命令
@@ -67,12 +64,17 @@ COW);1M×1536
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test                 # 单测 + 集成 + doctest
+cargo test                 # 单测 + 集成 + doctest(含 examples/memory 的离线用例)
 cargo doc --no-deps        # 公开项须 100% 文档覆盖
+
+# 端到端示例(交互式 REPL;真实嵌入 API 需 EXAMPLE_EMBEDDING_API_KEY,
+# base/model 经 MNEME_EMBEDDING_BASE_URL / MNEME_EMBEDDING_MODEL 覆盖)
+cargo run --example memory
 
 # 重门槛手动执行(不上 CI,需本机/专用 runner;默认 50_000×128 冒烟)
 # 建库并行:默认块级串行 + 块内 HNSW 批并行(Builder::parallelism,0=可用核数);
-# 块级并行经 MNEME_FLUSH_THREADS 显式开启(大内存/多核 runner 再试 2/4/8):
+# 块级并行由测试侧读 MNEME_FLUSH_THREADS 注入 Builder::tuning(Tuning::flush_threads)
+# 开启(大内存/多核 runner 再试 2/4/8;库本体绝不读环境变量):
 #   MNEME_FLUSH_THREADS=2 MNEME_HEAVY=1 cargo test --release --test cold_start -- --ignored
 MNEME_HEAVY=1 cargo test --release --test cold_start --test heavy_gate -- --ignored
 cargo test --release       # FC-GLOBAL-CPLX-001 复杂度操作计数
@@ -82,24 +84,23 @@ cargo mutants --no-shuffle --timeout 300    # 变异测试(mutants.toml;不阻�
 
 提交前按 fmt → clippy → test → doc 顺序跑。当前全绿,可作为基线。
 
-## 尚未可用,别踩
+## 工程现状与注意
 
-- `[features]` 已定义:`mmap`(默认开,引入 `memmap2`)、`quant-f16`(引入 `half`)、
+- `[features]`:`mmap`(默认开,引入 `memmap2`)、`quant-f16`(引入 `half`)、
   `async`(引入 `tokio` 的 `rt`)、`fuzzing`(fuzz 专用解析入口,无依赖)、
   `encrypt`(引入 `aes-gcm` + `getrandom`)、`compress`(零依赖)、
-  `compress-zstd`(引入 `zstd`)、`wasm`(关闭 mmap/后台线程;feature 已接线,
-  目标构建验证留 CI 的 `wasm-check` job)。
+  `compress-zstd`(引入 `zstd`)、`wasm`(关闭 mmap/后台线程;目标构建验证见 CI 的
+  `wasm-check` job)。
 - `cargo test --features async` / `--features quant-f16` / `--all-features` 均可跑;
   `AsyncNamespace` 的点读返回 owned `StoredRecord`(含 `RowId`)。
-- `benches/hnsw.rs` 与 `benches/quant.rs`(criterion,dev-dependency)已引入;
+- `benches/hnsw.rs` 与 `benches/quant.rs`(criterion,dev-dependency)提供趋势基准;
   heavy 门槛(冷启动/吞吐/延迟)不上 CI,由本机/专用 runner 手动跑,规模可经
   `MNEME_HEAVY_ROWS`/`MNEME_HEAVY_DIM` 覆盖(默认 50_000×128 冒烟、回归建议
-  100_000×128,吞吐/延迟门槛只在正式 1M×1536 下断言——待 ≥16GB 专用 runner);
-  夜间趋势图与基线回归 >10% 阻断待基线入库。
-- `fuzz/` 五目标骨架已搭起(独立 workspace,需 nightly + `cargo-fuzz`);
+  100_000×128,吞吐/延迟门槛只在正式 1M×1536 下断言——需 ≥16GB 专用 runner)。
+- `fuzz/` 五目标(独立 workspace,需 nightly + `cargo-fuzz`);
   `cargo test` 不编译 `fuzz/`,仓库内以 `src/fuzzing.rs` 冒烟单测兜底。
 - 契约追溯门禁为 `tests/contract_traceability.rs`(随 `cargo test` 运行,校验契约↔测试双向映射);仓库内**没有** `xtask/` 或 `xtask check-contracts`,不要试图运行。
-- `.gitlab-ci.yml` 只跑轻量两档 fast + middle(每次 push / MR;GitLab runner 已配置并通过首跑);heavy/fuzz/mutation 等重门槛不上 CI,由本机/专用 runner 手动执行(命令见上「命令」段),档位与触发定义见 `docs/design/14-testing.md §7`。
+- `.gitlab-ci.yml` 跑轻量两档 fast + middle(每次 push / MR);heavy/fuzz/mutation 等重门槛不上 CI,由本机/专用 runner 手动执行(命令见上「命令」段),档位与触发定义见 `docs/design/14-testing.md §7`。
 
 ## 测试
 
@@ -108,6 +109,8 @@ cargo mutants --no-shuffle --timeout 300    # 变异测试(mutants.toml;不阻�
   `tests/persist_contracts.rs`(L2)、`tests/hnsw_contracts.rs`(L3)、`tests/l4_contracts.rs`(L4)、
   `tests/l5_contracts.rs`(L5)、`tests/l6_contracts.rs`(L6,含 async/f16 条件用例);
   追溯门禁 `tests/contract_traceability.rs`;属性测试用 `proptest`(dev-dependency)。
+- 示例离线用例:`examples/memory/tests.rs`(mock 端点覆盖嵌入客户端成功/失败路径与引擎
+  边界,随 `cargo test` 运行);示例属 FSVDD 豁免面,不登记 `FC-*`、不参与追溯门禁。
 - 测试即文档:文件头列不变量编号,断言处引用 `FC-*`,与 `contracts.md` 双向可追溯(门禁强制:无悬空引用、无孤立测试)。
 
 ## 文档

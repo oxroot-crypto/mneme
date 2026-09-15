@@ -3,10 +3,10 @@
 > **本章目标**:理解泛型参数、trait 与 trait bound,读懂 `TopK<T: Ord>` 和 `Clock` 这类签名,
 > 并会自己实现标准 trait(`From`、`Display`、`Default`)。
 > **前置**:[03 章](03-structs-enums-impl.md)(`impl`)、[05 章](05-errors.md)。
-> **对应源码**:[`src/core/heap.rs`](../../src/core/heap.rs)、[`src/core/options/clock.rs`](../../src/core/options/clock.rs)、
+> **对应源码**:[`src/core/heap/`](../../src/core/heap/)、[`src/core/options/clock.rs`](../../src/core/options/clock.rs)、
 > [`src/core/types.rs`](../../src/core/types.rs)、[`src/core/metric.rs`](../../src/core/metric.rs)、
-> [`src/memory/score.rs`](../../src/memory/score.rs)、[`src/memory/dedup.rs`](../../src/memory/dedup.rs)、
-> [`src/memory/pred.rs`](../../src/memory/pred.rs)、[`src/query/json.rs`](../../src/query/json.rs)、
+> [`src/memory/score/`](../../src/memory/score/)、[`src/memory/dedup.rs`](../../src/memory/dedup.rs)、
+> [`src/memory/pred/`](../../src/memory/pred/)、[`src/query/json.rs`](../../src/query/json.rs)、
 > [`src/query/parse/literal.rs`](../../src/query/parse/literal.rs)。
 
 **泛型(generics)** 让一套代码适配多种类型;**trait** 定义"一个类型能做什么";
@@ -24,7 +24,7 @@ pub struct TopK<T: Ord> {
 }
 ```
 
-见 [`src/core/heap.rs:45-49`](../../src/core/heap.rs)。
+见 [`src/core/heap/topk.rs:16-20`](../../src/core/heap/)。
 
 - `T` 是**类型参数**,占位符;用 `TopK<u32>` 时 `T = u32`。
 - 可以实例化成 `TopK<u32>`、`TopK<RowId>`……同一份代码复用。
@@ -88,7 +88,7 @@ impl<T: Ord> TopK<T> {
 `T: Ord` 读作"T 必须实现 `Ord` trait"。为什么需要?因为 `TopK` 在分数相同时要按载荷
 `a_payload < b_payload` 排序,`<` 来自 `Ord`。没有这个约束,编译器不知道 `T` 能否比较大小。
 
-见 [`src/core/heap.rs:51`](../../src/core/heap.rs) 与 [`src/core/heap.rs:221-230`](../../src/core/heap.rs)。
+见 [`src/core/heap/topk.rs:22`](../../src/core/heap/) 与 [`src/core/heap/ordering.rs:26-35`](../../src/core/heap/)。
 
 等价写法(更复杂时用 `where`):
 
@@ -129,7 +129,7 @@ pub fn new<T: Into<Arc<str>>>(value: T) -> Self { ... }
 pub(crate) fn open(path: impl AsRef<std::path::Path>) -> std::io::Result<Self> {
 ```
 
-见 [`src/persist/source.rs:100`](../../src/persist/source.rs)。`AsRef<T>` 是"能借出
+见 [`src/persist/source/backend.rs:85`](../../src/persist/source/)。`AsRef<T>` 是"能借出
 `&T`"的转换 trait;`&str`/`String`/`PathBuf`/`Path` 都实现了 `AsRef<Path>`,所以调用方
 传什么都行,函数体里 `.as_ref()` 拿到统一的 `&Path`。这是标准库与社区广泛采用的参数
 惯例(比 `impl Into<PathBuf>` 少一次分配)。
@@ -144,7 +144,7 @@ pub struct RecordRef<'a> {
 }
 ```
 
-见 [`src/memory/record.rs:316-320`](../../src/memory/record.rs)。`PhantomData<T>` 不占
+见 [`src/memory/record/view.rs:16-20`](../../src/memory/record/)。`PhantomData<T>` 不占
 空间,只在类型层面声明"逻辑上借用/拥有 `T`",从而参与借用检查与 auto trait
 (`Send`/`Sync`)推断;去掉它,编译器会报"生命周期参数 `'a` 未被使用"。
 
@@ -276,7 +276,7 @@ pub summarizer: Option<Arc<dyn Summarizer>>,
 pub fn rerank(mut self, rerank: Arc<dyn Reranker>) -> Self { ... }
 ```
 
-见 [`src/memory/score.rs`](../../src/memory/score.rs) 与 [`src/memory/rerank.rs`](../../src/memory/rerank.rs)。
+见 [`src/memory/score/`](../../src/memory/score/) 与 [`src/memory/rerank.rs`](../../src/memory/rerank.rs)。
 
 - `dyn Trait` 是 **trait 对象**:只保留"实现了哪个 trait",不保留具体类型;`Arc<dyn Trait>`
   让它可共享、可跨线程(`Summarizer: Send + Sync`)。
@@ -321,7 +321,7 @@ decode_field_val(value, Expr::Contains);
 - `Expr::Exists` 不是方法调用,而是把**变体构造器**当函数指针值传递:元组变体的构造器
   签名就是它的参数列表。
 - 需要显式类型时写 `Expr::Exists as fn(String) -> Expr` 强转(见
-  [`src/query/parse.rs:249`](../../src/query/parse.rs));
+  [`src/query/parse/grammar.rs:85`](../../src/query/parse/));
 - 构造器**不能捕获环境**,天然满足 `fn` 指针签名,所以适合当"无状态工厂"传来传去;
 - 同一个构造器也能喂给泛型方法:`Option::map` / `Result::map` 要的正是 `FnOnce(T) -> U`,
   于是 JSON 解码里直接写 `value.as_bool().map(Val::Bool)`、
@@ -356,13 +356,13 @@ impl std::ops::BitAnd for Expr {
 }
 ```
 
-见 [`src/memory/pred.rs:267-273`](../../src/memory/pred.rs)。有了它,过滤条件就能像布尔式一样写:
+见 [`src/memory/pred/builder.rs:142-148`](../../src/memory/pred/builder.rs)。有了它,过滤条件就能像布尔式一样写:
 
 ```rust
 let expr = Expr::field("importance").gt(0.5_f32) & Expr::field("rank").lt(1028_i64);
 ```
 
-见 [`src/memory/pred.rs:267-281`](../../src/memory/pred.rs)。要点:
+见 [`src/memory/pred/builder.rs:142-156`](../../src/memory/pred/builder.rs)。要点:
 
 - `a & b` 只是 `a.bitand(b)` 的**语法糖**,`|` 同理;重载不改变优先级,也不能凭空造运算符。
 - **关联类型 vs 泛型参数**:`Output` 由 `Self` 唯一决定,所以用关联类型;如果要允许同一个类型

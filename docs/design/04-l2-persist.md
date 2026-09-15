@@ -6,9 +6,9 @@
 > **本章你将学到**:目录与文件布局 → 四种文件的字节图 → WAL 协议 → CRC 数学 →
 > zone map 与 Bloom filter 完整推导 → MANIFEST 原子性(Windows 专项) → 恢复流程。
 
-模块:`persist/{wal/, vsec.rs, msec/, edges.rs, manifest.rs, recover/, flush.rs, source.rs, storage.rs, trash.rs, store/}`
+模块:`persist/{wal/, vsec/, msec/, edges.rs, manifest/, recover/, flush/, source/, storage/, trash.rs, store/}`
 (`store/` 是协调句柄 `Store`:实现内存引擎的 `PersistHook`、承接 `open`/`flush`/Checkpoint;
-`delta/` 编解码模块已删除,`delta` 数据区自 L5 起实际写入访问/关系变更条目,见 §2.2a)
+`delta` 数据区承载访问/关系变更条目,见 §2.2a)
 
 ---
 
@@ -20,7 +20,7 @@ agent_memory/
 ├── MANIFEST.000041      # 旧版本 MANIFEST(write-once,保留最近 2 个)
 ├── MANIFEST.000042      # 当前版本 MANIFEST
 ├── wal/
-│   └── wal_000001.log   # 预写日志(单文件为 L2 形态;L5 起按字节上限多文件轮转,见 §3.2)
+│   └── wal_000001.log   # 预写日志(按字节上限多文件轮转,见 §3.2)
 ├── segments/
 │   ├── seg_000007.vsec  # 向量段(vectors + norm + 删除位图)
 │   ├── seg_000007.msec  # 元数据段(记录体 + 版本链表 + key 索引 + zone map + bloom + 倒排 + ns 统计)
@@ -30,8 +30,8 @@ agent_memory/
 
 **段(segment)** 是不可变文件三元组:`(vsec, msec[, hidx])` 共享同一 `SegmentId`。
 "不可变"是整个存储设计的锚点:只追加新段、只改 MANIFEST 指针,
-读路径因此只需短暂读锁换一次视图引用、扫描全程无锁(§8)。可变性由两个例外承担:WAL 阶段的内存可变表(L2 期间)、
-后台 compaction 的重写(L5)。
+读路径因此只需短暂读锁换一次视图引用、扫描全程无锁(§8)。可变性只有两个例外:
+WAL 之后未落盘的内存可变表、后台 compaction 的重写。
 
 ---
 
@@ -129,11 +129,11 @@ agent_memory/
        payload_crc32                 u32
 ```
 
-> **落地状态**:定长头实际为 **192 B**(偏移 `0..160` 为字段区、`header_crc32` 在
-> 偏移 **160**、`164..192` 为对齐填充)。L2 落地 `doc_region`、`version_table`、
-> `key_index`、`ns_stats` 与正向 `relations`;**L4 起** `field_dict`、`zmap`
-> (zone map;`ttl_map` 自 L5 起写入)、`bloom` 与 `inverted`(倒排)四区也实际写入
-> (布局与构建见 §5.1–§5.4);`delta` 区自 L5 起写入增量段携带的访问/关系变更(§2.2a)。
+> 定长头为 **192 B**(偏移 `0..160` 为字段区、`header_crc32` 在偏移 **160**、
+> `164..192` 为对齐填充)。msec 包含 `doc_region`、`version_table`、`key_index`、
+> `ns_stats`、正向 `relations`,以及 `field_dict`、`zmap`(含 `ttl_map`)、`bloom`、
+> `inverted`(倒排)四区(布局与构建见 §5.1–§5.4);`delta` 区承载增量段中的
+> 访问/关系变更(§2.2a)。
 
 **记录体(entry)格式**(doc_region 内,长度前缀):
 
@@ -175,12 +175,11 @@ agent_memory/
 
 ### 2.2a 跨段覆盖区(delta;L5 起写入访问/关系变更)
 
-> **落地状态(重要)**:删除/更新始终持久化为**完整新版本 + 墓碑**,写入
-> `version_table`/`key_index`(§2.2、§5.5),不依赖 delta 区;不变量 I19 由"WAL 不提前截断 +
-> 版本行"保证。L5 起 `delta` 区承载增量段中"作用于旧段记录"的非版本化变更
-> (kind=4 Access、kind=5/6 Relate/Unrelate;kind 1–3 保留),恢复时按段序回放、
-> compaction 时物化进新段;该设计已在 L5 落地(增量段 flush 与
-> compaction 均使用)。
+> 删除/更新始终持久化为**完整新版本 + 墓碑**,写入 `version_table`/`key_index`
+> (§2.2、§5.5),不依赖 delta 区;不变量 I19 由"WAL 不提前截断 + 版本行"保证。
+> `delta` 区承载增量段中"作用于旧段记录"的非版本化变更(kind=4 Access、
+> kind=5/6 Relate/Unrelate;kind 1–3 保留),恢复时按段序回放、compaction 时
+> 物化进新段(增量段 flush 与 compaction 均使用)。
 
 **问题**:`touch`(读路径攒批的访问统计)与 `relate` / `unrelate` 作用的对象可能位于
 **更早的不可变段**。这些是**非版本化变更**——它们不产生新记录版本,不能原地改写旧段
@@ -233,7 +232,7 @@ relations: [magic "EDG1"][u16 ver][u16 flags][u32 forward_count][u32 reverse_cou
            flags bit1=全量关系表:恢复时先重置关系表再应用;无该位为增量段(见 FC-MODEL-POST-007)
 ```
 
-> **落地状态**:默认 `RelationIndex::Outgoing` 只写正向表;`Both` 时自 L5 起追加反向表
+> 默认 `RelationIndex::Outgoing` 只写正向表;`Both` 时追加反向表
 > (`edges::encode(&relations, config.relation_index == Both)`),恢复时入边由正向+反向表并集
 > 重建(FC-MODEL-POST-007)。
 
@@ -282,7 +281,7 @@ Checkpoint = [u64 watermark_seqno]
 > **实际发出的帧**:`Insert`、`DeleteRow`、`TouchRow`、`Relate`、`Unrelate`、`NsRegister`、
 > `NsUnregister`,以及批量包裹 `BatchBegin`/`BatchCommit`。`Delete`(按 key)、`Touch`(按 key)、
 > `Update`、`UpdateRow`、`Checkpoint`、`RelKindRegister` 为**保留帧类型**:编号已分配、
-> 回放时识别为合法帧并按忽略处理,当前实现**不发出**(分别对应按 key 覆盖、局部更新与检查点能力;
+> 回放时识别为合法帧并按忽略处理,引擎**不发出**(分别对应按 key 覆盖、局部更新与检查点能力;
 > 检查点由增量段 flush + WAL 重置实现,§3.2)。
 
 > **`NsRegister` 的位置保证**:向一个新命名空间写入的**第一批** WAL 必须先写
@@ -415,12 +414,13 @@ HNSW 入口是**每段一个**(与 [05 §7/§9](05-l3-hnsw.md) 的"每段独立�
 
 ## 3. WAL 协议
 
-> **L5 落地状态(增量段)**:自 L5 起 `flush` 不再重写整个可变表——只把未落盘槽位与
-> 自上次 flush 的访问/关系 delta 物化为**新段**,旧段保持活跃(write-once),MANIFEST
-> 追加新段并 Checkpoint WAL,段数由 compaction 合并控制;当前实现见 [07 §4](07-l5-life.md)。
-> 大规模物化按 `MNEME_FLUSH_CHUNK_ROWS`(默认 65_536 行)**每块至多该行数**切开
-> (块数 = ⌈行数 / 块行数⌉),块级并行度由 `MNEME_FLUSH_THREADS` 显式覆盖、
-> 默认 **1(块级串行)**;每块内部的 HNSW 构建使用 `Builder::parallelism` 的
+> **增量段**:`flush` 只把未落盘槽位与自上次 flush 的访问/关系 delta 物化为**新段**,
+> 旧段保持活跃(write-once),MANIFEST 追加新段并 Checkpoint WAL,段数由 compaction
+> 合并控制(见 [07 §4](07-l5-life.md))。
+> 大规模物化按 `Tuning.flush_chunk_rows`(默认 65_536 行)**每块至多该行数**切开
+> (块数 = ⌈行数 / 块行数⌉),块级并行度由 `Tuning.flush_threads` 配置、
+> 默认 **1(块级串行)**;库本体绝不读取环境变量,调参一律经
+> `Builder::tuning` 显式注入(设计 16 §6);每块内部的 HNSW 构建使用 `Builder::parallelism` 的
 > **批内并行**(见 [05 §4.4](05-l3-hnsw.md)、`FC-INDEX-POST-012`)。默认块级串行是
 > 4 核机实测结论:块级并行与块内批并行嵌套会争抢内存带宽,100k×1536 实测
 > (2 块 × 4 线程)506s,而块级串行 + 块内批并行 295s。块级并行仅建议在大内存/
@@ -434,7 +434,7 @@ HNSW 入口是**每段一个**(与 [05 §7/§9](05-l3-hnsw.md) 的"每段独立�
 ```text
 1. 取写锁(全局串行) → 为本次写操作分配全局单调 seqno(批内各帧依次分配;
    flush 以批为单位,保证一批不横跨 watermark)
-2. 构帧追加进 WalWriter 的缓冲区:单条写 = Insert/DeleteRow/TouchRow(L2 不发出按 key 的
+2. 构帧追加进 WalWriter 的缓冲区:单条写 = Insert/DeleteRow/TouchRow(引擎不发出按 key 的
    Delete/Touch,见 §2.3);`insert_batch` = BatchBegin + N×Insert + BatchCommit(整批一次组提交)
 3. 按 FsyncPolicy 等待持久确认:
      Always      → 每帧 write + fsync 后返回
@@ -451,7 +451,7 @@ last_error }`。提交者追加后 `wait_while(last_durable < my_seqno)`。
 
 ### 3.2 轮转与检查点
 
-> **落地状态(L5 起)**:WAL 支持多文件轮转 `wal/wal_NNNNNN.log`;活动文件达
+> WAL 支持多文件轮转 `wal/wal_NNNNNN.log`;活动文件达
 > `wal_file_bytes` 后在事务末(批提交之后)换新文件,**整批不跨文件**。检查点 = "增量段
 > flush → 新 MANIFEST 记录 `watermark_seqno` → 截断活动文件并删除已完全覆盖的旧文件";
 > 回放按文件序跳过 `seqno ≤ watermark` 的帧。`Checkpoint` 帧类型(§2.3 type 4)保留但
@@ -567,11 +567,11 @@ $O(n)$ 时间(查表法每字节 1 次表查 + XOR,8KB 表)、$O(1)$ 空间;`crc
 
 ## 5. msec 内的轻量索引
 
-> **落地状态**:`key_index`(§5.5)与 `ns_stats`(§5.6)自 L2 起写入;`field_dict`、
-> zone map、bloom 与倒排自 **L4** 起实际写入——构建在 `flush` 期由写状态的加速结构
-> 编码,查询期由 L4 计划器下推与 BM25 打分消费,`open` 校验区结构并从磁盘倒排经
-> "段内槽位 → 全局槽位"重排映射直接重建(`ttl_map` 自 L5 起随段写入并在载入期校验)。
-> 字节布局与偏移见 §2.2,四区编码见 `src/persist/msec/index.rs`。
+> `key_index`(§5.5)与 `ns_stats`(§5.6)随段写入;`field_dict`、zone map、bloom 与
+> 倒排的构建在 `flush` 期由写状态的加速结构编码,查询期由计划器下推与 BM25 打分
+> 消费,`open` 校验区结构并从磁盘倒排经"段内槽位 → 全局槽位"重排映射直接重建
+> (`ttl_map` 随段写入并在载入期校验)。字节布局与偏移见 §2.2,四区编码见
+> `src/persist/msec/index/`。
 
 ### 5.1 字段字典
 
@@ -675,8 +675,8 @@ key 同时进入该字符串字段的 bloom(§5.3),不存在的 key 先被 bloom
   4. seqno 相同不可能(全局单调分配),故无并列。
 ```
 
-> **L2 落地状态**:来源 b)(段内 delta)在 L2 恒空;L5 起含访问/关系变更条目(§2.2a);可见性由来源 a)
-> (`version_table` 版本链,含墓碑版本)与 c)(可变表/WAL 覆盖)解析。L2 的按 key 删除/访问在
+> 来源 b)(段内 delta)承载访问/关系变更条目(§2.2a,可为空);可见性由来源 a)
+> (`version_table` 版本链,含墓碑版本)与 c)(可变表/WAL 覆盖)解析。按 key 删除/访问在
 > WAL 中以 `DeleteRow`/`TouchRow` 落盘(§2.3),表现为版本链上的墓碑版本与内存访问统计。
 
 - upsert/update **保留 RowId**、追加新版本(seqno 更大)
@@ -714,7 +714,7 @@ key 同时进入该字符串字段的 bloom(§5.3),不存在的 key 先被 bloom
   bloom/term_dict 二分即可跳过;
 - 只有查询命名空间完全相同的统计才可复用;**不变量 I21(BM25 统计一致性)**:IDF 的 N/avgdl/df
   按查询命名空间在**全部活跃段**全局聚合、只计活行,与段数无关,且不同命名空间的统计互不影响;
-- 若未来引入"全局词表"(跨段合并的 term 统计缓存),可把两遍降为一遍,但语义以本规则为准。
+- 若要引入"全局词表"(跨段合并的 term 统计缓存),可把两遍降为一遍,但语义以本规则为准。
 
 > **L4 落地口径**:内存实现只有一份跨"段 + 未落盘记录"的全局倒排,第一遍遍历查询命名空间
 > 的文档长度表统计 N/avgdl(只计当前视图可见行),第二遍按查询词 postings 打分;与"逐段
@@ -754,7 +754,7 @@ Windows 的 std `rename` 虽对应 `MoveFileExW(MOVEFILE_REPLACE_EXISTING)`、�
 
 ---
 
-## 7. 恢复流程:`recover.rs`
+## 7. 恢复流程:`recover/`
 
 ```text
 open(dir):
@@ -820,14 +820,12 @@ ReaderView(不可变):
 > 跨段访问/关系变更经 `delta` 区承载(L5 起,§2.2a)。因此 `flush` 之后即便 WAL 被
 > 重置截断,删除与更新依然有效(I19)。
 
-> **段句柄惰性驻留(已落地,L1–L6 收尾)**:生产实现在此骨架下引入
-> `SegmentHandle`/`ByteFile`(`persist/source.rs`):打开段只解析头部与
-> `node_table`(hidx),**向量/量化码/HNSW 邻接字节挂在段句柄上按需切片解码**
-> (`SlotData.vector: Arc<VectorStorage>`、`QuantCopy.rows: LazyRows`、
-> `HnswIndex.graph: GraphStore::Mapped`;FC-PERSIST-INV-021)。记录元数据
-> (`SlotData` 的 key/text/可见性字段与版本链)仍在打开期物化——把这一层也改为
-> 惰性(ReaderView 持段集 + 按需解 msec entry)是冷启动门槛 <1s 的后续工作,
-> 见 [14 §4](14-testing.md)。
+> **段句柄惰性驻留**:生产实现在此骨架下引入 `SegmentHandle`/`ByteFile`
+> (`persist/source/`):打开段只解析头部与 `node_table`(hidx),**向量/量化码/
+> HNSW 邻接字节挂在段句柄上按需切片解码**(`SlotData.vector: Arc<VectorStorage>`、
+> `QuantCopy.rows: LazyRows`、`HnswIndex.graph: GraphStore::Mapped`;
+> FC-PERSIST-INV-021)。记录元数据(`SlotData` 的 key/text/可见性字段与版本链)
+> 仍在打开期物化(见 §8);冷启动门槛见 [14 §4](14-testing.md)。
 
 > **可变表也是检索数据源**:除可见性合并外,可变表中**尚未落段**的记录同时参与检索——
 > 向量侧作为一个"内存段"参与暴力扫描([05 §9](05-l3-hnsw.md)),BM25 侧经内存增量倒排
@@ -877,8 +875,8 @@ pub trait FsyncHook: Send + Sync {
 经 `Builder::fsync_hook` 公开注入(测试用 seam;生产不设置即无开销)。
 用法见 [14 §2](14-testing.md):在随机点"杀死"进程,断言恢复后状态 = 已确认操作前缀。
 
-> **落地状态**:当前实现只发出 `Write` 与 `Fsync` 两种动作;`Rename` 变体为接口保留
-> (供段移动类原子操作使用),目前**没有任何发出点**——段回收直接经 `trash` 模块完成。
+> 引擎只发出 `Write` 与 `Fsync` 两种动作;`Rename` 变体为接口预留
+> (供段移动类原子操作使用),**无任何发出点**——段回收直接经 `trash` 模块完成。
 
 ### 10.2 时间源:`Clock`
 
@@ -896,7 +894,7 @@ pub trait Clock: Send + Sync { fn now_unix_ms(&self) -> i64; }
   ([07 §1](07-l5-life.md));
 - 仅影响时间语义,不影响 WAL 的 seqno(seqno 与时钟无关)。
 
-## 11. source.rs:两种段读取后端
+## 11. source/:两种段读取后端
 
 ```rust
 pub(crate) trait SegmentSource: Send + Sync {   // crate 内部抽象,非公开 API
@@ -906,21 +904,21 @@ pub(crate) trait SegmentSource: Send + Sync {   // crate 内部抽象,非公开 
 ```
 
 L2 提供 `FileSource`(std,`seek+read`);`MmapSource`(feature `mmap`,memmap2)按依赖
-白名单([01 §5](01-overview.md))**自 L3 起已实现**,保留给 `read_whole`(测试/诊断)使用。
-**段句柄惰性驻留已落地**(L1–L6 收尾,FC-PERSIST-INV-021):生产打开路径由
+白名单([01 §5](01-overview.md))引入,保留给 `read_whole`(测试/诊断)使用。
+**段句柄惰性驻留**(FC-PERSIST-INV-021):生产打开路径由
 `SegmentHandle` 长期持有三个 `ByteFile`(vsec/msec/hidx),`ByteFile` 实现 L1
 `memory::lazy::ByteSource`——feature `mmap`(默认)下按页惰性映射,关闭 mmap 时把
 整文件读入自有缓冲(功能等价)。向量(`SlotData.vector`)、量化码(`LazyRows`)与
 HNSW 邻接(`MappedGraph`)经这些句柄按需读取;compaction 把旧段移入 `trash/` 只影响
 目录项,已打开的描述符/映射在句柄存活期内继续可读(POSIX unlink/rename 语义)。
-记录元数据层仍为打开期物化(见 §8 说明);`read_whole` 仅保留给测试与诊断路径。
+记录元数据层为打开期物化(见 §8);`read_whole` 仅保留给测试与诊断路径。
 
 ---
 
 ## 12. 格式版本
 
-每个文件头都带 `format_version`(本章 §2),MANIFEST 另记录各段的版本。项目尚未发布,
-不存在需要读取的旧开发格式,规则从简:
+每个文件头都带 `format_version`(本章 §2),MANIFEST 另记录各段的版本。项目未发布,
+不存在任何已发布的旧格式,规则从简:
 
 | 场景 | 行为 |
 |---|---|

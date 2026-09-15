@@ -21,6 +21,6 @@ mod write_op;
 
 pub(crate) use handle::Table;
 pub use state::AccessStat;
-pub(crate) use state::{SlotData, WriterState};
-pub(crate) use view::ReaderView;
+pub(crate) use state::{InstallSegmentInput, SlotData, WriterState};
+pub(crate) use view::{CachedPlan, ReaderView};
 pub(crate) use write_op::{PersistHook, WriteOp};

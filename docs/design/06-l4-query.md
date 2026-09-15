@@ -6,22 +6,23 @@
 > **本章你将学到**:DSL 文法与解析器 → 查询计划器 → BM25 公式逐项拆解(含手算)→
 > RRF/加权融合 → 执行管线 → 去重服务。
 >
-> **落地状态(2026-09)**:本章已落地于 `src/query/`(解析/展示/JSON 往返、计划器、
-> BM25、融合、执行管线)与 `src/memory/analysis/`(内存倒排 / zone map / bloom),
-> msec 四区随 `flush` 落盘、`open` 经重排映射重建(设计 04 §5,契约 `FC-PERSIST-POST-008`)。
-> 与本章设计的工程口径差异:① 内存引擎只维护一份全局倒排(见 [04 §5.4](04-l2-persist.md)
-> 落地注);② 三值语义下 `Not` 不做块级取反(位图取反会把 `Unknown` 误判为命中),
-> 交行级残差求值;③ 计划编译仍含 $O(N)$ 的逐行可见性判定(待段句柄重构消除,
-> 契约 `FC-QUERY-CPLX-002`);④ `ttl_map` 与段内反向表随 L5 落地;⑤ 计划按**每查询一份**
-> 编译(内存引擎对全量槽位视图),而非设计中的每段一份;⑥ 残余谓词的**选择性重排**尚未
-> 落地,当前按原 AST 三值求值;⑦ §5 图示的双通道并行属设计目标,当前两通道**串行**
-> 执行,向量通道内部按块并行,融合只依赖各自 top-k,语义等价。验收:`tests/l4_contracts.rs`。
+> 本章实现位于 `src/query/`(解析/展示/JSON 往返、计划器、BM25、融合、执行管线)
+> 与 `src/memory/analysis/`(内存倒排 / zone map / bloom),msec 四区随 `flush` 落盘、
+> `open` 经重排映射重建(设计 04 §5,契约 `FC-PERSIST-POST-008`)。
+> **实现口径**(与本章理想化描述的差异):① 内存引擎只维护一份全局倒排(见
+> [04 §5.4](04-l2-persist.md) 落地注);② 三值语义下 `Not` 不做块级取反(位图取反会把
+> `Unknown` 误判为命中),交行级残差求值;③ 计划编译含 $O(N)$ 的逐行可见性判定
+> (首次编译;无过滤且无 TTL 行时按不可变视图缓存复用,`FC-QUERY-CPLX-002`/
+> `FC-QUERY-POST-008`);④ 计划按**视图级缓存**编译(内存引擎对全量槽位视图,首次一份、
+> 同快照复用),而非每段一份;⑤ 残余谓词按**预估选择性重排**后三值求值
+> (`FC-QUERY-POST-009`);⑥ §5 图示的双通道**串行**执行,向量通道内部按块并行、
+> 多段间按段并行,融合只依赖各自 top-k,语义等价。验收:`tests/l4_contracts.rs`。
 
-模块:`query/{parse.rs, parse/literal.rs, display.rs, json.rs, iso.rs, plan.rs, zmap.rs, bm25.rs, fusion.rs, exec.rs}`
+模块:`query/{parse/, display.rs, json.rs, iso.rs, plan/, zmap.rs, bm25.rs, fusion.rs, exec/}`
 
 ---
 
-## 1. 过滤 DSL:`parse.rs` + `parse/literal.rs`
+## 1. 过滤 DSL:`parse/` + `parse/literal.rs`
 
 ### 1.1 文法(EBNF)
 
@@ -47,7 +48,7 @@ duration_expr = "now" ( "-" | "+" ) duration ;   (* now - 7d *)
 duration = number ( "s" | "m" | "h" | "d" | "w" ) ;
 ```
 
-- **解析器**:递归下降,语法与运算符分派(`parse.rs`)+ 字面量解析(`parse/literal.rs`);优先级 `not > and > or`;
+- **解析器**:递归下降,语法与运算符分派(`parse/`)+ 字面量解析(`parse/literal.rs`);优先级 `not > and > or`;
 - **路径**:`path` 为 `a.b.c` 形式的点路径(嵌套元数据字段);
 - **运算符别名**:`&&` / `||` / `!` 作为 `and` / `or` / `not` 的等价写法被接受
   (01 §6 的 `filter!` 示例即用 `&&`);
@@ -71,9 +72,10 @@ duration = number ( "s" | "m" | "h" | "d" | "w" ) ;
 
 ---
 
-## 2. 查询计划器:`plan.rs` + `zmap.rs`
+## 2. 查询计划器:`plan/` + `zmap.rs`
 
-**目标**:把 AST 编译成"每查询一份的执行方案"(内存引擎对全量槽位视图编译),让数据越少被碰越好。
+**目标**:把 AST 编译成执行方案(内存引擎对全量槽位视图编译;无过滤且命名空间无 TTL
+行时按不可变视图缓存复用,`FC-QUERY-POST-008`),让数据越少被碰越好。
 
 ```text
 compile(view, ns_id, filter, now_ms) → Plan {
@@ -82,14 +84,16 @@ compile(view, ns_id, filter, now_ms) → Plan {
     selectivity: s = 候选数 / 命名空间活行数   → 传给 HNSW 选档(05 §8)
 }
 // 块级"可能匹配"位图与 key bloom 预筛是 compile 的内部步骤(zone map/bloom 下推);
-// 残余谓词未做选择性重排,按原 AST 三值求值。
+// 残余谓词按预估选择性重排后三值求值(FC-QUERY-POST-009)。
 ```
 
 - **块剪枝**:对每个合取子条件求块级 min/max(见 [04 §5.2](04-l2-persist.md) 算例);
   `And` = 位图按位与,`Or` = 按位或;`Not` 与无块级摘要可用的条件(子串/前缀/后缀/通配)
   一律保持全 1——三值语义下块级取反会把 `Unknown` 误判为命中,故不下推,交行级残差求值;
-- **条件重排**:合取链按"预估选择性"升序排列(等值 + 高选择字段优先)、短路求值的做法
-  属**设计目标,尚未落地**:当前残余谓词按原 AST 三值求值;块级下推已把大多数不相关块剪掉;
+- **条件重排**:合取链按**预估选择性**升序稳定重排(等值/`In`/`IsNull` 等高选择分支
+  在前,`Exists`/`Ne` 等低选择分支在后),高选择分支先行短路,昂贵谓词
+  (`contains`/通配等)只对幸存行求值;重排只改变求值顺序,候选集合与块级剪枝不变
+  (`FC-QUERY-POST-009`);
 - **残留谓词**:块位图只证明"块内**可能**有匹配",行级仍需精确求值——
   plan 只减少工作量,不改变语义(与逐行求值结果全等,属性测试保证)。
 
@@ -185,7 +189,7 @@ doc 区:    [u32 doc_count] + [u32 ns_id][u32 slot][u32 doc_len] × count   (归
 
 > 落盘在词表与 postings 区之间写入 `[u64 postings_total_len]` 显式长度,doc 区起点
 > 不靠"各词条声明区间的最大值"推断;重复词条与重复槽位在解码/编码时显式拒绝
-> (见 `src/persist/msec/inverted.rs`)。
+> (见 `src/persist/msec/inverted/`)。
 
 - **差分 + varint**:SlotId 升序时相邻差多为小整数,varint 平均 1–2 字节
   ([02 §6](02-l0-core.md));整条 postings 空间 ≈ $df \times 3$ 字节量级(经验值);
@@ -210,7 +214,7 @@ $$T = O\!\left(2\sum_{t \in Q} df_t\right)\ \text{postings accesses (count pass 
 规则:按 Unicode 空白切词 → 小写化 → 去首尾标点;**CJK 连续段做 bigram**
 ("记忆库" → "记忆","忆库")——bigram 是无词典分词的保底方案,精度对
 关键词通道足够;拉丁词按词切。停用词表为内置常量,经 `Tuning::stopwords` 开关(默认开,
-见 [16 §2](16-api-reference.md))。未来替换 jieba 级分词器只动 `core::text::tokenize` 一个函数。
+见 [16 §2](16-api-reference.md))。若要替换 jieba 级分词器,只动 `core::text::tokenize` 一个函数。
 
 ---
 
@@ -251,7 +255,7 @@ $$\text{score}(d) = \alpha \cdot \widehat{s_v}(d) + (1-\alpha)\cdot \widehat{s_b
 
 ---
 
-## 5. 执行管线:`exec.rs`
+## 5. 执行管线:`exec/`
 
 ```mermaid
 sequenceDiagram
@@ -263,7 +267,7 @@ sequenceDiagram
 
     C->>E: SearchBuilder.execute()
     E->>E: 解析 DSL → Expr;compile 一份 Plan(候选位图/候选列表/选择性,内存全量视图)
-    par 两通道(并行属设计目标,当前串行)
+    par 两通道(串行执行,融合只依赖各自 top-k)
         E->>V: q + 候选位图 + s
         V->>S: 三档策略(05 §8)→ TopK(2k)
     and BM25 通道
@@ -340,7 +344,7 @@ pub enum ResultDedup {
 
 1. `SearchBuilder::execute()` 的完整语义(过滤 + 混合 + 融合 + 关系扩展 + 综合打分 +
    去重/多样性 + 重排钩子),管线顺序见 §5;
-2. `Expr` 的解析/打印/JSON 往返;`Plan`(内部,每查询一份:候选位图/候选列表/选择性);
+2. `Expr` 的解析/打印/JSON 往返;`Plan`(内部,视图级缓存:候选位图/候选列表/选择性);
 3. `tokenize()`(分词,公开给需要自建文本索引的宿主);
 4. `Reranker` trait、`ResultDedup`、`Scoring`、`Diversity`、`RelationExpand`(与 [10](10-scoring.md) 共用)。
 

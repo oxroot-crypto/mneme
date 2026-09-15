@@ -76,22 +76,33 @@ pub(crate) enum QuantQuery {
     F16,
 }
 
+/// [`QuantQuery::score`] 的输入参数。
+#[derive(Debug)]
+pub(crate) struct QuantQueryScoreInput<'a> {
+    /// 距离度量。
+    pub(crate) metric: Metric,
+    /// 查询向量(`F16` 粗排直接对码流算点积;非 `quant-f16` 构建不使用)。
+    #[cfg_attr(not(feature = "quant-f16"), allow(dead_code))]
+    pub(crate) query: &'a [f32],
+    /// 查询向量范数平方。
+    pub(crate) query_norm: f32,
+    /// 节点码流。
+    pub(crate) codes: &'a [u8],
+    /// 目标向量范数平方。
+    pub(crate) target_norm: f32,
+}
+
 impl QuantQuery {
     /// 量化粗排分(点积为近似值,折算口径与 [`Metric::score`] 一致)。
-    pub(crate) fn score(
-        &self,
-        metric: Metric,
-        _query: &[f32],
-        query_norm: f32,
-        codes: &[u8],
-        target_norm: f32,
-    ) -> Score {
+    pub(crate) fn score(&self, input: &QuantQueryScoreInput<'_>) -> Score {
         let dot = match self {
-            QuantQuery::I8(prepared) => prepared.score(codes),
+            QuantQuery::I8(prepared) => prepared.score(input.codes),
             #[cfg(feature = "quant-f16")]
-            QuantQuery::F16 => crate::quant::f16::coarse_dot_unchecked(_query, codes),
+            QuantQuery::F16 => crate::quant::f16::coarse_dot_unchecked(input.query, input.codes),
         };
-        metric.score_from_dot(dot, query_norm, target_norm)
+        input
+            .metric
+            .score_from_dot(dot, input.query_norm, input.target_norm)
     }
 }
 
@@ -149,15 +160,30 @@ pub(crate) struct SegmentIndex {
     pub(crate) recall_est: Option<f32>,
 }
 
+/// [`SegmentIndex::new`] 的输入参数。
+pub(crate) struct SegmentIndexInput {
+    /// 所属段编号。
+    pub(crate) segment_id: u32,
+    /// 该段的 HNSW 图(节点经内部 `slot_of` 映射到全局槽位)。
+    pub(crate) index: Arc<dyn VectorIndex>,
+    /// 图节点顺序的全局槽位(`slots[node] = slot_of(node)`)。
+    pub(crate) slots: Vec<SlotId>,
+    /// 该段实际生效的量化格式。
+    pub(crate) quant: VectorFormat,
+    /// 建段抽样召回一致率估计(`None` = 无副本)。
+    pub(crate) recall_est: Option<f32>,
+}
+
 impl SegmentIndex {
     /// 由段号、索引、覆盖槽位与量化元信息构造;`slots` 与图节点一一对应。
-    pub(crate) fn new(
-        segment_id: u32,
-        index: Arc<dyn VectorIndex>,
-        slots: Vec<SlotId>,
-        quant: VectorFormat,
-        recall_est: Option<f32>,
-    ) -> Self {
+    pub(crate) fn new(input: SegmentIndexInput) -> Self {
+        let SegmentIndexInput {
+            segment_id,
+            index,
+            slots,
+            quant,
+            recall_est,
+        } = input;
         let mut covered = BitSet::default();
         for slot in &slots {
             covered.set(slot.get() as usize);
@@ -217,6 +243,21 @@ pub(crate) struct IndexBuildRequest<'a> {
     pub(crate) build: crate::core::options::HnswBuildParams,
 }
 
+/// [`IndexFactory::load`] 的输入参数。
+#[derive(Debug)]
+pub(crate) struct IndexLoadRequest<'a> {
+    /// hidx 文件视图(只读头部与 `node_table`,邻接按需解码)。
+    pub(crate) span: &'a crate::memory::lazy::ByteSpan,
+    /// 段内节点顺序的输入(与 hidx 节点 id 对齐)。
+    pub(crate) nodes: &'a [IndexNode],
+    /// 段内节点 id → 全局槽位(恢复重排映射)。
+    pub(crate) slot_of: &'a [SlotId],
+    /// 库距离度量(建库即锁定,不存于 hidx)。
+    pub(crate) metric: Metric,
+    /// 段的量化副本(`None` = 纯 f32)。
+    pub(crate) quant: Option<QuantCopy>,
+}
+
 /// 索引工厂:构建与载入(组合根注入)。
 pub(crate) trait IndexFactory: Send + Sync {
     /// 由构建请求构建索引。
@@ -234,23 +275,10 @@ pub(crate) trait IndexFactory: Send + Sync {
 
     /// 由 hidx 句柄载入索引。
     ///
-    /// # Arguments
-    /// * `span` - hidx 文件视图(只读头部与 `node_table`,邻接按需解码)。
-    /// * `nodes` - 段内节点顺序的输入(与 hidx 节点 id 对齐)。
-    /// * `slot_of` - 段内节点 id → 全局槽位(恢复重排映射)。
-    /// * `metric` - 库距离度量(建库即锁定,不存于 hidx)。
-    /// * `quant` - 段的量化副本(`None` = 纯 f32)。
-    ///
-    /// 载入以 hidx 头部记录的图参数为准(打开时的 `HnswParams` 只影响新构建)。
+    /// 载入以 hidx 头部记录的图参数为准(打开时的 `HnswParams` 只影响新构建);
+    /// `request` 各字段语义见 [`IndexLoadRequest`]。
     ///
     /// # Errors
     /// 魔数/版本/CRC/布局不符时返回结构化错误。
-    fn load(
-        &self,
-        span: &crate::memory::lazy::ByteSpan,
-        nodes: &[IndexNode],
-        slot_of: &[SlotId],
-        metric: Metric,
-        quant: Option<QuantCopy>,
-    ) -> Result<Arc<dyn VectorIndex>>;
+    fn load(&self, request: IndexLoadRequest<'_>) -> Result<Arc<dyn VectorIndex>>;
 }

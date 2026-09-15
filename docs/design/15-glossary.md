@@ -175,7 +175,7 @@
 | zone map 剪枝 | $O(\lceil N/1024\rceil \times \text{predicates})$ | 17B/块/字段 | [04 §5.2](04-l2-persist.md) |
 | bloom 判定 | $O(k) = O(7)$ | $1.44\log_2(1/p)$ bit/元素 | [04 §5.3](04-l2-persist.md) |
 | MANIFEST 提交 | $O(\text{segments})$ 写新文件 | 保留 2 版 | [04 §6](04-l2-persist.md) |
-| 恢复(open) | $O(\text{段总字节} + \text{WAL 字节})$(逐段校验 + 回放) | $O(\text{段总字节} + \text{WAL 字节})$;段句柄惰性驻留**已落地**(`FC-PERSIST-INV-021`,向量/量化码/图邻接按需解码),剩余 O(N) 项为记录元数据/版本链物化 | [04 §7](04-l2-persist.md) |
+| 恢复(open) | $O(\text{段总字节} + \text{WAL 字节})$(逐段校验 + 回放) | $O(\text{段总字节} + \text{WAL 字节})$;段句柄惰性驻留(`FC-PERSIST-INV-021`,向量/量化码/图邻接按需解码),剩余 O(N) 项为记录元数据/版本链物化 | [04 §7](04-l2-persist.md) |
 | HNSW 构建 | $O(N \cdot d \cdot ef_c \cdot M_0)$ | ≈$(8M+20)$ B/节点 | [05 §4/§6.3](05-l3-hnsw.md) |
 | HNSW 查询 | 上界 $O(d \cdot ef \cdot M_0)$;实测 ≈ (2–5)·ef 次点积 | — | [05 §6.1](05-l3-hnsw.md) |
 | 层级分布 | $P(\ge l) = (1/M)^l$;层高 $O(\log_M N)$ | — | [05 §3.2](05-l3-hnsw.md) |
@@ -203,14 +203,14 @@
 
 > **复杂度即契约**:上表主体复杂度由 [spec/contracts.md §9](../spec/contracts.md)
 > 的 `FC-*-CPLX-*` 契约保证(时间/空间上界、口径标注与回归门禁见该节 §9.3);
-> 加密/部署对应的 `FC-SEC-*`/`FC-DEPLOY-*` 已随 L11/L12 转正为 `Passed`,
-> 量化 `FC-QUANT-*` 已随 L6 落地为 `Passed`;`FC-GLOBAL-CPLX-001` 保持 `Planned`,
-> 由 CI `complexity` 档(release 下操作计数)与 heavy 门槛门禁,待 runner 首跑后转正。
-> 本表是阅读视图,冲突时以契约矩阵为准。
+> 加密/部署对应的 `FC-SEC-*`/`FC-DEPLOY-*` 与量化 `FC-QUANT-*` 均为 `Passed`;
+> `FC-GLOBAL-CPLX-001` 为 `Planned`,由 `cargo test --release` 的操作计数与 heavy
+> 门槛(专用 runner 手动执行)门禁。本表是阅读视图,冲突时以契约矩阵为准。
 
-**性能承诺汇总(目标;冷启动与 1M 门槛见 [14 §4](14-testing.md),待 CI runner 首跑验证)**:
-Recall@10 ≥ 0.95(ef=128);1M×1536 量化后 P99 < 10ms;批量插入 ≥ 50k 向量/秒;
-冷启动 < 1s;活跃段数有界。验收方法见 [14](14-testing.md)。
+**性能承诺汇总(目标;冷启动与 1M 门槛见 [14 §4](14-testing.md))**:
+Recall@10 ≥ 0.95(ef=128);1M×1536 量化后 P99 < 100ms(4 核基准);批量插入
+≥ 300 向量/秒(4 核基准;GPU 档 ≈50k+/s 属远期目标);冷启动 < 1s;活跃段数有界。
+验收方法见 [14](14-testing.md)。
 
 ---
 

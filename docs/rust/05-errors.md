@@ -5,9 +5,9 @@
 > **前置**:[03 章](03-structs-enums-impl.md)(枚举与 `impl`)。
 > **对应源码**:[`src/core/error.rs`](../../src/core/error.rs)、[`src/core/varint.rs`](../../src/core/varint.rs)、
 > [`src/core/options/dimension.rs`](../../src/core/options/dimension.rs)、[`src/core/meta.rs`](../../src/core/meta.rs)、
-> [`src/index/hidx.rs`](../../src/index/hidx.rs)、[`src/index/graph.rs`](../../src/index/graph.rs)、
+> [`src/index/hidx/`](../../src/index/hidx/)、[`src/index/graph.rs`](../../src/index/graph.rs)、
 > [`src/query/json.rs`](../../src/query/json.rs)、[`src/query/iso.rs`](../../src/query/iso.rs)、
-> [`src/query/zmap.rs`](../../src/query/zmap.rs)、[`src/query/plan.rs`](../../src/query/plan.rs)。
+> [`src/query/zmap.rs`](../../src/query/zmap.rs)、[`src/query/plan/`](../../src/query/plan/)。
 
 Rust 没有异常(exception)和 `try/catch`。它把"可能失败"编码进**类型**:
 
@@ -71,7 +71,7 @@ level.map_or(0, |l| l as usize);      // None 时给默认 0
 ```
 
 见 [`src/index/filtered.rs:109`](../../src/index/filtered.rs) 与
-[`src/index/hidx.rs:257-259`](../../src/index/hidx.rs)。`is_none_or` 是 Rust 1.82 稳定的
+[`src/index/hidx/read.rs:129-131`](../../src/index/hidx/)。`is_none_or` 是 Rust 1.82 稳定的
 新方法,名字直译就是"是 `None` 或者满足条件";在"默认放行、有值才检查"的语义下比
 `map_or(true, ...)` 更不容易读反。
 
@@ -84,7 +84,7 @@ let expected_node_table = header
     .ok_or_else(|| corrupt("node_table_len 溢出"))?;
 ```
 
-见 [`src/index/hidx.rs:243-246`](../../src/index/hidx.rs)。`checked_mul` 返回 `Option<usize>`
+见 [`src/index/hidx/read.rs:115-118`](../../src/index/hidx/read.rs)。`checked_mul` 返回 `Option<usize>`
 (见 [02 §2.1.2](02-values-and-ownership.md)),`ok_or_else` 把 `None` 变成
 `Err(MnemeError::Corrupted { .. })`,`?` 再立即返回——这是"受检运算 + 结构化错误"的标准配合。
 
@@ -101,7 +101,7 @@ let error = HnswIndex::load(...)
 assert!(matches!(error, MnemeError::Corrupted { .. }));
 ```
 
-见 [`src/index/hnsw.rs:786-800`](../../src/index/hnsw.rs)。
+见 [`src/index/hnsw/link.rs:177-191`](../../src/index/hnsw/)。
 
 mneme 的 `meta::get_path` 用 `?` 在 `Option` 上做链式短路:
 
@@ -155,10 +155,10 @@ filter.map_or_else(
 见 [`src/query/iso.rs:103`](../../src/query/iso.rs)、
 [`src/query/zmap.rs:153-159`](../../src/query/zmap.rs)、
 [`src/query/json.rs:101-104`](../../src/query/json.rs)、
-[`src/query/exec.rs:260`](../../src/query/exec.rs)、
-[`src/query/exec.rs:407-410`](../../src/query/exec.rs)、
-[`src/query/exec.rs:421`](../../src/query/exec.rs) 与
-[`src/query/plan.rs:53-56`](../../src/query/plan.rs)。逐条:
+[`src/query/exec/channels.rs:44`](../../src/query/exec/)、
+[`src/query/exec/post.rs:54-57`](../../src/query/exec/)、
+[`src/query/exec/post.rs:68`](../../src/query/exec/) 与
+[`src/query/plan/compile.rs:38-41`](../../src/query/plan/)。逐条:
 
 - `then_some`:等价于 `if cond { Some(v) } else { None }`,但 `v` **立即求值**;
   要惰性(只在 `true` 时才算)就用 `bool::then(|| ...)`。
@@ -168,20 +168,20 @@ filter.map_or_else(
   `Option<Vec<T>>` → `Option<&[T]>` 同理。
 - `as_ref`:`Option<T>` → `Option<&T>`,只借一层;若 `T` 还能继续解引用(如 `String`),
   `as_deref` 会再走一步给出 `Option<&str>`。L4 物化 `Hit` 时用 `slot_data.text.as_ref().map(...)`
-  借出文本再转拥有值(见 [`src/query/exec.rs:407`](../../src/query/exec.rs))。
+  借出文本再转拥有值(见 [`src/query/exec/post.rs:54`](../../src/query/exec/))。
 - `cloned()`:`Option<&T>` → `Option<T>`(要求 `T: Clone`);`HashMap::get` 返回引用,
   L4 取来源边时用 `via_map.get(&candidate.rowid).cloned()` 复制出拥有值(见
-  [`src/query/exec.rs:410`](../../src/query/exec.rs))。
+  [`src/query/exec/post.rs:57`](../../src/query/exec/))。
 - `copied()`:`Option<&T>` → `Option<T>`(要求 `T: Copy`),是 `cloned()` 的零成本版本;
   `RowId`、`u32`、`f32` 这类 `Copy` 类型一律用它——L4 从访问统计表、分数表取值都是
-  `get(...).copied()`(见 [`src/query/plan.rs:136`](../../src/query/plan.rs) 与
+  `get(...).copied()`(见 [`src/query/plan/filter.rs:80`](../../src/query/plan/) 与
   [`src/query/fusion.rs:109-123`](../../src/query/fusion.rs))。
 - `or_else(f)`:只有是 `None` 时才调用闭包 `f`(惰性),返回另一个 `Option`;常用来把
   "第一种写法失败就试第二种"串起来。L4 兼容时区后缀的大小写就靠它:
   `.strip_prefix(&[b'Z']).or_else(|| ...to_ascii_lowercase...)`,见
   [`src/query/iso.rs:67-72`](../../src/query/iso.rs)。`Result::or_else` 同理,只是换的是错误。
 - `unwrap_or_default()`:`None` 时取 `T::default()`(要求 `T: Default`);L4 未显式设置融合策略时
-  取默认的 RRF(见 [`src/query/exec.rs:275`](../../src/query/exec.rs))。
+  取默认的 RRF(见 [`src/query/exec/channels.rs:59`](../../src/query/exec/))。
 - `map_or_else(none_fn, some_fn)`:两个分支都惰性;L4 计划器用它"无过滤→全 1 位图,
   有过滤→下推求值"。默认值构造昂贵时,`map_or`(默认值立即求值)不合适。
 
@@ -367,7 +367,7 @@ let entries = match fs::read_dir(&dir) {
 };
 ```
 
-见 [`src/persist/storage.rs:154-157`](../../src/persist/storage.rs)(目录不存在视为空目录)。
+见 [`src/persist/storage/backend.rs:121-124`](../../src/persist/storage/)(目录不存在视为空目录)。
 常用种类:`NotFound`(文件不存在)、`UnexpectedEof`(读越界/文件被截断)、`InvalidInput`(参数非法)、
 `AlreadyExists`、`PermissionDenied`。
 
@@ -376,16 +376,16 @@ let entries = match fs::read_dir(&dir) {
   (返回值是实际写入字节数,可能小于缓冲区)。解析磁盘格式几乎只用 `read_exact` / `write_all`。
 - **trait 方法要先把 trait 带进作用域**:`read_exact` 是 `Read` 的方法,不 `use std::io::Read;`
   就调不到。只导入方法、不引入名字的惯用写法是 `use std::io::Write as _;`(见
-  [`src/persist/store/wal_writer.rs`](../../src/persist/store/wal_writer.rs))。
+  [`src/persist/store/wal_writer/`](../../src/persist/store/wal_writer/))。
 - `SeekFrom::Start(0)` / `SeekFrom::End(-n)` 用来定位;`File::try_lock` 是 OS 咨询锁,
   返回 `Result<(), TryLockError>`:已被占用 → `Err(TryLockError::WouldBlock)`(mneme 转成
   `Busy`),底层出错 → `Err(TryLockError::Error(io))`。进程崩溃/退出时由内核自动释放锁
-  (见 [`src/persist/storage.rs:252-263`](../../src/persist/storage.rs))。
+  (见 [`src/persist/storage/fs.rs:57-68`](../../src/persist/storage/))。
 - **`usize` 与固定宽度整数的转换**:磁盘格式用 `u64`/`u32`,内存数组长度是 `usize`。
   32 位平台上 `u64 → usize` 可能截断,所以显式写 `usize::try_from(value).map_err(...)`,
-  而不是 `as usize`(见 [`src/persist/source.rs`](../../src/persist/source.rs));
+  而不是 `as usize`(见 [`src/persist/source/`](../../src/persist/source/));
   `std::mem::size_of::<T>()` 取类型字节数,配合整型运算估算内存(见
-  [`src/memory/engine_ops.rs`](../../src/memory/engine_ops.rs))。
+  [`src/memory/engine_ops/`](../../src/memory/engine_ops/))。
 
 ---
 
@@ -419,7 +419,7 @@ if let Some(&(_, best)) = candidates.first() {
 }
 ```
 
-见 [`src/index/hnsw.rs:463`](../../src/index/hnsw.rs)。`candidates.first()` 返回
+见 [`src/index/hnsw/build.rs:173`](../../src/index/hnsw/)。`candidates.first()` 返回
 `Option<&(Score, u32)>`(切片首元素的引用);模式最前面的 `&` 把引用"拆开",`(_, best)`
 再解出元组第二个字段,`_` 忽略分数。于是 `best` 是复制出来的 `u32`,不是引用。
 规则:模式要对**值的类型**匹配,加 `&` 可以"透过引用看进去"——和 [07 §3.1](07-iterators-closures.md)
@@ -483,7 +483,7 @@ while let Some(current) = frontier.pop() {   // 堆非空就弹出一个继续�
 }
 ```
 
-见 [`src/index/hnsw.rs:337`](../../src/index/hnsw.rs)。`pop()` 返回 `Option<Cand>`:
+见 [`src/index/hnsw/quant.rs:45`](../../src/index/hnsw/quant.rs)。`pop()` 返回 `Option<Cand>`:
 `Some` 进入循环体,`None`(堆空)结束循环。它等价于:
 
 ```rust
@@ -511,7 +511,7 @@ let Ok(decoded) = decode(&bytes) else {
 // 从这里起,decoded 一定可用
 ```
 
-见 [`src/index/hidx.rs:782-784`](../../src/index/hidx.rs)。规则:
+见 [`src/index/hidx/tests.rs:292-294`](../../src/index/hidx/tests.rs)。规则:
 
 - `else` 块**必须发散(diverge)**:里面必须以 `return`/`break`/`continue`/`panic!` 结束,
   编译器才能保证"走到下面时模式一定匹配成功";
@@ -542,7 +542,7 @@ if let Some(links) = self.nodes.get_mut(node as usize)
   `if is_int && let Ok(int) = text.parse::<i64>()`(只有整数形态才尝试 `i64` 解析,见
   [`src/query/parse/literal.rs:60-63`](../../src/query/parse/literal.rs));参数校验则是
   `if let Some(ef) = self.ef && ef > self.config.limits.ef_max as usize`
-  (见 [`src/query/exec.rs:139-147`](../../src/query/exec.rs))。
+  (见 [`src/query/exec/validate.rs:22-30`](../../src/query/exec/))。
 
 ---
 

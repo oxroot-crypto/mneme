@@ -7,6 +7,7 @@
 //! * FC-DEPLOY-STA-001(只读视图切换 `V_n → V_{n+1}` 原子,无中间态)
 //! * FC-DEPLOY-INV-030(`Observer` 回调不改变引擎行为;回调 panic 被隔离)
 //! * FC-DEPLOY-CPLX-001(视图切换 `O(1)`:原子交换已构建视图)
+//! * FC-GLOBAL-INV-001(库本体不读环境变量;调参一律经配置显式注入)
 //!
 //! 不变量锚定:I29(只读一致)、I30(可观测无副作用)
 
@@ -237,4 +238,36 @@ fn repeated_reload_is_idempotent() {
     assert!(reader.namespace("n").get("a").expect("get").is_some());
     reader.close().expect("close");
     writer.close().expect("close");
+}
+
+/// **FC-GLOBAL-INV-001**:库本体不读环境变量。
+///
+/// 机械扫描 `src/**/*.rs`,源码不得出现 `std::env` / `env::var`(运行期环境读取);
+/// 所有调参与开关一律经 `Builder`/`Tuning`/`Limits` 等配置显式注入。dev 侧
+/// (契约测试/示例)的环境变量读取统一收敛于 `tests/common/env.rs`(变量清单见该文件头)。
+#[test]
+fn library_source_never_reads_environment_variables() {
+    fn walk(dir: &std::path::Path, offenders: &mut Vec<String>) {
+        let entries =
+            std::fs::read_dir(dir).unwrap_or_else(|error| panic!("读取 {dir:?} 失败: {error}"));
+        for entry in entries {
+            let path = entry.expect("目录项").path();
+            if path.is_dir() {
+                walk(&path, offenders);
+            } else if path.extension().is_some_and(|extension| extension == "rs") {
+                let text = std::fs::read_to_string(&path)
+                    .unwrap_or_else(|error| panic!("读取 {} 失败: {error}", path.display()));
+                if text.contains("std::env") || text.contains("env::var") {
+                    offenders.push(path.display().to_string());
+                }
+            }
+        }
+    }
+    let mut offenders = Vec::new();
+    walk(std::path::Path::new("src"), &mut offenders);
+    offenders.sort();
+    assert!(
+        offenders.is_empty(),
+        "库本体不得读取环境变量(FC-GLOBAL-INV-001),违规文件: {offenders:?}"
+    );
 }

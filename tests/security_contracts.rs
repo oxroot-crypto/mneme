@@ -363,7 +363,7 @@ fn large_payload_roundtrip_is_linear_path() {
 #[test]
 #[ignore = "CI 跨 feature 矩阵 phase 1:先用 --features encrypt 建库"]
 fn write_encrypted_fixture_for_cross_feature_check() {
-    let dir = std::env::var("MNEME_ENCRYPT_FIXTURE").expect("MNEME_ENCRYPT_FIXTURE 未设置");
+    let dir = common::env::require(common::env::ENCRYPT_FIXTURE);
     let path = std::path::Path::new(&dir);
     let _ = std::fs::remove_dir_all(path);
     std::fs::create_dir_all(path).expect("创建 fixture 目录");
@@ -382,7 +382,7 @@ fn write_encrypted_fixture_for_cross_feature_check() {
 #[test]
 #[ignore = "CI 跨 feature 矩阵 phase 2:默认构建打开加密库必须拒绝"]
 fn open_encrypted_fixture_requires_feature() {
-    let dir = std::env::var("MNEME_ENCRYPT_FIXTURE").expect("MNEME_ENCRYPT_FIXTURE 未设置");
+    let dir = common::env::require(common::env::ENCRYPT_FIXTURE);
     let error = Builder::default()
         .path(std::path::Path::new(&dir))
         .build()

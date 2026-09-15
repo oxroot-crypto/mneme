@@ -3,12 +3,12 @@
 > **本章目标**:理解 `&` / `&mut` 借用规则、切片、`String` / `&str` / `Arc<str>` 的区别,
 > 以及生命周期标注到底在标注什么。
 > **前置**:[02](02-values-and-ownership.md)、[03](03-structs-enums-impl.md) 章。
-> **对应源码**:[`src/core/types.rs`](../../src/core/types.rs)、[`src/core/simd.rs`](../../src/core/simd.rs)、
+> **对应源码**:[`src/core/types.rs`](../../src/core/types.rs)、[`src/core/simd/`](../../src/core/simd/)、
 > [`src/core/meta.rs`](../../src/core/meta.rs)、[`src/core/options/clock.rs`](../../src/core/options/clock.rs)、
-> [`src/memory/table/state.rs`](../../src/memory/table/state.rs)、[`src/index/hnsw.rs`](../../src/index/hnsw.rs)、
-> [`src/index/hidx.rs`](../../src/index/hidx.rs)、[`src/index/graph.rs`](../../src/index/graph.rs)、
+> [`src/memory/table/state/`](../../src/memory/table/state/)、[`src/index/hnsw/`](../../src/index/hnsw/)、
+> [`src/index/hidx/`](../../src/index/hidx/)、[`src/index/graph.rs`](../../src/index/graph.rs)、
 > [`src/query/parse/`](../../src/query/parse)、[`src/query/iso.rs`](../../src/query/iso.rs)、
-> [`src/query/exec.rs`](../../src/query/exec.rs)、[`src/query/display.rs`](../../src/query/display.rs)。
+> [`src/query/exec/`](../../src/query/exec/)、[`src/query/display.rs`](../../src/query/display.rs)。
 
 [02 章](02-values-and-ownership.md)说,把值传给函数会**移动所有权**。但大多数时候我们只想"看一眼"
 数据,不想把所有权交出去。这就是**借用(borrowing)**:用引用 `&` 借用,用完还回去。
@@ -79,7 +79,7 @@ fn dot(a: &[f32], b: &[f32]) -> f32 {
 }
 ```
 
-见 [`src/core/simd.rs:50`](../../src/core/simd.rs)。
+见 [`src/core/simd/mod.rs:60`](../../src/core/simd/)。
 
 - `&[f32]` 可以接收 `&[f32; 4]`(数组的引用)、`&Vec<f32>`、或 `&v[1..3]`(子切片)。
   **函数只依赖"能当切片用",不关心底层是数组还是 Vec**——这是很好的解耦。
@@ -144,8 +144,8 @@ if bytes[0..4] != MAGIC {
 }
 ```
 
-见 [`src/index/hidx.rs:20-21`](../../src/index/hidx.rs) 与
-[`src/index/hidx.rs:184-186`](../../src/index/hidx.rs)。`bytes[0..4]` 是对切片做范围索引,
+见 [`src/index/hidx/encode.rs:4-5`](../../src/index/hidx/) 与
+[`src/index/hidx/read.rs:56-58`](../../src/index/hidx/)。`bytes[0..4]` 是对切片做范围索引,
 得到的是 `[u8]`(不定长);比较运算符会自动借成两边引用,所以 `&[u8]` 与 `&[u8; 4]` 能比。
 
 **② 小端整数与字节互转**:格式规定整数小端存储,`to_le_bytes` 把整数变成 `[u8; N]`,
@@ -157,14 +157,14 @@ header[4..6].copy_from_slice(&FORMAT_VERSION.to_le_bytes());
 let version = u16::from_le_bytes([bytes[4], bytes[5]]);
 ```
 
-见 [`src/index/hidx.rs:120`](../../src/index/hidx.rs) 与
-[`src/index/hidx.rs:187`](../../src/index/hidx.rs)。
+见 [`src/index/hidx/encode.rs:85`](../../src/index/hidx/) 与
+[`src/index/hidx/read.rs:59`](../../src/index/hidx/)。
 
 - `slice.copy_from_slice(&src)`:把源切片拷进**已经就位**的目标切片,要求两边长度完全相等,
   否则 panic——长度已知的定长头部用它最合适;
 - `Vec::extend_from_slice(&src)`:追加到 `Vec` 末尾、自动增长,用于变长的数据区;
 - `Vec::with_capacity(n)`:按预估长度预留容量,避免反复扩容(见
-  [`src/index/hidx.rs:73-74`](../../src/index/hidx.rs))。
+  [`src/index/hidx/encode.rs:38-39`](../../src/index/hidx/))。
 
 **③ 空切片与函数指针**:`Graph::neighbors` 在节点/层级越界时返回一个**空切片**而不是
 `Option`,让上层循环无须判空:
@@ -326,10 +326,10 @@ fn resolve_ns_id(&self, view: &ReaderView) -> Option<NsId> {
 }
 ```
 
-见 [`src/query/exec.rs:216-223`](../../src/query/exec.rs)。`ns_registry` 的值类型是 `Arc<str>`,
+见 [`src/query/exec/validate.rs:99-106`](../../src/query/exec/)。`ns_registry` 的值类型是 `Arc<str>`,
 迭代给出 `path: &Arc<str>`,所以 `**path` 一路解到 `str`;`self.ns_path: Arc<str>`,`*self.ns_path`
 同样解到 `str`——两边比较的是字符内容。测试里 `**path == *"n"` 的 `*"n"` 也是把字面量 `&str`
-解一层得到 `str`(见 [`src/query/plan.rs:190`](../../src/query/plan.rs))。
+解一层得到 `str`(见 [`src/query/plan/tests.rs:38`](../../src/query/plan/))。
 
 ### 3.4 原始字符串与"模式" API:L4 解析器的字符串日常
 
@@ -356,17 +356,17 @@ trimmed.starts_with(')')
 rest.strip_prefix(keyword)                                      // Option<&str>,不是"剩余切片"
 ```
 
-见 [`src/query/parse.rs:110-121`](../../src/query/parse.rs) 与
+见 [`src/query/parse/parser.rs:102-113`](../../src/query/parse/parser.rs) 与
 [`src/query/display.rs:133-140`](../../src/query/display.rs)。常用成员:
 `starts_with`/`ends_with`/`contains`/`find`/`split`/`trim_start_matches` 等。
 不带模式的 `trim_start()` / `trim_end()` / `trim()` 则去掉开头 / 结尾 / 两端的全部 Unicode 空白
 (与 `trim_start_matches` 要传模式不同);L4 解析器用它跳过关键字后面的空格,如
-`after.trim_start().starts_with('(')`,见 [`src/query/parse.rs:123-133`](../../src/query/parse.rs)。
+`after.trim_start().starts_with('(')`,见 [`src/query/parse/parser.rs:115-125`](../../src/query/parse/parser.rs)。
 
 > `str::strip_prefix` 返回 `Option<&str>`:匹配时是"去掉前缀后的借用",不匹配是 `None`,
 > 所以常配 `let ... else`(见 [05 §4.6](05-errors.md))做"匹配失败就早退"。L4 解析器
 > 用它判定 `true`/`now`/`ts`/`exists` 等关键字,既完成比较又顺手吃掉输入
-> (见 [`src/query/parse.rs:111-121`](../../src/query/parse.rs))。
+> (见 [`src/query/parse/parser.rs:103-113`](../../src/query/parse/parser.rs))。
 
 ---
 
@@ -427,13 +427,13 @@ pub(crate) struct QueryRef<'a> {
 }
 ```
 
-见 [`src/index/hnsw.rs:33-40`](../../src/index/hnsw.rs)。含义:
+见 [`src/index/hnsw/build.rs:23-30`](../../src/index/hnsw/build.rs)。含义:
 
 - `QueryRef<'a>` 读作"借用寿命为 `'a` 的查询视图";`<'a>` 虽是类型参数,泛化的却是生命周期;
 - 它**不拥有**向量(字段类型是 `&'a [f32]`),所以实例不能活得比被借用的向量久——编译器保证;
 - 函数签名里用 `QueryRef<'_>`(省略具体名字)或 `QueryRef<'a>` 都行:
   `search_layer(&self, query: QueryRef<'_>, ...)`,见
-  [`src/index/hnsw.rs:320-326`](../../src/index/hnsw.rs);
+  [`src/index/hnsw/quant.rs:27-33`](../../src/index/hnsw/);
 - 字段都是 `Copy`(引用与 `f32` 都 `Copy`),所以 `QueryRef` 自己也能 `derive(Copy)`,
   按值传递十分廉价——它像一个"带数据的借用凭证"。
 
@@ -460,7 +460,7 @@ impl<'a> Parser<'a> {
 }
 ```
 
-见 [`src/query/parse.rs:61-82`](../../src/query/parse.rs)。三个新知识点:
+见 [`src/query/parse/parser.rs:53-74`](../../src/query/parse/parser.rs)。三个新知识点:
 
 - **`impl<'a> Parser<'a>`**:为带生命周期参数的类型实现方法时,`impl` 块也要引入 `'a`;
   如果方法不返回 `'a`,也可以写 `impl Parser<'_>` 省去命名(见
@@ -474,7 +474,7 @@ impl<'a> Parser<'a> {
 
 > 这也解释了 `parse_at` 为什么可以建一个临时 `Parser`、拿完结果就丢:AST 里的
 > `String` / `Arc<str>` 都是拥有型(见 §3),不借解析器;真正借用输入的返回值都被
-> 限制在 `'a` 之内(见 [`src/query/parse.rs:50-59`](../../src/query/parse.rs))。
+> 限制在 `'a` 之内(见 [`src/query/parse/parser.rs:42-51`](../../src/query/parse/))。
 
 ### 4.6 一个实用的记忆法
 
@@ -493,7 +493,7 @@ impl<T: Ord> TopK<T> {
 }
 ```
 
-见 [`src/core/heap.rs:131`](../../src/core/heap.rs)。调用方必须先拥有 `let mut top = ...`。
+见 [`src/core/heap/topk.rs:102`](../../src/core/heap/)。调用方必须先拥有 `let mut top = ...`。
 
 `Clock` trait 的方法用 `&self` 而非 `&mut self`,因为它只是"读时间",不修改自身:
 
@@ -564,8 +564,8 @@ static NEXT_QUERY_ID: AtomicU64 = AtomicU64::new(1);
 let id = NEXT_QUERY_ID.fetch_add(1, Ordering::Relaxed);
 ```
 
-见 [`src/query/exec.rs:36`](../../src/query/exec.rs) 与
-[`src/query/exec.rs:313`](../../src/query/exec.rs)。要点:
+见 [`src/query/exec/entry.rs:16`](../../src/query/exec/) 与
+[`src/query/exec/channels.rs:97`](../../src/query/exec/)。要点:
 
 - `static` 是**整个程序唯一**的变量(比 `const` 多一个固定地址);普通 `static mut` 的读写
   是 `unsafe`,而 `AtomicU64` 提供安全的原子读写,`&self` 也能改内部值——这是它版本的
@@ -676,7 +676,7 @@ let partials = std::thread::scope(|scope| {
 })?;
 ```
 
-见 [`src/memory/search.rs:380-407`](../../src/memory/search.rs)。要点:
+见 [`src/memory/search/ann.rs:220-247`](../../src/memory/search/)。要点:
 
 - 闭包返回什么,`scope` 就返回什么;`scope` 保证**所有线程在返回前 join**,所以借用
   合法、不会泄漏线程。
@@ -748,7 +748,7 @@ impl Drop for FileLock {
 }
 ```
 
-见 [`src/persist/storage.rs:265-271`](../../src/persist/storage.rs)。正因如此,mneme
+见 [`src/persist/storage/fs.rs:70-76`](../../src/persist/storage/)。正因如此,mneme
 把持久性承诺放在显式 `close()`(返回 `Ok` 才算已确认写入全部持久);`Drop` 只做
 "停线程、释放句柄、释放锁",不执行 flush。
 - **RAII(Resource Acquisition Is Initialization)**:把"获取资源"绑定到"对象构造",

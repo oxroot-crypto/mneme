@@ -28,7 +28,7 @@ use mneme::{
 mod common;
 
 /// 测试维度(16 维 = 64B 行步长,恰 32B 对齐;行补齐分支由
-/// `src/persist/vsec.rs` 的 4 维单测覆盖)。
+/// `src/persist/vsec/tests.rs` 的 4 维单测覆盖)。
 const DIM: u32 = 16;
 
 /// 强制 ANN + 关闭自动回退的竖控参数(抽样门槛 0 恒通过)。
@@ -644,7 +644,7 @@ fn async_and_sync_namespace_sequences_are_equivalent() {
 #[test]
 #[ignore = "CI 跨 feature 矩阵 phase 1:先用 --features quant-f16 建库"]
 fn write_f16_fixture_for_cross_feature_check() {
-    let dir = std::env::var("MNEME_F16_FIXTURE").expect("MNEME_F16_FIXTURE 未设置");
+    let dir = common::env::require(common::env::F16_FIXTURE);
     let path = Path::new(&dir);
     std::fs::create_dir_all(path).expect("创建 fixture 目录");
     let db = Builder::default()
@@ -670,7 +670,7 @@ fn write_f16_fixture_for_cross_feature_check() {
 #[test]
 #[ignore = "CI 跨 feature 矩阵 phase 2:默认构建打开 f16 库必须拒绝"]
 fn open_f16_fixture_requires_feature() {
-    let dir = std::env::var("MNEME_F16_FIXTURE").expect("MNEME_F16_FIXTURE 未设置");
+    let dir = common::env::require(common::env::F16_FIXTURE);
     let error = Mneme::open(Path::new(&dir))
         .err()
         .expect("未开 quant-f16 的构建必须拒绝 f16 段");

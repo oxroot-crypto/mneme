@@ -119,8 +119,23 @@ fn parse_offset(bytes: &[u8]) -> Option<i64> {
     Some(sign * (hour * HOUR_MS + minute * MINUTE_MS))
 }
 
-/// 解析日期时间部分(年-月-日之后),返回 `(时, 分, 秒, 毫秒, 时区偏移)`。
-fn parse_time_of_day(bytes: &[u8]) -> Option<(i64, i64, i64, i64, i64)> {
+/// 日期时间部分(年-月-日之后解析出的各字段)。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TimeOfDay {
+    /// 时(0–23)。
+    hour: i64,
+    /// 分(0–59)。
+    minute: i64,
+    /// 秒(0–59;闰秒 60 拒绝)。
+    second: i64,
+    /// 毫秒(0–999)。
+    milli: i64,
+    /// 时区偏移(毫秒;`Z` 或缺省为 0)。
+    offset_ms: i64,
+}
+
+/// 解析日期时间部分(年-月-日之后)。
+fn parse_time_of_day(bytes: &[u8]) -> Option<TimeOfDay> {
     let (mut hour, mut minute, mut second, mut milli) = (0, 0, 0, 0);
     let rest = match strip(bytes, b'T') {
         Some(rest) => {
@@ -150,8 +165,14 @@ fn parse_time_of_day(bytes: &[u8]) -> Option<(i64, i64, i64, i64, i64)> {
         // 闰秒(60)不支持:线性秒数会把它静默平移,不如直接拒绝。
         return None;
     }
-    let offset = parse_offset(rest)?;
-    Some((hour, minute, second, milli, offset))
+    let offset_ms = parse_offset(rest)?;
+    Some(TimeOfDay {
+        hour,
+        minute,
+        second,
+        milli,
+        offset_ms,
+    })
 }
 
 /// 把 ISO 8601 字符串解析为 Unix 毫秒;格式非法返回 `None`。
@@ -171,14 +192,14 @@ pub(crate) fn parse_iso8601_ms(input: &str) -> Option<i64> {
     if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
         return None;
     }
-    let (hour, minute, second, milli, offset) = parse_time_of_day(rest)?;
+    let time = parse_time_of_day(rest)?;
     let days = days_from_civil(year, month as u32, day as u32);
     // 往返校验拒绝 2 月 30 日等越界日期(避免静默归一化)。
     if civil_from_days(days) != (year, month as u32, day as u32) {
         return None;
     }
-    let seconds = days * DAY_SECS + hour * HOUR_SECS + minute * MINUTE_SECS + second;
-    Some(seconds * SECOND_MS + milli - offset)
+    let seconds = days * DAY_SECS + time.hour * HOUR_SECS + time.minute * MINUTE_SECS + time.second;
+    Some(seconds * SECOND_MS + time.milli - time.offset_ms)
 }
 
 /// 把 Unix 毫秒格式化为 UTC 的 `YYYY-MM-DDTHH:MM:SS.mmmZ`。

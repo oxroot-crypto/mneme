@@ -19,7 +19,7 @@
 ## 分层地图
 
 Mneme 采用**渐进式分层设计**:自底向上共 7 层(L0–L6),每层只依赖下层,
-**每层完成时都是一个可独立交付使用的完整产品**。层边界即稳定接口,上层替换实现不破坏 API。
+**每层都是可独立交付使用的完整产品**。层边界即稳定接口,上层替换实现不破坏 API。
 
 ```mermaid
 flowchart TD
@@ -33,10 +33,10 @@ flowchart TD
     C["L0 原语层 core/<br/>类型 · 错误 · SIMD 距离 · TopK 堆 · varint"]
 
     subgraph 产品能力层
-        MD["model/ 记忆模型(已落地)<br/>关系 · 双时态 · 沉淀 · 自定义关系注册表"]
-        SC["score/ 排序层(已落地)<br/>综合打分 · 联想 · 反馈 · MMR · 偏置路由"]
-        SEC["crypto+compress/ 可选(已落地)<br/>静态加密 · 密钥轮换 · 压缩"]
-        DEP["部署与可观测(已落地)<br/>persist/storage.rs 存储后端 · 只读共享<br/>core/observe.rs 可观测 · feature wasm"]
+        MD["model/ 记忆模型<br/>关系 · 双时态 · 沉淀 · 自定义关系注册表"]
+        SC["score/ 排序层<br/>综合打分 · 联想 · 反馈 · MMR · 偏置路由"]
+        SEC["crypto+compress/ 可选<br/>静态加密 · 密钥轮换 · 压缩"]
+        DEP["部署与可观测<br/>persist/storage/ 存储后端 · 只读共享<br/>core/observe.rs 可观测 · feature wasm"]
     end
 
     F --> Q --> L --> QL --> H --> P --> M --> C
@@ -49,10 +49,10 @@ flowchart TD
     F --> DEP
 ```
 
-| 层 | 完成后的可用形态 | 详细设计 |
+| 层 | 可用形态 | 详细设计 |
 |---|---|---|
 | L0 原语 | 无 I/O 的数学/类型库 | [02-l0-core.md](design/02-l0-core.md) |
-| L1 内存引擎 | 纯内存向量库(易失),公开 API 就此冻结 | [03-l1-memory.md](design/03-l1-memory.md) |
+| L1 内存引擎 | 纯内存向量库(易失),公开 API 冻结 | [03-l1-memory.md](design/03-l1-memory.md) |
 | L2 持久层 | 重启不丢数据,可崩溃恢复(含跨段覆盖持久化) | [04-l2-persist.md](design/04-l2-persist.md) |
 | L3 索引层 | 同一 API 下暴力→HNSW 无感升级 | [05-l3-hnsw.md](design/05-l3-hnsw.md) |
 | L4 检索层 | 过滤 + BM25 混合检索 + 去重 | [06-l4-query.md](design/06-l4-query.md) |
@@ -75,6 +75,7 @@ flowchart TD
 |---|---|---|
 | [00-fundamentals.md](design/00-fundamentals.md) | **零基础篇**:嵌入向量、相似度、ANN、WAL/MVCC 等所有前置概念,零 AI/数据库背景可读 | 所有人 |
 | [01-overview.md](design/01-overview.md) | 项目定位、设计目标、总体架构、依赖白名单、公开 API 清单 | 所有人 |
+| [guide.md](guide.md) | **开发者指南**:面向使用方,从引入依赖、建模、集成到上生产的完整路径与排障清单 | 使用者/集成者 |
 | [02-l0-core.md](design/02-l0-core.md) | 原语层:距离度量的数学、SIMD、TopK 堆、varint | 贡献者/学习者 |
 | [03-l1-memory.md](design/03-l1-memory.md) | 内存引擎、暴力检索、过滤 AST、公开 API 冻结 | 贡献者 |
 | [04-l2-persist.md](design/04-l2-persist.md) | 文件字节级布局、WAL/CRC/崩溃恢复、MANIFEST 原子性、Bloom/zone map | 贡献者 |
@@ -91,18 +92,19 @@ flowchart TD
 | [15-glossary.md](design/15-glossary.md) | 术语表(中英对照)、符号表、复杂度速查总表 | 所有人 |
 | [16-api-reference.md](design/16-api-reference.md) | 完整公开 API、配置总表、打开校验、错误/重试、线程安全、集成、备份恢复 runbook、数据限额 | 所有人 |
 | [spec/contracts.md](spec/contracts.md) | 形式化契约矩阵(FC-Matrix)与测试追溯 | 贡献者 |
-| [rust/README.md](rust/README.md) | **Rust 零基础教学**(11 章):以 mneme 源码为教材,覆盖读懂 L0–L6 各层新引入的全部 Rust 语法(L1–L6 新特性回填至各章) | 无 Rust 基础者 |
+| [rust/README.md](rust/README.md) | **Rust 零基础教学**(11 章):以 mneme 源码为教材,覆盖读懂 L0–L6 各层引入的 Rust 语法 | 无 Rust 基础者 |
 
 ---
 
 ## 阅读路线
 
 **我完全没写过 Rust**(零基础,约 7–11 小时):
-先读 [Rust 零基础教学](rust/README.md) 的 11 章(以 `src/core/` 源码为教材、L1–L6 新特性回填至各章,边读边敲),
+先读 [Rust 零基础教学](rust/README.md) 的 11 章(以 `src/core/` 与各层源码为教材,边读边敲),
 再回到这里按"贡献者"路线阅读。教学文档与源码的映射总表见
 [rust/README.md §4](rust/README.md)。
 
 **我只想用这个库**(使用者,约 30 分钟):
+[开发者指南](guide.md)(从安装到上线的完整路径)→
 [00 基础篇 §1–§3](design/00-fundamentals.md) → [01 总览的 API 清单](design/01-overview.md) →
 [13 记忆模式手册](design/13-cookbook.md)(照抄配方)→
 [16 API 与运维参考](design/16-api-reference.md)(配置/错误/备份按需查)。

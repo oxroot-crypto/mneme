@@ -5,14 +5,14 @@
 > **前置阅读**:[01 §6](01-overview.md)(API 速览)、[02](02-l0-core.md)。
 > **本章你将学到**:API 语义细则 → 内存表结构 → 暴力扫描 → 过滤 AST → 去重预检。
 
-模块:`memory/{engine.rs, engine_ops.rs, builder.rs, namespace/, snapshot.rs, snapshot_scan.rs,
-search_builder.rs, expand.rs, rerank.rs, analysis/(mod,inv,zones,bloom).rs, table/(mod,handle,state,view,write_op).rs, index.rs, search.rs, pred.rs,
-pred_eval.rs, record.rs, write_helpers.rs, mutate_helpers.rs, dedup.rs, relation.rs,
-temporal.rs, score.rs, lifecycle.rs, ops.rs, config.rs}`——`engine.rs` 承载库句柄 `Mneme`
-(统计/fsck/落盘门面在 `engine_ops.rs`),`namespace/` 承载 `Namespace` 的写/读/访问/
-生命周期/关系方法(过滤遍历与计数在 `namespace/scan.rs`),`snapshot.rs`/`snapshot_scan.rs`
-承载快照只读视图;`SearchBuilder` 链式配置仍在 `search_builder.rs`,
-`expand.rs` 承载联想扩展/结果去重,执行流程自 L4 起在 `query/exec.rs`(见 [06 §5](06-l4-query.md));
+模块:`memory/{engine.rs, engine_ops/, builder/, namespace/, snapshot/, snapshot_scan.rs,
+search_builder.rs, expand.rs, rerank.rs, analysis/、table/(mod,handle,view,write_op).rs + table/state/, index.rs, search/, pred/,
+pred_eval/, record/, write_helpers.rs, mutate_helpers.rs, dedup.rs, relation.rs,
+temporal.rs, score/, lifecycle.rs, ops.rs, config.rs}`——`engine.rs` 承载库句柄 `Mneme`
+(统计/fsck/落盘门面在 `engine_ops/`),`namespace/` 承载 `Namespace` 的写/读/访问/
+生命周期/关系方法(过滤遍历与计数在 `namespace/scan.rs`),`snapshot/`/`snapshot_scan.rs`
+承载快照只读视图;`SearchBuilder` 链式配置位于 `search_builder.rs`,
+`expand.rs` 承载联想扩展/结果去重,执行流程位于 `query/exec/`(见 [06 §5](06-l4-query.md));
 `analysis/` 承载内存倒排 / zone map / bloom(写路径增量维护、随快照 `Arc` 共享);
 `index.rs` 是 L3 索引替换缝(内部 trait,公开 API 不变);
 原 `bitset.rs` 已上移 L0 `core/bitset.rs`(构建期/查询期共用位图);本章 §2 的语义即其
@@ -25,7 +25,7 @@ temporal.rs, score.rs, lifecycle.rs, ops.rs, config.rs}`——`engine.rs` 承载
 1. **API 是最大的风险**。存储引擎可以重构,公开 API 一旦发布就难改。
    在最简单的载体(内存)上把 API 打磨冻结,成本最低;
 2. **它本身是可用产品**:单测、嵌入型场景的临时记忆、向量缓存;
-3. 后续每层都拿内存层当**正确性参照**:HNSW 的结果必须与暴力扫描一致(统计意义上),
+3. 各上层实现拿内存层当**正确性参照**:HNSW 的结果必须与暴力扫描一致(统计意义上),
    持久化的恢复结果必须与内存等价。
 
 ---
@@ -223,7 +223,7 @@ F  = { Reclaimed }
 
 ---
 
-## 4. 暴力扫描:`search.rs`
+## 4. 暴力扫描:`search/`
 
 ### 4.1 【直觉】图书馆逐本翻
 
@@ -276,7 +276,7 @@ r2 [1,1] imp=0.7 → 候选; r3 [2,0] imp=0.8 → 候选
 
 ---
 
-## 5. 过滤 AST 与求值:`pred.rs` / `pred_eval.rs`
+## 5. 过滤 AST 与求值:`pred/` / `pred_eval/`
 
 ### 5.1 AST 定义(与 L4 共用,此处定型)
 
@@ -319,10 +319,10 @@ impl FieldBuilder {
 
 ### 5.2 求值复杂度
 
-求值器位于 `pred_eval.rs`(AST 与组合器在 `pred.rs`)。
+求值器位于 `pred_eval/`(AST 与组合器在 `pred/`)。
 单行求值 $O(|E|)$;短路求值:`And` 左支 false 即停,`Or` 左支 true 即停——
-建议 AST 构造时把高选择性条件放左边;注意**残余谓词的选择性重排尚未落地**
-(计划器当前按原 AST 三值求值,见 [06 §2](06-l4-query.md)),块级下推已剪掉
+计划器对 `And` 合取链按**预估选择性升序**重排后再求值(高选择分支先行、
+短路更多行,`FC-QUERY-POST-009`,见 [06 §2](06-l4-query.md));块级下推已剪掉
 大多数不相关块,重排只影响残余部分的工作量。
 
 ---
@@ -409,12 +409,12 @@ snapshot / as_of / backup_to / stats / check / compact_control` 的签名。
 > **冻结的是签名,不是全部实现**:`relate`/`neighbors`/`supersede`/`consolidate`/`feedback`
 > 等在 L1 即以内存实现提供可用的最小语义(关系边、有效时间、简单摘要);产品能力层
 > [09](09-memory-model.md)/[10](10-scoring.md) 在其上补齐持久化、双时态与打分的完整语义,
-> **不改变签名**。因此 L1 仍是可独立交付的产品,后续层只增强语义。
+> **不改变签名**。因此 L1 是可独立交付的产品,上层只增强语义。
 
 **向下(L0)**:只使用 [02 §9](02-l0-core.md) 契约内的类型与函数。
 
 **向 L3 交接的内部接口**(L3 引入 HNSW 时落地,以便内存层无痛升级为索引层;
-L1/L2 阶段直接在引擎内实现公开签名,公开 API 始终不变):
+L1/L2 直接在引擎内实现公开签名,公开 API 始终不变):
 
 设计最初的"全量 `VectorStore` trait(`insert/update/delete/get/search/relate`…)"在
 落地时收敛为**只替换向量检索**的窄接口:`L1/L2` 继续直接实现全部公开 API,仅把
@@ -448,8 +448,8 @@ ANN + 未落盘尾部暴力 + `TopK` 归并**。工厂由组合根(`Builder`)注
 
 ## 本章小结
 
-- **API 是最大的风险**:先在纯内存层把公开 API 打磨冻结,后续层只换实现。
-- 写入/读取/生命周期/落盘四组 API 的语义细则,是后续所有层的**行为规约**。
+- **API 是最大的风险**:公开 API 在纯内存层打磨冻结,上层只换实现。
+- 写入/读取/生命周期/落盘四组 API 的语义细则,是所有上层的**行为规约**。
 - 内存表 = `RowId` 版本链 + `delta` 覆盖层 + `(NsId, key)` 索引;读路径无锁扫描。
 - 暴力扫描**过滤先行** + 分块并行;过滤 AST 采用三值语义;两级去重(FNV-1a + top-1)。
 - **本章不变量**:I15(批量原子)、I16(优雅关闭)、I24(更新原子可见);内部 `memory::index::{VectorIndex, IndexFactory}` 接口衔接 L3。

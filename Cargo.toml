@@ -61,6 +61,16 @@ tempfile = "3"
 # L3 起的 criterion 基准(设计 14 §4);仅 dev-dependency,不进入发布产物。
 # `black_box` 自 0.6 起改由 `std::hint` 提供,bench 不再从 criterion 引入。
 criterion = { version = "0.8", default-features = false }
+# 端到端示例 examples/memory:经 OpenAI 协议调用第三方嵌入 API(设计 16 §6)。
+# Rust 生态无官方 SDK,async-openai 是事实标准(活跃维护、按 OpenAI OpenAPI 生成)。
+# 仅 dev-dependency,不进发布产物;显式选 rustls 后端,避免系统 OpenSSL 依赖。
+async-openai = { version = "0.42", default-features = false, features = [
+    "embedding",
+    "rustls",
+] }
+# 示例的 `#[tokio::main]` 运行时(嵌入客户端是 async);库本体仍零 tokio,
+# 除非开启 feature `async`(那部分只用到 `rt`)。
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [[bench]]
 name = "hnsw"
@@ -69,6 +79,13 @@ harness = false
 [[bench]]
 name = "quant"
 harness = false
+
+# 端到端示例:经 OpenAI 协议接第三方嵌入 API。显式声明 `test = true`,
+# 让 `cargo test` 矩阵自动跑到示例里的离线路径用例(examples/memory/tests.rs)。
+[[example]]
+name = "memory"
+path = "examples/memory/main.rs"
+test = true
 
 [profile.release]
 # L0 为纯函数库,lto 收益有限;thin LTO 在跨 crate 内联与编译时间间折中,

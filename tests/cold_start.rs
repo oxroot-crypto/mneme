@@ -14,9 +14,9 @@ mod common;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use mneme::{Builder, FsyncPolicy, Metric, Record};
+use mneme::{Builder, FsyncPolicy, Metric, Record, Tuning};
 
-use common::{heavy_dimension, heavy_rows, heavy_vector};
+use common::{heavy_dimension, heavy_rows, heavy_vector, tuning_with_env};
 
 /// 单批写入条数(控制建库期内存峰值)。
 const BATCH: usize = 10_000;
@@ -32,6 +32,7 @@ fn build_fixture(dir: &Path, rows: usize, dimension: usize) {
         .metric(Metric::Dot)
         .fsync(FsyncPolicy::OnFlush)
         .maintenance(false)
+        .tuning(tuning_with_env(Tuning::default()))
         .path(dir)
         .build()
         .expect("build");
@@ -58,9 +59,7 @@ fn build_fixture(dir: &Path, rows: usize, dimension: usize) {
 #[test]
 #[ignore = "heavy:需显式 MNEME_HEAVY=1;规模由 MNEME_HEAVY_ROWS/MNEME_HEAVY_DIM 配置"]
 fn cold_open_under_one_second() {
-    if std::env::var("MNEME_HEAVY").as_deref() != Ok("1") {
-        panic!("MNEME_HEAVY=1 未设置:heavy 门槛不应静默跳过(显式失败,杜绝 CI 假绿)");
-    }
+    common::env::require_heavy();
     let rows = heavy_rows();
     let dimension = heavy_dimension();
     let dir = tempfile::tempdir().expect("tempdir");
