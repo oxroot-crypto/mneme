@@ -67,6 +67,21 @@ impl Namespace {
     ///
     /// # Errors
     /// 库已关闭 → [`MnemeError::Closed`];`boost` 含非有限值 → [`MnemeError::NonFinite`]。
+    ///
+    /// # Examples
+    /// ```
+    /// use mneme::{InsertOutcome, Mneme, Record};
+    ///
+    /// let db = Mneme::in_memory(2).unwrap();
+    /// let ns = db.namespace("demo");
+    /// let id = match ns.insert(Record::new(vec![1.0, 0.0]).key("a")).unwrap() {
+    ///     InsertOutcome::Inserted(id) => id,
+    ///     other => panic!("unexpected: {other:?}"),
+    /// };
+    /// assert!(ns.touch_by_rowid(id, Some(0.2)).unwrap());
+    /// // 缺省 importance 0.5,boost 后钳制到 [0,1]。
+    /// assert_eq!(ns.get_by_rowid(id).unwrap().unwrap().importance(), 0.7);
+    /// ```
     pub fn touch_by_rowid(&self, id: RowId, boost: Option<f32>) -> Result<bool> {
         let config = Arc::clone(&self.config);
         self.table.write_tx(move |ws| {

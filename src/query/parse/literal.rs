@@ -10,7 +10,7 @@ use crate::core::error::Result;
 use crate::memory::pred::Val;
 use crate::query::iso;
 
-use super::Parser;
+use super::parser::Parser;
 
 /// 相对时间量的最大毫秒数(约 2^53):超出后 `f64` 不再精确,拒绝以免静默失真。
 const MAX_DELTA_MS: f64 = 9.0e15;

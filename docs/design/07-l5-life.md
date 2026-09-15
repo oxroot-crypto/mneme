@@ -6,7 +6,7 @@
 > **本章你将学到**:TTL 双阶段过期 → 访问统计的零写放大设计 → 指数遗忘曲线推导 →
 > compaction 写放大分析 → 命名空间 → 快照备份 → stats/fsck。
 
-模块:`life/{compact.rs, maintenance.rs}`(调度与幸存版本筛选)+ 既有挂点
+模块:`life/{compact/, maintenance.rs}`(调度与幸存版本筛选)+ 既有挂点
 (`memory/{ttl 逻辑过期, namespace, snapshot, engine_ops}`, `persist/{flush, compact, wal 轮转, delta 区}`);
 `Mneme::maintenance_tick()` 提供手动单轮维护入口(后台线程不可用/测试确定性推进时用);
 `Builder::maintenance(false)` 可整体不启动后台维护线程(自动 compaction/遗忘/访问统计
@@ -14,12 +14,12 @@
 导入与维护争抢 CPU/IO(`FC-LIFE-POST-010`);公开契约验收见
 [`tests/l5_contracts.rs`](../../tests/l5_contracts.rs)。
 
-> **落地状态**:本节语义已随 L5 落地——TTL 两阶段(逻辑过期 + compaction 物理回收,
+> 本章语义涵盖:TTL 两阶段(逻辑过期 + compaction 物理回收,
 > msec `ttl_map` 块级剪枝)、访问攒批后台落盘、自动遗忘(默认关闭)、size-tiered
 > compaction(多段增量段 + MANIFEST 原子替换 + `history_horizon`)、命名空间规范化与
 > 注销持久化、`SnapshotStats`/硬链接备份/死比率 fsck。已知取舍:压缩后的物理槽位从
-> 版本链剪除并标死(零拷贝段句柄已随 L1–L6 收尾落地,惰性向量经句柄存活期保证可读;
-> 记录元数据层仍为打开期物化,见 [14 §4](14-testing.md));
+> 版本链剪除并标死(零拷贝段句柄经惰性向量保证句柄存活期内可读;
+> 记录元数据层为打开期物化,见 [14 §4](14-testing.md));
 > `history_horizon = None`(默认)时墓碑/历史永久保留,物理回收仅在有限窗口下发生。
 
 ---
@@ -136,7 +136,7 @@ ns.retain(policy):  扫描候选(过滤 + protect 白名单豁免)
 
 ---
 
-## 4. Compaction:`compact.rs`——超长期的定海神针
+## 4. Compaction:`compact/`——超长期的定海神针
 
 ### 4.1 【直觉】整理书桌
 
@@ -197,12 +197,13 @@ delta 区承载([04 §2.2a](04-l2-persist.md));合并只重排物理布局,不�
 
 ### 4.4 流程(与崩溃安全)
 
-> **当前实现口径(L5)**:过滤/重建为**单线程顺序**执行,`io_budget` 仅建库校验、
-> 尚未接入限速(并行与配额留后续层);旧段在 MANIFEST 提交后立即 `rename → trash/`
-> 并清理——段句柄惰性驻留落地后,惰性向量/图经已打开的描述符与 mmap 映射在句柄存活期
-> 内继续可读(POSIX unlink/rename 语义,FC-PERSIST-INV-021),trash 中的文件由下次
-> 可写打开 `purge` 兜底;任何清理失败只遗留孤儿文件,由下次启动清理(Windows 上的
-> 延迟删除仍为设计目标,当前矩阵未覆盖)。
+> **实现口径**:单轮 compaction 在 `io_budget` 输入字节预算内**连续**合并段组
+> (预算 = 活跃段文件总字节 × `io_budget`,至少一个段组;`FC-LIFE-POST-011`),
+> 段内过滤/重建按 `Builder::parallelism` 批并行(见 [05 §4.4](05-l3-hnsw.md));
+> 旧段在 MANIFEST 提交后立即 `rename → trash/` 并清理——惰性向量/图经已打开的
+> 描述符与 mmap 映射在句柄存活期内继续可读(POSIX unlink/rename 语义,
+> FC-PERSIST-INV-021),trash 中的文件由下次可写打开 `purge` 兜底;任何清理失败
+> 只遗留孤儿文件,由下次启动清理(Windows 上的延迟删除不在当前平台矩阵内)。
 
 ```text
 1. 调度线程选段组 → 生成合并计划(登记,可取消)
@@ -225,9 +226,10 @@ flowchart LR
     H --> I["立即 purge<br/>(读者只持内存视图)"]
 ```
 
-- **限速**:`pause()` / `resume()` 可在步骤边界中止(见
-  [16 §1.6](16-api-reference.md));`io_budget` 的磁盘配额限速尚未落地(当前为
-  "尽力而为、提交点前可暂停"),查询可见性不受影响;
+- **限速与预算**:`pause()` / `resume()` 可在步骤边界中止(见
+  [16 §1.6](16-api-reference.md));`io_budget` 约束单轮合并的输入字节总量
+  (= 活跃段文件总字节 × `io_budget`,至少一个段组,`FC-LIFE-POST-011`),
+  超预算的段组留待下一次;查询可见性不受影响;
 - **查询可见性**:合并期间新旧段同时在 MANIFEST 里吗?不——旧段保持到提交瞬间,
   新段在提交后可见,中间的读者要么看旧要么看新(快照语义),永不看到半成品;
 - **结果稳定性**:重建会重排 HNSW 邻接(新段布局),故同一数据在合并前后
@@ -255,7 +257,7 @@ flowchart LR
   `list_namespaces()` 直接读该注册表(路径 ↔ NsId),重启后依然可枚举;
 - 物理形态:**单库前缀聚合**(同库内所有 NS 共享段,按前缀过滤)。
   依据:段内 zone map 对 `__ns` 等值极高效(通常整块剪除),独立目录的强隔离收益
-  (单独备份/删除某 Agent)暂无场景;未来若需要,升级路径是"NS → 子目录",
+  (单独备份/删除某 Agent)暂无场景;若要独立目录形态,升级路径是"NS → 子目录",
   接口(`namespace()` 语义)不变;
 - **生命周期 API**:
 
@@ -279,7 +281,7 @@ ns.iter(None)?;                 // 遍历/导出一个命名空间的全部活�
 
 ---
 
-## 6. 快照与备份:`memory/snapshot.rs` + `persist/store/snapshot.rs`
+## 6. 快照与备份:`memory/snapshot/` + `persist/store/snapshot/`
 
 ```text
 db.snapshot()  → SnapshotHandle: 钉住当前 ReaderView(该时刻的 MANIFEST 段集 +
@@ -307,7 +309,7 @@ neighbors / iter`)见 [16 §1.6](16-api-reference.md);二者均 `Send + Sync`,�
 
 ---
 
-## 7. stats 与 fsck:`memory/engine_ops.rs`
+## 7. stats 与 fsck:`memory/engine_ops/`
 
 ```rust
 db.stats()?  -> Stats {
@@ -320,7 +322,7 @@ db.stats()?  -> Stats {
     retain: Option<RetainReport>,  // 最近一次后台遗忘(未开启则 None,§3.4)
     relations: u64,                // 关系边数(09 §2)
     history: HistoryStat,          // 版本链/历史保留统计(§4.2a)
-    storage: StorageStat,          // 存储安全配置与迁移进度(加密/压缩均已落地;11)
+    storage: StorageStat,          // 存储安全配置与迁移进度(加密/压缩;11)
 }
 db.check()?   // fsck: 全量 CRC + version_table/RowId 版本链一致性 + key 索引 ↔ entries 对账
               //           + 墓碑/TTL 占比报告 + 建议动作(如 "建议合并 3 个 25MB 段")

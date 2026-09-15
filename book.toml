@@ -5,6 +5,8 @@ authors = ["Mneme contributors"]
 language = "zh"
 src = "docs"
 
+# 站点图标:根目录 theme/ 会被 mdBook 识别为自定义主题目录,
+# 其中 favicon.svg / favicon.png 覆盖内置默认图标(其余主题文件仍走内置默认)。
 [output.html]
 default-theme = "light"
 preferred-dark-theme = "navy"

@@ -6,7 +6,7 @@
 > [`tests/contract_traceability.rs`](../../tests/contract_traceability.rs)、
 > [`tests/l4_contracts.rs`](../../tests/l4_contracts.rs)、[`tests/l5_contracts.rs`](../../tests/l5_contracts.rs)、
 > [`tests/l6_contracts.rs`](../../tests/l6_contracts.rs)、
-> [`src/index/hnsw.rs`](../../src/index/hnsw.rs)、[`src/index/hidx.rs`](../../src/index/hidx.rs)、
+> [`src/index/hnsw/`](../../src/index/hnsw/)、[`src/index/hidx/`](../../src/index/hidx/)、
 > [`src/index/filtered.rs`](../../src/index/filtered.rs)、[`src/quant/`](../../src/quant)、
 > [`benches/quant.rs`](../../benches/quant.rs)、[`src/fuzzing.rs`](../../src/fuzzing.rs)、[`fuzz/`](../../fuzz)。
 
@@ -337,7 +337,7 @@ fn mutated_valid_hidx_strategy() -> impl Strategy<Value = Vec<u8>> {
 }
 ```
 
-见 [`src/index/hidx.rs:730-770`](../../src/index/hidx.rs)。三个新工具:
+见 [`src/index/hidx/tests.rs:240-280`](../../src/index/hidx/)。三个新工具:
 
 - **`impl Strategy<Value = T>`**:策略也是值,可以写成函数返回。`impl Trait` 返回类型让调用者
   不必关心具体策略类型(见 [06 §2.3](06-generics-traits.md));
@@ -367,7 +367,7 @@ proptest! {
 }
 ```
 
-见 [`src/index/hidx.rs:771-801`](../../src/index/hidx.rs)。要点:
+见 [`src/index/hidx/tests.rs:281-311`](../../src/index/hidx/)。要点:
 
 - `prop_oneof![a, b, c]` 每次从几个策略中随机挑一个执行,适合"混合来源"的输入;
 - `return Ok(())` 在 `proptest!` 宏里表示"本用例通过"——测试体返回
@@ -399,7 +399,7 @@ fn bump_dist_calls() {
 }
 ```
 
-见 [`src/index/hnsw.rs:42-51`](../../src/index/hnsw.rs)。逐个概念:
+见 [`src/index/hnsw/build.rs:33-42`](../../src/index/hnsw/build.rs)。逐个概念:
 
 - **`thread_local!`**:声明"每个线程各有一份"的静态变量。测试默认并行、各跑各的线程,
   全局计数器会互相污染;线程局部正好把每个测试隔开;
@@ -422,7 +422,7 @@ assert!(r1 < 4.0, "200→500 增长过快(疑似二次):{r1}");
 assert!(r2 < 4.0, "500→1200 增长过快(疑似二次):{r2}");
 ```
 
-见 [`src/index/hnsw.rs:604-656`](../../src/index/hnsw.rs)。要点:
+见 [`src/index/hnsw/build.rs:314-366`](../../src/index/hnsw/)。要点:
 
 - 断言的是**规模之间的比值**,不是绝对次数——常数随实现微调而变,但"线性时 2.5 倍节点
   对应约 2.5 倍操作数,二次时约 6.25 倍"这个结构性质稳定;
@@ -430,8 +430,8 @@ assert!(r2 < 4.0, "500→1200 增长过快(疑似二次):{r2}");
 - 探针代码全部在 `#[cfg(test)]` 下,发布产物里一行不剩。测试里先重置计数
   (`DIST_CALLS.with(|calls| calls.set(0))`)再执行,读取时把 `Cell::get` 当函数指针传给
   `with`(`DIST_CALLS.with(std::cell::Cell::get)`),见
-  [`src/index/hnsw.rs:604-607`](../../src/index/hnsw.rs) 与
-  [`src/index/hnsw.rs:661-673`](../../src/index/hnsw.rs)。
+  [`src/index/hnsw/build.rs:314-317`](../../src/index/hnsw/) 与
+  [`src/index/hnsw/link.rs:52-64`](../../src/index/hnsw/)。
 
 > 同类探针在 `filtered.rs` 里记录"最近一次搜索命中的档位与 `ef`",用于把档位分派公式
 > 逐值钉死;`thread_local!` 保证并行测试互不干扰(见
@@ -441,7 +441,7 @@ assert!(r2 < 4.0, "500→1200 增长过快(疑似二次):{r2}");
 > 加不到一起),要换成原子。例如 `FsyncHook` 要求实现 `Send + Sync`——回调可能由后台
 > 维护线程触发,测试里的故障注入计数器因此用 `AtomicUsize` +
 > `.fetch_add(1, Ordering::Relaxed)`(见
-> [`src/persist/store/wal_writer.rs:415-427`](../../src/persist/store/wal_writer.rs)),
+> [`src/persist/store/wal_writer/tests.rs:42-58`](../../src/persist/store/wal_writer/)),
 > 原子类型见 [04 §5.2](04-borrowing-strings-slices.md)。
 
 ---
@@ -604,8 +604,8 @@ b.iter(|| {
 - `sample_size(10)` / `measurement_time(Duration::from_secs(10))` 是"这个基准太重,少采几次、
   每次测久点"的取舍:默认 100 个样本对"建 4k×512 库 + 查询"太贵。采样越少统计噪声越大,
   适合前后对比而非绝对数字;
-- 为什么用微缩规模:1M×1536 的正式门槛属于 CI heavy 档(已接线 `.gitlab-ci.yml`,
-  待 runner 首跑),所以 `benches/quant.rs` 先用 4k×512 / 8k×128 做趋势对照(见文件头注释
+- 为什么用微缩规模:1M×1536 的正式门槛属 heavy 手动档(需 ≥16GB 专用 runner,见
+  设计 14 §4),所以 `benches/quant.rs` 先用 4k×512 / 8k×128 做趋势对照(见文件头注释
   [`benches/quant.rs:1-6`](../../benches/quant.rs))。
 
 运行:
@@ -793,13 +793,13 @@ cargo test --all-features           # 打开全部 feature(async + quant-f16 + f
 新引入的递归枚举与 `Box`、生命周期参数化解析器、`HashMap` entry API、原子类型、
 运算符重载与 `fmt::Write`、可注入假时钟,L5( [`src/life/`](../../src/life) )
 新引入的 `std::thread`/`JoinHandle`、`Weak`、`Condvar`、CAS 循环与 `Drop`/RAII 等,
-都已回填到 01–10 章的对应小节(回填总表见 [README §4](README.md))。
+都分散在 01–10 章的对应小节(总表见 [README §4](README.md))。
 
 L6( [`src/quant/`](../../src/quant) 与
-[`src/memory/async_facade.rs`](../../src/memory/async_facade.rs) )新引入的 `half::f16`
+[`src/memory/async_facade/`](../../src/memory/async_facade/) )新引入的 `half::f16`
 半精度、`f32::round`/`powi` 与 `usize::is_multiple_of`、枚举 + `match` 的量化格式分派、
 `chunks_exact` 按块迭代、条件模块与条件 `use`、`cfg!` 单点特性门控、feature 门控测试,
-以及 criterion 基准与 fuzz 骨架,也已回填到 01–10 章;`async fn`/`.await`/`Future` 的惰性、
+以及 criterion 基准与 fuzz 骨架,同样分散在 01–10 章;`async fn`/`.await`/`Future` 的惰性、
 `tokio::task::spawn_blocking`、`Send + 'static` 约束与取消语义见新增的第
 [11 章 异步与 tokio 最小封装](11-async-tokio.md)。
 

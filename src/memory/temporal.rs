@@ -36,6 +36,10 @@ pub(crate) fn snapshot_at(view: &ReaderView, tx_ms: i64) -> ReaderView {
         key_bloom: Arc::clone(&view.key_bloom),
         seqno,
         closed: view.closed,
+        // 历史视图是独立快照:空缓存起步,绝不复用当前视图的缓存
+        // (FC-QUERY-POST-008)。
+        plan_cache: std::sync::Mutex::new(HashMap::new()),
+        segment_alive_cache: std::sync::Mutex::new(HashMap::new()),
     }
 }
 
@@ -109,11 +113,13 @@ mod tests {
         let mut ws = WriterState::new();
         let built = Arc::new(HnswIndex::build(&[], HnswParams::default(), Metric::Dot));
         Arc::make_mut(&mut ws.indexes).push(crate::memory::index::SegmentIndex::new(
-            0,
-            built,
-            Vec::new(),
-            VectorFormat::F32,
-            None,
+            crate::memory::index::SegmentIndexInput {
+                segment_id: 0,
+                index: built,
+                slots: Vec::new(),
+                quant: VectorFormat::F32,
+                recall_est: None,
+            },
         ));
         let view = ws.snapshot();
         assert!(!view.indexes.is_empty(), "构造的视图应携带索引");

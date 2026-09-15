@@ -10,7 +10,7 @@
 > (压缩仅多一个恒 0 的 msec `flags2` 字节,`FORMAT_VERSION = 0x0006`),
 > 依赖白名单不扩大。
 >
-> **落地状态(2026-09,已落地)**:`src/crypto/`(feature `encrypt`)提供
+> `src/crypto/`(feature `encrypt`)提供
 > `KeyId`/`Key`(导出名 `CryptoKey`)/`Cipher`/`KeyProvider`/`Encryption`/`Keyring`;
 > 段/WAL/MANIFEST 写盘为**自描述整文件/整帧 AEAD 信封**(`[MNEC][版本][key_id]
 > [明文长度][nonce][密文][tag]`,AAD 绑定用途/标识/格式版本),读路径自动解密;
@@ -19,10 +19,9 @@
 > `migrated_segments/total_segments`。`src/compress/`(feature `compress` /
 > `compress-zstd`)对记录体 `text`/`meta`/`provenance` 按字段压缩,自描述 codec 与
 > 原始长度、无收益回退原文;`Compression::None` 语义不变(记录体新增恒 0 的
-> `flags2` 字节,`FORMAT_VERSION = 0x0006`)。`FC-SEC-*` 均已转正,见
-> `tests/security_contracts.rs`。
+> `flags2` 字节,`FORMAT_VERSION = 0x0006`)。验收见 `tests/security_contracts.rs`。
 >
-> **实现口径与目标设计的差异**(登记):采用**整文件/整帧信封**而非页级加密
+> **实现口径**(与页级加密的理想化设计差异):采用**整文件/整帧信封**而非页级加密
 > (加密段已放弃 mmap,页级零拷贝无收益);头部定长字段也随之密文化(而非保留明文),
 > 版本/维度在解密后校验(`I18` 语义不变)。
 
@@ -89,7 +88,7 @@ impl Key {
     #[cfg(feature = "encrypt")]
     pub fn generate() -> Result<Self>;            // OS 熵源(CSPRNG)
 }
-/// 支持的 AEAD 算法(当前仅 AES-256-GCM)。
+/// 支持的 AEAD 算法(仅 AES-256-GCM)。
 pub enum Cipher { Aes256Gcm }
 
 pub trait KeyProvider: Send + Sync {
@@ -124,10 +123,10 @@ impl Keyring {
 3. 全部段迁移完成后,宿主可 Keyring::retire(旧 key_id) 退役旧密钥
 ```
 
-轮换**已落地**(`FC-SEC-POST-001`):`provider.rotate()` 获取新密钥后全量段重写,
+密钥轮换(`FC-SEC-POST-001`):`provider.rotate()` 获取新密钥后全量段重写,
 迁移期间新旧密钥均可读(`KeyProvider` 需同时持有两者);`db.stats().storage` 的
 `migrated_segments/total_segments` 以信封头 `key_id` 是否等于 active 实计。
-纯内存库 → `Unsupported`,库未启用加密 → `Config`。项目未发布期不保留混合版本兼容。
+纯内存库 → `Unsupported`,库未启用加密 → `Config`。项目未发布,不保留混合版本兼容。
 
 ### 2.5 复杂度与不变量
 
@@ -187,7 +186,7 @@ pub enum Compression { None, Lz4, Zstd }   // 默认 None;`Lz4` 为内置自研�
 
 1. `Encryption` + `KeyProvider`(feature `encrypt`)与密钥轮换;
 2. `Compression` + `Codec`(feature `compress`)与内置 codec;
-3. `Stats.storage` 暴露加密/压缩的配置值与迁移进度(均已随 L11 落地;见 [16 §5](16-api-reference.md))。
+3. `Stats.storage` 暴露加密/压缩的配置值与迁移进度(见 [16 §5](16-api-reference.md))。
 
 **依赖**:L0(类型)、L2(段/WAL/MANIFEST 布局、`SegmentSource`)、L5(后台迁移复用 compaction)。
 

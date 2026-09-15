@@ -8,7 +8,7 @@
 >
 > `Scoring`/`Diversity`/`expand` 默认关闭,不改变默认行为。
 
-模块(`memory/` 下):`score.rs`(综合打分公式与归一化)、`expand.rs`(联想扩展)、
+模块(`memory/` 下):`score/`(综合打分公式与归一化)、`expand.rs`(联想扩展)、
 `rerank.rs`(MMR 多样性/去重/精排钩子);`Feedback` 闭环经 `namespace` 写路径落地。
 
 ---
@@ -79,15 +79,15 @@ $$
 ② 综合重排:对候选集计算 S(d),取 top-k。
 ```
 
-> **落地状态(已落地)**:① 候选放大 `ef' = max(ef, 4k)` 在 `Scoring` 开启任一
-> 非相似度因子时对向量通道生效(`FC-SCORE-POST-003`,相对暴力综合排序召回损失
-> ≤ 2%);`Scoring::bias_routing = true` 按下方启发式改变 HNSW 前沿出堆顺序,
-> 只影响访问顺序、不改最终打分(`FC-SCORE-POST-007`);② 综合重排已落地。
+> **实现口径**:① 候选放大 `ef' = max(ef, 4k)` 在 `Scoring` 开启任一非相似度因子时
+> 对向量通道生效(`FC-SCORE-POST-003`,相对暴力综合排序召回损失 ≤ 2%);
+> `Scoring::bias_routing = true` 按下方启发式改变 HNSW 前沿出堆顺序,只影响访问顺序、
+> 不改最终打分(`FC-SCORE-POST-007`);② 综合重排在候选集上完成。
 > 默认 `Scoring`(仅相似度)不放大,排序与未开启时全等(`FC-SCORE-POST-001`)。
 
 - 放大 $ef$ 是为了让"向量相似度略低、但综合分高"的记忆进入候选池:经验上
   `ef' = max(ef, 4k)` 时综合排序的相对召回损失 ≤ 2%(门槛见 [14 §4](14-testing.md));
-- **可选的重要性偏置路由**(`Scoring::bias_routing=true`,已落地):HNSW 遍历时以前沿
+- **可选的重要性偏置路由**(`Scoring::bias_routing=true`):HNSW 遍历时以前沿
   优先级 `priority = close_key(score) + β·(imp + min(acc/c_norm, 1))` 出堆(β 为实现内部
   固定系数 1.0;仅改候选访问顺序,不改最终打分与 `ef→∞` 结果)。它能在保持召回的同时
   减少探查量;默认关闭(`FC-SCORE-POST-007`);
@@ -198,7 +198,7 @@ $$
   已选集的**最大余弦** `max_sim`,每选中一条只对剩余候选各算一次对级余弦并增量取最大
   (每个候选-已选对至多计算一次,自范数预计算复用);空间 $O(m)$(`max_sim` + 范数表)。
   契约见 FC-SCORE-CPLX-003,操作计数单测
-  `src/memory/score.rs::mmr_caches_pairwise_similarity`;$k$ 通常 ≤ 50。
+  `src/memory/score/::mmr_caches_pairwise_similarity`;$k$ 通常 ≤ 50。
 
 ### 5.2 与去重的关系
 

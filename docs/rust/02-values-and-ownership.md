@@ -3,10 +3,10 @@
 > **本章目标**:掌握 Rust 的变量、基本类型,以及最重要的**所有权(ownership)**。
 > **前置**:读过 [01 章](01-toolchain.md),会 `cargo build`。
 > **对应源码**:[`src/core/types.rs`](../../src/core/types.rs)、[`src/core/varint.rs`](../../src/core/varint.rs)、
-> [`src/core/metric.rs`](../../src/core/metric.rs)、[`src/memory/table/state.rs`](../../src/memory/table/state.rs)、
-> [`src/index/hidx.rs`](../../src/index/hidx.rs)、[`src/index/filtered.rs`](../../src/index/filtered.rs)、
+> [`src/core/metric.rs`](../../src/core/metric.rs)、[`src/memory/table/state/`](../../src/memory/table/state/)、
+> [`src/index/hidx/`](../../src/index/hidx/)、[`src/index/filtered.rs`](../../src/index/filtered.rs)、
 > [`src/query/iso.rs`](../../src/query/iso.rs)、[`src/query/zmap.rs`](../../src/query/zmap.rs)、
-> [`src/query/fusion.rs`](../../src/query/fusion.rs)、[`src/query/parse.rs`](../../src/query/parse.rs)、
+> [`src/query/fusion.rs`](../../src/query/fusion.rs)、[`src/query/parse/`](../../src/query/parse/)、
 > [`src/quant/scalar_i8.rs`](../../src/quant/scalar_i8.rs)、[`src/quant/f16.rs`](../../src/quant/f16.rs)。
 
 这是全书**最关键**的一章。所有权是 Rust 区别于其他语言的核心,也是初学者最容易卡住的地方。
@@ -134,7 +134,7 @@ put_u32(
 );
 ```
 
-见 [`src/index/hidx.rs:78-82`](../../src/index/hidx.rs)。`try_from` 失败返回 `Err`,配合
+见 [`src/index/hidx/encode.rs:43-47`](../../src/index/hidx/)。`try_from` 失败返回 `Err`,配合
 `.map_err(...)?` 转成带字段名与实际值的领域错误——**绝不静默截断**。
 解码路径同理:`validate_layout` 用 `checked_mul`/`checked_add` 防止恶意长度在偏移计算时回绕,
 溢出就用 `ok_or_else` 变成结构化错误:
@@ -146,7 +146,7 @@ let expected_node_table = header
     .ok_or_else(|| corrupt("node_table_len 溢出"))?;
 ```
 
-见 [`src/index/hidx.rs:243-246`](../../src/index/hidx.rs),`ok_or_else` 的用法在
+见 [`src/index/hidx/read.rs:115-118`](../../src/index/hidx/read.rs),`ok_or_else` 的用法在
 [05 §1.2](05-errors.md) 展开。
 
 选择原则:
@@ -225,7 +225,7 @@ f32::MIN_POSITIVE;         // 最小的正规格化浮点数,常用来替代 0 �
 ```
 
 - `is_finite` 用于**入口校验**:hidx 头部解码到 `ml` 时,先 `!ml.is_finite() || ml <= 0.0`
-  就拒绝,绝不让 `NaN` 混进建图参数(见 [`src/index/hidx.rs:235`](../../src/index/hidx.rs))。
+  就拒绝,绝不让 `NaN` 混进建图参数(见 [`src/index/hidx/read.rs:107`](../../src/index/hidx/read.rs))。
 - `clamp(min, max)` 同时完成上下限约束;过滤档①的 `ef` 放大系数写作
   `(1.0 / selectivity.max(f32::MIN_POSITIVE)).clamp(1.0, MAX_EF_AMPLIFICATION)`,
   既不除以 0 也不超放大上限(见 [`src/index/filtered.rs:160`](../../src/index/filtered.rs))。
@@ -375,8 +375,8 @@ c.len_utf8();          // 3:'好' 在 UTF-8 里占 3 个字节
 - 别把 `char` 当 `u8`:一个汉字 3 字节、一个 emoji 常是 4 字节,
   `self.pos += 1` 会切在字符中间,后续 `&input[pos..]` 直接 panic。
 
-见 [`src/query/parse.rs:84-93`](../../src/query/parse.rs) 与
-[`src/query/parse.rs:298-315`](../../src/query/parse.rs)。
+见 [`src/query/parse/parser.rs:76-85`](../../src/query/parse/parser.rs) 与
+[`src/query/parse/grammar.rs:138-155`](../../src/query/parse/grammar.rs)。
 
 ### 2.5 数组与元组
 
@@ -529,7 +529,7 @@ pub(crate) fn hide_latest(&mut self, rowid: RowId) {
 }
 ```
 
-见 [`src/memory/table/state.rs`](../../src/memory/table/state.rs)。因此"给写状态拍快照"(`WriterState::clone`)
+见 [`src/memory/table/state/`](../../src/memory/table/state/)。因此"给写状态拍快照"(`WriterState::clone`)
 只是复制一批 `Arc` 句柄,非常廉价——这是写事务失败回滚与读者无锁扫描的共同前提
 (用法见 [04 §5.1](04-borrowing-strings-slices.md) 与 [07 §4.3](07-iterators-closures.md))。
 
@@ -542,7 +542,7 @@ pub(crate) fn hide_latest(&mut self, rowid: RowId) {
 > let shared: Arc<[f32]> = Arc::from(vector.into_boxed_slice());
 > ```
 >
-> 见 [`src/index/hnsw.rs:583-587`](../../src/index/hnsw.rs)。`into_boxed_slice()` 把
+> 见 [`src/index/hnsw/build.rs:293-297`](../../src/index/hnsw/)。`into_boxed_slice()` 把
 > `Vec<T>` 收缩成 `Box<[T]>`(丢掉多余容量,长度固定),`Arc::from` 再接管这块内存。
 > 此后每次克隆都只是引用计数 +1,索引与段数据因此可以零拷贝共享同一份向量——和
 > `Arc<str>` 是同一个套路,只是元素从 `u8` 换成了 `f32`。

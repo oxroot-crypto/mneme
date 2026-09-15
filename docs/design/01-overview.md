@@ -22,8 +22,8 @@ Mneme 是一个**纯 Rust 的进程内嵌入型向量存储库**,面向 **AI Age
 |---|---|---|
 | 嵌入型零运维 | 单进程独占(文件锁);`cargo add mneme` 即用 | [01](01-overview.md) |
 | 超长期不失控 | 活跃段数 O(log N) 有界;1M 条冷启动打开 < 1s;RSS 有上界 | [07](07-l5-life.md) |
-| 高召回低延迟 | 1M×1536 维 P99 查询 < 10ms(量化后),Recall@10 ≥ 0.95 | [05](05-l3-hnsw.md) + [08](08-l6-quant.md) |
-| 吞吐 | 批量插入 ≥ 50k 向量/秒 | [14](14-testing.md) |
+| 高召回低延迟 | 1M×1536 维 P99 查询 < 100ms(量化后,4 核基准),Recall@10 ≥ 0.95 | [05](05-l3-hnsw.md) + [08](08-l6-quant.md) |
+| 吞吐 | 批量插入 ≥ 300 向量/秒(4 核、1M×1536 高召回参数;GPU 档不属 CPU 门槛,见 [14 §4](14-testing.md)) | [14](14-testing.md) |
 | 崩溃安全 | 任意时刻掉电:已确认写入不丢、不出现半写数据、删除不复活 | [04](04-l2-persist.md) + [14](14-testing.md) |
 | **记忆模型** | 关系图、双时态 `as_of`(历史版本默认永久保留,可配保留期)、来源/可信度、记忆沉淀均为引擎级能力 | [09](09-memory-model.md) |
 | **记忆感知排序** | 相似度 + 新鲜度 + 重要度 + 访问 + 可信度 + 联想可配置参与排序 | [10](10-scoring.md) |
@@ -134,40 +134,31 @@ flowchart LR
 
 ---
 
-## 3. 渐进式分层(建造顺序)
+## 3. 分层架构与交付形态
 
-每一层只依赖下层;**每层完成时都是一个可交付的完整产品**;层边界 = 稳定接口。
+每一层只依赖下层;**每一层单独拿出来都是可交付的完整产品**;层边界 = 稳定接口。
 
-| 层 | 目录 | 内容 | 完成后的可用形态 | 验收(详见 [14](14-testing.md)) |
+| 层 | 目录 | 内容 | 可用形态 | 验收(详见 [14](14-testing.md)) |
 |---|---|---|---|---|
 | L0 | `core/` | 类型/错误/ID、SIMD 距离、TopK 堆、varint | 无 I/O 数学库 | 距离函数对照测试 |
-| L1 | `memory/` | 全内存引擎、暴力扫描、过滤 AST、去重预检 | **纯内存向量库**(易失,可用于测试/缓存);**公开 API 在此冻结** | 全 API 集成测试 |
+| L1 | `memory/` | 全内存引擎、暴力扫描、过滤 AST、去重预检 | **纯内存向量库**(易失,可用于测试/缓存);**公开 API 冻结** | 全 API 集成测试 |
 | L2 | `persist/` | WAL、vsec/msec 段、MANIFEST、恢复、墓碑删除 | 重启不丢数据;WAL 超限自动增量段 flush 兜底 | 崩溃注入测试全绿 |
 | L3 | `index/` | 自研 HNSW、hidx 持久化、过滤三档搜索 | 同一 API 下暴力→ANN 无感升级;mmap 引入(可关) | Recall@10 ≥ 0.95 |
 | L4 | `query/` | 过滤 DSL 解析、zone map 下推、BM25+RRF、去重 | 混合检索可用 | 混合检索集成测试 |
-| L5 | `life/` | TTL、遗忘曲线、size-tiered compaction、命名空间、快照/备份、stats | **超长期闭环**:段数有界、安全遗忘 | 24h 长跑测试 |
-| L6 | `quant/` | i8/f16 量化+两阶段重打分、建段抽样回退、async 门面、基准、fuzz | 查询带宽 i8 ÷4;async 门面可用 | 召回损失 ≤2%;1M×1536 门槛已接线 CI heavy 档(待 runner 首跑) |
+| L5 | `life/` | TTL、遗忘曲线、size-tiered compaction、命名空间、快照/备份、stats | **超长期闭环**:段数有界、安全遗忘 | 多段/compaction/快照验收([14 §6](14-testing.md)) |
+| L6 | `quant/` | i8/f16 量化+两阶段重打分、建段抽样回退、async 门面、基准、fuzz | 查询带宽 i8 ÷4;async 门面可用 | 召回损失 ≤2%;1M×1536 性能门槛(heavy 手动档,[14 §4](14-testing.md)) |
 
-> **产品能力层(09–12)** 不改变 L0–L6 的建造顺序,而是横切其上:
+> **产品能力层(09–12)** 横切在 L0–L6 之上:
 > 记忆模型/排序在 L1 冻结的 API 上追加类型与语义([09](09-memory-model.md)/[10](10-scoring.md)),
 > 安全存储复用 L2 布局([11](11-security-storage.md)),部署形态复用 write-once 语义
-> ([12](12-deployment.md))。它们默认关闭,开启不改变默认行为。
+> ([12](12-deployment.md))。它们均以独立 feature 或配置面提供,默认关闭,开启不改变默认行为。
 
-**渐进式的两个关键手段**:
+**两个关键设计手段**:
 
-> **落地状态**:L0–L6 已实现(L3 = `src/index/` 自研 HNSW + `hidx` 持久化 + 过滤三档,
-> 验收 `tests/hnsw_contracts.rs`;L4 = `src/query/` 过滤 DSL + zone map/bloom 计划器 +
-> BM25/RRF 融合 + msec 四区落盘,验收 `tests/l4_contracts.rs`;L5 = `src/life/` 多段
-> size-tiered compaction + 后台维护 + TTL 块剪枝 + 命名空间/快照/备份/统计运维面,
-> 验收 `tests/l5_contracts.rs`;L6 = `src/quant/` i8/f16 量化副本 + 两阶段检索 +
-> 建段抽样回退 + `feature = "async"` 门面 + `benches/quant.rs` + `fuzz/` 骨架,
-> 验收 `tests/l6_contracts.rs`)。1M×1536 性能门槛与 fuzz 长跑已接线 CI
-> heavy/夜跑档,待 runner 首跑验证。
-
-1. **接口先于实现**:公开 API 在 L1 冻结(暴力与 HNSW 同签名),L3 **引入内部 trait
-   `memory::index::{VectorIndex, IndexFactory}`** 作为暴力→HNSW 的替换缝;L2 的段文件头从第一天就带 `format_version` 字段。
+1. **接口先于实现**:公开 API 在 L1 冻结(暴力与 HNSW 同签名),L3 以内部 trait
+   `memory::index::{VectorIndex, IndexFactory}` 作为暴力→HNSW 的替换缝;L2 的段文件头自带 `format_version` 字段。
    (L1/L2 直接在引擎内实现公开语义,不下沉该内部 trait;见 [03 §8](03-l1-memory.md)。)
-2. **每层有兜底**:L2 阶段用"WAL 总量超 256MB 自动 flush 兜底"(L5 起为增量段,[04 §3.2](04-l2-persist.md));
+2. **每层自带兜底**:L2 以"WAL 总量超阈值自动增量段 flush"保证 WAL 有界([04 §3.2](04-l2-persist.md));
    L3 永远保留暴力扫描作为过滤极端选择性时的第三档策略。
    系统在每一层都是"完整能跑"的,性能和功能是逐层叠加的。
 
@@ -175,29 +166,29 @@ flowchart LR
 
 ## 4. 单 crate 模块布局
 
-**决定:单 crate 起步,不做 workspace。** L0–L6 之间只允许向下依赖(L 序号大的依赖小的);
+**决定:单 crate,不做 workspace。** L0–L6 之间只允许向下依赖(L 序号大的依赖小的);
 产品能力层(09–12 的 `model/`、`score/`、`crypto/`、`compress/`、`deploy/`、`obs/`)可在其
 **内部**相互依赖(如 `score → model`),但不得反向依赖门面或上层。`core` 之外禁止跨层
-反向穿透。若未来某边界确需独立发布,再按现成模块边界拆分(不在承诺内)。
+反向穿透。若某边界确需独立发布,再按现成模块边界拆分(不在承诺内)。
 
 ```text
 mneme/
 ├── src/
 │   ├── lib.rs          # 门面:Mneme / Namespace / Builder;pub use 公开类型
-│   ├── core/           # L0:types.rs error.rs metric.rs simd.rs varint.rs meta.rs heap.rs bitset.rs text.rs options/
-│   ├── memory/         # L1:engine.rs engine_ops.rs builder/ namespace/ analysis/ table/ snapshot.rs snapshot_scan.rs search_builder.rs expand.rs rerank.rs index.rs search.rs pred.rs pred_eval.rs record.rs write_helpers.rs mutate_helpers.rs dedup.rs relation.rs temporal.rs score.rs lifecycle.rs ops.rs config.rs async_facade.rs(async)
-│   ├── persist/        # L2:mod.rs codec.rs hook.rs wal/ msec/ recover/ store/ vsec.rs manifest.rs edges.rs flush.rs source.rs storage.rs trash.rs
-│   ├── index/          # L3:hnsw.rs graph.rs filtered.rs rebuild.rs hidx.rs factory.rs
-│   ├── query/          # L4:parse.rs parse/literal.rs display.rs json.rs iso.rs plan.rs zmap.rs bm25.rs fusion.rs exec.rs
-│   ├── life/           # L5:compact.rs(选段/幸存版本)maintenance.rs(后台维护)
+│   ├── core/           # L0:types.rs error.rs metric.rs simd/ varint.rs meta.rs heap/ bitset.rs text.rs options/
+│   ├── memory/         # L1:engine.rs engine_ops/ builder/ namespace/ analysis/ table/ snapshot/ snapshot_scan.rs search_builder.rs expand.rs rerank.rs index.rs search/ pred/ pred_eval/ record/ write_helpers.rs mutate_helpers.rs dedup.rs relation.rs temporal.rs score/ lifecycle.rs ops.rs config.rs async_facade/(async)
+│   ├── persist/        # L2:mod.rs codec.rs hook.rs wal/ msec/ recover/ store/ vsec/ manifest/ edges.rs flush/ source/ storage/ trash.rs
+│   ├── index/          # L3:hnsw/ graph.rs filtered.rs rebuild.rs hidx/ factory.rs
+│   ├── query/          # L4:parse/ display.rs json.rs iso.rs plan/ zmap.rs bm25.rs fusion.rs exec/
+│   ├── life/           # L5:compact/(选段/幸存版本)maintenance.rs(后台维护)
 │   ├── quant/          # L6(纯原语,依赖等级同 L0):scalar_i8.rs f16.rs(quant-f16) rescore.rs support.rs
 │   ├── fuzzing.rs      # feature fuzzing:cargo-fuzz 专用解析入口(不参与运行时)
-│   ├── model/(未独立成目录) # 记忆模型:当前实现见 memory/{relation,temporal}.rs、score.rs、namespace/life.rs (09)
-│   ├── score/(未独立成目录) # 排序层:当前实现见 memory/{score,expand,rerank}.rs               (10)
-│   ├── crypto/         # feature encrypt:mod.rs 整文件/整帧 AES-256-GCM 信封 + 密钥环(已落地) (11)
-│   ├── compress/       # feature compress/compress-zstd:mod.rs + lz4.rs(已落地)             (11)
-│   ├── persist/storage.rs  # Storage/FsStorage/MemStorage 与文件锁(已落地)                   (12)
-│   └── core/observe.rs # Observer/Event/WriteOp(已落地)                                      (12)
+│   ├── model/          # 记忆模型(随 memory/ 组织):relation.rs、temporal.rs、score/、namespace/life.rs (09)
+│   ├── score/          # 排序层(随 memory/ 组织):score/、expand.rs、rerank.rs             (10)
+│   ├── crypto/         # feature encrypt:mod.rs 整文件/整帧 AES-256-GCM 信封 + 密钥环       (11)
+│   ├── compress/       # feature compress/compress-zstd:mod.rs + lz4.rs                      (11)
+│   ├── persist/storage/  # Storage/FsStorage/MemStorage 与文件锁                            (12)
+│   └── core/observe.rs # Observer/Event/WriteOp                                               (12)
 ├── benches/            # criterion 基准(L3 起;L6 增 quant.rs)
 ├── fuzz/               # cargo-fuzz 五目标(L6 起;需 nightly + cargo-fuzz)
 ├── tests/              # 契约验收 + contract_traceability.rs 追溯门禁
@@ -232,6 +223,10 @@ compaction 调度、分词)**全部自研**。
 >
 > **元数据构造**:`Meta` 即 `serde_json::Value`,库重导出 `json!` 宏(`use mneme::json;`),
 > 宿主无需直接依赖 `serde_json`;除此之外不暴露任何 serde_json 类型。
+>
+> **dev-dependencies 口径**:上表只约束库本体(发布产物);`proptest`、`tempfile`、
+> `criterion` 以及端到端示例(`examples/memory`)用的 `async-openai`/`tokio` 只在
+> dev 构建(测试/基准/示例)生效,不进入发布依赖树。
 
 **明确不引入**(自研替代):`rayon`(用 `std::thread::scope`)、`crossbeam`(用
 `std::sync::mpsc`)、`parking_lot`/`arc-swap`(用 std `RwLock`/`Mutex`)、
@@ -253,14 +248,14 @@ dev-dependencies(不进入发布产物):`proptest`、`tempfile`、`criterion`。
 | `compress-zstd` | ❌ 关 | `zstd` | 可选更强压缩 |
 | `wasm` | ❌ 关 | 无 | 关闭 mmap/线程并行,WASM 适配(目标构建验证留 CI `wasm-check`,[12 §3](12-deployment.md)) |
 
-> 上述八个 feature 均已定义并落地对应能力;加密/压缩/`wasm` 均默认关闭,开启不改变
+> 八个 feature 均提供对应能力;加密/压缩/`wasm` 默认关闭,开启不改变
 > 默认构建的磁盘布局与依赖面。
 
 ---
 
-## 6. 公开 API(在 L1 冻结)
+## 6. 公开 API(签名在 L1 冻结)
 
-以下类型与方法的**签名在 L1 完成时冻结**,后续层只升级实现。完整语义见
+以下类型与方法的**签名在 L1 冻结**,上层只升级实现。完整语义见
 [03 章](03-l1-memory.md),此处为速览。
 
 ```rust
@@ -287,7 +282,7 @@ let outcome = ns.insert(
         .ttl(Duration::from_secs(30 * 86400))    // 可选;到期自动遗忘
 )?;   // -> InsertOutcome { Inserted(RowId) | Merged(RowId) | Duplicate{..} }(去重开启时)
 
-let outcomes = ns.insert_batch(batch)?;          // 批量原子写入(50k/s 目标的公开入口)
+let outcomes = ns.insert_batch(batch)?;          // 批量原子写入(批量建库吞吐目标的公开入口)
 ns.update("mem_001", UpdatePatch::new().text(Some("用户偏好深色模式".into())))?;  // 保留 RowId 的局部更新
 
 // ---- 检索(向量 + 过滤 + 记忆感知排序) ----

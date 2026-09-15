@@ -8,8 +8,8 @@
 > 只读共享与 WASM 是**采用门槛级**能力:许多 Agent 框架会
 > 以多进程运行,边缘/浏览器则是嵌入式库的天然战场。单写者语义保持不变。
 
-模块:`persist/storage.rs`(`Storage`/`FsStorage`/`MemStorage` 与文件锁,已落地)、
-`core/observe.rs`(`Observer`/`Event`/`WriteOp`,已落地);只读共享与周期探测落在 L1/L2
+模块:`persist/storage/`(`Storage`/`FsStorage`/`MemStorage` 与文件锁)、
+`core/observe.rs`(`Observer`/`Event`/`WriteOp`);只读共享与周期探测落在 L1/L2
 引擎路径。
 
 ---
@@ -73,13 +73,13 @@ let db = Mneme::builder().path("./agent_memory").read_only(true).build()?;
 
 [04 §11](04-l2-persist.md) 已把段读取抽象为 `SegmentSource`(mmap / `FileSource`)。
 WASM 没有 mmap,但有内存文件系统/IndexedDB;为此需要把**写路径**也抽象出来。
-`Storage` trait 已定义在 `persist/storage.rs`(与 `SegmentSource` 同层,
+`Storage` trait 已定义在 `persist/storage/`(与 `SegmentSource` 同层,
 避免上层反向依赖);WASM 适配由 `MemStorage`/宿主后端提供。
-> **落地状态(已落地)**:`Storage` trait 与 `FsStorage`/`MemStorage` 已抽取到
-> `persist/storage.rs`,`Builder::storage` 可注入任意后端;段/WAL/MANIFEST/trash/
-> 恢复/校验全链路经后端读写(WAL 写入器已去 `File` 句柄化),`MemStorage` 通过
-> 完整生命周期测试(`FC-DEPLOY-POST-001`)。WASM 目标由 feature `wasm` 关闭 mmap
-> 与后台线程、配合 `MemStorage`/宿主后端;目标构建验证留 CI(`wasm-check` job)。
+> `Storage` trait 与 `FsStorage`/`MemStorage` 定义在 `persist/storage/`,
+> `Builder::storage` 可注入任意后端;段/WAL/MANIFEST/trash/恢复/校验全链路经后端
+> 读写(WAL 写入器不持 `File` 句柄),`MemStorage` 覆盖完整生命周期测试
+> (`FC-DEPLOY-POST-001`)。WASM 目标由 feature `wasm` 关闭 mmap 与后台线程、
+> 配合 `MemStorage`/宿主后端;目标构建由 CI `wasm-check` job 验证。
 
 ```rust
 /// 存储后端的文件元数据(不依赖 `std::fs`,WASM 后端同样可实现)。
@@ -137,12 +137,12 @@ WASM 通过 `Storage` 抽象接入;本章固化 `Storage`/`SegmentSource` 抽象
 
 ### 4.1 设计
 
-[16 §10](16-api-reference.md) 目前只有 `stats()` 轮询。产品化需要**事件级**可观测,
-但又要守住"默认不引 `log`/`tracing` 依赖"。
+[16 §10](16-api-reference.md) 提供 `stats()` 轮询;事件级可观测由 `Observer` 提供,
+同时守住"默认不引 `log`/`tracing` 依赖"的边界。
 
-> **落地状态(已落地)**:`Observer`/`Event`/`WriteOp`/`ErrorKind` 定义于
-> `src/core/observe.rs`,`Builder::observer` 注册;查询/写入/flush/compaction/错误
-> 均发事件,回调 panic 经 `catch_unwind` 隔离(FC-DEPLOY-INV-030)。
+> `Observer`/`Event`/`WriteOp`/`ErrorKind` 定义于 `src/core/observe.rs`,
+> `Builder::observer` 注册;查询/写入/flush/compaction/错误均发事件,回调 panic 经
+> `catch_unwind` 隔离(FC-DEPLOY-INV-030)。
 
 ```rust
 pub trait Observer: Send + Sync {

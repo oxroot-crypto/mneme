@@ -123,7 +123,7 @@ fuzzing = []
 - 除了"编不编"的 `#[cfg(...)]`,还有"条件成立时附加属性"的 `#[cfg_attr(条件, 属性)]`。
   例如 `#[cfg_attr(feature = "mmap", allow(dead_code))]` 在开启 mmap 时对那段代码放行
   `dead_code` 告警(此时兜底后端只被测试用到),关闭时则不放行(见
-  [`src/persist/source.rs:27-41`](../../src/persist/source.rs))。
+  [`src/persist/source/backend.rs:12-26`](../../src/persist/source/))。
 
 再看依赖清单:
 

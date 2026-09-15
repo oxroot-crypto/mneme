@@ -7,12 +7,11 @@
 > **本章你将学到**:NSW 与小世界 → 层级概率分布推导 → 构建/搜索算法逐步 →
 > 复杂度(构建 O(N·d·ef_c·M_0) 等)→ 8 点手算算例 → 墓碑删除 → 过滤三档策略。
 
-模块:`index/{hnsw.rs, graph.rs, filtered.rs, rebuild.rs, hidx.rs, factory.rs}`
-(原计划的 `merge.rs` 在 L5 前单段单图架构下退化为 L0 `TopK::merge`,不单设;
-L5 引入多图 compaction 重建时恢复为独立模块。)
+模块:`index/{hnsw/, graph.rs, filtered.rs, rebuild.rs, hidx/, factory.rs}`
+(多段查询的归并由 L0 `TopK::merge` 承担,不单设 `merge.rs`。)
 参考:HNSW 原论文(Malkov & Yashunin, 2016)的思想,实现为纯 Rust 自研、适配墓碑删除与过滤。
 
-> **落地状态(L3 已实现)**:`src/index/` 完整实现本章算法;HNSW 经 L1 内部 trait
+> `src/index/` 实现本章算法;HNSW 经 L1 内部 trait
 > `memory::index::{VectorIndex, IndexFactory}` 注入(见 §12),`flush` 随段写 `.hidx`、
 > `open` 从 hidx 载入并经"段内槽位→全局槽位"重排映射对齐恢复后的 `SlotId`;
 > 验收测试见 `tests/hnsw_contracts.rs`(Recall@10 ≥ 0.95、`ef→∞` 收敛、过滤三档、
@@ -195,10 +194,11 @@ $$T_{\text{build}}(N) = O(N \cdot d \cdot ef_c \cdot M_0), \qquad S_{\text{graph
 
 **工程注**:上述是**单线程**界。Mneme 用 scoped threads 按批并行:批内节点在批开始
 图快照上并行搜索/选邻(只读),批间串行应用连边与修剪;批行数只依赖节点数、与线程数
-无关,见 §4.4 落地状态与 `FC-INDEX-POST-012`。50k 向量/秒的目标依赖批内并行 +
-常见维度(768–1536)的 SIMD 吞吐,基准验证见 [14 §4](14-testing.md)。
+无关,见 §4.4 与 `FC-INDEX-POST-012`。建库吞吐门槛为 4 核基准 ≥300 向量/秒
+(1M×1536 高召回参数实测 424–1187/s,受内存带宽约束,核数不线性放大;GPU/CAGRA
+档 ≈50k+/s 为可选 GPU 后端的远期目标,不参与 CPU 门槛),基准验证见 [14 §4](14-testing.md)。
 
-> **L3 落地状态**:`HnswIndex::build` 固定种子(层级骰子)保证同输入同图,并已接线
+> **构建确定性**:`HnswIndex::build` 固定种子(层级骰子)保证同输入同图,并以
 > **批内并行**(`FC-INDEX-POST-012`):构建分批——批内节点基于**批开始图快照**并行
 > 计算选邻计划(只读);应用先串行加边(无距离计算)并收集被触达的 `(节点,层)`,
 > 再把**修剪邻接计算并行求值**(只读批末快照、各改各的邻接表)、按序写回;批行数
@@ -207,13 +207,15 @@ $$T_{\text{build}}(N) = O(N \cdot d \cdot ef_c \cdot M_0), \qquad S_{\text{graph
 > 逐字节同图);构建结束后对批内互不可见留下的极少量不可达节点做链式可达性修复
 > (`entry → u₀ → u₁ → …`,修复边受保护、永久有效)。批内不可见是唯一的语义近似:
 > 同一批节点看不到彼此的边(批间可见),召回影响由 `FC-INDEX-POST-009/011` 门槛约束。
-> L5 compaction 重建走同一入口。
-> 1M×1536 的吞吐/延迟基准尚未接入 CI,`benches/hnsw.rs` 当前只是微缩趋势样本。
+> compaction 重建走同一入口。
+> 1M×1536 的吞吐/延迟门槛为 heavy 手动档(见 [14 §4](14-testing.md));
+> `benches/hnsw.rs` 提供微缩趋势样本。
 >
 > **工程参数可配**:批行数/小图串行阈值/批内线程上限/选邻比较上限经
 > `Tuning.{hnsw_batch_rows, hnsw_serial_rows, hnsw_threads_max, hnsw_compare_cap}`
 > 配置(默认 8/64/8/4);flush 切块行数与块级并行经
-> `Tuning.{flush_chunk_rows, flush_threads}`(默认 65_536/1,环境变量优先)。
+> `Tuning.{flush_chunk_rows, flush_threads}`(默认 65_536/1;库本体不读环境变量,
+> 调参经 `Builder::tuning` 显式注入)。
 > 选邻比较上限把启发式的两两距离从 `O(候选×已选)` 压到 `O(候选×上限)`;
 > 1536 维实测 8→4 召回不降、构建再快约 1.4×。
 >
@@ -272,7 +274,8 @@ $ef_c=4$。
 | 上层下降 | $O(d \cdot M \cdot \log_M N)$ | ≤ 5 层 × 16 邻居 |
 
 对比暴力 $O(N \cdot d)$:$N = 10^6$,查询读取向量数从 $10^6$ 降到 ~$10^3$,
-**三个数量级**——这就是 P99 < 10ms 目标的来源([14 §4](14-testing.md) 验证)。
+**三个数量级**——这是查询延迟门槛的算法基础;多段形态下墙钟还受逐段随机访问的
+内存延迟约束,门槛按 4 核实测口径定(见 [14 §4](14-testing.md))。
 
 > `Hybrid` 建图档(§4.4)不改变上表的**距离计算次数**,只把遍历期单次距离的读带宽
 > 从 $4d$ 字节降到 $d$ 字节(i8 码流),选邻/剪枝仍为 f32。
@@ -283,9 +286,9 @@ $ef_c=4$。
 Recall@10 ≥ 0.95(ef=128,随机均匀 + 8 簇合成数据两套固定种子数据,见 [14 §3](14-testing.md))。
 调参方向:$ef \uparrow$ → 召回↑延迟↑;$M \uparrow$ → 召回↑,空间/构建时间↑。
 
-> **L3 落地口径**:当前 CI 档验收为微缩规模(2500 条 × 32 维、默认 `HnswParams`,
+> **验收规模口径**:CI 档验收为微缩规模(2500 条 × 32 维、默认 `HnswParams`,
 > 两套分布分别达标,见 `tests/hnsw_contracts.rs`);设计规模(64 维 10 万条 × 2 套)
-> 属 heavy/夜间档,尚未接线(设计规模不改变门槛语义,只提高统计置信度)。
+> 属 heavy 手动档(见 [14 §4](14-testing.md);设计规模不改变门槛语义,只提高统计置信度)。
 
 > **确定性边界**:HNSW 的构建(并行插入)与 compaction 重建都会改变图的邻接结构,
 > 因此**同一逻辑数据集在 compaction 前后、或两次重建之间,近似结果可能不同**。
@@ -323,11 +326,11 @@ HNSW 的剪枝只依赖**向量距离**;而 [10](10-scoring.md) 的综合排序�
 
 - **默认(落地口径)**:HNSW 用原始相似度粗排,再由 [10 §2.3](10-scoring.md) 综合重排;
   当 `Scoring` 开启任一非相似度因子时,向量通道的探查宽度放大到 `ef' = max(ef, 4k)`
-  (`FC-SCORE-POST-003`,已落地,见 [10 §2.3](10-scoring.md));
+  (`FC-SCORE-POST-003`,见 [10 §2.3](10-scoring.md));
 - **可选重要性偏置路由**(`Scoring::bias_routing`):遍历优先级用
   `dist / √(1 + β·imp + β·acc)` 作为启发式(β 为实现内部固定系数,默认 1.0,不对外暴露),
   **只改访问顺序、不改最终分**,在不显著损召回的前提下减少探查量;这是"时间感知 ANN"的
-  工程形态;已落地,默认关闭(`FC-SCORE-POST-007`,见 [10 §2.3](10-scoring.md))。
+  工程形态;默认关闭(`FC-SCORE-POST-007`,见 [10 §2.3](10-scoring.md))。
 
 ---
 
@@ -397,16 +400,15 @@ $s = |\text{cand}| / N_{\text{alive}}$ 自适应三档:
 
 ## 9. 跨段归并:`merge.rs`
 
-> **落地状态**:L5 之前每次 flush 只保留一个活跃段,故 L3 的"多段图"退化为
-> **单个索引前缀 + 未建树尾扫描**:查询 = 前缀 ANN(`filtered.rs`)+ 尾部暴力,
-> 二者以 L0 `TopK::merge` 归并(见 `src/memory/search.rs`)。L5 起多段并存已落地,
-> 查询按 MANIFEST 段序**串行**逐段归并(`merge` 仍由 `TopK::merge` 承担);
-> 下述 scoped threads 并行模型与独立归并模块是**目标形态**、尚未接线。
+> **多段归并**:查询 = 各段 ANN(`filtered.rs`)或暴力 + 未落盘内存段暴力,
+> 段间按可用核数 **scoped threads 并行搜索**(动态游标分派、结果按段号回填),
+> 各段 TopK 由 L0 `TopK::merge` 按段序归并(见 `src/memory/search/`,
+> `FC-QUERY-POST-008`);单段时退化为"索引前缀 + 未建树尾扫描"。
 
 库由多个段组成(追加式存储),每段有自己的图。查询 = 各段搜索 + 全局归并:
 
 ```text
-逐段(当前实现:串行;目标形态:scoped threads 并行):
+逐段(段间按可用核数并行):
     每段 → 选择 HNSW / 暴力(段行数 ≤ 2048 恒暴力) → 段内 TopK(k)
 归并: k 路分数归并([02 §5 TopK.merge]) → 全局 top-k
 ```
@@ -433,16 +435,16 @@ adj_blob:   逐点逐层 [u16 degree] + u32 邻居槽位数组(层0 ≤ M0 个,�
 ```
 
 > 上图为**简图**:真实 hidx 头部为定长 64 B,含 `header_len`(6..8)、头部 CRC(36..40)
-> 与 `0..64` 的对齐 padding(`src/index/hidx.rs` 模块文档为逐字节权威)。
+> 与 `0..64` 的对齐 padding(`src/index/hidx/` 模块文档为逐字节权威)。
 > hidx 头部**没有**加密/压缩扩展字段:加密由整文件信封在读取时透明解封装
 > (见 [11 §2.2](11-security-storage.md)),压缩只作用于 msec 记录体字段
 > (见 [04 §2.2](04-l2-persist.md) 的 `flags2`);版本号与 vsec/msec 同代
 > (`FORMAT_VERSION`),版本不一致一律拒读(I18)。
 
-**惰性加载(已落地,L1–L6 收尾)**:打开段只读头部与 `node_table`(5 B/节点),
+**惰性加载**:打开段只读头部与 `node_table`(5 B/节点),
 邻接 blob 由段句柄按节点缺页/按需解码并缓存首次访问的节点(`MappedGraph`,
 FC-PERSIST-INV-021)。这是"1M 条冷启动 < 1s"的主要支撑点([01 §1.1](01-overview.md));
-冷启动另有记录元数据物化项待后续(见 [14 §4](14-testing.md))。
+记录元数据物化口径见 [04 §8](04-l2-persist.md),冷启动门槛见 [14 §4](14-testing.md)。
 
 > **L3 实现口径**:`MmapSource`(feature `mmap`,默认开)与 `ByteFile` 统一用于段字节读取;
 > `HnswIndex::load` 接收 hidx 句柄视图(`ByteSpan`),只物化 `node_table` 与头部,

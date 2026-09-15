@@ -6,11 +6,9 @@
 use std::sync::Arc;
 
 use crate::core::error::Result;
-use crate::core::metric::Metric;
-use crate::core::types::SlotId;
-use crate::memory::index::{IndexBuildRequest, IndexFactory, IndexNode, QuantCopy, VectorIndex};
+use crate::memory::index::{IndexBuildRequest, IndexFactory, IndexLoadRequest, VectorIndex};
 
-use super::hnsw::HnswIndex;
+use super::hnsw::{HnswIndex, HnswLoadInput};
 use super::{hidx, rebuild};
 
 /// HNSW 索引工厂。
@@ -25,17 +23,14 @@ impl IndexFactory for HnswFactory {
         hidx::verify(bytes)
     }
 
-    fn load(
-        &self,
-        span: &crate::memory::lazy::ByteSpan,
-        nodes: &[IndexNode],
-        slot_of: &[SlotId],
-        metric: Metric,
-        quant: Option<QuantCopy>,
-    ) -> Result<Arc<dyn VectorIndex>> {
-        Ok(Arc::new(HnswIndex::load(
-            span, nodes, slot_of, metric, quant,
-        )?))
+    fn load(&self, request: IndexLoadRequest<'_>) -> Result<Arc<dyn VectorIndex>> {
+        Ok(Arc::new(HnswIndex::load(HnswLoadInput {
+            span: request.span,
+            nodes: request.nodes,
+            slot_of: request.slot_of,
+            metric: request.metric,
+            quant: request.quant,
+        })?))
     }
 }
 

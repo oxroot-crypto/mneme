@@ -133,14 +133,30 @@ fn read_length(src: &[u8], index: &mut usize, base: usize, overflow: &str) -> Re
     Ok(len)
 }
 
-/// 拷贝字面量段并推进游标;越界或超过声明输出长度即拒绝。
-fn append_literals(
-    src: &[u8],
-    index: &mut usize,
+/// [`append_literals`] 的输入参数。
+#[derive(Debug)]
+struct AppendLiteralsInput<'a> {
+    /// 输入字节流。
+    src: &'a [u8],
+    /// 解码游标(指向字面量段起点,函数内推进)。
+    index: &'a mut usize,
+    /// 字面量字节数。
     literal_len: usize,
-    out: &mut Vec<u8>,
+    /// 输出缓冲。
+    out: &'a mut Vec<u8>,
+    /// 声明的输出总长度上界。
     expected_len: usize,
-) -> Result<()> {
+}
+
+/// 拷贝字面量段并推进游标;越界或超过声明输出长度即拒绝。
+fn append_literals(input: AppendLiteralsInput<'_>) -> Result<()> {
+    let AppendLiteralsInput {
+        src,
+        index,
+        literal_len,
+        out,
+        expected_len,
+    } = input;
     let end = index
         .checked_add(literal_len)
         .filter(|&end| end <= src.len())
@@ -153,14 +169,30 @@ fn append_literals(
     Ok(())
 }
 
-/// 解码一个匹配段:偏移 + 匹配长度,逐字节复制以支持重叠匹配(LZ77 语义)。
-fn append_match(
-    src: &[u8],
-    index: &mut usize,
+/// [`append_match`] 的输入参数。
+#[derive(Debug)]
+struct AppendMatchInput<'a> {
+    /// 输入字节流。
+    src: &'a [u8],
+    /// 解码游标(指向匹配偏移起点,函数内推进)。
+    index: &'a mut usize,
+    /// token 低 4 位的匹配长度基线。
     token_len: u8,
-    out: &mut Vec<u8>,
+    /// 输出缓冲。
+    out: &'a mut Vec<u8>,
+    /// 声明的输出总长度上界。
     expected_len: usize,
-) -> Result<()> {
+}
+
+/// 解码一个匹配段:偏移 + 匹配长度,逐字节复制以支持重叠匹配(LZ77 语义)。
+fn append_match(input: AppendMatchInput<'_>) -> Result<()> {
+    let AppendMatchInput {
+        src,
+        index,
+        token_len,
+        out,
+        expected_len,
+    } = input;
     let offset_bytes = src
         .get(*index..*index + 2)
         .ok_or_else(|| corrupt("匹配偏移越界"))?;
@@ -198,11 +230,23 @@ fn decompress(src: &[u8], expected_len: usize) -> Result<Vec<u8>> {
             usize::from(token >> 4),
             "字面量长度扩展越界",
         )?;
-        append_literals(src, &mut index, literal_len, &mut out, expected_len)?;
+        append_literals(AppendLiteralsInput {
+            src,
+            index: &mut index,
+            literal_len,
+            out: &mut out,
+            expected_len,
+        })?;
         if index == src.len() {
             break;
         }
-        append_match(src, &mut index, token & 0x0F, &mut out, expected_len)?;
+        append_match(AppendMatchInput {
+            src,
+            index: &mut index,
+            token_len: token & 0x0F,
+            out: &mut out,
+            expected_len,
+        })?;
     }
     if out.len() != expected_len {
         return Err(MnemeError::Corrupted {

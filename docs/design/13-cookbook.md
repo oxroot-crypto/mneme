@@ -16,6 +16,9 @@
 一个完整的"建库 → 写入 → 混合检索 → 反馈 → 关闭"流程。`embed(...)` 是宿主嵌入模型,
 不是库 API(见章首说明)。
 
+> **可直接运行的版本**:`examples/memory`(交互式 REPL,经 OpenAI 协议接真实嵌入 API,
+> 内置 mock 端点的离线路径用例);配置与命令见 [README](../../README.md) 的「端到端示例」。
+
 ```rust
 use mneme::{filter, json, Diversity, Feedback, FsyncPolicy, Metric, Mneme, Record, Scoring};
 use std::time::Duration;
@@ -278,7 +281,7 @@ db.close()?;
 - 备份目标必须不存在或为空([16 §7](16-api-reference.md));
 - PITR:按目标时间点定期 `backup_to`,每份备份独立可开;单份备份**不能**把 `current`
   指回旧 MANIFEST(实时库的 MANIFEST 保留 2 版可供回滚,见 [16 §7.2](16-api-reference.md));
-- 观测:`.observer(Arc::new(MyMetrics))` 接事件流(`Observer` 已落地;回调 panic 被
+- 观测:`.observer(Arc::new(MyMetrics))` 接事件流(`Observer`;回调 panic 被
   `catch_unwind` 隔离,见 [12 §4](12-deployment.md))。
 
 ---

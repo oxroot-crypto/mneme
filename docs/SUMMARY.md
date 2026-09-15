@@ -9,6 +9,10 @@
 
 ---
 
+- [开发者指南:从集成到生产](guide.md)
+
+---
+
 - [02 L0 原语层](design/02-l0-core.md)
 - [03 L1 内存引擎](design/03-l1-memory.md)
 - [04 L2 持久层](design/04-l2-persist.md)

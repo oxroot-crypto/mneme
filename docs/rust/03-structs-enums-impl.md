@@ -5,9 +5,9 @@
 > **前置**:[02 章](02-values-and-ownership.md)。
 > **对应源码**:[`src/core/types.rs`](../../src/core/types.rs)、[`src/core/metric.rs`](../../src/core/metric.rs)、
 > [`src/core/error.rs`](../../src/core/error.rs)、[`src/core/options/`](../../src/core/options)、
-> [`src/memory/builder.rs`](../../src/memory/builder.rs)、[`src/memory/pred.rs`](../../src/memory/pred.rs)、
-> [`src/index/hnsw.rs`](../../src/index/hnsw.rs)、[`src/index/hidx.rs`](../../src/index/hidx.rs)、
-> [`src/query/parse.rs`](../../src/query/parse.rs)、[`src/persist/flush.rs`](../../src/persist/flush.rs)。
+> [`src/memory/builder/`](../../src/memory/builder/)、[`src/memory/pred/`](../../src/memory/pred/)、
+> [`src/index/hnsw/`](../../src/index/hnsw/)、[`src/index/hidx/`](../../src/index/hidx/)、
+> [`src/query/parse/`](../../src/query/parse/)、[`src/persist/flush/`](../../src/persist/flush/)。
 
 Rust 没有"类(class)",而是把数据和行为分开:
 
@@ -49,7 +49,7 @@ let ctx = MaskCtx { view, blocks };   // 等价于 MaskCtx { view: view, blocks:
 
 L4 的内部结构几乎都这么构造——`MaskCtx`、`Plan`、`EvalCtx`、`ChannelCtx` 等,见
 [`src/query/zmap.rs:20-23`](../../src/query/zmap.rs) 与
-[`src/query/plan.rs:89-93`](../../src/query/plan.rs)。简写与完整写法可以混用
+[`src/query/plan/compile.rs:118-122`](../../src/query/plan/)。简写与完整写法可以混用
 (`Plan { candidates, bits, selectivity }` 三个字段全是简写),只影响书写,字段名与语义不变。
 
 只想改几个字段、其余沿用另一份值时,用**结构体更新语法(struct update syntax)** `..`:
@@ -67,8 +67,8 @@ const GRAPH_PARAMS: GraphParams = GraphParams {
 let fast = GraphParams { m: 4, ..GRAPH_PARAMS };
 ```
 
-见 [`src/index/hidx.rs:401-407`](../../src/index/hidx.rs) 与
-[`src/index/hidx.rs:523-525`](../../src/index/hidx.rs)。要点:
+见 [`src/index/hidx/layout.rs:82-88`](../../src/index/hidx/) 与
+[`src/index/hidx/tests.rs:33-35`](../../src/index/hidx/)。要点:
 
 - `..` 后面的表达式必须与目标类型相同,可以是变量、常量,也可以是 `T::default()`;
 - 更新语法按字段依次构造,`..` 表达式里**未被显式覆盖的字段会被移动**进新值;
@@ -148,7 +148,7 @@ impl Expr {
 }
 ```
 
-见 [`src/query/parse.rs:19-48`](../../src/query/parse.rs)。要点:
+见 [`src/query/parse/parser.rs:11-40`](../../src/query/parse/)。要点:
 
 - **固有方法(inherent method)** 直接挂在类型上,`Expr::from_str(..)` 调用时不需要任何 `use`;
   而 **trait 方法**要求 trait 在作用域里才能调用(见 [08 §4](08-modules-docs.md))。
@@ -213,7 +213,7 @@ pub fn into_sorted_vec(mut self) -> Vec<T> {
 
 `mut self` 不是一种新的接收者,而是"`self`(值接收) + 一个可变的局部绑定"。调用后原 `TopK`
 被**移动**进函数,不能再使用——这正是 `into_*` 命名的语义。见
-[`src/core/heap.rs:205-214`](../../src/core/heap.rs)。
+[`src/core/heap/topk.rs:176-185`](../../src/core/heap/)。
 
 #### 2.2.3 链式方法:`mut self -> Self` 与构建者模式
 
@@ -226,7 +226,7 @@ pub fn dimension(mut self, dimension: u32) -> Self {
 }
 ```
 
-见 [`src/memory/builder/options.rs`](../../src/memory/builder/options.rs)。于是可以一口气写:
+见 [`src/memory/builder/options/`](../../src/memory/builder/options/)。于是可以一口气写:
 
 ```rust
 let db = Builder::default()
@@ -240,7 +240,7 @@ let db = Builder::default()
 
 - 每个 setter 都是"消费 + 返回",所以链式调用后**原构建器变量不能再使用**(它已被移动)。
 - setter 只写字段、不做校验;**校验收敛在 `build()` 一处**,见
-  [`src/memory/builder.rs`](../../src/memory/builder.rs)。
+  [`src/memory/builder/`](../../src/memory/builder/)。
 - 这是 Rust 里最常用的"可选参数"方案:比 `new(a, b, c, ...)` 好读,也比到处传 `Option` 清晰。
 
 ### 2.3 关联常量
@@ -332,7 +332,7 @@ pub enum Expr {
 }
 ```
 
-见 [`src/memory/pred.rs:92-128`](../../src/memory/pred.rs)。如果直接写 `Not(Expr)` /
+见 [`src/memory/pred/ast.rs:87-123`](../../src/memory/pred/)。如果直接写 `Not(Expr)` /
 `And(Vec<Expr>)`,类型大小会**无限大**(`Expr` 里含 `Expr`……循环下去),编译器报
 `recursive type has infinite size`。`Box<T>` / `Box<[T]>` 是"堆上单个值"的所有权指针,
 本身大小固定(分别为一个指针、一个"指针 + 长度"胖指针),递归因此被截断。要点:
@@ -341,7 +341,7 @@ pub enum Expr {
   字段(如 `StartsWith(String, Arc<str>)`),模式里用 `(..)` 比写死 `(_, _)` 更稳;
 
 - **构造**:`Expr::Not(Box::new(inner))`、`Expr::And(vec![a, b].into_boxed_slice())`——
-  L4 的解析器与 `Display` 都这么造节点,见 [`src/query/parse.rs:228`](../../src/query/parse.rs);
+  L4 的解析器与 `Display` 都这么造节点,见 [`src/query/parse/grammar.rs:64`](../../src/query/parse/);
 - **解构**:模式写法和普通枚举一样,`Expr::Not(inner)` 里的 `inner` 绑定到 `&Box<Expr>`,
   用 `*inner` 或直接当 `Expr` 用(自动 deref);`match` 里也照常写 `Expr::Not(_)`;
 - **列表为什么用 `Box<[Expr]>` 而不是 `Vec<Expr>`**:AST 构造完就不再增删,`Box<[T]>`
@@ -384,7 +384,7 @@ match format {
 }
 ```
 
-见 [`src/persist/flush.rs:205-242`](../../src/persist/flush.rs)。要点:
+见 [`src/persist/flush/quant.rs:18-55`](../../src/persist/flush/quant.rs)。要点:
 
 - **穷尽性是免费的分派约束**:新增格式时,每个漏掉的 `match` 都会在编译期报
   `non-exhaustive patterns`(见 §3.3),不用维护"实现了 trait 却忘了登记"的注册表;
@@ -441,7 +441,7 @@ pub struct Scoring {                         // 字段含 f32
   所以载荷**不能是 `f32`**(`RowId`、`u32` 可以)。
 - 需要给 `f32` 排序时,用 `f32::total_cmp`(它定义了一个把 `NaN` 也纳入的全序),而不是
   `partial_cmp().unwrap()`(遇 `NaN` 会 panic)。mneme 的 `TopK` 排序不依赖载荷是浮点,而是由
-  `Metric::better` 决定方向,同分再比 `Ord` 载荷。见 [`src/core/heap.rs:221-230`](../../src/core/heap.rs)。
+  `Metric::better` 决定方向,同分再比 `Ord` 载荷。见 [`src/core/heap/ordering.rs:26-35`](../../src/core/heap/)。
 
 `derive` 也能用在枚举上,见 [`src/core/options/index.rs:87-97`](../../src/core/options/index.rs)
 的 `VectorFormat`。
@@ -486,7 +486,7 @@ impl Ord for Cand {
 }
 ```
 
-见 [`src/index/hnsw.rs:68-95`](../../src/index/hnsw.rs)。逐条解释:
+见 [`src/index/hnsw/search.rs:33-60`](../../src/index/hnsw/)。逐条解释:
 
 - **`f32::total_cmp` 提供全序**:`partial_cmp` 遇 `NaN` 返回 `None`,而 `Ord::cmp` 必须
   **永远**给出 `Less`/`Equal`/`Greater` 之一。`total_cmp` 按 IEEE-754 位模式定义了一个
@@ -587,7 +587,7 @@ pub enum MnemeError { ... }
 
 `#[non_exhaustive]` 表示"这个枚举将来可能增加变体":
 **外部 crate 的代码必须用 `_` 兜底匹配**,不能假设变体已全部列完。
-这样 mneme 未来新增错误变体时,不会破坏下游用户的编译。库的公共错误类型通常会加。
+这样 mneme 新增错误变体时,不会破坏下游用户的编译。库的公共错误类型通常会加。
 
 ---
 

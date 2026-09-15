@@ -89,6 +89,28 @@ impl Graph {
     }
 }
 
+/// [`MappedGraph::new`] 的输入参数(字段全部来自已校验的 hidx 头部与
+/// `node_table`,由打开期 [`open`](super::hidx::open) 逐项校验后传入)。
+#[derive(Debug)]
+pub(crate) struct MappedGraphParts {
+    /// hidx 文件整段视图(句柄存活期内有效)。
+    pub(crate) span: ByteSpan,
+    /// 节点数。
+    pub(crate) count: usize,
+    /// 每节点层级(`node_table` 的 level 列)。
+    pub(crate) levels: Vec<u8>,
+    /// 每节点邻接块在邻接区内的相对偏移(`node_table` 的 adj_off 列)。
+    pub(crate) offsets: Vec<usize>,
+    /// 邻接区在文件内的绝对起始偏移。
+    pub(crate) adj_start: usize,
+    /// 图参数(来自 hidx 头部)。
+    pub(crate) params: GraphParams,
+    /// 入口节点 id(载入期已验证 = 全图最高层)。
+    pub(crate) entry: u32,
+    /// 入口节点层级。
+    pub(crate) entry_level: u8,
+}
+
 /// hidx 头部记录的图参数(m/M0/构建宽度/ml)。
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct GraphParams {
@@ -130,17 +152,17 @@ pub(crate) struct MappedGraph {
 
 impl MappedGraph {
     /// 由已校验的头部数据与句柄构造惰性图。
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        span: ByteSpan,
-        count: usize,
-        levels: Vec<u8>,
-        offsets: Vec<usize>,
-        adj_start: usize,
-        params: GraphParams,
-        entry: u32,
-        entry_level: u8,
-    ) -> Self {
+    pub(crate) fn new(parts: MappedGraphParts) -> Self {
+        let MappedGraphParts {
+            span,
+            count,
+            levels,
+            offsets,
+            adj_start,
+            params,
+            entry,
+            entry_level,
+        } = parts;
         Self {
             span,
             count,
@@ -212,12 +234,16 @@ impl MappedGraph {
         let mut links = Vec::with_capacity(level + 1);
         let mut cursor = self.offsets[node];
         for _ in 0..=level {
+            // reason: 邻接区布局在打开期已逐节点校验(FC-INDEX-ERR-001),
+            // 此处 `cursor` 必指向本节点该层的 2 字节度数头。
             let header = self
                 .span
                 .slice(self.adj_start + cursor, 2)
                 .expect("hidx 邻接区载入期已校验(FC-INDEX-ERR-001)");
             let degree = usize::from(u16::from_le_bytes([header[0], header[1]]));
             let start = cursor + 2;
+            // reason: 同一次打开期校验保证 `degree` 个邻居字节必在邻接区内
+            // (越界/度数越界均在载入期被拒),故取切片不会失败。
             let bytes = self
                 .span
                 .slice(self.adj_start + start, degree * 4)

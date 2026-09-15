@@ -3,7 +3,7 @@
 感谢参与 Mneme。本项目的核心约束写在设计文档里,提交前请先读:
 
 - [docs/DESIGN.md](docs/DESIGN.md):分层地图、阅读路线、文档约定;
-- [14 测试与验收](docs/design/14-testing.md):每层"完成"的验收标准;
+- [14 测试与验收](docs/design/14-testing.md):每层的验收标准;
 - 各章末尾的**层边界契约**:本层向上暴露、向下依赖的精确接口。
 
 ## 基本规则
@@ -19,15 +19,15 @@
    [spec/contracts.md](docs/spec/contracts.md) 的 `FC-*` 编号,测试代码注释引用编号,
    防止"测了个寂寞";`tests/contract_traceability.rs` 在 `cargo test` 中校验契约↔测试双向映射。
 5. **无 panic 契约**:L0 所有函数返回 `Result` 或数学上可证明不 panic;
-   `unsafe` 仅允许出现在全库两处白名单:`src/core/simd.rs` 的 arch 内联与
-   `src/persist/source.rs` 的 `MmapSource`(均须 `// SAFETY:`)。
+   `unsafe` 仅允许出现在全库两处白名单:`src/core/simd/` 的 arch 内联与
+   `src/persist/source/` 的 `MmapSource`(均须 `// SAFETY:`)。
 
 ## 提交前检查
 
 ```bash
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test
+cargo test                   # 单测 + 集成 + doctest + examples/memory 离线用例
 cargo doc --no-deps          # 公开项必须 100% 文档覆盖(#![deny(missing_docs)])
 ```
 
@@ -72,12 +72,16 @@ Per 04 §13,未知帧类型必须在回放时中止而非跳过。补充覆盖�
 6. 交付前自查:无孤儿实现、无失效契约、无孤立测试;
 7. 证伪原则:每条 ERR/INV 契约须配备专项失败测试(放宽约束必有测试变红);
    机械化变异测试 `cargo-mutants`(配置见根目录 `mutants.toml`)由本机/专用
-   runner 手动执行(`cargo mutants`;存活变异体须补测试后重跑,不上 CI)。
+   runner 手动执行(`cargo mutants`;存活变异体须补测试后重跑,不上 CI);
+8. 示例/一次性脚本(`examples/memory`)按 FSVDD §1.2 豁免:不登记 `FC-*`、不参与
+   追溯矩阵,但仍须随 `cargo test` 通过 fmt / clippy / 离线用例。
 
 ## 文档修改
 
 - 设计文档改动请同步更新 [docs/DESIGN.md](docs/DESIGN.md) 的目录/约定与相关交叉引用;
 - 数学公式统一用 KaTeX 书写(行内 `$...$`、块级 `$$...$$`),不再提供纯文本降级形式;
+  `\text{...}` 内的下划线必须转义为 `\_`,否则 `mdbook build` 报 KaTeX parse error
+  (渲染失败时公式会原样留在页面上,必须零 WARN);
 - 本地预览:`cargo install mdbook mdbook-mermaid && cargo install mdbook-katex --no-default-features --features duktape && mdbook serve`
   (Windows MSVC 无法编译 `mdbook-katex` 默认的 quick-js 后端,须改用 duktape 后端)。
 

@@ -7,7 +7,7 @@
 use crate::core::error::Result;
 use crate::memory::index::IndexBuildRequest;
 
-use super::hnsw::HnswIndex;
+use super::hnsw::{BuildWithSlotsInput, HnswIndex};
 
 /// 由新节点集整体重建 HNSW 图,并显式给出节点到全局槽位的映射。
 ///
@@ -18,13 +18,13 @@ use super::hnsw::HnswIndex;
 /// # Errors
 /// 建图期段内量化或索引装配失败时返回结构化错误,绝不静默降级档位。
 pub(crate) fn rebuild_with_slots(request: IndexBuildRequest<'_>) -> Result<HnswIndex> {
-    HnswIndex::build_with_slots(
-        request.nodes,
-        request.slot_of,
-        request.params,
-        request.metric,
-        request.quant,
-        request.build_precision,
-        request.build,
-    )
+    HnswIndex::build_with_slots(BuildWithSlotsInput {
+        nodes: request.nodes,
+        slot_of: request.slot_of,
+        params: request.params,
+        metric: request.metric,
+        quant: request.quant,
+        precision: request.build_precision,
+        build: request.build,
+    })
 }

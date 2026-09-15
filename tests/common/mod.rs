@@ -1,14 +1,19 @@
-//! 契约测试共享辅助:可注入假时钟与常用断言工具。
+//! 契约测试共享辅助:可注入假时钟、环境变量入口与常用断言工具。
 //!
 //! 供 `tests/` 下的契约测试文件(`core_contracts.rs`、`memory_contracts.rs`、
 //! `query_contracts.rs`、`model_contracts.rs`、`life_contracts.rs`)复用;
 //! 本模块只提供工具,不承载任何 `#[test]`。各测试 crate 只用到其中一部分,
 //! 故对未用条目显式豁免 dead_code(reason: 按 crate 选择性使用,属共享工具)。
+//!
+//! 环境变量一律经 [`env`] 子模块读取(变量清单与 `.env` 兜底口径见该文件);
+//! Mneme 本体不读环境变量,heavy 调参由测试侧读入后经 [`tuning_with_env`] 显式注入配置。
 #![allow(dead_code)]
+
+pub mod env;
 
 use std::sync::{Arc, Mutex};
 
-use mneme::{Clock, InsertOutcome, Mneme, RowId};
+use mneme::{Clock, InsertOutcome, Mneme, RowId, Tuning};
 
 /// 可注入的假时钟(毫秒)。
 #[derive(Clone, Default)]
@@ -57,28 +62,32 @@ pub fn reference_dot(query: &[f32], records: &[(u64, Vec<f32>)], k: usize) -> Ve
 
 /// heavy 门槛默认规模(冒烟):50_000×128,普通开发机秒级到分钟级完成。
 ///
-/// 正式门槛(1M×1536)由 CI heavy 档以 `MNEME_HEAVY_ROWS`/`MNEME_HEAVY_DIM` 指定。
+/// 正式门槛(1M×1536)由 CI heavy 档以 [`env::HEAVY_ROWS`]/[`env::HEAVY_DIM`] 指定。
 pub const HEAVY_DEFAULT_ROWS: usize = 50_000;
 /// heavy 门槛默认向量维度(见 [`HEAVY_DEFAULT_ROWS`])。
 pub const HEAVY_DEFAULT_DIMENSION: usize = 128;
 
-/// 读取 `MNEME_HEAVY_ROWS`(缺省 [`HEAVY_DEFAULT_ROWS`]);非法值显式失败。
+/// 读取 [`env::HEAVY_ROWS`](缺省 [`HEAVY_DEFAULT_ROWS`]);非法值显式失败。
 pub fn heavy_rows() -> usize {
-    env_usize("MNEME_HEAVY_ROWS", HEAVY_DEFAULT_ROWS)
+    env::usize_or(env::HEAVY_ROWS, HEAVY_DEFAULT_ROWS)
 }
 
-/// 读取 `MNEME_HEAVY_DIM`(缺省 [`HEAVY_DEFAULT_DIMENSION`]);非法值显式失败。
+/// 读取 [`env::HEAVY_DIM`](缺省 [`HEAVY_DEFAULT_DIMENSION`]);非法值显式失败。
 pub fn heavy_dimension() -> usize {
-    env_usize("MNEME_HEAVY_DIM", HEAVY_DEFAULT_DIMENSION)
+    env::usize_or(env::HEAVY_DIM, HEAVY_DEFAULT_DIMENSION)
 }
 
-/// 从环境变量读取正整数;未设置用 `default`,配错不得静默回退。
-fn env_usize(name: &str, default: usize) -> usize {
-    match std::env::var(name) {
-        Ok(value) => value
-            .parse()
-            .unwrap_or_else(|_| panic!("{name} 非法(需为正整数): {value:?}")),
-        Err(_) => default,
+/// 依环境变量覆盖建库调参:设置 [`env::FLUSH_THREADS`] / [`env::FLUSH_CHUNK_ROWS`]
+/// 时注入对应 [`Tuning`] 字段,未设置保持 `base` 原值。
+///
+/// 库本体不读环境变量(设计 16 §6);heavy 档的块级调参由测试侧读入后显式注入,
+/// 与 `Builder::tuning` 的配置路径完全一致。
+pub fn tuning_with_env(base: Tuning) -> Tuning {
+    Tuning {
+        flush_threads: env::optional_usize(env::FLUSH_THREADS).unwrap_or(base.flush_threads),
+        flush_chunk_rows: env::optional_usize(env::FLUSH_CHUNK_ROWS)
+            .unwrap_or(base.flush_chunk_rows),
+        ..base
     }
 }
 

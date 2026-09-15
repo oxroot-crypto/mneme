@@ -10,7 +10,7 @@ use crate::core::error::{MnemeError, Result};
 use crate::persist::hook::{FsyncHook, IoAction};
 use crate::persist::manifest::{self, Manifest};
 use crate::persist::recover::SegmentBytes;
-use crate::persist::source::SegmentHandle;
+use crate::persist::source::{SegmentHandle, SegmentHandleOpenInput};
 use crate::persist::storage::{
     CURRENT_FILE, MANIFEST_KEEP, SEGMENTS_DIR, Storage, WAL_DIR, hidx_name, manifest_name,
     msec_name, parse_manifest_name, vsec_name,
@@ -207,13 +207,13 @@ pub(super) fn open_segment_handles(
 ) -> Result<Vec<SegmentBytes>> {
     let mut segments = Vec::new();
     for segment in &manifest.segments {
-        let handle = SegmentHandle::open(
+        let handle = SegmentHandle::open(&SegmentHandleOpenInput {
             storage,
-            segment.segment_id,
-            segment.hidx_crc,
+            segment_id: segment.segment_id,
+            expected_hidx_crc: segment.hidx_crc,
             fail_fast,
             encryption,
-        )?;
+        })?;
         segments.push(SegmentBytes::from_handle(&handle));
     }
     Ok(segments)

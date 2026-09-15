@@ -78,23 +78,23 @@ src/
   lib.rs          # crate 根:pub mod core/memory;私有 mod index/life/persist/quant/query
   core/           # L0 原语层(公开)
     mod.rs        # 声明子模块
-    types.rs error.rs metric.rs simd.rs heap.rs varint.rs meta.rs bitset.rs text.rs
+    types.rs error.rs metric.rs simd/ heap/ varint.rs meta.rs bitset.rs text.rs
     options/
       mod.rs
       clock.rs dimension.rs ...
   memory/         # L1 内存引擎(公开)
-    mod.rs engine.rs engine_ops.rs config.rs record.rs search.rs pred.rs ...
+    mod.rs engine.rs engine_ops/ config.rs record/ search/ pred/ ...
     table/ namespace/ analysis/ ...
   persist/        # L2 持久层(crate 内部;门面经 memory 暴露)
-    mod.rs vsec.rs manifest.rs edges.rs flush.rs source.rs storage.rs
+    mod.rs vsec/ manifest/ edges.rs flush/ source/ storage/
     codec.rs hook.rs trash.rs
     wal/ msec/ recover/ store/
   index/          # L3 索引层(crate 内部)
-    mod.rs hnsw.rs graph.rs filtered.rs rebuild.rs hidx.rs factory.rs
+    mod.rs hnsw/ graph.rs filtered.rs rebuild.rs hidx/ factory.rs
   query/          # L4 检索层(crate 内部)
-    mod.rs parse/ display.rs json.rs iso.rs plan.rs zmap.rs bm25.rs fusion.rs exec.rs
+    mod.rs parse/ display.rs json.rs iso.rs plan/ zmap.rs bm25.rs fusion.rs exec/
   life/           # L5 生命周期层(crate 内部)
-    mod.rs compact.rs maintenance.rs
+    mod.rs compact/ maintenance.rs
   quant/          # L6 量化原语(crate 内部;纯原语,依赖等级同 L0)
     mod.rs f16.rs scalar_i8.rs rescore.rs support.rs
   fuzzing.rs      # fuzz 专用解析入口(feature "fuzzing";仅 fuzz 构建)
@@ -121,7 +121,7 @@ pub mod varint;
 
 见 [`src/core/mod.rs`](../../src/core/mod.rs)。**规范要求 `mod.rs` 只做组织与 `pub use`,不写业务逻辑。**
 
-> **条件模块/条件项**:`mod` 声明与其他项一样能用 `#[cfg]` 控制。L2 的 `source.rs` 里
+> **条件模块/条件项**:`mod` 声明与其他项一样能用 `#[cfg]` 控制。L2 的 `source/` 里
 > `MmapSource` 整个类型只在 `feature = "mmap"` 时存在:
 >
 > ```rust
@@ -131,7 +131,7 @@ pub mod varint;
 > }
 > ```
 >
-> 见 [`src/persist/source.rs:89-92`](../../src/persist/source.rs)。关闭 feature 时该类型
+> 见 [`src/persist/source/backend.rs:74-77`](../../src/persist/source/)。关闭 feature 时该类型
 > 与相关方法都不参与编译,由 `FileSource` 兜底(见 [09 §4.2](09-cfg-unsafe-simd.md))。
 
 条件还能加在**模块声明**上。L6 的 `quant` 模块把 f16 子模块整个挂上 feature 门:
@@ -269,8 +269,8 @@ f.write_str("never")?;   // 同上
 
 `{self, Write}` 里的 `self` 指"这个模块本身"——这一行同时把模块名 `fmt` 与 trait `Write`
 带进作用域(`fmt::Formatter`、`fmt::Result` 因此可用)。`use` 的路径组里都能写 `self`:
-L4 的 plan.rs 用 `use crate::memory::pred::{self, EvalCtx, Expr};` 同时引入模块 `pred`
-(以便调用 `pred::matches`)与两个类型,见 [`src/query/plan.rs:10`](../../src/query/plan.rs)。
+L4 的 plan/ 用 `use crate::memory::pred::{self, EvalCtx, Expr};` 同时引入模块 `pred`
+(以便调用 `pred::matches`)与两个类型,见 [`src/query/plan/filter.rs:8`](../../src/query/plan/)。
 
 ---
 

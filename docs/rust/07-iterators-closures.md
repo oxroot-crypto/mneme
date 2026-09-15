@@ -2,9 +2,9 @@
 
 > **本章目标**:掌握 `for` 循环、迭代器链式调用(adapter)、闭包,以及 `sort_by` + `Ordering`。
 > **前置**:[04 章](04-borrowing-strings-slices.md)(引用)、[06 章](06-generics-traits.md)(trait)。
-> **对应源码**:[`src/core/simd.rs`](../../src/core/simd.rs)、[`src/core/heap.rs`](../../src/core/heap.rs)、
+> **对应源码**:[`src/core/simd/`](../../src/core/simd/)、[`src/core/heap/`](../../src/core/heap/)、
 > [`src/core/varint.rs`](../../src/core/varint.rs)、[`src/memory/namespace/access.rs`](../../src/memory/namespace/access.rs)、
-> [`src/index/hnsw.rs`](../../src/index/hnsw.rs)、[`src/index/filtered.rs`](../../src/index/filtered.rs)、
+> [`src/index/hnsw/`](../../src/index/hnsw/)、[`src/index/filtered.rs`](../../src/index/filtered.rs)、
 > [`src/query/bm25.rs`](../../src/query/bm25.rs)、[`src/query/fusion.rs`](../../src/query/fusion.rs)、
 > [`src/quant/scalar_i8.rs`](../../src/quant/scalar_i8.rs)、[`src/quant/f16.rs`](../../src/quant/f16.rs)。
 
@@ -65,7 +65,7 @@ a.iter()                       // &f32
  .sum::<f32>()                 // 消费:求和
 ```
 
-这是 mneme 的标量点积实现(下为教学简化片段),见 [`src/core/simd.rs:86-99`](../../src/core/simd.rs):
+这是 mneme 的标量点积实现(下为教学简化片段),见 [`src/core/simd/mod.rs:96-109`](../../src/core/simd/):
 
 ```rust
 pub fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
@@ -74,7 +74,7 @@ pub fn dot_scalar(a: &[f32], b: &[f32]) -> f32 {
 ```
 
 > 上面略去了闭包内的 `#[cfg(test)]` 计数块(`MUL_ADDS` 逐元素累加乘加次数,与
-> `heap.rs::COMPARES` 同口径,只有测试构建才编译);其余与源码一致。
+> `heap/::COMPARES` 同口径,只有测试构建才编译);其余与源码一致。
 > `zip` 在**较短的迭代器耗尽时停止**,所以 `dot_scalar` 对长度不等的切片按较短者计算,
 > 不会 panic。`dot`(SIMD 版)也显式用 `n = a.len().min(b.len())` 保持同样语义;
 > 只有 `dot` 在 debug 构建下对等长做 `debug_assert`(见 [09 章](09-cfg-unsafe-simd.md)),
@@ -118,7 +118,7 @@ view.ns_registry.iter().find_map(|(id, path)| {
 })
 ```
 
-见 [`src/query/exec.rs:216-223`](../../src/query/exec.rs)。闭包返回 `Option`,所以既能"过滤掉
+见 [`src/query/exec/validate.rs:99-106`](../../src/query/exec/)。闭包返回 `Option`,所以既能"过滤掉
 不关心的项",又能顺手做转换;`**path` 的双重解引用见 [04 §3.3](04-borrowing-strings-slices.md)。
 
 `chunks_exact(n)` 是"按块处理连续数据"的入口,L6 的量化编解码到处在用它:i8 参数表以交错
@@ -148,9 +148,9 @@ for (index, pair) in table.chunks_exact(2).enumerate() {
 
 - `Vec::extend(iter)`:把另一个迭代器(或 `Vec`)的元素追加进来。L4 解析器把第一个子表达式与
   收集到的其余项合并成一个列表再 `into_boxed_slice`,见
-  [`src/query/parse.rs:191-194`](../../src/query/parse.rs);
+  [`src/query/parse/grammar.rs:27-30`](../../src/query/parse/grammar.rs);
 - `Vec::truncate(n)`:只保留前 `n` 个元素(多出的直接丢掉)。L4 执行管线在融合排序后按 `top_k`
-  截断,见 [`src/query/exec.rs:391`](../../src/query/exec.rs)。
+  截断,见 [`src/query/exec/post.rs:38`](../../src/query/exec/)。
 
 ### 3.1 `enumerate` 的例子
 
@@ -220,13 +220,13 @@ let max = oriented.iter().copied().fold(f64::NEG_INFINITY, f64::max);
   versions.sort_by_key(|(row, _)| (row.rowid, row.seqno));
   ```
 
-  见 [`src/persist/recover/state.rs:81`](../../src/persist/recover/state.rs)。要求键类型
+  见 [`src/persist/recover/state/types.rs:72`](../../src/persist/recover/state/)。要求键类型
   实现 `Ord`;键里含 `f32` 时不能直接用,得换成 `total_cmp` 版的 `sort_by`(见
   [03 §4.1](03-structs-enums-impl.md))。
 
 - **`binary_search`**:在**已排序**切片上二分定位,返回 `Ok(下标)` 或 `Err(插入点)`;
   L5 的 compaction 用它把"按槽位排序的幸存列表"定位到目标槽位(见
-  [`src/memory/engine_ops.rs:431`](../../src/memory/engine_ops.rs))。
+  [`src/memory/engine_ops/compact.rs:218`](../../src/memory/engine_ops/compact.rs))。
 
 - **`filter_map`**:`filter` + `map` 合一,闭包返回 `Option`,`None` 直接丢弃:
 
@@ -238,7 +238,7 @@ let max = oriented.iter().copied().fold(f64::NEG_INFINITY, f64::max);
       .collect()
   ```
 
-  见 [`src/memory/table/state.rs:536-540`](../../src/memory/table/state.rs)。和 `find_map`
+  见 [`src/memory/table/state/index.rs:22-26`](../../src/memory/table/state/)。和 `find_map`
   (§3)的区别是:它消费**整个**迭代器,而不是拿到第一个 `Some` 就停。
 
 - **`windows(n)`**:滑动窗口,每次产出连续的 `n` 个元素的切片;CJK bigram 分词靠它:
@@ -293,7 +293,7 @@ self.heap.sort_by(|a, b| {
 });
 ```
 
-见 [`src/core/heap.rs:207-218`](../../src/core/heap.rs)。
+见 [`src/core/heap/topk.rs:178-189`](../../src/core/heap/)。
 
 - 闭包参数 `a`、`b` 是 `&Entry<T>`(因为 `sort_by` 传引用)。
 - 返回值是 `std::cmp::Ordering`,三选一:`Less`(a 在前)、`Greater`(b 在前)、`Equal`。
@@ -304,7 +304,7 @@ self.heap.sort_by(|a, b| {
 > `a.score.partial_cmp(&b.score).unwrap()` 的原因:`f32` 的 `partial_cmp` 遇到 `NaN` 返回 `None`,
 > `unwrap()` 会 panic。mneme 绕开浮点比较,改用 `Metric::better` + `Ord` 载荷保证全序:
 > 对任意 `a`、`b`,`is_better(a, b)` 与 `is_better(b, a)` 至多一个为真,相等时再用
-> `a_payload < b_payload` 兜底。见 [`src/core/heap.rs:221-230`](../../src/core/heap.rs)。
+> `a_payload < b_payload` 兜底。见 [`src/core/heap/ordering.rs:26-35`](../../src/core/heap/)。
 
 ### 4.2 闭包捕获与借用规则
 
@@ -430,7 +430,7 @@ while let Some(current) = frontier.pop() {
 }
 ```
 
-见 [`src/index/hnsw.rs:320-365`](../../src/index/hnsw.rs)。两个堆的分工:
+见 [`src/index/hnsw/quant.rs:27-72`](../../src/index/hnsw/)。两个堆的分工:
 
 - `frontier`(最大堆):按"越近键越大",每次弹**最有希望**的候选继续扩展——best-first;
 - `results`(最小堆 + `Reverse`):固定大小 `ef`,只淘汰**最差**。`Reverse` 让"堆顶 =
@@ -454,7 +454,7 @@ if !visited.insert(neighbor) {
 }
 ```
 
-见 [`src/index/hnsw.rs:328-346`](../../src/index/hnsw.rs)。对照 `Vec<u32>` 的 `contains`
+见 [`src/index/hnsw/quant.rs:35-53`](../../src/index/hnsw/)。对照 `Vec<u32>` 的 `contains`
 是 $O(n)$ 线性扫描;需要反复问"在不在集合里"时,`HashSet` 的期望 $O(1)$ 是数量级差别
 (代价是哈希与额外内存)。要放进 `HashSet` 的类型必须实现 `Hash + Eq`(见
 [03 §4](03-structs-enums-impl.md))。
@@ -517,7 +517,7 @@ let v: Vec<i32> = [Some(1), None, Some(3)].into_iter().flatten().collect();
 
 数组则经 `IntoIterator` 进入 `for` 循环(即 §2 表中的 `into_iter` 一行,拿到的是元素值)。
 mneme 的测试里也常见 `for (score, id) in [...]` 直接遍历数组,见
-[`src/core/heap.rs:287-296`](../../src/core/heap.rs)。
+[`src/core/heap/tests.rs:7-16`](../../src/core/heap/)。
 
 ---
 

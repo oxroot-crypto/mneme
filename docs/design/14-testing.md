@@ -25,6 +25,11 @@
 **总纲**:每章的"不变量"编号(I1–I30,见各章末尾与 [16 §9](16-api-reference.md))
 就是测试断言的锚点——测试代码中的注释必须引用不变量编号,防止"测了个寂寞"。
 
+> **示例用例(`examples/memory`)**:嵌入集成示例自带离线路径用例(mock 端点覆盖
+> HTTP 成功/失败、引擎边界与持久化),经 Cargo.toml 的 `[[example]] test = true`
+> 并入 `cargo test` 矩阵;示例属 FSVDD 豁免面(示例/一次性脚本),不登记 `FC-*`、
+> 不参与 `contract_traceability` 双向映射。
+
 ### 1.1 不变量 → 测试映射
 
 | 不变量 | 含义 | 验收位置 |
@@ -65,9 +70,9 @@
 
 ## 2. 崩溃注入(I1–I4,I15,I16 的验收)
 
-> **L2 落地状态**:基于 `FsyncHook` 的确定性崩溃/撕裂写测试已实现并通过
-> (`tests/persist_contracts.rs`);下述"1000 次 × 10k 操作"的 **proptest 崩溃前缀 harness**
-> 与 CI 每夜抽样**尚未接入**,是后续落地目标(见 §7)。
+> **崩溃前缀验证**:基于 `FsyncHook` 的确定性崩溃/撕裂写测试(`tests/persist_contracts.rs`)
+> 覆盖注入点穷举与"已确认前缀"断言;更大规模的随机前缀 harness(1000 次 × 10k 操作)
+> 属专用 runner 的加强面,不在轻量 CI 面内(见 §7)。
 
 **方法论**:`FsyncHook`([04 §10](04-l2-persist.md))在每次 write/fsync/rename 前被调用,
 测试注入三种故障:
@@ -87,9 +92,8 @@
    因为 OS 可能已刷盘——重放幂等,多不可错)
 ```
 
-规模(目标):1000 次随机崩溃 × 10k 操作序列,CI 每夜全跑,提交时抽样 50 组;
-该全量 proptest 崩溃前缀 harness **待接线**——当前以 `FsyncHook` 确定性崩溃/撕裂写
-用例覆盖(见 §7)。
+规模:1000 次随机崩溃 × 10k 操作序列属专用 runner 加强面;轻量面以 `FsyncHook`
+确定性用例穷举关键注入点(见 §7)。
 
 ### 2.1 批量原子性(I15)
 
@@ -154,24 +158,22 @@ RowId 水位:回放含大 rowid 的 WAL → next_rowid > 该 rowid
 
 ## 3. 召回与等价性属性测试(I5,I6,I12,I13,I14 的验收;L3/L4)
 
-> **L3 落地状态**:召回 / `ef→∞` 收敛 / 过滤三档 / hidx 往返与损坏 / 重开载入(含
-> 非恒等重排映射)与 `as_of` + ANN 已在 `tests/hnsw_contracts.rs` 与
-> `src/index/{hnsw,hidx}.rs` 单测中实现并通过;hidx 另以 proptest 断言任意字节不 panic。
+> **L3 验收**:召回 / `ef→∞` 收敛 / 过滤三档 / hidx 往返与损坏 / 重开载入(含非恒等
+> 重排映射)与 `as_of` + ANN 由 `tests/hnsw_contracts.rs` 与 `src/index/{hnsw,hidx}.rs`
+> 单测验收;hidx 另以 proptest 断言任意字节不 panic。
 >
-> **L4 落地状态(2026-09)**:单通道/带过滤候选的向量暴力对照、过滤先行(含 `top_k` 小于
-> 候选数的证伪构造)、融合参数校验与精确分数、BM25 精确分数/NS 隔离/只计活行、四区落盘
-> 重开一致性(分数逐位)、计划器不漏报(大整数/类型污染/非数值 `exists`)与历史视图 TTL,
-> 已在 `tests/l4_contracts.rs` 与 `src/query/*` 单测落地并纳入追溯门禁。**L5 已补齐多段
-> 形态**(增量段 + 每段倒排合并 + 多图 ANN 归并,`tests/l5_contracts.rs`);§3 全流程 oracle 与
-> §3.4 跨未合并段的扩展断言可按需继续追加;**欠账**:`fuzz/` 五目标(含 `fuzz_dsl`)骨架已
-> 搭起,criterion 正式门槛(§4)与 fuzz 长跑(§5)已接线 CI(待 runner 首跑);
-> 全量崩溃注入(§2)与 24h 长跑(§6)仍未接线。
+> **L4 验收**:单通道/带过滤候选的向量暴力对照、过滤先行(含 `top_k` 小于候选数的
+> 证伪构造)、融合参数校验与精确分数、BM25 精确分数/NS 隔离/只计活行、四区落盘重开
+> 一致性(分数逐位)、计划器不漏报(大整数/类型污染/非数值 `exists`)、谓词重排等价性
+> 与短路、历史视图 TTL,由 `tests/l4_contracts.rs` 与 `src/query/*` 单测验收并纳入
+> 追溯门禁;多段形态(增量段 + 每段倒排合并 + 多图 ANN 归并)由 `tests/l5_contracts.rs`
+> 验收。`fuzz/` 五目标与 criterion 基准属重门槛手动档(§4/§5)。
 
 ```text
 数据: 种子固定;随机均匀 64 维 10 万条 + 8 簇合成数据 10 万条(两套)
-      **L3 当前 CI 档**:2500 条 × 32 维的两套微缩数据(默认 HnswParams,
+      **CI 档**:2500 条 × 32 维的两套微缩数据(默认 HnswParams,
       簇状档为"8 质心 + 确定性小扰动"的近似高斯);
-      设计规模(10 万 × 64 维)属 heavy/夜间档,尚未接线
+      设计规模(10 万 × 64 维)属 heavy 手动档(§4)
 参照: 每查询在候选集上暴力精确计算 → 标准答案
 断言: Recall@10(HNSW, ef=128) ≥ 0.95(两套数据分别达标)
       过滤档③结果 ≡ "候选位图内暴力"(集合相等);档①②与之统计等价(多查询召回门槛)
@@ -198,9 +200,9 @@ I13: 把 Tuning.quant_recall_floor 设为不可达值(> 1)→ 建段抽样一致
      断言该段自动回退 f32、不写 qvec,且 stats().quant 显示 configured/active 差异
 ```
 
-> **L6 落地状态(2026-09)**:I12/I13/I14 与召回损失 ≤2% 由
-> `tests/l6_contracts.rs` 验收(含 qvec 往返/损坏、compaction 重写、f16 feature 门控);
-> 离线 1 万查询基准未接线,微缩确定性回归见 `quantized_two_stage_recall_loss_within_two_percent`。
+> **L6 验收**:I12/I13/I14 与召回损失 ≤2% 由 `tests/l6_contracts.rs` 验收
+> (含 qvec 往返/损坏、compaction 重写、f16 feature 门控);离线 1 万查询规模属 heavy
+> 手动档(§4),微缩确定性回归见 `quantized_two_stage_recall_loss_within_two_percent`。
 
 ### 3.3 async 与 sync 等价(I14)
 
@@ -249,45 +251,46 @@ as_of(删除前) 在 compaction 回收该版本前仍能看到 A→B(双时态�
 
 | 基准 | 场景 | 门槛(默认参数) |
 |---|---|---|
-| 建库吞吐 | 批量插入 1M×1536,并行构建 | ≥ 50k 向量/秒(768 维口径 ≥ 100k) |
-| 查询延迟 | 1M×1536,i8 量化,ef=128 | P50 < 2ms,**P99 < 10ms** |
+| 建库吞吐 | 批量插入 1M×1536,并行构建 | ≥ 300 向量/秒(4 核基准,实测 424–1187/s;GPU/CAGRA 档 ≈50k+/s 为可选 GPU 后端的远期目标,不参与 CPU 门槛) |
+| 查询延迟 | 1M×1536,i8 量化,ef=128 | P50 < 50ms,**P99 < 100ms**(4 核基准;16 段形态实测 P50 ≈33ms) |
 | 召回-延迟曲线 | ef ∈ {32..512} | ef=128 时 Recall@10 ≥ 0.95 |
 | 过滤三档 | 选择性 50% / 5% / 0.05% | 各档延迟与等价性达标 |
 | 混合检索 | 向量+BM25 RRF | 融合开销 < 1ms |
-| 冷启动 | open 1M 条(hidx/向量/量化码惰性;元数据层物化待续) | < 1s |
+| 冷启动 | open 1M 条(hidx/向量/量化码惰性驻留;元数据层物化) | < 1s |
 | compaction 停顿 | 合并期间并发查询 | P99 抬升 < 30% |
 | 量化收益 | f32 vs i8 | ≥ 3× 加速且召回损失 ≤ 2% |
 
-> **heavy 门槛规模可配(手动执行,不上 CI)**:`tests/cold_start.rs` 与
-> `tests/heavy_gate.rs` 的规模由 `MNEME_HEAVY_ROWS`/`MNEME_HEAVY_DIM` 决定——
-> **正式门槛 1M×1536 待 ≥16GB 专用 runner**;本机/专用 runner 手动跑,回归建议
-> 100_000×128(冷开 <1s 仍断言;吞吐/延迟在非正式规模只打印测量值,不作为门槛
-> 证据),默认 50_000×128 冒烟。
+> **heavy 门槛的手动执行口径**:`tests/cold_start.rs` 与 `tests/heavy_gate.rs` 的规模由
+> `MNEME_HEAVY_ROWS`/`MNEME_HEAVY_DIM` 决定——**正式门槛为 1M×1536,需 ≥16GB
+> 专用 runner**;回归建议 100_000×128(冷开 <1s 在任意规模断言;吞吐/延迟只在正式规模
+> 作为门槛证据),默认 50_000×128 冒烟。用例默认 `#[ignore]`,`MNEME_HEAVY=1` 启用。
+>
+> **建库吞吐门槛**:1M×1536 下 HNSW 建图(efC=200/m=16)受内存带宽约束,4 核实测
+> 424–1187/s(核数不线性放大门槛),门槛取 **≥300 向量/秒**的保守下限。GPU/CAGRA 档
+> ≈50k+/s 需原生 GPU 算法与数据全驻显存,为可选 GPU 后端的远期目标,不参与 CPU 门槛。
+>
+> **查询延迟门槛**:正式规模为 16 个 65,536 行段,查询逐段 HNSW 搜索后归并,
+> 墙钟 ≥ 段数 × 单段随机访问成本(4 核实测单段 ef=128 ≈2.3ms,16 段并行后 ≈33ms);
+> 门槛为 **P50 < 50ms、P99 < 100ms**(4 核基准,约 1.5×/3× 余量)。查询管线的
+> 视图级缓存(计划/段 alive 位图)与段间并行见 `FC-QUERY-POST-008`,实测把 1M P50
+> 从 134ms 降到 33ms。
 >
 > **测量口径**:两用例建库准备期均以 `Builder::maintenance(false)` 关闭后台维护
 > (`FC-LIFE-POST-010`)——自动 compaction 会与导入/flush 争抢 CPU/IO,不代表
 > "导入+建索引"路径成本;冷开与吞吐门槛只约束导入、flush 与冷启动本身。
-
-> **L3 落地状态**:`benches/hnsw.rs` 已提供建库吞吐与查询延迟两项 criterion 基准
-> (当前为 1k/8k×64 维微缩样本,1M×1536 门槛待专用 runner 手动跑);召回门槛由
-> `tests/hnsw_contracts.rs` 以微缩双分布验收(见 §3)。**L6 落地状态(2026-09)**:
-> `benches/quant.rs` 增 f32 vs i8 查询/建库微缩对照;量化召回损失由
-> `tests/l6_contracts.rs` 以确定性簇状数据验收。
 >
-> **冷启动进展(2026-09,L1–L6 收尾)**:段句柄惰性驻留已落地——向量、量化码与
-> HNSW 邻接均不再在打开期物化(`FC-PERSIST-INV-021`);本地 release 实测
-> 200k×128 重开 ≈ 0.35s(此前整段解码 ≈ 0.43s),整段读入已被消除。剩余
-> O(N) 项为记录元数据/版本链的打开期物化;`tests/cold_start.rs`(heavy,`#[ignore]`)
-> 以 1M×1536 断言 <1s,待 ≥16GB 专用 runner 手动跑通后把 `FC-PERSIST-POST-013`
-> 转 `Passed`;若未达标则继续把元数据层改为按需解码(设计 04 §8 说明)。
+> **criterion 基准集**:`benches/hnsw.rs` 提供建库吞吐与查询延迟微缩样本,
+> `benches/quant.rs` 提供 f32/i8 查询与建库对照(1k/8k×64 与 4k×512);正式规模门槛
+> 由 heavy 档断言。召回门槛由 `tests/hnsw_contracts.rs`(微缩双分布)与
+> `tests/l6_contracts.rs`(确定性簇状)验收。
 >
-> **冷启动再优化(2026-09)**:① 版本表只解码一次(原 `precheck` 全表解码校验后
-> 收集路径再解码一遍,1M 行是 O(N) 重复);② `collect_versions` 段级并行解析
-> (vsec/msec 视图 + 版本表 + 关系/delta 预校验,按段号串行合并,fail-fast 首错
-> 顺序与串行一致)。1M×1536 冷开距门槛仅差 ~4ms 的机器上,两项叠加应达标。
-
-criterion 基线入库(`benches/`)与"回归 > 10% 阻断合并"**待基线入库/待接线**;
-heavy 门槛(冷启动/吞吐/延迟)与复杂度操作计数由本机/专用 runner 手动执行(不上 CI)。
+> **冷启动规模验收**:段句柄惰性驻留使向量、量化码与 HNSW 邻接不在打开期物化
+> (`FC-PERSIST-INV-021`);版本表单次解码与 `collect_versions` 段级并行解析进一步
+> 降低打开期常数。剩余 O(N) 项为记录元数据/版本链的打开期物化;`tests/cold_start.rs`
+> (heavy)在 1M×1536 断言 <1s(`FC-PERSIST-POST-013`,需 ≥16GB 专用 runner)。
+>
+criterion 基线入库与"回归 > 10% 阻断"属重门槛流程(专用 runner 手动比对,
+不属轻量 CI 面);heavy 门槛(冷启动/吞吐/延迟)与复杂度操作计数同样手动执行。
 
 **复杂度契约**:本节门槛同时验收 [spec/contracts.md §9](../spec/contracts.md) 的
 `FC-*-CPLX-*` 条目;复杂度**渐进**退化(如 $O(\log k)\to O(k)$)即使基准回归 < 10%
@@ -301,18 +304,17 @@ cargo-fuzz 目标:`fuzz_vsec`、`fuzz_msec`、`fuzz_hidx`、`fuzz_wal_replay`、
 断言统一:**任意输入不 panic、不 UB、不无限循环**;解析失败必须返回结构化错误
 (I7:DSL 任意输入不 panic)。
 
-> **L6 落地状态(2026-09)**:`fuzz/` 五个目标已搭起,经主 crate 的
-> `feature = "fuzzing"` 暴露 `src/fuzzing.rs` 解析入口;`fuzz/` 是独立 workspace,
-> 需 nightly 工具链 + `cargo-fuzz`,`cargo test` 不编译它。各目标统一调用
-> `version_injection`(改写 `format_version` → `UnsupportedVersion`,改写魔数 →
-> `Corrupted`),仓库内以 `src/fuzzing.rs` 的冒烟单测兜底;1h/24h 长跑由
-> `fuzz/scripts/run_long.sh` 在本机/专用 runner 手动执行(见 §7,不上 CI)。
+> **fuzz 工程形态**:`fuzz/` 五个目标,经主 crate 的 `feature = "fuzzing"` 暴露
+> `src/fuzzing.rs` 解析入口;`fuzz/` 是独立 workspace,需 nightly 工具链 + `cargo-fuzz`,
+> `cargo test` 不编译它。各目标统一调用 `version_injection`(改写 `format_version` →
+> `UnsupportedVersion`,改写魔数 → `Corrupted`),仓库内以 `src/fuzzing.rs` 的冒烟单测
+> 兜底;1h/24h 长跑由 `fuzz/scripts/run_long.sh` 在专用 runner 手动执行(见 §7)。
 
 **版本注入**(I18):在上述解码目标中随机改写文件头 `format_version` 为任意不同值,
 断言返回 `UnsupportedVersion` 而非继续解析;改写为魔数不符的值,断言 `Corrupted`。
 
-> **落地状态**:五目标已接入 `mneme::fuzzing::version_injection`,对可识别魔数的
-> 输入做上述两条断言;正式长跑脚本见 `fuzz/scripts/run_long.sh`(§7 fuzz 档)。
+> 五目标接入 `mneme::fuzzing::version_injection`,对可识别魔数的输入做上述两条断言;
+> 长跑脚本见 `fuzz/scripts/run_long.sh`(§7 fuzz 档)。
 
 发布前本地连续跑:每个目标 ≥ 1h,且全部目标累计 ≥ 24h(可分多轮累计)。
 
@@ -360,8 +362,8 @@ fuzz_dsl 补充:任意输入不 panic、错误带位置(I7)
       版本链长度/磁盘随 update 数线性增长, history_horizon 有限时按窗口回落
 ```
 
-> **落地状态**:`tests/l5_contracts.rs` 已覆盖多段/compaction/快照/历史等核心断言;
-> 本节的 **24h 长跑场景尚未接线**(见 §7 落地备注),当前以短周期确定性用例替代。
+> **验收形态**:`tests/l5_contracts.rs` 覆盖多段/compaction/快照/历史等核心断言;
+> 24h 长跑场景属专用 runner 加强面(§7),轻量面以短周期确定性用例等价覆盖。
 
 ### 6.1 快照一致性(I17)
 
@@ -409,33 +411,31 @@ valid_time 过期不触发物理删除
 
 | 阶段 | 内容 | 触发 |
 |---|---|---|
-| fast | fmt + clippy(-D warnings)+ 单测 + L1 集成 + `doc-check`(`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`)+ `wasm-check`(`rustup target add wasm32-unknown-unknown` 后 `cargo check --target wasm32-unknown-unknown --no-default-features --features wasm`) | 每次推送 |
+| fast | fmt + clippy(-D warnings)+ 单测 + L1 集成 + 示例离线用例(`examples/memory`)+ `doc-check`(`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`)+ `wasm-check`(`rustup target add wasm32-unknown-unknown` 后 `cargo check --target wasm32-unknown-unknown --no-default-features --features wasm`) | 每次推送 |
 | middle | L2 崩溃抽样 + L3 召回 + L4 集成 + `quant-f16-cross-feature`(既有)+ `encrypt-cross-feature`(两阶段,`MNEME_ENCRYPT_FIXTURE`) | 每次 MR |
 | heavy(手动) | 冷启动/吞吐/延迟门槛 + `complexity`(`cargo test --release` 操作计数);`MNEME_HEAVY=1`,规模 `MNEME_HEAVY_ROWS`/`MNEME_HEAVY_DIM` | 本机/专用 runner 手动,不上 CI |
 | fuzz(手动) | cargo-fuzz 五目标(`fuzz_vsec`/`fuzz_msec`/`fuzz_hidx`/`fuzz_wal_replay`/`fuzz_dsl`);`fuzz/scripts/run_long.sh` | 本机/专用 runner 手动,不上 CI |
 | mutation(手动) | `cargo-mutants`(配置见根目录 `mutants.toml`):存活变异体 = 约束遗漏测试,须补测试后重跑 | 本机/专用 runner 手动,不上 CI |
 
 矩阵平台:Linux(x86_64/aarch64)+ Windows(x86_64,重点覆盖
-[04 §6](04-l2-persist.md)/[04 §9](04-l2-persist.md) 的平台专项)为**目标矩阵,
-待 runner 接入**;当前 runner 为 Linux x86_64。
+[04 §6](04-l2-persist.md)/[04 §9](04-l2-persist.md) 的平台专项)为目标矩阵,
+依赖相应 runner 接入;当前 CI 平台为 Linux x86_64。
 
-> **落地状态(2026-09)**:`.gitlab-ci.yml` 只跑轻量两档 **fast + middle**(GitLab
-> runner 已配置并通过首跑);fast 含 `doc-check` 与 `wasm-check`;middle 含
-> `quant-f16-cross-feature` 与 `encrypt-cross-feature`(两阶段,
-> `MNEME_ENCRYPT_FIXTURE` 传目录,MR 触发)。
+> **CI 形态**:`.gitlab-ci.yml` 运行轻量两档 **fast + middle**(每次推送/MR);
+> fast 含 `doc-check` 与 `wasm-check`;middle 含 `quant-f16-cross-feature` 与
+> `encrypt-cross-feature`(两阶段,`MNEME_ENCRYPT_FIXTURE` 传目录,MR 触发)。
 >
-> **重门槛手动执行(不上 CI,避免普通 push/MR 排队)**:heavy
-> (`tests/cold_start.rs` 冷启动 <1s、`tests/heavy_gate.rs` 建库 ≥50k/s 与 i8 查询
-> P50/P99)与复杂度操作计数(`cargo test --release` 下全部 `FC-*-CPLX-*` 单测)由
-> 本机/专用 runner 手动跑——`MNEME_HEAVY=1`,规模 `MNEME_HEAVY_ROWS`/
-> `MNEME_HEAVY_DIM`(默认 50_000×128 冒烟,回归建议 100_000×128;正式 1M×1536 门槛
-> 待 ≥16GB 专用 runner);fuzz 长跑由 `fuzz/scripts/run_long.sh`(`DURATION=3600`,
-> 发布前累计 24h)手动执行,版本注入断言已并入五个目标;`cargo-mutants` 以
-> `mutants.toml` 手动跑(存活变异体补测试)。
+> **重门槛(手动执行,不占 CI 排队)**:heavy(`tests/cold_start.rs` 冷启动 <1s、
+> `tests/heavy_gate.rs` 建库 ≥300/s 与 i8 查询 P50/P99)与复杂度操作计数
+> (`cargo test --release` 下全部 `FC-*-CPLX-*` 单测)由本机/专用 runner 执行——
+> `MNEME_HEAVY=1`,规模 `MNEME_HEAVY_ROWS`/`MNEME_HEAVY_DIM`(默认 50_000×128 冒烟,
+> 回归建议 100_000×128;正式 1M×1536 需 ≥16GB 专用 runner);fuzz 长跑由
+> `fuzz/scripts/run_long.sh`(`DURATION=3600`,发布前累计 24h)执行,版本注入断言
+> 并入五个目标;`cargo-mutants` 以 `mutants.toml` 执行(存活变异体补测试)。
 >
-> **尚未接线/待基线**:criterion 基线回归 >10% 阻断、全量崩溃前缀 proptest harness
-> (§2)、24h 长跑(§6)、平台矩阵(Linux aarch64/Windows);正式 1M×1536 heavy 需要
-> ≥16GB 专用 runner。
+> **不在轻量 CI 面的加强项**:criterion 基线回归比对(>10% 阻断)、随机化崩溃前缀
+> harness(§2)、24h 长跑(§6)、Linux aarch64/Windows 平台矩阵——依赖专用 runner
+> 资源,按发布前检查单执行。
 >
 > **跨 feature 用例(`FC-QUANT-ERR-002` / `FC-SEC-ERR-001`)**:「建库带 f16 段 →
 > 未开 `quant-f16` 的构建打开返回 `Unsupported`」需要两次不同 feature 的构建,
@@ -466,7 +466,7 @@ valid_time 过期不触发物理删除
 - 测试金字塔:单元 / 属性 / 集成 / 长跑;不变量编号是测试断言的锚点。
 - 崩溃注入用 `FsyncHook` + **前缀不变量**,覆盖撕裂写与位翻转。
 - 召回/等价性用属性测试;性能有明确门槛;fuzz 保证不 panic/不 UB。
-- CI 轻量两档(fast/middle)+ 目标平台矩阵(待 runner 接入);`db.check()` 与生产复用同一套校验器。
+- CI 轻量两档(fast/middle),heavy/fuzz/mutation 与平台矩阵在专用 runner 上执行;`db.check()` 与生产复用同一套校验器。
 - 契约追溯由 `tests/contract_traceability.rs` 在 `cargo test` 中强制双向映射。
 
 ## 下一章

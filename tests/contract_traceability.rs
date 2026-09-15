@@ -53,61 +53,61 @@ const SECURITY_TESTS: &str = include_str!("security_contracts.rs");
 /// L12 部署形态契约验收(存储后端/只读共享/可观测;FC-DEPLOY-*)。
 const DEPLOY_TESTS: &str = include_str!("deploy_contracts.rs");
 /// 承载操作计数单测的源码文件。
-const SRC_SEARCH: &str = include_str!("../src/memory/search.rs");
-const SRC_TABLE: &str = include_str!("../src/memory/table/state.rs");
+const SRC_SEARCH: &str = include_str!("../src/memory/search/tests.rs");
+const SRC_TABLE: &str = include_str!("../src/memory/table/state/tests.rs");
 const SRC_LIFECYCLE: &str = include_str!("../src/memory/lifecycle.rs");
 /// L1 双时态视图源码(`snapshot_at` 保留索引句柄单测被契约引用)。
 const SRC_TEMPORAL: &str = include_str!("../src/memory/temporal.rs");
 /// L3 索引源码(HNSW 操作计数与图不变量单测被契约引用)。
-const SRC_INDEX_HNSW: &str = include_str!("../src/index/hnsw.rs");
-const SRC_INDEX_HIDX: &str = include_str!("../src/index/hidx.rs");
+const SRC_INDEX_HNSW: &str = include_str!("../src/index/hnsw/tests.rs");
+const SRC_INDEX_HIDX: &str = include_str!("../src/index/hidx/tests.rs");
 /// L3 过滤三档源码(档位选择单测被契约引用)。
 const SRC_INDEX_FILTERED: &str = include_str!("../src/index/filtered.rs");
 /// L2 编解码源码(片级损坏/版本拒绝单测被契约引用)。
-const SRC_VSEC: &str = include_str!("../src/persist/vsec.rs");
+const SRC_VSEC: &str = include_str!("../src/persist/vsec/tests.rs");
 const SRC_MSEC: &str = include_str!("../src/persist/msec/mod.rs");
 const SRC_WAL: &str = include_str!("../src/persist/wal/mod.rs");
-const SRC_MANIFEST: &str = include_str!("../src/persist/manifest.rs");
+const SRC_MANIFEST: &str = include_str!("../src/persist/manifest/tests.rs");
 /// L2 恢复/锁源码(批原子校验、独占锁语义单测被契约引用)。
 const SRC_RECOVER_REPLAY: &str = include_str!("../src/persist/recover/replay.rs");
 /// L2 WAL 帧应用源码(极大 ID 水位推进拒绝单测被 ERR 契约引用)。
 const SRC_RECOVER_WAL_REPLAY: &str = include_str!("../src/persist/recover/wal_replay.rs");
-const SRC_STORAGE: &str = include_str!("../src/persist/storage.rs");
+const SRC_STORAGE: &str = include_str!("../src/persist/storage/tests.rs");
 /// 段读取后端源码(`read_whole`/`MmapSource` 单测被契约引用)。
-const SRC_SOURCE: &str = include_str!("../src/persist/source.rs");
+const SRC_SOURCE: &str = include_str!("../src/persist/source/tests.rs");
 /// L0 SIMD 源码(逐元素乘加计数单测被 CPLX 契约引用)。
-const SRC_CORE_SIMD: &str = include_str!("../src/core/simd.rs");
+const SRC_CORE_SIMD: &str = include_str!("../src/core/simd/tests.rs");
 /// L0 TopK 源码(堆操作计数单测被 CPLX 契约引用)。
-const SRC_CORE_HEAP: &str = include_str!("../src/core/heap.rs");
+const SRC_CORE_HEAP: &str = include_str!("../src/core/heap/tests.rs");
 /// L0 度量源码(`score_order` 全序单测被 POST 契约引用)。
 const SRC_CORE_METRIC: &str = include_str!("../src/core/metric.rs");
 /// L2 恢复重排映射源码(槽位一致性单测被 ERR 契约引用)。
-const SRC_RECOVER_STATE: &str = include_str!("../src/persist/recover/state.rs");
+const SRC_RECOVER_STATE: &str = include_str!("../src/persist/recover/state/tests.rs");
 /// L1 惰性字节源/向量源码(解码缓存与区间校验单测被 INV 契约引用)。
 const SRC_MEMORY_LAZY: &str = include_str!("../src/memory/lazy.rs");
 /// L12 可观测源码(事件派发/panic 隔离单测被 DEPLOY 契约引用)。
 const SRC_OBSERVE: &str = include_str!("../src/core/observe.rs");
 /// L11 静态加密源码(信封往返/篡改/轮换单测被 SEC 契约引用)。
-const SRC_CRYPTO: &str = include_str!("../src/crypto/mod.rs");
+const SRC_CRYPTO: &str = include_str!("../src/crypto/tests.rs");
 /// L11 压缩源码(LZ4 往返/畸形拒绝单测被 SEC 契约引用)。
 const SRC_COMPRESS: &str = include_str!("../src/compress/mod.rs");
 /// L2 打开路径源码(载入期重排越界二次校验单测被 ERR 契约引用)。
-const SRC_STORE_OPEN: &str = include_str!("../src/persist/store/open.rs");
+const SRC_STORE_OPEN: &str = include_str!("../src/persist/store/open/tests.rs");
 /// L4 计划器源码(块级剪枝等价性单测被契约引用)。
-const SRC_QUERY_PLAN: &str = include_str!("../src/query/plan.rs");
+const SRC_QUERY_PLAN: &str = include_str!("../src/query/plan/tests.rs");
 /// L4 解析器源码(越界/位置错误单测被契约引用)。
-const SRC_QUERY_PARSE: &str = include_str!("../src/query/parse.rs");
+const SRC_QUERY_PARSE: &str = include_str!("../src/query/parse/tests.rs");
 /// L4 BM25 源码(公式/可见性单测被契约引用)。
 const SRC_QUERY_BM25: &str = include_str!("../src/query/bm25.rs");
 /// L4 融合源码(RRF/加权单测被契约引用)。
 const SRC_QUERY_FUSION: &str = include_str!("../src/query/fusion.rs");
 /// L2 倒排区源码(畸形结构拒绝单测被契约引用)。
-const SRC_MSEC_INVERTED: &str = include_str!("../src/persist/msec/inverted.rs");
-const SRC_MSEC_INDEX: &str = include_str!("../src/persist/msec/index.rs");
+const SRC_MSEC_INVERTED: &str = include_str!("../src/persist/msec/inverted/tests.rs");
+const SRC_MSEC_INDEX: &str = include_str!("../src/persist/msec/index/tests.rs");
 /// L1 bloom 源码(极值 fpp 夹紧单测被 CPLX 契约引用)。
 const SRC_ANALYSIS_BLOOM: &str = include_str!("../src/memory/analysis/bloom.rs");
 /// L1 zone map 源码(类型冲突退出剪枝单测被查询契约引用)。
-const SRC_ANALYSIS_ZONES: &str = include_str!("../src/memory/analysis/zones.rs");
+const SRC_ANALYSIS_ZONES: &str = include_str!("../src/memory/analysis/zones/tests.rs");
 /// L4 打印/JSON 往返源码(空列表规约单测被 POST 契约引用)。
 const SRC_QUERY_DISPLAY: &str = include_str!("../src/query/display.rs");
 const SRC_QUERY_JSON: &str = include_str!("../src/query/json.rs");
@@ -118,29 +118,30 @@ const SRC_QUERY_ISO: &str = include_str!("../src/query/iso.rs");
 /// L1 内存倒排源码(NS 隔离/词频累计单测被 INV 契约引用)。
 const SRC_ANALYSIS_INV: &str = include_str!("../src/memory/analysis/inv.rs");
 /// L2 flush 段编码源码(字段字典 `key` 去重单测被 POST 契约引用)。
-const SRC_PERSIST_FLUSH: &str = include_str!("../src/persist/flush.rs");
+const SRC_PERSIST_FLUSH: &str = include_str!("../src/persist/flush/tests.rs");
 /// L2 msec delta 区源码(往返/畸形拒绝单测被 POST/ERR 契约引用)。
-const SRC_MSEC_DELTA: &str = include_str!("../src/persist/msec/delta.rs");
+const SRC_MSEC_DELTA: &str = include_str!("../src/persist/msec/delta/tests.rs");
 /// L2 msec 记录体源码(字段标志畸形拒绝单测被 ERR 契约引用)。
 const SRC_MSEC_ENTRY: &str = include_str!("../src/persist/msec/entry.rs");
 /// L2 WAL 写入器源码(文件序号解析单测被 POST 契约引用)。
-const SRC_WAL_WRITER: &str = include_str!("../src/persist/store/wal_writer.rs");
+const SRC_WAL_WRITER: &str = include_str!("../src/persist/store/wal_writer/tests.rs");
 /// L5 调度源码(选段/幸存筛选单测被 CPLX 契约引用)。
-const SRC_LIFE_COMPACT: &str = include_str!("../src/life/compact.rs");
+const SRC_LIFE_COMPACT: &str = include_str!("../src/life/compact/tests.rs");
 /// L2 关系区源码(正/反向表往返单测被 POST 契约引用)。
 const SRC_PERSIST_EDGES: &str = include_str!("../src/persist/edges.rs");
 /// L1 谓词求值源码(保留字段清单同步单测被 POST 契约引用)。
-const SRC_PRED_EVAL: &str = include_str!("../src/memory/pred_eval.rs");
+const SRC_PRED_EVAL: &str = include_str!("../src/memory/pred_eval/tests.rs");
+const SRC_MEMORY_PRED: &str = include_str!("../src/memory/pred/tests.rs");
 /// L5 运维源码(compaction 状态机转移单测被 STA 契约引用)。
 const SRC_MEMORY_OPS: &str = include_str!("../src/memory/ops.rs");
 /// L2 增量 flush/备份源码(硬链接回退单测被 POST 契约引用)。
-const SRC_STORE_SNAPSHOT: &str = include_str!("../src/persist/store/snapshot.rs");
+const SRC_STORE_SNAPSHOT: &str = include_str!("../src/persist/store/snapshot/tests.rs");
 /// L6 量化原语入口源码(feature 门控单测被 ERR 契约引用)。
 const SRC_QUANT_MOD: &str = include_str!("../src/quant/mod.rs");
 /// L6 i8 量化源码(误差界单测被 POST 契约引用)。
 const SRC_QUANT_I8: &str = include_str!("../src/quant/scalar_i8.rs");
 /// L1 排序源码(MMR 缓存化操作计数单测被 CPLX 契约引用)。
-const SRC_MEMORY_SCORE: &str = include_str!("../src/memory/score.rs");
+const SRC_MEMORY_SCORE: &str = include_str!("../src/memory/score/tests.rs");
 /// L0 分块向量源码(与 Vec 全等/块级 COW 单测被 POST 契约引用)。
 const SRC_CORE_CHUNKED: &str = include_str!("../src/core/chunked.rs");
 /// L0 分片哈希表源码(与 HashMap 全等/分片级 COW 单测被 POST 契约引用)。
@@ -166,7 +167,7 @@ const CONTRACT_TEST_FILES: [(&str, &str); 14] = [
 ];
 
 /// 契约引用的测试可能落在的全部文件(路径必须与 `contracts.md` 中书写一致)。
-const SOURCES: [(&str, &str); 65] = [
+const SOURCES: [(&str, &str); 66] = [
     ("tests/core_contracts.rs", CORE_TESTS),
     ("tests/memory_contracts.rs", MEMORY_TESTS),
     ("tests/query_contracts.rs", QUERY_TESTS),
@@ -182,54 +183,55 @@ const SOURCES: [(&str, &str); 65] = [
     ("tests/security_contracts.rs", SECURITY_TESTS),
     ("tests/deploy_contracts.rs", DEPLOY_TESTS),
     ("src/core/observe.rs", SRC_OBSERVE),
-    ("src/crypto/mod.rs", SRC_CRYPTO),
+    ("src/crypto/tests.rs", SRC_CRYPTO),
     ("src/compress/mod.rs", SRC_COMPRESS),
-    ("src/memory/search.rs", SRC_SEARCH),
-    ("src/memory/table/state.rs", SRC_TABLE),
+    ("src/memory/search/tests.rs", SRC_SEARCH),
+    ("src/memory/table/state/tests.rs", SRC_TABLE),
     ("src/memory/lifecycle.rs", SRC_LIFECYCLE),
     ("src/memory/temporal.rs", SRC_TEMPORAL),
-    ("src/index/hnsw.rs", SRC_INDEX_HNSW),
-    ("src/index/hidx.rs", SRC_INDEX_HIDX),
+    ("src/index/hnsw/tests.rs", SRC_INDEX_HNSW),
+    ("src/index/hidx/tests.rs", SRC_INDEX_HIDX),
     ("src/index/filtered.rs", SRC_INDEX_FILTERED),
-    ("src/persist/vsec.rs", SRC_VSEC),
+    ("src/persist/vsec/tests.rs", SRC_VSEC),
     ("src/persist/msec/mod.rs", SRC_MSEC),
     ("src/persist/wal/mod.rs", SRC_WAL),
-    ("src/persist/manifest.rs", SRC_MANIFEST),
+    ("src/persist/manifest/tests.rs", SRC_MANIFEST),
     ("src/persist/recover/replay.rs", SRC_RECOVER_REPLAY),
     ("src/persist/recover/wal_replay.rs", SRC_RECOVER_WAL_REPLAY),
-    ("src/persist/storage.rs", SRC_STORAGE),
-    ("src/persist/source.rs", SRC_SOURCE),
-    ("src/core/simd.rs", SRC_CORE_SIMD),
-    ("src/core/heap.rs", SRC_CORE_HEAP),
+    ("src/persist/storage/tests.rs", SRC_STORAGE),
+    ("src/persist/source/tests.rs", SRC_SOURCE),
+    ("src/core/simd/tests.rs", SRC_CORE_SIMD),
+    ("src/core/heap/tests.rs", SRC_CORE_HEAP),
     ("src/core/metric.rs", SRC_CORE_METRIC),
-    ("src/persist/recover/state.rs", SRC_RECOVER_STATE),
+    ("src/persist/recover/state/tests.rs", SRC_RECOVER_STATE),
     ("src/memory/lazy.rs", SRC_MEMORY_LAZY),
-    ("src/persist/store/open.rs", SRC_STORE_OPEN),
-    ("src/query/plan.rs", SRC_QUERY_PLAN),
-    ("src/query/parse.rs", SRC_QUERY_PARSE),
+    ("src/persist/store/open/tests.rs", SRC_STORE_OPEN),
+    ("src/query/plan/tests.rs", SRC_QUERY_PLAN),
+    ("src/query/parse/tests.rs", SRC_QUERY_PARSE),
     ("src/query/bm25.rs", SRC_QUERY_BM25),
     ("src/query/fusion.rs", SRC_QUERY_FUSION),
-    ("src/persist/msec/inverted.rs", SRC_MSEC_INVERTED),
-    ("src/persist/msec/index.rs", SRC_MSEC_INDEX),
+    ("src/persist/msec/inverted/tests.rs", SRC_MSEC_INVERTED),
+    ("src/persist/msec/index/tests.rs", SRC_MSEC_INDEX),
     ("src/memory/analysis/bloom.rs", SRC_ANALYSIS_BLOOM),
-    ("src/memory/analysis/zones.rs", SRC_ANALYSIS_ZONES),
+    ("src/memory/analysis/zones/tests.rs", SRC_ANALYSIS_ZONES),
     ("src/query/display.rs", SRC_QUERY_DISPLAY),
     ("src/query/json.rs", SRC_QUERY_JSON),
     ("src/core/text.rs", SRC_CORE_TEXT),
     ("src/query/iso.rs", SRC_QUERY_ISO),
     ("src/memory/analysis/inv.rs", SRC_ANALYSIS_INV),
-    ("src/persist/flush.rs", SRC_PERSIST_FLUSH),
-    ("src/memory/pred_eval.rs", SRC_PRED_EVAL),
-    ("src/persist/msec/delta.rs", SRC_MSEC_DELTA),
+    ("src/persist/flush/tests.rs", SRC_PERSIST_FLUSH),
+    ("src/memory/pred_eval/tests.rs", SRC_PRED_EVAL),
+    ("src/memory/pred/tests.rs", SRC_MEMORY_PRED),
+    ("src/persist/msec/delta/tests.rs", SRC_MSEC_DELTA),
     ("src/persist/msec/entry.rs", SRC_MSEC_ENTRY),
-    ("src/persist/store/wal_writer.rs", SRC_WAL_WRITER),
-    ("src/life/compact.rs", SRC_LIFE_COMPACT),
+    ("src/persist/store/wal_writer/tests.rs", SRC_WAL_WRITER),
+    ("src/life/compact/tests.rs", SRC_LIFE_COMPACT),
     ("src/persist/edges.rs", SRC_PERSIST_EDGES),
     ("src/memory/ops.rs", SRC_MEMORY_OPS),
-    ("src/persist/store/snapshot.rs", SRC_STORE_SNAPSHOT),
+    ("src/persist/store/snapshot/tests.rs", SRC_STORE_SNAPSHOT),
     ("src/quant/mod.rs", SRC_QUANT_MOD),
     ("src/quant/scalar_i8.rs", SRC_QUANT_I8),
-    ("src/memory/score.rs", SRC_MEMORY_SCORE),
+    ("src/memory/score/tests.rs", SRC_MEMORY_SCORE),
     ("src/core/chunked.rs", SRC_CORE_CHUNKED),
     ("src/core/sharded.rs", SRC_CORE_SHARDED),
 ];

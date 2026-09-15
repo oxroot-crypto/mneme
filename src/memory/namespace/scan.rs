@@ -49,7 +49,13 @@ impl Namespace {
             if view.dead.get(idx) || slot.ns_id != ns_id || !slot.is_live(now) {
                 continue;
             }
-            if !passes_filter(&filter, slot, &view, &slot.rowid, uses_access) {
+            if !passes_filter(PassesFilterInput {
+                filter: &filter,
+                slot_data: slot.as_ref(),
+                view: &view,
+                rowid: &slot.rowid,
+                uses_access,
+            }) {
                 continue;
             }
             count += 1;
@@ -124,7 +130,13 @@ impl Namespace {
                 {
                     continue;
                 }
-                if !passes_filter(&filter, slot_data, &view, rowid, uses_access) {
+                if !passes_filter(PassesFilterInput {
+                    filter: &filter,
+                    slot_data: slot_data.as_ref(),
+                    view: &view,
+                    rowid,
+                    uses_access,
+                }) {
                     continue;
                 }
                 collected.push(Arc::clone(slot_data));
@@ -142,16 +154,31 @@ fn ns_id_of(view: &ReaderView, ns_path: &str) -> Option<NsId> {
     view.ns_by_path.get(ns_path).copied()
 }
 
+/// [`passes_filter`] 的输入参数。
+struct PassesFilterInput<'a> {
+    /// 三值过滤表达式(`None` = 不过滤)。
+    filter: &'a Option<Expr>,
+    /// 待判定的物理槽位。
+    slot_data: &'a SlotData,
+    /// 不可变读视图(访问统计查表用)。
+    view: &'a ReaderView,
+    /// 槽位行标识(访问统计主键)。
+    rowid: &'a RowId,
+    /// 表达式是否引用访问统计(调用方在循环外预判定)。
+    uses_access: bool,
+}
+
 /// 判断记录是否通过可选过滤表达式(三值语义,缺失字段不命中)。
 ///
 /// `uses_access` 由调用方在循环外预判定:表达式未引用访问统计时不查访问表。
-fn passes_filter(
-    filter: &Option<Expr>,
-    slot_data: &SlotData,
-    view: &ReaderView,
-    rowid: &RowId,
-    uses_access: bool,
-) -> bool {
+fn passes_filter(input: PassesFilterInput<'_>) -> bool {
+    let PassesFilterInput {
+        filter,
+        slot_data,
+        view,
+        rowid,
+        uses_access,
+    } = input;
     match filter {
         Some(expr) => pred::matches(
             expr,
