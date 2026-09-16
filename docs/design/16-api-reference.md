@@ -339,7 +339,7 @@ impl Mneme {
     pub fn compact_control(&self) -> CompactionControl;  // pause()/resume()/state()
     pub fn compact(&self) -> Result<()>;         // 显式触发一轮 size-tiered compaction(预算内连续合并段组;无触发/暂停/纯内存库时空操作,见 07 §4.4、FC-LIFE-POST-011)
     pub fn maintenance_tick(&self) -> Result<()>; // 手动执行一轮后台维护(访问攒批/自动遗忘/自动 compaction,见 07 §2–§4)
-    pub fn flush(&self) -> Result<()>;           // 把可变表落成增量段并 fsync WAL
+    pub fn flush(&self) -> Result<()>;           // 持久库:落增量段并 fsync WAL;纯内存库:建内存段(HNSW 图,不落盘,见 05 §9)
     /// 只读实例重载:发现更新的已提交 MANIFEST 时原子切换视图,返回新版本号
     /// (无新版本 → `None`,旧视图保持);纯内存库 → `Unsupported`,可写实例 → `Config`
     /// (见 [12 §2.1](12-deployment.md))。
@@ -848,7 +848,7 @@ pub struct Tuning {
     pub rescore_oversample: usize,      // 默认 4     两阶段粗排候选 = top_k × 本值(08 §4.2;仅量化段生效)
     pub quant_recall_floor: f32,        // 默认 0.98  建段抽样召回一致率门槛(0.0 关回退,>1 恒回退;08 §4.3)
     pub hnsw_compare_cap: usize,        // 默认 4     选邻"新方向"比较上限:只与最近至多该数量的已选项比(05 §4.3/§4.4)
-    pub hnsw_batch_rows: usize,         // 默认 8     批内建图批行数(只依赖节点数,与线程数无关;FC-INDEX-POST-012)
+    pub hnsw_batch_rows: usize,         // 默认 128   批内建图批行数(只依赖节点数,与线程数无关;FC-INDEX-POST-012)
     pub hnsw_serial_rows: usize,        // 默认 64    节点数 ≤ 本值不分批(等价串行)
     pub hnsw_threads_max: usize,        // 默认 8     建图批内并行度上限(实际线程数还受 Builder::parallelism 与批行数约束)
     pub flush_chunk_rows: usize,        // 默认 65536 大 flush 切块行数

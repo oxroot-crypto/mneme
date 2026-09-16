@@ -98,16 +98,20 @@ fn bump_dist_calls() {
 }
 
 /// 分数与节点组成的可比较候选(按"越近键越大"排序)。
+///
+/// `order` 为键的**保序位模式**(`sortable_bits`):对任意两个有限值、`±0` 与
+/// 两种符号的 `NaN`,其 `u32` 序与 `f32::total_cmp` 全序一致,堆比较退化为
+/// 一次整数 `cmp`(热路径每次查询数千次比较)。
 #[derive(Debug, Clone, Copy)]
 struct Cand {
-    key: f32,
+    order: u32,
     score: Score,
     node: u32,
 }
 
 impl PartialEq for Cand {
     fn eq(&self, other: &Self) -> bool {
-        self.key.total_cmp(&other.key) == Ordering::Equal && self.node == other.node
+        self.order == other.order && self.node == other.node
     }
 }
 
@@ -121,25 +125,38 @@ impl PartialOrd for Cand {
 
 impl Ord for Cand {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.key
-            .total_cmp(&other.key)
+        self.order
+            .cmp(&other.order)
             .then(self.node.cmp(&other.node))
+    }
+}
+
+/// 分数 → 保序位模式(`f32::total_cmp` 等价的 `u32` 全序)。
+///
+/// 标准 radix 技巧:负数取反、非负数翻转符号位;`-0 < +0`、`-NaN < … < +NaN`
+/// 与 `total_cmp` 逐位一致。候选堆用它做排序键,比较退化为整数 `cmp`。
+pub(super) fn sortable_bits(value: f32) -> u32 {
+    let bits = value.to_bits();
+    if bits & 0x8000_0000 != 0 {
+        !bits
+    } else {
+        bits | 0x8000_0000
     }
 }
 
 /// 偏置路由的固定系数(设计 10 §2.3:β 为实现内部固定 1.0)。
 const BIAS_BETA: f32 = 1.0;
 
-/// 偏置路由的前沿项:`priority` 只决定出堆顺序,`cand.key` 仍是未偏置真实键。
+/// 偏置路由的前沿项:`priority` 只决定出堆顺序,`cand.order` 仍是未偏置真实键。
 #[derive(Debug, Clone, Copy)]
 struct BiasCand {
-    priority: f32,
+    priority: u32,
     cand: Cand,
 }
 
 impl PartialEq for BiasCand {
     fn eq(&self, other: &Self) -> bool {
-        self.priority.total_cmp(&other.priority) == Ordering::Equal && self.cand == other.cand
+        self.priority == other.priority && self.cand == other.cand
     }
 }
 
@@ -154,7 +171,7 @@ impl PartialOrd for BiasCand {
 impl Ord for BiasCand {
     fn cmp(&self, other: &Self) -> Ordering {
         self.priority
-            .total_cmp(&other.priority)
+            .cmp(&other.priority)
             .then(self.cand.node.cmp(&other.cand.node))
     }
 }
@@ -170,7 +187,7 @@ struct CandidateSets {
 
 impl CandidateSets {
     /// 把候选同时推入前沿与结果堆(结果堆存未偏置真实键)。
-    fn push(&mut self, cand: Cand, priority: f32) {
+    fn push(&mut self, cand: Cand, priority: u32) {
         self.frontier.push(BiasCand { priority, cand });
         self.results.push(std::cmp::Reverse(cand));
     }
@@ -182,7 +199,7 @@ impl CandidateSets {
             return false;
         }
         let worst = self.results.peek().map_or(current, |rev| rev.0);
-        current.key.total_cmp(&worst.key) == Ordering::Less
+        current.order < worst.order
     }
 }
 
@@ -230,7 +247,7 @@ impl HnswIndex {
                     if sets.results.len() < ef {
                         sets.push(cand, self.bias_priority(query.bias, &cand));
                     } else if let Some(worst) = sets.results.peek().map(|rev| rev.0)
-                        && cand.key.total_cmp(&worst.key) == Ordering::Greater
+                        && cand.order > worst.order
                     {
                         sets.results.pop();
                         sets.push(cand, self.bias_priority(query.bias, &cand));
@@ -245,12 +262,15 @@ impl HnswIndex {
         })
     }
 
-    /// 遍历前沿优先级:无偏置时即真实键;有偏置时加 `β·bias(全局槽位)`。
-    fn bias_priority(&self, bias: Option<&dyn crate::memory::index::NodeBias>, cand: &Cand) -> f32 {
+    /// 遍历前沿优先级(保序位模式):无偏置时即真实键;有偏置时加
+    /// `β·bias(全局槽位)` 后转回保序位模式(仍与 `total_cmp` 全序一致)。
+    fn bias_priority(&self, bias: Option<&dyn crate::memory::index::NodeBias>, cand: &Cand) -> u32 {
         let Some(bias) = bias else {
-            return cand.key;
+            return cand.order;
         };
-        cand.key + BIAS_BETA * bias.bias(self.slot_of(cand.node))
+        sortable_bits(
+            close_key(self.metric, cand.score) + BIAS_BETA * bias.bias(self.slot_of(cand.node)),
+        )
     }
 
     /// 在给定层做贪心下降,返回距查询最优的节点(best-first 单步)。
@@ -319,10 +339,10 @@ impl HnswIndex {
             .score(&left.vector, &right.vector, left.norm_sq, right.norm_sq)
     }
 
-    /// 构造排序候选。
+    /// 构造排序候选(`order` 为键的保序位模式)。
     fn cand(&self, score: Score, node: u32) -> Cand {
         Cand {
-            key: close_key(self.metric, score),
+            order: sortable_bits(close_key(self.metric, score)),
             score,
             node,
         }

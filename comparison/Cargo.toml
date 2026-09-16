@@ -1,0 +1,29 @@
+[workspace]
+
+[package]
+name = "mneme-comparison"
+version = "0.0.0"
+publish = false
+edition = "2024"
+description = "Mneme 与主流嵌入型向量库的横向性能对比(开发期基准工具,不进入发布产物)"
+
+[dependencies]
+# 被测对象:主仓库本地 path 依赖,按默认 feature(mmap 开)构建。
+mneme = { path = ".." }
+# 竞品(仅本独立 workspace 使用,不进入主 crate 依赖树):
+# - usearch:C++ 核心 + 官方 Rust 绑定,当代跨语言主流 ANN 库。
+usearch = "2.26"
+# - hnsw_rs:纯 Rust 生态主流 HNSW 实现;simdeez_f 开 x86 SIMD(其推荐构建方式)。
+hnsw_rs = { version = "0.3", features = ["simdeez_f"] }
+# - hnsw-stable:经典 C++ hnswlib 的纯 Rust 移植(stable 工具链分支)。
+hnsw-stable = "0.10"
+# - instant-distance:InstantDomainSearch 生产使用的纯 Rust HNSW(补充对照)。
+instant-distance = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Mneme 对比跑在临时目录上的持久库(RAII 清理)。
+tempfile = "3"
+
+[profile.release]
+# 与主 crate 发布 profile 对齐,避免对比受优化档位差异影响。
+lto = "thin"

@@ -17,7 +17,7 @@ use super::build::{
     BuildWithOptionsInput, build_batch_rows, build_first_batch_rows, build_threads,
 };
 use super::quant::{build_codes, validate_quant};
-use super::search::DIST_CALLS;
+use super::search::{DIST_CALLS, sortable_bits};
 
 fn make_nodes(count: usize, dim: usize) -> Vec<IndexNode> {
     (0..count)
@@ -91,8 +91,8 @@ fn build_batch_rows_depends_only_on_count() {
     assert_eq!(build_batch_rows(0, &defaults), 1);
     assert_eq!(build_batch_rows(1, &defaults), 1);
     assert_eq!(build_batch_rows(64, &defaults), 1);
-    assert_eq!(build_batch_rows(65, &defaults), 8);
-    assert_eq!(build_batch_rows(1_000_000, &defaults), 8);
+    assert_eq!(build_batch_rows(65, &defaults), 128);
+    assert_eq!(build_batch_rows(1_000_000, &defaults), 128);
     let custom = HnswBuildParams {
         serial_rows: 100,
         batch_rows: 32,
@@ -171,6 +171,9 @@ fn parallel_build_keeps_graph_reachable_from_entry() {
 }
 
 /// FC-INDEX-POST-012:同输入下构建结果与线程数无关(逐字节相同 hidx)。
+///
+/// 覆盖串行内联路径(1)与常驻 worker 池路径(2/3/4/8):池化只改变任务
+/// 分派方式,不改变批边界与批开始快照语义,故必须逐字节同图。
 #[test]
 fn parallel_build_is_thread_count_independent() {
     let nodes = make_nodes(600, 8);
@@ -188,20 +191,23 @@ fn parallel_build_is_thread_count_independent() {
         parallelism: 1,
     })
     .expect("单线程构建");
-    let parallel = HnswIndex::build_with_options(BuildWithOptionsInput {
-        nodes: &nodes,
-        params,
-        metric: Metric::Dot,
-        precision: BuildPrecision::Hybrid,
-        parallelism: 4,
-    })
-    .expect("四线程构建");
-    assert_eq!(
-        single.serialize().expect("serialize"),
-        parallel.serialize().expect("serialize"),
-        "批内并行结果必须与线程数无关"
-    );
-    assert_graph_invariants(&parallel);
+    let reference = single.serialize().expect("serialize");
+    for parallelism in [2, 3, 4, 8] {
+        let parallel = HnswIndex::build_with_options(BuildWithOptionsInput {
+            nodes: &nodes,
+            params,
+            metric: Metric::Dot,
+            precision: BuildPrecision::Hybrid,
+            parallelism,
+        })
+        .expect("并行构建");
+        assert_eq!(
+            reference,
+            parallel.serialize().expect("serialize"),
+            "批内并行结果必须与线程数无关(parallelism={parallelism})"
+        );
+        assert_graph_invariants(&parallel);
+    }
 }
 
 /// FC-INDEX-POST-010:`Hybrid` 档构建确定(同输入逐字节同图)且图不变量成立。
@@ -628,4 +634,34 @@ fn malformed_quant_copies() -> Vec<(QuantCopy, usize, usize)> {
         // f16 副本自推维度(2)与索引节点维度(1)不符。
         (copy(VectorFormat::F16, rows(4, 4, 1), Vec::new()), 1, 1),
     ]
+}
+
+/// 候选堆的保序位模式与 `f32::total_cmp` 全序逐对一致(含 `±0`、`±inf`、NaN
+/// 载荷与次正规数);堆比较退化为整数 `cmp` 不得改变遍历的剪枝/替换语义。
+#[test]
+fn sortable_bits_matches_total_cmp_total_order() {
+    let values = [
+        f32::NEG_INFINITY,
+        -1.0e30_f32,
+        -1.0,
+        -f32::MIN_POSITIVE,
+        -0.0,
+        0.0,
+        f32::MIN_POSITIVE,
+        1.0,
+        1.0e30,
+        f32::INFINITY,
+        f32::from_bits(0x7fc0_0001),
+        f32::from_bits(0xffc0_0002),
+        f32::from_bits(1),
+    ];
+    for &left in &values {
+        for &right in &values {
+            assert_eq!(
+                left.total_cmp(&right),
+                sortable_bits(left).cmp(&sortable_bits(right)),
+                "保序位模式与 total_cmp 不一致:{left:?} vs {right:?}"
+            );
+        }
+    }
 }

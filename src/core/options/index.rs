@@ -71,10 +71,11 @@ pub struct Tuning {
     /// 候选按距离升序,只与最近选中的至多该数量比较:调小更快、调大更准
     /// (1536 维实测 8→4 与无上限召回相同、构建快约 1.4×)。必须 ≥ 1。
     pub hnsw_compare_cap: usize,
-    /// HNSW 批内并行建图的批行数,默认 8。
+    /// HNSW 批内并行建图的批行数,默认 128。
     ///
     /// 批大小只依赖节点数、与线程数无关(同输入同图);调大并行任务更多、
-    /// 批内互不可见更强。必须 ≥ 1。
+    /// 批内互不可见更强。默认值经 4 核基准实测:128 维 / 1536 维均较 8 快
+    /// 10%–20%,召回不变;256 起召回出现可测下降。必须 ≥ 1。
     pub hnsw_batch_rows: usize,
     /// HNSW 建图小图串行阈值,默认 64。
     ///
@@ -100,8 +101,8 @@ pub struct Tuning {
 
 /// HNSW 建图选邻比较上限缺省值(设计 05 §4.3;1536 维实测 4 与无上限同召回)。
 pub(crate) const DEFAULT_HNSW_COMPARE_CAP: usize = 4;
-/// HNSW 批内建图批行数缺省值(`FC-INDEX-POST-012`)。
-pub(crate) const DEFAULT_HNSW_BATCH_ROWS: usize = 8;
+/// HNSW 批内建图批行数缺省值(`FC-INDEX-POST-012`;经 4 核实测标定,见字段文档)。
+pub(crate) const DEFAULT_HNSW_BATCH_ROWS: usize = 128;
 /// HNSW 建图小图串行阈值缺省值。
 pub(crate) const DEFAULT_HNSW_SERIAL_ROWS: usize = 64;
 /// HNSW 建图批内并行度硬上限缺省值。
@@ -217,7 +218,7 @@ mod tests {
     }
 
     /// FC-INDEX-PRE-001 / FC-INDEX-POST-012:建图/建段工程调参默认值与设计一致
-    /// (选邻比较上限 4、批 8、小图阈值 64、建图线程上限 8、块行数 65_536、
+    /// (选邻比较上限 4、批 128、小图阈值 64、建图线程上限 8、块行数 65_536、
     /// 块级串行 1)。
     #[test]
     fn build_tuning_defaults_match_design() {
@@ -229,6 +230,7 @@ mod tests {
         assert_eq!(tuning.flush_chunk_rows, DEFAULT_FLUSH_CHUNK_ROWS);
         assert_eq!(tuning.flush_threads, DEFAULT_FLUSH_THREADS);
         assert_eq!(tuning.hnsw_compare_cap, 4, "1536 维实测默认值");
+        assert_eq!(tuning.hnsw_batch_rows, 128, "4 核基准标定默认值");
         assert_eq!(tuning.flush_threads, 1, "块级默认串行");
         let build = HnswBuildParams::from_tuning(&tuning, 0);
         assert_eq!(
@@ -239,7 +241,7 @@ mod tests {
                 build.serial_rows,
                 build.compare_cap
             ),
-            (0, 8, 8, 64, 4)
+            (0, 8, 128, 64, 4)
         );
     }
 

@@ -2,13 +2,72 @@
 
 use std::sync::Arc;
 
-use crate::core::options::VectorFormat;
+use crate::core::error::Result;
+use crate::core::options::{HnswBuildParams, VectorFormat};
 use crate::core::types::SlotId;
 use crate::memory::analysis::{BLOOM_INITIAL_CAPACITY, BloomSet, InvertedIndex, ZoneIndex};
-use crate::memory::index::{SegmentIndex, SegmentIndexInput, VectorIndex};
+use crate::memory::config::Config;
+use crate::memory::index::{
+    IndexBuildRequest, IndexNode, QuantCopy, SegmentIndex, SegmentIndexInput, VectorIndex,
+};
 
 use super::WriterState;
 use super::slot::SlotData;
+
+/// 由写状态指定槽位构建向量索引(不序列化、不落盘)。
+///
+/// 持久 flush 与纯内存建段共用:节点顺序 = `included` 顺序(节点 id = 下标),
+/// 图参数 / 精度档 / 并行度取自配置;同输入同配置逐字节确定
+/// (`FC-INDEX-POST-012`)。未配置索引工厂时返回 `None`(调用方按无索引段处理)。
+///
+/// # Errors
+/// 建图输入不满足档位前置(如维度不一致)时返回结构化错误,绝不静默降级。
+pub(crate) fn build_segment_index(
+    ws: &WriterState,
+    config: &Config,
+    included: &[usize],
+    quant: Option<QuantCopy>,
+    parallelism: usize,
+) -> Result<Option<Arc<dyn VectorIndex>>> {
+    let Some(factory) = config.index_factory.as_ref() else {
+        return Ok(None);
+    };
+    let (nodes, slot_of) = collect_index_nodes(ws, included);
+    factory
+        .build(IndexBuildRequest {
+            nodes: &nodes,
+            slot_of: &slot_of,
+            params: config.hnsw,
+            metric: config.metric,
+            quant,
+            build_precision: config.build_precision,
+            build: HnswBuildParams::from_tuning(&config.tuning, parallelism),
+        })
+        .map(Some)
+}
+
+/// 按 `included` 顺序收集 HNSW 节点与全局槽位编号。
+fn collect_index_nodes(ws: &WriterState, included: &[usize]) -> (Vec<IndexNode>, Vec<SlotId>) {
+    let nodes: Vec<IndexNode> = included
+        .iter()
+        .map(|&idx| {
+            let slot = &ws.slots[idx];
+            IndexNode {
+                rowid: slot.rowid,
+                vector: Arc::clone(&slot.vector),
+                norm_sq: slot.norm_sq,
+            }
+        })
+        .collect();
+    let slot_of: Vec<SlotId> = included
+        .iter()
+        .map(|&idx| {
+            // 槽位下标 ≤ u32::MAX(FC-MEM-INV-004),转换可证明不会失败。
+            SlotId::new(u32::try_from(idx).expect("槽位下标必可转入 u32(FC-MEM-INV-004)"))
+        })
+        .collect();
+    (nodes, slot_of)
+}
 
 /// [`WriterState::install_segment`] 的输入参数。
 pub(crate) struct InstallSegmentInput<'a> {

@@ -4,7 +4,9 @@ use std::collections::HashMap;
 
 use crate::core::error::{MnemeError, Result};
 use crate::core::options::VectorFormat;
+use crate::core::types::SegmentId;
 use crate::memory::engine::Mneme;
+use crate::memory::index::SegmentIndex;
 use crate::memory::ops::{HistoryStat, NsStat, QuantStat, SegmentStat, Stats, StorageStat};
 use crate::memory::table::ReaderView;
 
@@ -156,7 +158,7 @@ impl Mneme {
         })
     }
 
-    /// 收集持久后端的段/WAL/trash 统计;纯内存库返回零值。
+    /// 收集持久后端的段/WAL/trash 统计;纯内存库的段取自内存索引(无文件)。
     fn collect_store_stats(&self, view: &ReaderView) -> StoreStats {
         match &self.store {
             Some(store) => StoreStats {
@@ -165,7 +167,28 @@ impl Mneme {
                 trash_bytes: store.trash_bytes(),
                 total_segments: store.total_segments(),
             },
-            None => StoreStats::default(),
+            None => StoreStats {
+                segments: memory_segment_stats(&view.indexes),
+                ..StoreStats::default()
+            },
         }
     }
+}
+
+/// 纯内存库的段统计(无文件:字节数与创建时刻为 0;图统计取自真实索引)。
+fn memory_segment_stats(indexes: &[SegmentIndex]) -> Vec<SegmentStat> {
+    indexes
+        .iter()
+        .map(|segment| SegmentStat {
+            id: SegmentId::new(segment.segment_id),
+            rows: segment.slots.len() as u64,
+            bytes: 0,
+            dead_ratio: 0.0,
+            created: 0,
+            index_nodes: segment.index.node_count() as u64,
+            index_levels: segment.index.max_level(),
+            quant: segment.quant,
+            recall_est: segment.recall_est,
+        })
+        .collect()
 }

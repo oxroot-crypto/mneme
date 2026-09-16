@@ -1114,3 +1114,86 @@ fn reopen_after_delete_remaps_slots() {
             .collect();
     assert_eq!(got, want, "非恒等重排映射下 ef→∞ 结果应与存活记录暴力一致");
 }
+
+/// FC-INDEX-INV-008(内存段):纯内存库 `flush` 用同一 `IndexFactory` 把未覆盖槽位
+/// 建成内存段(不写盘、不序列化),此后查询走「内存段 ANN + 尾部暴力」:
+/// flush 前恒精确;flush 后小 `ef` 呈现近似、`ef→∞` 仍 ≡ 暴力;
+/// 无新增时再 flush 为空操作;新插入的尾部行仍被精确补扫。
+#[test]
+fn in_memory_flush_builds_ann_segments() {
+    const ROWS: usize = 3_000;
+    const DIM: usize = 32;
+    const QUERIES: usize = 30;
+    let vectors: Vec<Vec<f32>> = (0..ROWS).map(|row| vector(row as u64, DIM)).collect();
+    let db = Builder::default()
+        .dimension(DIM as u32)
+        .metric(Metric::Dot)
+        .hnsw(fast_hnsw())
+        .tuning(ann_tuning())
+        .build()
+        .expect("纯内存建库");
+    let ns = db.namespace("t");
+    let batch: Vec<Record> = vectors.iter().map(|v| Record::new(v.clone())).collect();
+    ns.insert_batch(batch).expect("insert_batch");
+    let queries: Vec<Vec<f32>> = (0..QUERIES)
+        .map(|index| vector(3_000_000 + index as u64, DIM))
+        .collect();
+    let recall = |ef: usize| -> f64 {
+        let mut sum = 0.0;
+        for query in &queries {
+            let hits = ns
+                .search()
+                .vector(query)
+                .top_k(10)
+                .ef(ef)
+                .execute()
+                .expect("search");
+            let got: HashSet<usize> = hits.iter().map(|hit| hit.rowid.get() as usize).collect();
+            let want: HashSet<usize> = brute_topk(&vectors, query, 10).into_iter().collect();
+            sum += got.intersection(&want).count() as f64 / 10.0;
+        }
+        sum / queries.len() as f64
+    };
+
+    // flush 前:无内存段 → 全量暴力,小 ef 亦精确。
+    assert_eq!(recall(2), 1.0, "flush 前应精确");
+
+    db.flush().expect("内存建段");
+    // 内存段可在 stats 中观测(无文件:bytes/created 为 0,图统计取自真实索引)。
+    let stats = db.stats().expect("stats");
+    assert_eq!(stats.segments.len(), 1, "建段后应恰好一个内存段");
+    assert_eq!(stats.segments[0].index_nodes as usize, ROWS);
+    // flush 后:小 ef 走内存段 ANN,不再精确(证明确实安装了段并走进索引)。
+    let approximate = recall(2);
+    assert!(
+        approximate < 1.0,
+        "内存段 ANN 在小 ef 下不应与暴力全等(实际 {approximate})"
+    );
+    // ef→∞ 收敛回精确(FC-INDEX-INV-008)。
+    assert_eq!(recall(4096), 1.0, "ef 极大时应与暴力精确一致");
+
+    // 无新增 → 空操作:查询行为逐批不变。
+    db.flush().expect("空 flush");
+    assert_eq!(recall(2), approximate, "空 flush 不得改变查询行为");
+    assert_eq!(
+        db.stats().expect("stats").segments.len(),
+        1,
+        "空 flush 不得新增段"
+    );
+
+    // 新插入的尾部行(未覆盖)被暴力补扫精确命中,即使 ef 很小。
+    let extra = vector(7_000_000, DIM);
+    ns.insert(Record::new(extra.clone())).expect("插入尾部行");
+    let hits = ns
+        .search()
+        .vector(&extra)
+        .top_k(1)
+        .ef(1)
+        .execute()
+        .expect("search");
+    assert_eq!(
+        hits[0].rowid.get() as usize,
+        ROWS,
+        "尾部未覆盖行必须被暴力补扫精确命中"
+    );
+}

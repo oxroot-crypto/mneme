@@ -11,6 +11,7 @@
 
 [![License](https://img.shields.io/badge/license-Unlicense-blue?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.93%2B-orange?style=flat-square)](Cargo.toml)
+[![GitHub](https://img.shields.io/badge/GitHub-oxroot--crypto%2Fmneme-181717?style=flat-square&logo=github)](https://github.com/oxroot-crypto/mneme)
 
 </div>
 
@@ -22,12 +23,13 @@
 
 LLM 每次对话结束就忘光上下文之外的一切。要跑上数月的 Agent,必须配一个能语义检索、能遗忘琐碎信息、能撑十年的外部记忆。Mneme 就是这样一个引擎。
 
-**状态**:未发布到 crates.io。L0–L6 已完整实现并通过形式化契约验收;1M×1536 性能门槛与 fuzz 长跑由本机/专用 runner 手动执行(不上 CI,正式门槛需 ≥16GB 专用 runner)。设计与验收标准见 [docs/DESIGN.md](docs/DESIGN.md)。
+**状态**:版本 `0.1.0`(发布准备中,尚未上线 crates.io)。L0–L6 已完整实现并通过形式化契约验收;1M×1536 性能门槛与 fuzz 长跑由本机/专用 runner 手动执行(不上 CI,正式门槛需 ≥16GB 专用 runner)。设计与验收标准见 [docs/DESIGN.md](docs/DESIGN.md)。
 
 ## 📑 目录
 
 - [特性](#-特性)
 - [架构](#-架构)
+- [性能](#-性能)
 - [安装](#-安装)
 - [快速开始](#-快速开始)
 - [用法](#-用法)
@@ -77,6 +79,73 @@ LLM 每次对话结束就忘光上下文之外的一切。要跑上数月的 Age
 | 存储安全 | AES-256-GCM 静态加密与密钥轮换(`encrypt`)、文本/元数据压缩(`compress` / `compress-zstd`,无收益回退原文) |
 | 部署形态 | 多进程只读共享(`Mneme::reload`)、`Storage`/`FsStorage`/`MemStorage` 后端(WASM/边缘)、`Observer` 事件钩子 |
 
+## 📊 性能
+
+> 50 000 行 × 128 维 · 1 000 条查询 · top-10 · L2² · `M=16` / `ef_construction=200` ·
+> 4 核 Intel Xeon 8255C。多轮轮转交错取中位数(轮间极差 ±3–8%);
+> **Mneme 构建为真实建库路径**(`insert_batch` + `flush`:WAL + 段文件 + MANIFEST + 图落盘),
+> 其余引擎为纯内存建图。完整方法、召回全表与原始数据见
+> [`comparison/README.md`](comparison/README.md)。
+
+### 建库耗时(4 线程,越短越好)
+
+```text
+usearch         ██ 3.76 s
+hnsw_stable     ██████ 8.66 s
+mneme i8        ███████ 10.52 s
+hnsw_rs         ███████ 10.61 s
+mneme (f32)     ███████ 10.85 s
+instant_dist    ██████████████████████████████████████████████ 69.32 s
+```
+
+### 单线程查询延迟 P50(ef=128,越短越好)
+
+```text
+usearch         █████████████████ 189 µs
+mneme i8        █████████████████ 193 µs
+mneme (f32)     ███████████████████████████ 295 µs
+hnsw_stable     ██████████████████████████████████ 377 µs
+hnsw_rs         ████████████████████████████████████████ 441 µs
+```
+
+### 4 线程总吞吐(ef=128,越高越好)
+
+```text
+usearch         ████████████████████████████████████████ 17 020 QPS
+mneme i8        ████████████████████████████████ 13 699 QPS
+mneme (f32)     ████████████████████████ 10 095 QPS
+hnsw_rs         █████████████ 5 599 QPS
+hnsw_stable     █████████████ 5 502 QPS
+```
+
+### 关键数字对照
+
+| 引擎 | ef | Recall@10 | P50 | 4 线程 QPS | RSS 增量 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| usearch | 128 | 0.9996 | 189 µs | 17 020 | 37.2 MiB |
+| **Mneme(i8,按需开启)** | 128 | 0.9980 | **193 µs** | **13 699** | 103.7 MiB |
+| **Mneme(默认 f32)** | 128 | 0.9980 | 295 µs | 10 095 | 97.3 MiB |
+| hnsw_stable | 128 | 1.0000 | 377 µs | 5 502 | 39.4 MiB |
+| hnsw_rs | 128 | 0.9799 | 441 µs | 5 599 | 134.3 MiB |
+| instant_distance | 64 | 0.9999 | 296 µs | 12 453 | 67.4 MiB |
+
+### 怎么读这些数字
+
+- **构建**:Mneme 10.9 s 与 hnsw_rs(10.6 s)同档,慢于 hnsw_stable(8.7 s)与
+  usearch(3.8 s);但 Mneme 是唯一把 WAL、不可变段、MANIFEST 与图文件全部写盘、
+  可在任意点崩溃恢复的实现。其中 `insert_batch`(WAL 追加)仅 0.45 s,
+  其余是 `flush` 内的建图与编码。
+- **查询**:默认 f32 档与 hnsw_stable 持平(295 µs vs 377 µs);按需开启 i8 量化副本
+  (`.quantization(VectorFormat::I8Rescored)`)后 P50 193 µs,与最快的 C++ 实现
+  usearch 基本持平,召回仅降 ≤0.001,4 线程吞吐 +36%。
+- **召回**:第一梯队——ef=128 时 0.9980,ef=256 时 1.0000;hnsw_rs 落后约 2 个百分点。
+- **纯内存形态**:`Builder` 不设 `path` 即纯内存库;`flush()` 后同样建 HNSW 内存段
+  (不写盘、不做量化副本),查询与召回同持久库一致,构建约 −7%(省 WAL 与段编码)、
+  RSS 约 −17%。未 `flush()` 的纯内存库走精确暴力扫描(20k×128 P50 ≈ 0.7 ms),
+  大规模内存库请先 `flush()`。
+- 均匀随机高维数据(ANN 最困难集合)下所有引擎召回按预期塌缩,而 Mneme 每档召回
+  最高,细节见 [`comparison/README.md`](comparison/README.md)。
+
 ## 📦 安装
 
 ### 环境要求
@@ -88,12 +157,12 @@ LLM 每次对话结束就忘光上下文之外的一切。要跑上数月的 Age
 
 ### 添加依赖
 
-本 crate 尚未发布到 crates.io,请按路径或 Git 引入;发布后照常写 `mneme = "0.1"` 即可。
+当前版本 `0.1.0`,尚未发布到 crates.io:请按路径或 Git 引入;发布后照常写 `mneme = "0.1"` 即可。
 
 ```toml
 [dependencies]
 mneme = { path = "../mneme" }                              # 本地克隆后按路径引入
-# mneme = { git = "https://gitlab.oxroot.io/rustlib/mneme" }  # 或按 Git 引入
+# mneme = { git = "https://github.com/oxroot-crypto/mneme" }  # 或按 Git 引入
 # mneme = "0.1"                                           # 发布到 crates.io 之后
 ```
 
@@ -102,7 +171,7 @@ mneme = { path = "../mneme" }                              # 本地克隆后按�
 ### 1. 建一个 demo 工程
 
 ```bash
-git clone https://gitlab.oxroot.io/rustlib/mneme.git
+git clone https://github.com/oxroot-crypto/mneme.git
 cargo new agent-memory && cd agent-memory
 cargo add --path ../mneme mneme     # 未发布到 crates.io,按路径引入
 ```
@@ -339,6 +408,7 @@ cargo run --example memory
 | [12 部署形态](docs/design/12-deployment.md) | 多进程只读、WASM 适配、可观测 |
 | [13 记忆模式手册](docs/design/13-cookbook.md) | Agent 记忆配方(可直接照抄) |
 | [spec/contracts.md](docs/spec/contracts.md) | 形式化契约矩阵(FC-Matrix) |
+| [comparison/README.md](comparison/README.md) | 与 usearch / hnsw_rs / hnsw-stable / instant-distance 的横向基准(方法学、全表、复现命令) |
 | [CHANGELOG.md](CHANGELOG.md) | 变更记录(Keep a Changelog 格式) |
 | [rust/README.md](docs/rust/README.md) | **Rust 零基础教学**(11 章):以本仓库源码为教材 |
 
@@ -384,7 +454,7 @@ mdbook serve               # 本地预览 http://localhost:3000
 mdbook build               # 输出到 book/
 ```
 
-GitLab CI(`.gitlab-ci.yml`)只跑轻量两档:`fast` 随每次 push(fmt + clippy + 单测 + feature 矩阵 + rustdoc 门禁 + wasm32 构建检查),`middle` 随 MR(全量 L2–L6 契约集成,加 f16/encrypt 跨 feature 矩阵)。重门槛、fuzz 长跑与变异测试仍由本机/专用 runner 手动执行。
+项目 CI(仓库根 `.gitlab-ci.yml`)只跑轻量两档:`fast` 随每次 push(fmt + clippy + 单测 + feature 矩阵 + rustdoc 门禁 + wasm32 构建检查),`middle` 随 PR(全量 L2–L6 契约集成,加 f16/encrypt 跨 feature 矩阵)。重门槛、fuzz 长跑与变异测试仍由本机/专用 runner 手动执行。
 
 MSRV 为 **1.93**(edition 2024),在 `Cargo.toml` 中声明;CI 以 `rust:1.93` 镜像构建与测试。
 
@@ -396,7 +466,7 @@ MSRV 为 **1.93**(edition 2024),在 `Cargo.toml` 中声明;CI 以 `rust:1.93` �
 2. 新增外部依赖必须在 PR 中论证;HNSW、BM25、量化、bloom、compaction、分词一律自研。
 3. 提交信息遵循 [Conventional Commits](https://www.conventionalcommits.org/),首行 ≤ 72 字符。
 
-问题与 MR 入口:[gitlab.oxroot.io/rustlib/mneme](https://gitlab.oxroot.io/rustlib/mneme/-/issues)。
+问题与 PR 入口:[github.com/oxroot-crypto/mneme](https://github.com/oxroot-crypto/mneme/issues)。
 
 ## 📄 许可证
 

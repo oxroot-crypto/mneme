@@ -11,6 +11,7 @@
 
 [![License](https://img.shields.io/badge/license-Unlicense-blue?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.93%2B-orange?style=flat-square)](Cargo.toml)
+[![GitHub](https://img.shields.io/badge/GitHub-oxroot--crypto%2Fmneme-181717?style=flat-square&logo=github)](https://github.com/oxroot-crypto/mneme)
 
 </div>
 
@@ -22,12 +23,13 @@ English | [简体中文](README.md)
 
 LLMs forget everything outside the context window once a conversation ends. An agent that runs for months needs an external memory that retrieves semantically, forgets trivia, and keeps working for a decade. Mneme is that engine.
 
-**Status**: not published to crates.io. L0–L6 are implemented and verified against formal contracts; the 1M×1536 performance gates and long fuzz runs are executed manually on a local or dedicated runner (not in CI; the official gate needs a ≥16GB runner). Design and acceptance criteria: [docs/DESIGN.md](docs/DESIGN.md).
+**Status**: version `0.1.0` (release in preparation; not yet published to crates.io). L0–L6 are implemented and verified against formal contracts; the 1M×1536 performance gates and long fuzz runs are executed manually on a local or dedicated runner (not in CI; the official gate needs a ≥16GB runner). Design and acceptance criteria: [docs/DESIGN.md](docs/DESIGN.md).
 
 ## 📑 Table of Contents
 
 - [Features](#-features)
 - [Architecture](#-architecture)
+- [Performance](#-performance)
 - [Installation](#-installation)
 - [Quick Start](#-quick-start)
 - [Usage](#-usage)
@@ -77,6 +79,76 @@ Capabilities in detail:
 | Storage security | AES-256-GCM encryption at rest (`encrypt`), key rotation, text/metadata compression (`compress` / `compress-zstd`) with fallback to raw bytes |
 | Deployment | Multi-process read-only sharing (`Mneme::reload`), `Storage`/`FsStorage`/`MemStorage` backends for WASM/edge, `Observer` event hooks |
 
+## 📊 Performance
+
+> 50,000 rows × 128 dims · 1,000 queries · top-10 · L2² · `M=16` / `ef_construction=200` ·
+> 4-core Intel Xeon 8255C. Medians over multiple interleaved rounds (round-to-round spread ±3–8%);
+> **Mneme's build time is the real ingestion path** (`insert_batch` + `flush`: WAL, segment files,
+> MANIFEST and graph persistence), while the other engines build purely in memory.
+> Full methodology, recall tables and raw data: [`comparison/README.md`](comparison/README.md).
+
+### Build time (4 threads, lower is better)
+
+```text
+usearch         ██ 3.76 s
+hnsw_stable     ██████ 8.66 s
+mneme i8        ███████ 10.52 s
+hnsw_rs         ███████ 10.61 s
+mneme (f32)     ███████ 10.85 s
+instant_dist    ██████████████████████████████████████████████ 69.32 s
+```
+
+### Single-thread query latency, P50 (ef=128, lower is better)
+
+```text
+usearch         █████████████████ 189 µs
+mneme i8        █████████████████ 193 µs
+mneme (f32)     ███████████████████████████ 295 µs
+hnsw_stable     ██████████████████████████████████ 377 µs
+hnsw_rs         ████████████████████████████████████████ 441 µs
+```
+
+### 4-thread aggregate throughput (ef=128, higher is better)
+
+```text
+usearch         ████████████████████████████████████████ 17,020 QPS
+mneme i8        ████████████████████████████████ 13,699 QPS
+mneme (f32)     ████████████████████████ 10,095 QPS
+hnsw_rs         █████████████ 5,599 QPS
+hnsw_stable     █████████████ 5,502 QPS
+```
+
+### Key numbers
+
+| Engine | ef | Recall@10 | P50 | 4-thread QPS | RSS delta |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| usearch | 128 | 0.9996 | 189 µs | 17,020 | 37.2 MiB |
+| **Mneme (i8, opt-in)** | 128 | 0.9980 | **193 µs** | **13,699** | 103.7 MiB |
+| **Mneme (default f32)** | 128 | 0.9980 | 295 µs | 10,095 | 97.3 MiB |
+| hnsw_stable | 128 | 1.0000 | 377 µs | 5,502 | 39.4 MiB |
+| hnsw_rs | 128 | 0.9799 | 441 µs | 5,599 | 134.3 MiB |
+| instant_distance | 64 | 0.9999 | 296 µs | 12,453 | 67.4 MiB |
+
+### How to read this
+
+- **Build**: Mneme (10.9 s) is on par with hnsw_rs (10.6 s), behind hnsw_stable (8.7 s) and
+  usearch (3.8 s) — but it is the only engine that writes WAL, immutable segments, MANIFEST
+  and the graph to disk and can recover from any crash point. `insert_batch` (WAL append)
+  takes just 0.45 s; the rest is graph construction and encoding inside `flush`.
+- **Query**: the default f32 mode matches hnsw_stable (295 µs vs 377 µs). Enabling the
+  optional i8 quantized copy (`.quantization(VectorFormat::I8Rescored)`) brings P50 down to
+  193 µs, essentially level with the fastest C++ implementation (usearch), for a recall cost
+  of ≤0.001 and +36% 4-thread throughput.
+- **Recall**: first tier — 0.9980 at ef=128 and 1.0000 at ef=256; hnsw_rs trails by ~2 points.
+- **In-memory mode**: a `Builder` without `path` is a pure in-memory store. After
+  `flush()` it builds an in-memory HNSW segment (no files, no quantized copy), so
+  queries and recall match the persistent store while saving the persistence cost
+  (build ~−7%, RSS ~−17%). Without `flush()` an in-memory store answers by exact
+  brute force (20k×128: P50 ≈ 0.7 ms), so flush large in-memory stores first.
+- On uniform random high-dimensional data (the hardest ANN regime) recall collapses for every
+  engine as expected, and Mneme has the highest recall at every ef. See
+  [`comparison/README.md`](comparison/README.md) for details.
+
 ## 📦 Installation
 
 ### Requirements
@@ -88,12 +160,12 @@ Capabilities in detail:
 
 ### Add the dependency
 
-The crate is not on crates.io yet; use a path or git dependency. Once released, `mneme = "0.1"` will work as usual.
+Current version is `0.1.0`, not yet on crates.io; use a path or git dependency. Once released, `mneme = "0.1"` will work as usual.
 
 ```toml
 [dependencies]
 mneme = { path = "../mneme" }                              # from a local clone
-# mneme = { git = "https://gitlab.oxroot.io/rustlib/mneme" }  # or via git
+# mneme = { git = "https://github.com/oxroot-crypto/mneme" }  # or via git
 # mneme = "0.1"                                           # after the crates.io release
 ```
 
@@ -102,7 +174,7 @@ mneme = { path = "../mneme" }                              # from a local clone
 ### 1. Create a demo crate
 
 ```bash
-git clone https://gitlab.oxroot.io/rustlib/mneme.git
+git clone https://github.com/oxroot-crypto/mneme.git
 cargo new agent-memory && cd agent-memory
 cargo add --path ../mneme mneme     # not on crates.io yet: path dependency
 ```
@@ -341,6 +413,7 @@ Every knob has a default; tune after reading `db.stats()`. The full table, inclu
 | [12 Deployment](docs/design/12-deployment.md) | Multi-process read-only, WASM, observability |
 | [13 Cookbook](docs/design/13-cookbook.md) | Agent memory recipes you can copy directly |
 | [spec/contracts.md](docs/spec/contracts.md) | Formal contract matrix (FC-Matrix) |
+| [comparison/README.md](comparison/README.md) | Cross-engine benchmarks vs usearch / hnsw_rs / hnsw-stable / instant-distance (methodology, full tables, reproduction) |
 | [CHANGELOG.md](CHANGELOG.md) | Release notes (Keep a Changelog format) |
 | [rust/README.md](docs/rust/README.md) | **Rust from zero** (11 chapters) using this source tree as the textbook |
 
@@ -386,7 +459,7 @@ mdbook serve               # preview at http://localhost:3000
 mdbook build               # output in book/
 ```
 
-GitLab CI (`.gitlab-ci.yml`) runs two light tiers: `fast` on every push (fmt + clippy + unit tests + feature matrix + rustdoc gate + wasm32 build check) and `middle` on merge requests (full L2–L6 contract integration plus f16/encrypt cross-feature matrices). The heavy gates, long fuzz runs and mutation testing stay manual.
+The project CI (`.gitlab-ci.yml` at the repository root) runs two light tiers: `fast` on every push (fmt + clippy + unit tests + feature matrix + rustdoc gate + wasm32 build check) and `middle` on pull requests (full L2–L6 contract integration plus f16/encrypt cross-feature matrices). The heavy gates, long fuzz runs and mutation testing stay manual.
 
 MSRV is **1.93** (edition 2024), declared in `Cargo.toml`; CI builds and tests on the `rust:1.93` image.
 
@@ -398,7 +471,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md). In short:
 2. New external dependencies must be justified in the pull request; HNSW, BM25, quantization, bloom, compaction and tokenization are in-house by policy.
 3. Commits follow [Conventional Commits](https://www.conventionalcommits.org/) with the first line ≤ 72 characters.
 
-Issues and merge requests: [gitlab.oxroot.io/rustlib/mneme](https://gitlab.oxroot.io/rustlib/mneme/-/issues).
+Issues and pull requests: [github.com/oxroot-crypto/mneme](https://github.com/oxroot-crypto/mneme/issues).
 
 ## 📄 License
 

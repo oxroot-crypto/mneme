@@ -85,7 +85,14 @@ Per 04 §13,未知帧类型必须在回放时中止而非跳过。补充覆盖�
 - 本地预览:`cargo install mdbook mdbook-mermaid && cargo install mdbook-katex --no-default-features --features duktape && mdbook serve`
   (Windows MSVC 无法编译 `mdbook-katex` 默认的 quick-js 后端,须改用 duktape 后端)。
 
-## 报告问题
+## 报告问题与提交 PR
 
-请在 [GitLab Issues](https://gitlab.oxroot.io/rustlib/mneme/-/issues) 提交,并附上:
+问题与功能建议请在 [GitHub Issues](https://github.com/oxroot-crypto/mneme/issues) 提交,并附上:
 版本、平台、最小复现、期望行为与实际行为。
+
+提交代码请走 [GitHub Pull Request](https://github.com/oxroot-crypto/mneme/pulls):
+
+1. 从 `main` 切出特性分支(`feat/*`、`fix/*`、`docs/*` 等),一次 PR 只做一件事;
+2. 提交信息遵循上文「提交信息」;契约相关改动在 PR 描述里写明对应的 `FC-*` 编号;
+3. PR 描述写清动机、公开 API/磁盘格式影响与验证命令,并在本机跑完「提交前检查」;
+4. 评审意见用行内评论回复,合并前保持与 `main` 同步(rebase 优先,保持线性历史)。

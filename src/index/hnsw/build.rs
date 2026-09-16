@@ -22,6 +22,7 @@ use crate::core::options::HnswParams;
 
 mod inputs;
 mod plan;
+mod pool;
 
 // 拆分唔改外部可达性:旧路径 `crate::index::hnsw::build::{...}` 照旧经重导出可达。
 #[cfg(test)]
@@ -219,103 +220,81 @@ impl HnswIndex {
     /// 阶段 1/2:批内并行计算计划、批间按节点序串行应用(结果与线程数无关)。
     ///
     /// 首批受 `m0` 约束:冷启动核心的入边不被集中修剪,保证从入口可达。
+    /// 单线程退化为纯串行路径;多线程经常驻 worker 池执行(见 [`pool`] 模块),
+    /// 批次间复用 worker,避免逐批创建/销毁线程。
     ///
     /// # Errors
-    /// 计划计算失败(档位量化不一致)或构建线程 panic 时返回结构化错误。
+    /// 计划计算失败(档位量化不一致)或构建 worker 退出时返回结构化错误。
     fn run_build_batches(&mut self, levels: &[u8], build: &HnswBuildParams) -> Result<()> {
         let count = levels.len();
         let batch_rows = build_batch_rows(count, build);
         let first_batch = build_first_batch_rows(batch_rows, self.m0);
         let threads = build_threads(build.parallelism, batch_rows, build.threads_max);
+        if threads <= 1 {
+            return self.run_build_batches_serial(levels, batch_rows, first_batch);
+        }
+        self.run_build_batches_pooled(levels, batch_rows, first_batch, threads)
+    }
+
+    /// 串行路径:逐批内联计算计划并应用(单线程/小图)。
+    fn run_build_batches_serial(
+        &mut self,
+        levels: &[u8],
+        batch_rows: usize,
+        first_batch: usize,
+    ) -> Result<()> {
+        let count = levels.len();
         let mut start = 0;
         while start < count {
             let size = if start == 0 { first_batch } else { batch_rows };
             let end = (start + size).min(count);
-            let plans = self.plan_batch(start, end, levels, threads)?;
-            self.apply_batch(start, &plans, levels, threads)?;
+            let plans: Vec<LinkPlan> = (start..end)
+                .map(|position| self.plan_node(position as u32, levels[position]))
+                .collect::<Result<_>>()?;
+            self.apply_batch(start, &plans, levels);
             start = end;
         }
         Ok(())
     }
 
-    /// 并行计算 `[start, end)` 的建图计划(只读图快照;结果与线程数无关)。
+    /// 并行路径:常驻 worker 池计算计划/修剪,主线程在阶段之间持写锁应用。
     ///
-    /// 动态游标分派:每个位置的计划只依赖批开始快照,分派顺序只影响耗时。
-    ///
-    /// # Errors
-    /// 计划计算失败(档位量化不一致)或构建线程 panic 时返回结构化错误。
-    fn plan_batch(
-        &self,
-        start: usize,
-        end: usize,
+    /// 锁纪律(避免死锁):计划与修剪阶段 worker 持读锁、主线程等待结果;
+    /// 主线程只在两阶段之间持写锁,持锁期间不向 worker 派活。
+    fn run_build_batches_pooled(
+        &mut self,
         levels: &[u8],
+        batch_rows: usize,
+        first_batch: usize,
         threads: usize,
-    ) -> Result<Vec<LinkPlan>> {
-        let batch = end - start;
-        let workers = threads.min(batch).max(1);
-        if workers <= 1 {
-            return (start..end)
-                .map(|position| self.plan_node(position as u32, levels[position]))
-                .collect();
-        }
-        self.plan_batch_parallel(start..end, workers, levels)?
-            .into_iter()
-            .map(|slot| {
-                slot.ok_or(crate::core::error::MnemeError::Inconsistent {
-                    reason: "HNSW 建图计划缺失",
-                })
-            })
-            .collect()
-    }
-
-    /// 多线程分派批内计划:每线程经原子游标领取位置,结果按位置回填槽位。
-    ///
-    /// 只读批开始图快照、各写各的槽位,故结果与线程数无关;线程 panic 结构化上报。
-    ///
-    /// # Errors
-    /// 构建线程 panic 或单节点计划失败时返回结构化错误。
-    fn plan_batch_parallel(
-        &self,
-        range: std::ops::Range<usize>,
-        workers: usize,
-        levels: &[u8],
-    ) -> Result<Vec<Option<LinkPlan>>> {
-        let start = range.start;
-        let batch = range.len();
-        let cursor = std::sync::atomic::AtomicUsize::new(0);
-        let mut slots: Vec<Option<LinkPlan>> = (0..batch).map(|_| None).collect();
+    ) -> Result<()> {
+        let count = levels.len();
+        let lock = std::sync::RwLock::new(self);
         std::thread::scope(|scope| -> Result<()> {
-            let handles: Vec<_> = (0..workers)
-                .map(|_| {
-                    scope.spawn(|| -> Result<Vec<(usize, LinkPlan)>> {
-                        let mut produced = Vec::new();
-                        loop {
-                            let offset = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if offset >= batch {
-                                break;
-                            }
-                            let position = start + offset;
-                            produced
-                                .push((offset, self.plan_node(position as u32, levels[position])?));
-                        }
-                        Ok(produced)
-                    })
-                })
-                .collect();
-            for handle in handles {
-                let produced =
-                    handle
-                        .join()
-                        .map_err(|_| crate::core::error::MnemeError::Inconsistent {
-                            reason: "HNSW 建图线程 panic",
-                        })??;
-                for (offset, plan) in produced {
-                    slots[offset] = Some(plan);
+            let pool = pool::BuildPool::spawn(scope, threads, &lock, levels);
+            let mut start = 0;
+            while start < count {
+                let size = if start == 0 { first_batch } else { batch_rows };
+                let end = (start + size).min(count);
+                let plans = pool.plan_batch(start, end)?;
+                let touched = {
+                    let mut guard = lock
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    guard.apply_batch_links(start, &plans, levels)
+                };
+                let pruned = pool.prune_batch(&touched)?;
+                {
+                    let mut guard = lock
+                        .write()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    guard.write_back_pruned(touched, pruned);
                 }
+                start = end;
             }
+            pool.shutdown();
             Ok(())
-        })?;
-        Ok(slots)
+        })
     }
 
     /// 在批开始图快照上计算单节点各层的选邻计划(只读;可多线程并行)。
