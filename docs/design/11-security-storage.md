@@ -126,7 +126,7 @@ impl Keyring {
 密钥轮换(`FC-SEC-POST-001`):`provider.rotate()` 获取新密钥后全量段重写,
 迁移期间新旧密钥均可读(`KeyProvider` 需同时持有两者);`db.stats().storage` 的
 `migrated_segments/total_segments` 以信封头 `key_id` 是否等于 active 实计。
-纯内存库 → `Unsupported`,库未启用加密 → `Config`。项目未发布,不保留混合版本兼容。
+纯内存库 → `Unsupported`,库未启用加密 → `Config`。不保留混合版本兼容。
 
 ### 2.5 复杂度与不变量
 

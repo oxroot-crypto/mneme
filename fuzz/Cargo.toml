@@ -9,7 +9,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-mneme = { path = "..", features = ["fuzzing"] }
+# 显式 `package` rename:发布名为 `mneme-db`,库名仍为 `mneme`,目标码里的 `use mneme::` 不变。
+mneme = { package = "mneme-db", path = "..", features = ["fuzzing"] }
 
 [[bin]]
 name = "fuzz_vsec"

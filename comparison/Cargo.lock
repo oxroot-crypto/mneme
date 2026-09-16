@@ -767,7 +767,21 @@ dependencies = [
 ]
 
 [[package]]
-name = "mneme"
+name = "mneme-comparison"
+version = "0.0.0"
+dependencies = [
+ "hnsw-stable",
+ "hnsw_rs",
+ "instant-distance",
+ "mneme-db",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "usearch",
+]
+
+[[package]]
+name = "mneme-db"
 version = "0.1.0"
 dependencies = [
  "crc32fast",
@@ -775,20 +789,6 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
-]
-
-[[package]]
-name = "mneme-comparison"
-version = "0.0.0"
-dependencies = [
- "hnsw-stable",
- "hnsw_rs",
- "instant-distance",
- "mneme",
- "serde",
- "serde_json",
- "tempfile",
- "usearch",
 ]
 
 [[package]]

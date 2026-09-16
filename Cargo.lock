@@ -1117,7 +1117,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "mneme"
+name = "mneme-db"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",

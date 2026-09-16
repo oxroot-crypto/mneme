@@ -5,10 +5,14 @@
 本仓库(Mneme)的**全部代码与文档**均由 AI 模型生成,不存在人工逐行编写的部分,也未经过完整的人工审查与评估,
 包括但不限于:
 
-- 源码:`src/`、`examples/`、`benches/`、`tests/`、`fuzz/`;
+- 源码:`src/`、`examples/`、`benches/`、`tests/`、`fuzz/`、`comparison/`;
 - 文档:`README.md`、`README.en.md`、`CHANGELOG.md`、`CONTRIBUTING.md`、`AGENTS.md`、
   `docs/`(设计文档、契约、Rust 教学)及 `docs/assets/`;
 - 工程与配置:`Cargo.toml`、`Cargo.lock`、`.gitlab-ci.yml`、`book.toml`、`mutants.toml` 等。
+
+> [!NOTE]
+> `comparison/` 下的基准比较结论由 AI 编写基准代码、运行测试并汇总得出,
+> 不保证完全可信。
 
 本声明文件本身亦由 AI 生成。
 

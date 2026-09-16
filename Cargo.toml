@@ -1,5 +1,5 @@
 [package]
-name = "mneme"
+name = "mneme-db"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.93"
@@ -9,6 +9,11 @@ repository = "https://github.com/oxroot-crypto/mneme"
 readme = "README.md"
 keywords = ["vector", "embedding", "database", "hnsw", "memory"]
 categories = ["database"]
+
+# crates.io 上 `mneme` 已被占用,发布名改用 `mneme-db`;lib target 仍为 `mneme`,
+# 仓内与下游的 `use mneme::` 均不需改动。
+[lib]
+name = "mneme"
 
 [features]
 # 默认开启 mmap(L3 起,见 docs/design/01-overview.md §5.1);关闭后段文件走

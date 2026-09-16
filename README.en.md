@@ -23,7 +23,7 @@ English | [简体中文](README.md)
 
 LLMs forget everything outside the context window once a conversation ends. An agent that runs for months needs an external memory that retrieves semantically, forgets trivia, and keeps working for a decade. Mneme is that engine.
 
-**Status**: version `0.1.0` (release in preparation; not yet published to crates.io). L0–L6 are implemented and verified against formal contracts; the 1M×1536 performance gates and long fuzz runs are executed manually on a local or dedicated runner (not in CI; the official gate needs a ≥16GB runner). Design and acceptance criteria: [docs/DESIGN.md](docs/DESIGN.md).
+**Status**: version `0.1.0`. L0–L6 are implemented and verified against formal contracts; the 1M×1536 performance gates and long fuzz runs are executed manually on a local or dedicated runner (not in CI; the official gate needs a ≥16GB runner). Design and acceptance criteria: [docs/DESIGN.md](docs/DESIGN.md).
 
 ## 📑 Table of Contents
 
@@ -160,13 +160,14 @@ hnsw_stable     █████████████ 5,502 QPS
 
 ### Add the dependency
 
-Current version is `0.1.0`, not yet on crates.io; use a path or git dependency. Once released, `mneme = "0.1"` will work as usual.
+The name `mneme` is already taken on crates.io, so the published package is `mneme-db`.
+The library (crate) name remains `mneme`, so keep writing `use mneme::...` in code.
 
 ```toml
 [dependencies]
-mneme = { path = "../mneme" }                              # from a local clone
-# mneme = { git = "https://github.com/oxroot-crypto/mneme" }  # or via git
-# mneme = "0.1"                                           # after the crates.io release
+mneme-db = "0.1"                                           # published name (library name: mneme)
+# mneme-db = { path = "../mneme" }                         # or a local clone via path
+# mneme-db = { git = "https://github.com/oxroot-crypto/mneme" }  # or via git
 ```
 
 ## 🚀 Quick Start
@@ -174,9 +175,8 @@ mneme = { path = "../mneme" }                              # from a local clone
 ### 1. Create a demo crate
 
 ```bash
-git clone https://github.com/oxroot-crypto/mneme.git
 cargo new agent-memory && cd agent-memory
-cargo add --path ../mneme mneme     # not on crates.io yet: path dependency
+cargo add mneme-db                  # library name stays mneme; keep use mneme::...
 ```
 
 ### 2. Write `src/main.rs`
@@ -314,7 +314,7 @@ ns.supersede(
 
 ```toml
 [dependencies]
-mneme = { path = "../mneme", features = ["encrypt", "compress"] }
+mneme-db = { version = "0.1", features = ["encrypt", "compress"] }
 ```
 
 ```rust
