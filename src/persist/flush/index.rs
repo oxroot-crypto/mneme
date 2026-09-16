@@ -8,7 +8,7 @@ use crate::memory::analysis::{
     BLOOM_INITIAL_CAPACITY, BloomSet, InvertedIndex, ZONE_BLOCK_ROWS, ZoneIndex,
 };
 use crate::memory::config::Config;
-use crate::memory::index::{IndexNode, QuantCopy, VectorIndex};
+use crate::memory::index::{QuantCopy, VectorIndex};
 use crate::memory::table::WriterState;
 use crate::persist::msec::{self, FieldKind};
 
@@ -168,22 +168,15 @@ pub(super) fn build_index(input: BuildIndexInput<'_>) -> Result<BuiltIndex> {
         quant,
         parallelism,
     } = input;
-    let Some(factory) = config.index_factory.as_ref() else {
-        return Ok(empty_built_index());
-    };
     if included.is_empty() {
         return Ok(empty_built_index());
     }
-    let (nodes, slot_of) = collect_index_nodes(ws, included);
-    let index = factory.build(crate::memory::index::IndexBuildRequest {
-        nodes: &nodes,
-        slot_of: &slot_of,
-        params: config.hnsw,
-        metric: config.metric,
-        quant,
-        build_precision: config.build_precision,
-        build: crate::core::options::HnswBuildParams::from_tuning(&config.tuning, parallelism),
-    })?;
+    // 节点收集与建图走 L1 共享实现(纯内存建段同路径):无工厂时视为无索引段。
+    let Some(index) =
+        crate::memory::table::build_segment_index(ws, config, included, quant, parallelism)?
+    else {
+        return Ok(empty_built_index());
+    };
     let entry = index.entry();
     let bytes = index.serialize()?;
     Ok(BuiltIndex {
@@ -202,27 +195,4 @@ fn empty_built_index() -> BuiltIndex {
         entry_slot: 0,
         entry_level: 0,
     }
-}
-
-/// 按 `included` 顺序收集 HNSW 节点与全局槽位编号。
-fn collect_index_nodes(ws: &WriterState, included: &[usize]) -> (Vec<IndexNode>, Vec<SlotId>) {
-    let nodes: Vec<IndexNode> = included
-        .iter()
-        .map(|&idx| {
-            let slot = &ws.slots[idx];
-            IndexNode {
-                rowid: slot.rowid,
-                vector: Arc::clone(&slot.vector),
-                norm_sq: slot.norm_sq,
-            }
-        })
-        .collect();
-    let slot_of: Vec<SlotId> = included
-        .iter()
-        .map(|&idx| {
-            // 槽位下标 ≤ u32::MAX(FC-MEM-INV-004),转换可证明不会失败。
-            SlotId::new(u32::try_from(idx).expect("槽位下标必可转入 u32(FC-MEM-INV-004)"))
-        })
-        .collect();
-    (nodes, slot_of)
 }

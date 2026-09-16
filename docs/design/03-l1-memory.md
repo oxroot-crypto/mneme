@@ -445,6 +445,8 @@ pub(crate) trait IndexFactory: Send + Sync {
 ANN + 未落盘尾部暴力 + `TopK` 归并**。工厂由组合根(`Builder`)注入,`HNSW` 实现见
 `crate::index`(设计 [05](05-l3-hnsw.md));`persist` 只经该接口安装/校验索引,不认识
 `crate::index` 具体类型,层方向保持 L3 → L1。该接口对象安全(无 RPITIT),可存于 `Arc<dyn>`。
+纯内存库经 `Mneme::flush` 以**同一工厂**安装内存段(不落盘、不序列化),查询口径与
+持久库一致(`FC-INDEX-INV-008`)。
 
 ## 本章小结
 

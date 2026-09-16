@@ -2,28 +2,33 @@
 
 use std::cmp::Ordering;
 
-use crate::core::error::Result;
 use crate::core::metric::Score;
 
 use super::HnswIndex;
 use super::model::LinkPlan;
 
 impl HnswIndex {
-    /// 串行应用一批计划:先全部加边(无距离计算),再把超员节点的修剪计算
-    /// **按批并行求值**、按 `(节点, 层)` 序串行写回。
-    ///
-    /// 修剪只读批末图快照、各改各的邻接表,故结果与线程数无关(确定性不变);
-    /// 相比逐节点边加边剪,批末统一修剪的输入含本批全部新边,修剪更彻底。
-    ///
-    /// # Errors
-    /// 修剪计算线程 panic 时返回结构化错误,绝不把 panic 抛给调用方。
-    pub(super) fn apply_batch(
+    /// 串行应用一批计划:先全部加边(无距离计算),再串行计算超员节点的修剪
+    /// 邻接并按 `(节点, 层)` 序写回(单线程路径;与常驻 worker 池路径共用
+    /// [`apply_batch_links`](Self::apply_batch_links) 与
+    /// [`write_back_pruned`](Self::write_back_pruned),保证两条路径逐字节同图)。
+    pub(super) fn apply_batch(&mut self, start: usize, plans: &[LinkPlan], levels: &[u8]) {
+        let touched = self.apply_batch_links(start, plans, levels);
+        let pruned: Vec<Vec<u32>> = touched
+            .iter()
+            .map(|&(node, layer)| self.compute_pruned(node, layer))
+            .collect();
+        self.write_back_pruned(touched, pruned);
+    }
+
+    /// 串行加边(无距离计算):双向连边、记录被触达的 `(节点,层)`,返回按
+    /// `(节点, 层)` 序排序去重、且度数超过上界需修剪的目标。
+    pub(super) fn apply_batch_links(
         &mut self,
         start: usize,
         plans: &[LinkPlan],
         levels: &[u8],
-        threads: usize,
-    ) -> Result<()> {
+    ) -> Vec<(u32, usize)> {
         let mut touched: Vec<(u32, usize)> = Vec::new();
         for (offset, plan) in plans.iter().enumerate() {
             let position = start + offset;
@@ -35,14 +40,17 @@ impl HnswIndex {
             let max_conn = if layer == 0 { self.m0 } else { self.m };
             self.graph.degree(node, layer) > max_conn
         });
-        let pruned = self.compute_prune_batch(&touched, threads)?;
+        touched
+    }
+
+    /// 按 `(节点, 层)` 序写回修剪后的邻接(`touched` 与 `pruned` 一一对应)。
+    pub(super) fn write_back_pruned(&mut self, touched: Vec<(u32, usize)>, pruned: Vec<Vec<u32>>) {
         for ((node, layer), selected) in touched.into_iter().zip(pruned) {
             // reason: 构建路径的图恒为 `Heap`(载入路径不经此函数)。
             if let Some(graph) = self.graph.heap_mut() {
                 graph.set_neighbors(node, layer, selected);
             }
         }
-        Ok(())
     }
 
     /// 串行加边(无距离计算):双向连边、记录被触达的 `(节点, 层)`、必要时推进入口。
@@ -82,82 +90,11 @@ impl HnswIndex {
         }
     }
 
-    /// 并行计算一批超员节点的修剪后邻接(只读图快照;结果与线程数无关)。
-    ///
-    /// # Errors
-    /// 修剪计算线程 panic 时返回结构化错误。
-    fn compute_prune_batch(
-        &self,
-        targets: &[(u32, usize)],
-        threads: usize,
-    ) -> Result<Vec<Vec<u32>>> {
-        let count = targets.len();
-        let workers = threads.min(count).max(1);
-        if workers <= 1 {
-            return Ok(targets
-                .iter()
-                .map(|&(node, layer)| self.compute_pruned(node, layer))
-                .collect());
-        }
-        self.compute_prune_parallel(targets, workers)?
-            .into_iter()
-            .map(|slot| {
-                slot.ok_or(crate::core::error::MnemeError::Inconsistent {
-                    reason: "HNSW 修剪结果缺失",
-                })
-            })
-            .collect()
-    }
-
-    /// 多线程分派修剪计算:每线程经原子游标领取目标,结果按位置回填槽位。
-    ///
-    /// 只读批末图快照、各改各的邻接表,故结果与线程数无关。
-    ///
-    /// # Errors
-    /// 修剪计算线程 panic 时返回结构化错误。
-    fn compute_prune_parallel(
-        &self,
-        targets: &[(u32, usize)],
-        workers: usize,
-    ) -> Result<Vec<Option<Vec<u32>>>> {
-        let count = targets.len();
-        let cursor = std::sync::atomic::AtomicUsize::new(0);
-        let mut slots: Vec<Option<Vec<u32>>> = (0..count).map(|_| None).collect();
-        std::thread::scope(|scope| -> Result<()> {
-            let handles: Vec<_> = (0..workers)
-                .map(|_| {
-                    scope.spawn(|| -> Vec<(usize, Vec<u32>)> {
-                        let mut produced = Vec::new();
-                        loop {
-                            let index = cursor.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                            if index >= count {
-                                break;
-                            }
-                            let (node, layer) = targets[index];
-                            produced.push((index, self.compute_pruned(node, layer)));
-                        }
-                        produced
-                    })
-                })
-                .collect();
-            for handle in handles {
-                let produced =
-                    handle
-                        .join()
-                        .map_err(|_| crate::core::error::MnemeError::Inconsistent {
-                            reason: "HNSW 修剪线程 panic",
-                        })?;
-                for (index, selected) in produced {
-                    slots[index] = Some(selected);
-                }
-            }
-            Ok(())
-        })?;
-        Ok(slots)
-    }
-
     /// 计算 `node` 在 `layer` 层修剪后的邻接(只读;不写图)。
-    fn compute_pruned(&self, node: u32, layer: usize) -> Vec<u32> {
+    ///
+    /// 常驻 worker 池的修剪阶段经共享读锁调用(见
+    /// [`pool`](super::build::pool) 模块),故对 `hnsw` 模块可见。
+    pub(super) fn compute_pruned(&self, node: u32, layer: usize) -> Vec<u32> {
         let max_conn = if layer == 0 { self.m0 } else { self.m };
         let current: Vec<u32> = self.graph.neighbors(node, layer).to_vec();
         let mut scored: Vec<(Score, u32)> = current

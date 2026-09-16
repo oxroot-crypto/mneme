@@ -14,7 +14,7 @@ mod slot;
 mod version;
 mod writer;
 
-pub(crate) use index::InstallSegmentInput;
+pub(crate) use index::{InstallSegmentInput, build_segment_index};
 pub use slot::AccessStat;
 pub(crate) use slot::{SlotData, slot_id_for};
 pub(crate) use writer::WriterState;

@@ -286,6 +286,18 @@ impl WriterState {
             .collect()
     }
 
+    /// 下一个内存段编号(纯内存库建段用;持久段编号来自 MANIFEST)。
+    ///
+    /// 取现存内存段编号最大值 + 1:段编号在单个视图内唯一即可(与持久库同口径,
+    /// 供段级 `alive` 位图缓存键 `(段号, NsId)` 使用),不要求全局单调。
+    pub(crate) fn next_memory_segment_id(&self) -> u32 {
+        self.indexes
+            .iter()
+            .map(|segment| segment.segment_id.saturating_add(1))
+            .max()
+            .unwrap_or(0)
+    }
+
     /// 清空自上次 flush 以来关系变更标记(全量重写关系表后调用)。
     pub(crate) fn clear_edge_dirty(&mut self) {
         self.edge_dirty = Arc::new(HashSet::new());

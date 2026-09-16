@@ -11,6 +11,13 @@
 **/*.rs.bk
 *.pdb
 
+# 对比基准独立 workspace 的构建产物
+/comparison/target/
+# comparison 的自动运行产物(原始 JSON 与自动 Markdown);结论报告是手写的
+# comparison/README.md,可追踪的数值以报告表格为准。
+/comparison/results/
+/comparison/results-*/
+
 # 编辑器 / IDE
 .idea/
 .vscode/

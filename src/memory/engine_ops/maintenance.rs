@@ -1,7 +1,9 @@
 //! 运维方法:只读重载、加密密钥轮换与显式落盘。
 
 use crate::core::error::{MnemeError, Result};
+use crate::core::options::VectorFormat;
 use crate::memory::engine::Mneme;
+use crate::memory::table::{InstallSegmentInput, build_segment_index};
 
 impl Mneme {
     /// 只读实例重载:发现更新的已提交 MANIFEST 时原子切换视图。
@@ -106,13 +108,15 @@ impl Mneme {
         Ok(new_id)
     }
 
-    /// 显式落盘:把未落盘槽位与自上次 flush 的 delta 物化为新段并提交 MANIFEST。
+    /// 显式落盘 / 显式建索引:把未落盘槽位物化为新段。
     ///
-    /// 纯内存库为空操作;持久库执行增量段 flush + WAL Checkpoint(设计 04 §3.2、
-    /// 07 §4);无新增且无 delta 时为空操作。
+    /// 持久库执行增量段 flush + WAL Checkpoint(设计 04 §3.2、07 §4);
+    /// **纯内存库在内存中建段**:用同一 `IndexFactory` 建 HNSW 图并安装为
+    /// 内存段(不写 vsec/msec/hidx、不做量化副本),此后查询走「内存段 ANN +
+    /// 未覆盖尾部暴力」(`FC-INDEX-INV-008`)。两类库无新增槽位时均为空操作。
     ///
     /// # Returns
-    /// 落盘完成(含空操作)返回 `Ok(())`。
+    /// 完成(含空操作)返回 `Ok(())`。
     ///
     /// # Errors
     /// 库已关闭时返回 [`MnemeError::Closed`];只读模式返回
@@ -125,7 +129,7 @@ impl Mneme {
     /// let db = Mneme::in_memory(2).unwrap();
     /// let ns = db.namespace("demo");
     /// ns.insert(Record::new(vec![1.0, 0.0]).key("a")).unwrap();
-    /// // 纯内存库上 flush 是空操作,数据仍在且返回 `Ok(())`。
+    /// // 纯内存库上 flush 建内存段(不落盘),数据仍在且返回 `Ok(())`。
     /// db.flush().unwrap();
     /// assert!(ns.exists("a").unwrap());
     /// ```
@@ -135,14 +139,46 @@ impl Mneme {
             return Err(MnemeError::Closed);
         }
         drop(view);
-        if let Some(store) = &self.store {
-            let mut ws = self.table.write();
-            if ws.closed {
-                return Err(MnemeError::Closed);
+        match &self.store {
+            Some(store) => {
+                let mut ws = self.table.write();
+                if ws.closed {
+                    return Err(MnemeError::Closed);
+                }
+                store.flush(&mut ws, &self.config)?;
+                self.table.publish(&ws);
             }
-            store.flush(&mut ws, &self.config)?;
-            self.table.publish(&ws);
+            None => self.flush_memory_segment()?,
         }
+        Ok(())
+    }
+
+    /// 纯内存库建段:把未覆盖槽位建成内存段并发布新视图(无新增时为空操作)。
+    fn flush_memory_segment(&self) -> Result<()> {
+        let mut ws = self.table.write();
+        if ws.closed {
+            return Err(MnemeError::Closed);
+        }
+        let included = ws.unpersisted_slots();
+        if included.is_empty() {
+            return Ok(());
+        }
+        let Some(index) =
+            build_segment_index(&ws, &self.config, &included, None, self.config.parallelism)?
+        else {
+            // 未配置索引工厂(理论不可达:组合根恒注入):退化为无索引段,保持暴扫。
+            return Ok(());
+        };
+        let segment_id = ws.next_memory_segment_id();
+        ws.install_segment(InstallSegmentInput {
+            segment_id,
+            slot_indices: &included,
+            index: Some(index),
+            quant: VectorFormat::F32,
+            recall_est: None,
+        });
+        ws.note_materialized(included.len());
+        self.table.publish(&ws);
         Ok(())
     }
 }
