@@ -9,7 +9,8 @@ description = "Mneme 与主流嵌入型向量库的横向性能对比(开发期�
 
 [dependencies]
 # 被测对象:主仓库本地 path 依赖,按默认 feature(mmap 开)构建。
-mneme = { path = ".." }
+# 显式 `package` rename:发布名为 `mneme-db`,库名仍为 `mneme`,基准码里的 `use mneme::` 不变。
+mneme = { package = "mneme-db", path = ".." }
 # 竞品(仅本独立 workspace 使用,不进入主 crate 依赖树):
 # - usearch:C++ 核心 + 官方 Rust 绑定,当代跨语言主流 ANN 库。
 usearch = "2.26"

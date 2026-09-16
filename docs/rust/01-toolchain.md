@@ -16,7 +16,7 @@
   在编译期保证不出现野指针、双重释放、数据竞争。这是 Rust 最大的卖点,也是最陡的学习曲线
   (第 [02](02-values-and-ownership.md) 章专讲)。
 
-mneme 是一个**库(library)**,不是一个可执行程序——它被别的程序 `cargo add mneme` 引入后使用。
+mneme 是一个**库(library)**,不是一个可执行程序——它被别的程序 `cargo add mneme-db` 引入后使用。
 所以它没有 `main()` 作为入口,入口是 `src/lib.rs`。
 
 ---

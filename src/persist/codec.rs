@@ -7,14 +7,14 @@ use crate::core::error::{MnemeError, Result};
 
 /// 当前文件格式版本:高 8 位主版本、低 8 位次版本(设计 04 §2)。
 ///
-/// 项目尚未发布,不存在需要读取的旧开发格式;任何版本差异都直接拒绝
-/// (不保留旧版本读取分支),详见 `AGENTS.md`「项目状态与兼容纪律」。
+/// 不存在需要读取的旧格式;任何版本差异都直接拒绝(不保留旧版本读取分支),
+/// 详见 `AGENTS.md`「项目状态与兼容纪律」。
 pub(crate) const FORMAT_VERSION: u16 = 0x0006;
 
 /// 校验文件格式版本必须与 `expected` 完全一致(I18)。
 ///
-/// 项目未发布:主/次版本任何不一致都返回
-/// [`MnemeError::UnsupportedVersion`],不给旧开发格式留宽容读取路径。
+/// 主/次版本任何不一致都返回
+/// [`MnemeError::UnsupportedVersion`],不给旧格式留宽容读取路径。
 pub(crate) fn check_version(file: &'static str, found: u16, expected: u16) -> Result<()> {
     if found != expected {
         return Err(MnemeError::UnsupportedVersion {
@@ -158,7 +158,7 @@ pub(crate) fn put_bytes_u32(out: &mut Vec<u8>, bytes: &[u8]) {
 mod tests {
     use super::*;
 
-    /// I18:未发布期格式版本必须精确等于当前定义,任何差异都拒绝。
+    /// I18:格式版本必须精确等于当前定义,任何差异都拒绝。
     #[test]
     fn version_gate_rejects_any_mismatch() {
         assert!(check_version("vsec", FORMAT_VERSION, FORMAT_VERSION).is_ok());

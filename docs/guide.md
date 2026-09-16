@@ -40,16 +40,17 @@
 ```toml
 [dependencies]
 # 默认构建:含 mmap 段读取(推荐)
-mneme = "0.1"
+mneme-db = "0.1"
 
 # 常用组合
-# mneme = { version = "0.1", features = ["async"] }          # async 门面(引入 tokio 的 rt)
-# mneme = { version = "0.1", features = ["quant-f16"] }      # f16 量化副本(引入 half)
-# mneme = { version = "0.1", features = ["encrypt", "compress"] }  # 静态加密 + 压缩
-# mneme = { version = "0.1", default-features = false }      # 关闭 mmap(纯 Read+Seek 兜底)
+# mneme-db = { version = "0.1", features = ["async"] }          # async 门面(引入 tokio 的 rt)
+# mneme-db = { version = "0.1", features = ["quant-f16"] }      # f16 量化副本(引入 half)
+# mneme-db = { version = "0.1", features = ["encrypt", "compress"] }  # 静态加密 + 压缩
+# mneme-db = { version = "0.1", default-features = false }      # 关闭 mmap(纯 Read+Seek 兜底)
 ```
 
-> Mneme 未发布到 crates.io 时,请以路径或 git 依赖引入。八个 feature 的作用与默认值
+> `mneme` 已被 crates.io 占用,发布名为 `mneme-db`;库名仍为 `mneme`,
+> 代码里照旧 `use mneme::...`。八个 feature 的作用与默认值
 > 见 [README 的 feature 表](../README.md)与 [16 §2](design/16-api-reference.md)。
 
 ### 2.2 最小可用程序
@@ -600,12 +601,11 @@ fn with_retry<T>(mut f: impl FnMut() -> mneme::Result<T>) -> mneme::Result<T> {
 
 ## 8. 升级与兼容
 
-- 项目**未发布**:当前的磁盘格式与 API 均视为未发布,不存在旧格式读取分支;
-  段/MANIFEST/WAL/hidx 的版本号**精确匹配**,任何不一致都拒绝打开(`UnsupportedVersion`),
-  绝不静默误读([04 §12](design/04-l2-persist.md));
-- 发布之后:破坏性变更走版本化流程并在 [spec/contracts.md](spec/contracts.md)
-  的「变更记录」登记;在此之前,升级 Mneme 请**从备份恢复或重新灌入**
-  (格式与 API 可能随开发变化);
+- 磁盘格式**只有当前一个版本**:段/MANIFEST/WAL/hidx 的版本号**精确匹配**,
+  任何不一致都拒绝打开(`UnsupportedVersion`),绝不静默误读,也不存在
+  读取旧开发格式的分支([04 §12](design/04-l2-persist.md));
+- 破坏性变更走版本化流程并在 [spec/contracts.md](spec/contracts.md)
+  的「变更记录」登记;升级 Mneme 遇格式不匹配时请**从备份恢复或重新灌入**;
 - 公开 API 自 L1 冻结;改签名需单独 RFC 并同步 [16](design/16-api-reference.md)。
 
 ---

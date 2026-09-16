@@ -23,7 +23,7 @@
 
 LLM 每次对话结束就忘光上下文之外的一切。要跑上数月的 Agent,必须配一个能语义检索、能遗忘琐碎信息、能撑十年的外部记忆。Mneme 就是这样一个引擎。
 
-**状态**:版本 `0.1.0`(发布准备中,尚未上线 crates.io)。L0–L6 已完整实现并通过形式化契约验收;1M×1536 性能门槛与 fuzz 长跑由本机/专用 runner 手动执行(不上 CI,正式门槛需 ≥16GB 专用 runner)。设计与验收标准见 [docs/DESIGN.md](docs/DESIGN.md)。
+**状态**:版本 `0.1.0`。L0–L6 已完整实现并通过形式化契约验收;1M×1536 性能门槛与 fuzz 长跑由本机/专用 runner 手动执行(不上 CI,正式门槛需 ≥16GB 专用 runner)。设计与验收标准见 [docs/DESIGN.md](docs/DESIGN.md)。
 
 ## 📑 目录
 
@@ -157,13 +157,14 @@ hnsw_stable     █████████████ 5 502 QPS
 
 ### 添加依赖
 
-当前版本 `0.1.0`,尚未发布到 crates.io:请按路径或 Git 引入;发布后照常写 `mneme = "0.1"` 即可。
+`mneme` 这个包名在 crates.io 上已被占用,故发布名为 `mneme-db`;库名(crate 名)仍为
+`mneme`,代码里照旧 `use mneme::...`。
 
 ```toml
 [dependencies]
-mneme = { path = "../mneme" }                              # 本地克隆后按路径引入
-# mneme = { git = "https://github.com/oxroot-crypto/mneme" }  # 或按 Git 引入
-# mneme = "0.1"                                           # 发布到 crates.io 之后
+mneme-db = "0.1"                                           # crates.io 发布名(库名仍为 mneme)
+# mneme-db = { path = "../mneme" }                         # 或本地克隆后按路径引入
+# mneme-db = { git = "https://github.com/oxroot-crypto/mneme" }  # 或按 Git 引入
 ```
 
 ## 🚀 快速开始
@@ -171,9 +172,8 @@ mneme = { path = "../mneme" }                              # 本地克隆后按�
 ### 1. 建一个 demo 工程
 
 ```bash
-git clone https://github.com/oxroot-crypto/mneme.git
 cargo new agent-memory && cd agent-memory
-cargo add --path ../mneme mneme     # 未发布到 crates.io,按路径引入
+cargo add mneme-db                  # 库名仍为 mneme,代码照旧 use mneme::...
 ```
 
 ### 2. 写入 `src/main.rs`
@@ -311,7 +311,7 @@ ns.supersede(
 
 ```toml
 [dependencies]
-mneme = { path = "../mneme", features = ["encrypt", "compress"] }
+mneme-db = { version = "0.1", features = ["encrypt", "compress"] }
 ```
 
 ```rust

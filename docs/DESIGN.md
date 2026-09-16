@@ -9,7 +9,7 @@
 
 ## 一句话定位
 
-**把"给 Agent 装一个不会失忆、也不会记忆膨胀的大脑"做成一个 `cargo add mneme` 就能用的库。**
+**把"给 Agent 装一个不会失忆、也不会记忆膨胀的大脑"做成一个 `cargo add mneme-db` 就能用的库。**
 
 如果你完全不了解 RAG、嵌入向量、近似检索这些概念,请从 [00-fundamentals.md](design/00-fundamentals.md) 开始——
 它假设读者只懂得基础编程,不假设任何 AI/数据库背景。

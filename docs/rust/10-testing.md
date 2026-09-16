@@ -639,13 +639,13 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-mneme = { path = "..", features = ["fuzzing"] }
+mneme = { package = "mneme-db", path = "..", features = ["fuzzing"] }
 ...
 [workspace]
 ```
 
-见 [`fuzz/Cargo.toml:1-12`](../../fuzz/Cargo.toml) 与
-[`fuzz/Cargo.toml:49`](../../fuzz/Cargo.toml)。要点:
+见 [`fuzz/Cargo.toml:1-13`](../../fuzz/Cargo.toml) 与
+[`fuzz/Cargo.toml:50`](../../fuzz/Cargo.toml)。要点:
 
 - 文件末尾的空 `[workspace]` 表让 `fuzz/` 成为**独立 workspace**:主 crate 的
   `cargo test`/`cargo build` 不会编译它(它有自己的 `Cargo.lock` 与 `target/`,均已
@@ -653,10 +653,11 @@ mneme = { path = "..", features = ["fuzzing"] }
 - `[package.metadata] cargo-fuzz = true` 是 cargo-fuzz 的识别标记;没有它,
   `cargo fuzz` 会认为这个 crate 不合法;
 - 依赖 `libfuzzer-sys` 提供 `fuzz_target!` 宏与 libFuzzer 运行时;
-- `mneme = { path = "..", features = ["fuzzing"] }` 打开主 crate 的 `fuzzing` feature,
-  才看得见 `mneme::fuzzing` 下的解析入口。
+- `mneme = { package = "mneme-db", path = "..", features = ["fuzzing"] }` 通过显式
+  `package` rename 把发布名 `mneme-db` 绑定回库名 `mneme`,并打开主 crate 的 `fuzzing`
+  feature,才看得见 `mneme::fuzzing` 下的解析入口。
 
-每个目标是一个极短的 `[[bin]]`(见 [`fuzz/Cargo.toml:14-19`](../../fuzz/Cargo.toml)):
+每个目标是一个极短的 `[[bin]]`(见 [`fuzz/Cargo.toml:15-20`](../../fuzz/Cargo.toml)):
 
 ```rust
 #![no_main]

@@ -929,7 +929,7 @@ pub struct Tuning {
 | `Unsupported` | ❌ | 与 feature 门控或库形态不符的能力(**纯内存库 `backup_to`**;纯内存库配量化;未开 `quant-f16` 的 f16 段;只读模式写);按版本/feature 调整 |
 | `Inconsistent` | ❌ | 内部不变量被破坏(应为 bug);上报并附上下文 |
 | `IdExhausted` | ❌ | `RowId`/`NsId`/`SeqNo` 或段号/MANIFEST 版本的整型表示空间耗尽(恢复出近上限水位后再写入/提交);绝不回绕复用(FC-PERSIST-ERR-012) |
-| `UnsupportedVersion` | ❌ | 文件格式版本与当前定义不一致(未发布:无旧格式兼容);从备份恢复或重建 |
+| `UnsupportedVersion` | ❌ | 文件格式版本与当前定义不一致(无旧格式兼容);从备份恢复或重建 |
 | `Corrupted` | ❌ | 数据损坏:立即停止写入,跑 `db.check()`,按 §7 恢复 |
 
 **原则**:错误信息面向排查——`Corrupted` 带段号与原因,`FilterParse` 带出错位置
